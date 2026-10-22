@@ -3,13 +3,15 @@ import { defineConfig } from 'astro/config'
 import starlightImageZoom from 'starlight-image-zoom'
 import starlightLinksValidator from 'starlight-links-validator'
 import starlightLlmsTxt from 'starlight-llms-txt'
+import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi'
 import starlightSidebarTopics from 'starlight-sidebar-topics'
 import previewNoindex from './src/integrations/preview-noindex.ts'
 import { sidebarTopics } from './src/lib/sidebar.ts'
 
 const isPreview = process.env.DOCS_PREVIEW === '1'
-const topicsConfig = sidebarTopics()
-const hasDevelopers = topicsConfig.some((t) => 'id' in t && t.id === 'developers')
+// Placeholder that starlight-openapi fills with the generated API reference pages (Developers topic).
+const apiSidebarGroup = createOpenAPISidebarGroup()
+const topicsConfig = sidebarTopics(apiSidebarGroup)
 
 export default defineConfig({
   site: 'https://docs.reputecast.com',
@@ -51,9 +53,28 @@ export default defineConfig({
       },
       routeMiddleware: './src/routeData.ts',
       plugins: [
+        // Must come before starlightSidebarTopics so the API reference group resolves inside the Developers topic.
+        starlightOpenAPI([
+          {
+            base: 'api',
+            schema: './src/data/openapi/reputecast.json',
+            sidebar: {
+              label: 'API reference',
+              group: apiSidebarGroup,
+              operations: { badges: true, labels: 'summary', sort: 'document' },
+              tags: { sort: 'document' },
+            },
+            snippets: {
+              operation: {
+                clients: { shell: ['curl'], javascript: ['fetch'], go: ['nethttp'] },
+                default: { target: 'shell', client: 'curl' },
+              },
+            },
+          },
+        ]),
         starlightSidebarTopics(topicsConfig, {
           exclude: ['/', '/vi/'],
-          topics: hasDevelopers ? { developers: ['/api/**'] } : {},
+          topics: { developers: ['/api/**'] },
         }),
         starlightLinksValidator(),
         starlightImageZoom(),

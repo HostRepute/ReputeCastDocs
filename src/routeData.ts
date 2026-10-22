@@ -2,7 +2,9 @@
 import { defineRouteMiddleware } from '@astrojs/starlight/route-data'
 import sans400 from '@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-400-normal.woff2?url'
 import sans600 from '@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-normal.woff2?url'
+import { apiPageMeta } from './lib/api-pages.ts'
 import { ogKey } from './lib/og.ts'
+import { hasHeadingComponents, mergeHeadings, nestToc } from './lib/toc.ts'
 import { firstSegment, groupFor, localize, localizedPath, topicFor } from './lib/topics.ts'
 
 const SITE = 'https://docs.reputecast.com'
@@ -14,17 +16,45 @@ export const onRequest = defineRouteMiddleware(async (context, next) => {
   await next()
   const route = context.locals.starlightRoute
   const { entry, lang } = route
-  const head = route.head
   const site = (context.site?.href ?? `${SITE}/`).replace(/\/$/, '')
   const canonical = new URL(context.url.pathname, `${site}/`).href
+  const isApi = firstSegment(route.id) === 'api'
+
+  if (isApi) {
+    // The API reference is English-only: no hreflang alternates, better titles and descriptions.
+    route.head = route.head.filter((h) => !(h.tag === 'link' && h.attrs?.rel === 'alternate' && h.attrs?.hreflang))
+    const meta = await apiPageMeta(route)
+    if (meta) {
+      entry.data.title = meta.title
+      entry.data.description = meta.description
+      for (const h of route.head) {
+        if (h.tag === 'title') h.content = `${meta.title} · ${route.siteTitle}`
+        if (h.tag === 'meta' && h.attrs?.property === 'og:title') h.attrs.content = meta.title
+      }
+      route.head = route.head.filter(
+        (h) => !(h.tag === 'meta' && (h.attrs?.name === 'description' || h.attrs?.property === 'og:description')),
+      )
+      route.head.push(
+        { tag: 'meta', attrs: { name: 'description', content: meta.description } },
+        { tag: 'meta', attrs: { property: 'og:description', content: meta.description } },
+      )
+    }
+  }
+  const head = route.head
   const title = entry.data.title
   const description = entry.data.description
+
+  const body = entry.body ?? ''
+  if (route.toc && hasHeadingComponents(body)) {
+    route.headings = await mergeHeadings(body, route.headings, lang)
+    const overview = route.toc.items[0]?.text ?? title
+    route.toc.items = nestToc(route.headings, route.toc.minHeadingLevel, route.toc.maxHeadingLevel, overview)
+  }
 
   for (const href of [sans400, sans600]) {
     head.push({ tag: 'link', attrs: { rel: 'preload', as: 'font', type: 'font/woff2', crossorigin: '', href } })
   }
 
-  const isApi = firstSegment(route.id) === 'api'
   const is404 = route.id === '404' || route.id.endsWith('/404')
   if (!is404) {
     const image = `${site}/og/${isApi ? 'api' : ogKey(entry.id)}.png`

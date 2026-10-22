@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  checkDataLinks,
   checkPages,
+  dataLinks,
   findTags,
   locateEntry,
   parseFrontmatter,
@@ -143,5 +145,21 @@ describe('parsing helpers', () => {
     expect(data).toEqual({ title: 'A' })
     expect(findTags(body, 'UiPath')[0].attrs).toEqual({ path: 'a > b' })
     expect(findTags(body, 'Screenshot')[0].attrs).toEqual({ id: 'x', alt: 'a > b' })
+  })
+})
+
+describe('data links', () => {
+  it('collects link/page fields and Markdown links, and flags targets that are not pages', () => {
+    const rows = [
+      { id: 'a', link: '/campaigns/reports/#bounces', definition: { en: 'See [routing](/providers/routing/).' } },
+      { id: 'b', page: '/providers/gone/', name: 'Gone' },
+      { id: 'c', link: 'https://example.com/' },
+    ]
+    const links = dataLinks(rows)
+    expect(links).toEqual(['/campaigns/reports/#bounces', '/providers/routing/', '/providers/gone/'])
+    const pages = new Set(['campaigns/reports', 'providers/routing', 'smtp-errors/index'])
+    expect(
+      checkDataLinks('x.yaml', [...links, '/smtp-errors/', '/api/operations/x/'], pages).map((i) => i.detail),
+    ).toEqual(['/providers/gone/ is not a page'])
   })
 })

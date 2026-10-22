@@ -3,7 +3,16 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { parse as parseYaml } from 'yaml'
-import { checkPages, formatIssues, locateEntry, parseFrontmatter, type CheckContext, type Page } from './lib.ts'
+import {
+  checkDataLinks,
+  checkPages,
+  dataLinks,
+  formatIssues,
+  locateEntry,
+  parseFrontmatter,
+  type CheckContext,
+  type Page,
+} from './lib.ts'
 
 const root = new URL('../../', import.meta.url).pathname
 const docsDir = join(root, 'src/content/docs')
@@ -54,7 +63,15 @@ const ctx: CheckContext = {
   strictI18n: process.argv.includes('--strict-i18n'),
 }
 
-const issues = checkPages(pages, ctx)
+const enPaths = new Set(pages.filter((p) => p.locale === 'en').map((p) => p.path))
+const dataDir = join(root, 'src/data')
+const dataIssues = readdirSync(dataDir)
+  .filter((f) => f.endsWith('.yaml'))
+  .flatMap((f) =>
+    checkDataLinks(`src/data/${f}`, dataLinks(parseYaml(readFileSync(join(dataDir, f), 'utf8'))), enPaths),
+  )
+
+const issues = [...checkPages(pages, ctx), ...dataIssues]
 if (issues.length > 0) {
   console.error(formatIssues(issues))
   console.error(`\n${issues.length} content issue(s) in ${new Set(issues.map((i) => i.file)).size} file(s).`)

@@ -184,3 +184,25 @@ export function checkPages(pages: Page[], ctx: CheckContext): Issue[] {
 export function formatIssues(issues: Issue[]): string {
   return issues.map((i) => `${i.file}: ${i.rule}: ${i.detail}`).join('\n')
 }
+
+/** Root-relative docs links found in data catalog values: `link`/`page` fields and Markdown links in text. */
+export function dataLinks(value: unknown, key = ''): string[] {
+  if (typeof value === 'string') {
+    const links = [...value.matchAll(/\]\((\/[^)\s]*)\)/g)].map((m) => m[1])
+    if ((key === 'link' || key === 'page') && value.startsWith('/')) links.push(value)
+    return links
+  }
+  if (Array.isArray(value)) return value.flatMap((v) => dataLinks(v))
+  if (value && typeof value === 'object') return Object.entries(value).flatMap(([k, v]) => dataLinks(v, k))
+  return []
+}
+
+/** Data links must point at an existing English page (`/campaigns/reports/#anchor` → `campaigns/reports`). */
+export function checkDataLinks(file: string, links: string[], pagePaths: Set<string>): Issue[] {
+  return links.flatMap((link) => {
+    const path = link.split('#')[0].replace(/^\/+|\/+$/g, '')
+    if (path === '' || path.startsWith('api/') || path === 'api') return []
+    const exists = pagePaths.has(path) || pagePaths.has(`${path}/index`)
+    return exists ? [] : [{ file, rule: 'link', detail: `${link} is not a page` }]
+  })
+}

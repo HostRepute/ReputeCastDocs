@@ -54,8 +54,10 @@ function toItems(spec: SidebarSpec, apiGroup: SidebarItem | undefined): SidebarI
 export function sidebarTopics(apiGroup?: SidebarItem): StarlightSidebarTopicsUserConfig {
   return topics.flatMap((topic) => {
     const items = topic.sidebar.flatMap((spec) => toItems(spec, apiGroup))
-    const hasOwnPage = topic.sidebar.some((s) => (s.kind === 'group' || s.kind === 'flat') && hasPages(s.directory))
-    if (!hasOwnPage) return []
+    const hasContent = topic.sidebar.some(
+      (s) => ((s.kind === 'group' || s.kind === 'flat') && hasPages(s.directory)) || (s.kind === 'api' && apiGroup),
+    )
+    if (!hasContent) return []
     return [{ id: topic.id, label: topic.label, link: topic.link, icon: topic.icon, items }]
   })
 }
