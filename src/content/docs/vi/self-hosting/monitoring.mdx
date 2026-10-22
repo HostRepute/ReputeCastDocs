@@ -1,0 +1,130 @@
+---
+title: Health check, metrics và log
+description: Tham chiếu giám sát ReputeCast bằng Prometheus, gồm các probe /healthz và /readyz, các chuỗi số liệu của /metrics và log JSON mà mỗi tiến trình ghi ra.
+type: reference
+audience: [operator]
+primaryKeyword: giám sát ReputeCast bằng Prometheus
+sources:
+  - internal/app/app.go
+  - internal/server/metrics.go
+  - internal/server/middleware.go
+  - internal/logging/logging.go
+  - internal/config/config.go
+  - internal/cli/serve.go
+  - deploy/Dockerfile.release
+sidebar:
+  order: 11
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Những gì ReputeCast cung cấp cho việc giám sát ReputeCast bằng Prometheus, health check từ load balancer và thu thập log.
+
+## Endpoint
+
+<TableScroll label="Các endpoint kiểm tra tình trạng và metrics">
+
+| Endpoint       | Phản hồi                                                                                                         | Dùng để                                                                          |
+| -------------- | ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `GET /healthz` | `200` với nội dung `ok` (`text/plain`). Không bao giờ chạm đến cơ sở dữ liệu.                                    | Liveness: tiến trình đang chạy và phục vụ HTTP.                                  |
+| `GET /readyz`  | `200` với `ready` sau khi ping cơ sở dữ liệu; `503` với `database unavailable` khi ping thất bại hoặc mất hơn 2 giây. | Readiness: đưa tiến trình ra khỏi load balancer trong lúc không kết nối được PostgreSQL. |
+| `GET /metrics` | Định dạng văn bản của Prometheus.                                                                                | Scrape. Được phục vụ trên listener chính trừ khi bạn đặt `metrics.addr`; `metrics.enabled: false` tắt endpoint này. |
+
+</TableScroll>
+
+- Ba endpoint này nằm trên listener HTTP (`http.addr`, mặc định `:8080`), vốn chỉ chạy trong các tiến trình có vai trò
+  `web` hoặc `ingest`. Tiến trình chỉ chạy worker (`reputecast worker` hoặc `serve --role=worker`) không có listener
+  HTTP: hãy đặt `metrics.addr` (ví dụ `:9090`) để scrape nó. Xem
+  [mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/).
+- Khi đặt `metrics.addr`, một máy chủ riêng trả lời trên địa chỉ đó và `/metrics` không còn được phục vụ trên listener
+  chính.
+- Cả ba endpoint đều không yêu cầu xác thực.
+
+<Aside type="caution" title="Không công khai /metrics">
+  `/metrics` mở cho bất kỳ ai truy cập được listener, và nhãn route của nó cho thấy những phần nào của ứng dụng đang được
+  dùng. Hãy đặt `metrics.addr` thành một địa chỉ mà chỉ Prometheus truy cập được, hoặc chặn `/metrics` trong
+  [reverse proxy](/vi/self-hosting/reverse-proxy/).
+</Aside>
+
+## Image Docker
+
+Image phát hành là distroless: không có shell, không có `curl` và không có `HEALTHCHECK`. Một `healthcheck` của Compose
+chạy lệnh bên trong container ứng dụng sẽ không hoạt động được. Hãy kiểm tra `/healthz` và `/readyz` qua HTTP từ bên
+ngoài container: từ load balancer, công cụ điều phối (orchestrator), reverse proxy hoặc dịch vụ giám sát uptime.
+
+## Metrics
+
+<TableScroll label="Metrics Prometheus">
+
+| Chuỗi                                      | Kiểu      | Nhãn                         | Ý nghĩa                                                                                                                         |
+| ------------------------------------------ | --------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `reputecast_http_requests_total`           | counter   | `method`, `route`, `status`  | Số yêu cầu HTTP. `route` là mẫu route khớp với yêu cầu (`/api/v1/auth/password`), hoặc `unmatched`; `status` là nhóm mã: `2xx`, `4xx`, `5xx`. |
+| `reputecast_http_request_duration_seconds` | histogram | `method`, `route`            | Độ trễ của yêu cầu. Các bucket: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 và 10 giây.                                 |
+| `go_*`                                     | nhiều loại | —                           | Bộ thu thập của runtime Go: goroutine, thu gom rác, bộ nhớ.                                                                     |
+| `process_*`                                | nhiều loại | —                           | Bộ thu thập của tiến trình: thời gian CPU, bộ nhớ thường trú, file descriptor đang mở, thời điểm khởi động.                     |
+
+</TableScroll>
+
+ReputeCast không xuất metrics nào khác: không có chuỗi số liệu cho lượt gửi, hàng đợi công việc hay nhà cung cấp gửi
+thư. Hãy theo dõi những thông tin đó trong ứng dụng, ở <UiPath path="nav.deliverability" /> và
+<UiPath path="nav.providers" />.
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: reputecast
+    static_configs:
+      - targets: ['reputecast.internal:9090'] # the host and port of metrics.addr, or of http.addr
+```
+
+```txt title="Ví dụ truy vấn PromQL"
+# Server errors per second, by route
+sum by (route) (rate(reputecast_http_requests_total{status="5xx"}[5m]))
+
+# 95th percentile latency, by route
+histogram_quantile(0.95, sum by (le, route) (rate(reputecast_http_request_duration_seconds_bucket[5m])))
+```
+
+## Log
+
+| Thiết lập    | Giá trị                                      | Mặc định                                       |
+| ------------ | -------------------------------------------- | ---------------------------------------------- |
+| `log.level`  | `debug`, `info`, `warn`, `error`             | `info`; `--log-level` ghi đè giá trị này       |
+| `log.format` | `text` hoặc `json` (mỗi dòng một đối tượng JSON) | `text`; image Docker đặt `json`            |
+
+Mọi tiến trình ghi log ra standard error. Trong Docker, hãy đọc log bằng `docker compose logs app`.
+
+```json title="docker compose logs app (định dạng json)"
+{"time":"2026-10-22T12:24:02.125352804Z","level":"INFO","msg":"http listening","addr":":8080","public_url":"http://localhost:8110","roles":["web","worker","ingest"]}
+```
+
+- Mỗi yêu cầu có một dòng `http`, gồm `method`, `path`, `status`, `bytes`, `duration_ms` và `request_id`. Cùng request
+  ID đó được lưu với các mục [nhật ký kiểm tra](/vi/reference/glossary/#audit-log) của yêu cầu.
+- Phản hồi có mã trạng thái từ 500 trở lên được ghi ở mức `error`, từ 400 đến 499 ở mức `warn`. Yêu cầu đến `/healthz`,
+  `/readyz` và tài nguyên tĩnh được ghi ở mức `debug`, để các probe không làm đầy log.
+- Các phần bí mật trong đường dẫn được thay bằng `{token}` trước khi ghi log: liên kết theo dõi và liên kết trong email,
+  liên kết hủy đăng ký và liên kết tùy chọn, báo cáo được chia sẻ, địa chỉ webhook của nhà cung cấp, lời mời và liên kết
+  đặt lại mật khẩu.
+
+Những dòng log nên đặt cảnh báo:
+
+| Thông điệp                                                                                | Mức   | Ý nghĩa                                                                                         |
+| ----------------------------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------- |
+| `generated a new secret key; back it up together with the database`                      | WARN  | Không tìm thấy khóa nên một khóa mới đã được ghi. Bình thường chỉ xảy ra một lần trên bản cài mới; nếu xảy ra sau khi khôi phục thì nghĩa là thiếu khóa ([sao lưu và khôi phục](/vi/self-hosting/backups/)). |
+| ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate`` | WARN  | Tệp nhị phân mới hơn schema ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).                 |
+| `ignoring invalid trusted proxy`                                                          | WARN  | Một giá trị trong `http.trusted_proxies` không phải IP hay CIDR.                                |
+| `http listening`                                                                          | INFO  | Listener HTTP đã khởi động; hiển thị `addr`, `public_url` và `roles`.                           |
+| `workers started`                                                                         | INFO  | Một vai trò worker đã khởi động; hiển thị `concurrency`.                                        |
+
+## Giới hạn của máy chủ HTTP
+
+<LimitsTable area="server" />
+
+## Liên quan
+
+- [Tham chiếu cấu hình](/vi/reference/configuration/): các thiết lập `metrics.*`, `log.*` và `http.*`.
+- [Khắc phục sự cố](/vi/self-hosting/troubleshooting/): triệu chứng, nguyên nhân và cách khắc phục.
+- [URL công khai và endpoint](/vi/reference/public-urls/): mọi đường dẫn ReputeCast phục vụ, và vai trò nào phục vụ
+  đường dẫn đó.

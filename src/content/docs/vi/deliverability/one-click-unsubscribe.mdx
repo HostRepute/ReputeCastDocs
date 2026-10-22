@@ -1,0 +1,188 @@
+---
+title: Hủy đăng ký một lần nhấp (RFC 8058)
+description: Cách ReputeCast hỗ trợ hủy đăng ký một lần nhấp theo RFC 8058, các header List-Unsubscribe được thêm, endpoint POST, điều gì thay đổi và cách thử bằng curl.
+type: explanation
+audience: [publisher, admin, developer]
+primaryKeyword: hủy đăng ký một lần nhấp
+sources:
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/automation.go
+  - internal/providers/provider.go
+  - internal/publicurl/publicurl.go
+  - internal/publicpages/publicpages.go
+  - internal/publicpages/tokens.go
+  - internal/publicpages/notifications.go
+  - internal/audience/signup.go
+  - internal/linktoken/linktoken.go
+  - internal/transactional/send.go
+  - internal/readiness/assemble.go
+  - internal/providers/brevo/brevo.go
+  - internal/providers/azureacs/azureacs.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[Hủy đăng ký một lần nhấp](/vi/reference/glossary/#one-click-unsubscribe) cho phép người đọc rời khỏi bản tin của bạn
+bằng nút Hủy đăng ký (Unsubscribe) mà ứng dụng thư hiển thị cạnh tên người gửi, không cần mở trang web nào. RFC 8058
+quy định cách hoạt động: hai header trong thư và một yêu cầu HTTPS POST. ReputeCast thêm các header hủy đăng ký một lần
+nhấp theo RFC 8058 vào mọi thư Gửi hàng loạt và Tự động hóa, và tự trả lời yêu cầu POST, nên bạn không cần cấu hình gì;
+trang này giải thích những gì ReputeCast gửi đi và cách kiểm tra.
+
+## Các header ReputeCast thêm vào
+
+Mọi thư Gửi hàng loạt và Tự động hóa đều mang các header sau (`TOKEN` là token đã ký của một người nhận):
+
+```txt title="Header của một thư Gửi hàng loạt"
+List-Unsubscribe: <https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN>, <mailto:digest@news.acme.io?subject=unsubscribe%20TOKEN>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Feedback-ID: 0199ab12:acme-newsletter:broadcast:reputecast
+```
+
+- **Địa chỉ HTTPS** là URL công khai của hệ thống, tiếp theo là `/p/<workspace>/unsubscribe/<token>`. Địa chỉ này luôn
+  dùng URL công khai của hệ thống, kể cả khi các trang công khai của không gian làm việc chạy trên
+  [tên miền riêng](/vi/forms/branding-and-domain/).
+- **Token** xác định không gian làm việc, thư và liên hệ. Token được ký bằng HMAC dẫn xuất từ khóa bí mật của hệ thống,
+  không chứa dữ liệu cá nhân ở dạng đọc được, và không hết hạn.
+- **Địa chỉ `mailto:`** là địa chỉ Reply-To của chiến dịch, hoặc Reply-To của người gửi, nếu không có thì là địa chỉ
+  From, với tiêu đề `unsubscribe <token>`. Địa chỉ này dành cho các ứng dụng thư không gửi được POST. ReputeCast không
+  đọc thư gửi đến đó: các yêu cầu này đến hộp thư đó, và bạn tự hủy đăng ký cho liên hệ trong
+  [Quản lý liên hệ](/vi/audience/contacts/).
+- **`Feedback-ID`** dành cho vòng phản hồi của Gmail: phần đầu của mã chiến dịch, không gian làm việc, luồng và
+  `reputecast`.
+
+RFC 8058 yêu cầu một URI HTTPS trong `List-Unsubscribe`, giá trị chính xác `List-Unsubscribe=One-Click` trong
+`List-Unsubscribe-Post`, và một chữ ký DKIM bao gồm cả hai header
+([RFC 8058, mục 3.1 và 4](https://www.rfc-editor.org/rfc/rfc8058#section-3.1), kiểm tra tháng 10/2026). Chữ ký DKIM do
+nhà cung cấp gửi thư tạo, nên nó phụ thuộc vào việc [DKIM đã được cấu hình](/vi/deliverability/spf-dkim-dmarc/).
+
+### Thư nào mang các header này
+
+<TableScroll label="Header hủy đăng ký một lần nhấp theo luồng">
+
+| Thư                                                         | Header                                                                                                       |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Gửi hàng loạt (chiến dịch)                                  | `List-Unsubscribe` với địa chỉ HTTPS và `mailto:`, cùng `List-Unsubscribe-Post`                              |
+| Tự động hóa                                                 | Như trên                                                                                                     |
+| Email giao dịch thuộc danh mục Tùy chọn                     | `List-Unsubscribe` chỉ với địa chỉ HTTPS, cùng `List-Unsubscribe-Post`                                       |
+| Email giao dịch thuộc danh mục Thiết yếu                    | Không có. Người nhận không thể tắt các thư này; liên kết hủy đăng ký của chúng mở trung tâm tùy chọn         |
+| Thư Hệ thống: xác nhận, đặt lại mật khẩu, thư gửi thử       | Không có                                                                                                     |
+| Bản sao của kiểm tra vị trí thư                             | Các header của Gửi hàng loạt, nhưng hủy đăng ký từ một bản sao không thay đổi gì                             |
+
+</TableScroll>
+
+Gmail và Yahoo chỉ yêu cầu hủy đăng ký một lần nhấp với thư tiếp thị; thư giao dịch được miễn
+([Google, Email sender guidelines FAQ](https://support.google.com/a/answer/14229414), kiểm tra tháng 10/2026). Xem
+[Email giao dịch trong ReputeCast](/vi/transactional/overview/) để biết về các danh mục.
+
+Hai nhà cung cấp gửi thư làm thay đổi điều này:
+
+- **Brevo** gỡ hai header của ReputeCast và đặt header riêng, nên các lượt hủy đăng ký một lần nhấp đi đến Brevo, rồi
+  Brevo báo lại cho ReputeCast qua webhook hủy đăng ký. Sau đó ReputeCast thêm địa chỉ vào danh sách chặn gửi. Xem
+  [Gửi thư bằng Brevo](/vi/providers/brevo/).
+- **Azure Communication Services** không đưa `List-Unsubscribe` vào chữ ký DKIM, nên không thể trông cậy vào hủy đăng
+  ký một lần nhấp của Gmail và Yahoo ở đó. Xem
+  [Gửi thư bằng Azure Communication Services](/vi/providers/azure-communication-services/).
+
+## Hủy đăng ký một lần nhấp hoạt động thế nào
+
+1. Khi gửi, ReputeCast ký một token cho từng người nhận và đặt địa chỉ hủy đăng ký vào các header và vào liên kết
+   `{{ unsubscribe_url }}` ở chân thư.
+2. Ứng dụng thư hiển thị nút Hủy đăng ký. Gmail chỉ hiển thị nút này cho những thư vượt qua các bước kiểm tra điều kiện
+   riêng của Gmail, kể cả khi các header đã đúng ([FAQ](https://support.google.com/a/answer/14229414), kiểm tra tháng
+   10/2026).
+3. Khi người đọc xác nhận, ứng dụng thư gửi một yêu cầu HTTPS POST với nội dung `List-Unsubscribe=One-Click`, không
+   kèm cookie hay thông tin đăng nhập nào.
+4. ReputeCast kiểm tra token và hủy đăng ký cho liên hệ ngay trong cùng yêu cầu, rồi trả lời `200` với nội dung
+   `Unsubscribed.`
+5. Từ đó, các thư Gửi hàng loạt và Tự động hóa bỏ qua địa chỉ này.
+
+```http title="Yêu cầu do ứng dụng thư gửi"
+POST /p/acme-newsletter/unsubscribe/TOKEN HTTP/1.1
+Host: reputecast.acme.io
+Content-Type: application/x-www-form-urlencoded
+
+List-Unsubscribe=One-Click
+```
+
+| Phản hồi | Khi nào                                                                                                   |
+| -------- | --------------------------------------------------------------------------------------------------------- |
+| `200`    | `Unsubscribed.` Liên hệ đã được hủy đăng ký, hoặc đã hủy từ trước. Lặp lại yêu cầu không thay đổi gì.    |
+| `400`    | Không đọc được nội dung yêu cầu.                                                                          |
+| `404`    | Token không hợp lệ, bị hỏng, hoặc thuộc về không gian làm việc khác.                                      |
+| `500`    | Cơ sở dữ liệu gặp lỗi: "Couldn't unsubscribe right now; try again in a minute."                           |
+
+Endpoint chỉ đọc trường này từ nội dung yêu cầu, gửi dưới dạng `application/x-www-form-urlencoded` hoặc
+`multipart/form-data`, và không bao giờ chuyển hướng một yêu cầu POST một lần nhấp. Yêu cầu `GET` đến cùng địa chỉ sẽ
+mở trang hủy đăng ký (với đề nghị tùy chọn "fewer emails", tức nhận ít email hơn, và ô chọn lý do) và không thay đổi gì
+cho đến khi người đọc xác nhận trên trang đó. Yêu cầu `HEAD`, loại yêu cầu mà các trình quét liên kết gửi, cũng không
+thay đổi gì.
+
+## Một lần hủy đăng ký thay đổi những gì
+
+- **Danh sách:** liên hệ rời khỏi mọi danh sách của không gian làm việc, không chỉ danh sách của chiến dịch, và trạng
+  thái của liên hệ chuyển thành đã hủy đăng ký.
+- **Danh sách chặn gửi:** địa chỉ được thêm vào với lý do Đã hủy đăng ký và phạm vi
+  <UiPath path="audience.suppressions.marketingOnly" />: các thư Gửi hàng loạt và Tự động hóa dừng lại, còn thư Hệ
+  thống (như đặt lại mật khẩu) và email giao dịch vẫn đến. Xem [Danh sách chặn gửi](/vi/audience/suppressions/).
+- **Lịch sử đồng ý:** một sự kiện cho mỗi danh sách đã rời, với nguồn là một lần nhấp (one-click), địa chỉ IP và trình
+  duyệt hoặc ứng dụng thư.
+- **Báo cáo:** lượt hủy đăng ký được tính cho chiến dịch mà thư thuộc về. Hủy đăng ký một lần nhấp không kèm lý do.
+- **Email giao dịch:** hủy đăng ký một lần nhấp từ một danh mục Tùy chọn chỉ tắt riêng danh mục đó.
+
+## Yêu cầu
+
+- **URL công khai dùng HTTPS.** Ứng dụng thư chỉ gửi POST đến địa chỉ HTTPS. Khi URL công khai của hệ thống không phải
+  `https://`, Độ sẵn sàng gửi cảnh báo trong nhóm Tuân thủ: "One-click unsubscribe needs an HTTPS address". Hãy đặt URL
+  công khai như mô tả trong [Cấu hình ReputeCast](/vi/self-hosting/configuration/).
+- **Reverse proxy chuyển nguyên vẹn các yêu cầu POST** đến các đường dẫn `/p/`
+  ([Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+- **DKIM tại nhà cung cấp gửi thư**, bao gồm cả các header, như RFC 8058 yêu cầu.
+- **Liên kết hủy đăng ký hiển thị** trong cả nội dung thư. Các header không thay thế được liên kết này: Độ sẵn sàng gửi
+  chặn chiến dịch có nội dung thư thiếu liên kết hủy đăng ký hoặc địa chỉ bưu chính
+  ([Yêu cầu gửi thư hàng loạt của Gmail, Yahoo và Microsoft](/vi/deliverability/bulk-sender-requirements/)).
+
+## Kiểm tra hủy đăng ký một lần nhấp
+
+<Aside type="caution">
+Một lần kiểm tra thành công sẽ hủy đăng ký liên hệ thật sự. Hãy dùng một liên hệ mang địa chỉ của chính bạn trong một
+danh sách thử nghiệm.
+</Aside>
+
+<Steps>
+
+1. Gửi một chiến dịch đến danh sách chỉ chứa địa chỉ của chính bạn. Thư gửi thử từ trình soạn thảo được gửi dưới dạng
+   thư Hệ thống và không có header `List-Unsubscribe`.
+
+2. Trong ứng dụng thư, mở mã nguồn của thư và sao chép địa chỉ HTTPS trong header `List-Unsubscribe`.
+
+3. Gửi yêu cầu một lần nhấp:
+
+   ```sh title="Terminal"
+   curl -i -X POST 'https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data 'List-Unsubscribe=One-Click'
+   ```
+
+4. Kiểm tra phản hồi: trạng thái `200`, `Content-Type: text/plain; charset=utf-8`, và nội dung `Unsubscribed.` Dòng
+   trạng thái là `HTTP/1.1 200 OK` hoặc `HTTP/2 200`, tùy reverse proxy của bạn.
+
+5. Mở liên hệ trong <UiPath path="nav.audience" />: hồ sơ cho thấy liên hệ đã hủy đăng ký khỏi mọi danh sách, và danh
+   sách chặn gửi có địa chỉ đó với phạm vi <UiPath path="audience.suppressions.marketingOnly" />. Để hoàn tác lần kiểm
+   tra, hãy mở địa chỉ HTTPS trong trình duyệt và đăng ký lại từ trang đó.
+
+</Steps>
+
+Để kiểm tra mà không hủy đăng ký ai, hãy dùng địa chỉ từ một bản sao của
+[kiểm tra vị trí thư](/vi/deliverability/placement-tests/): cùng yêu cầu POST đó trả lời `200` với "This is a placement
+test copy. Nobody was unsubscribed."
+
+## Liên quan
+
+- [Yêu cầu gửi thư hàng loạt của Gmail, Yahoo và Microsoft](/vi/deliverability/bulk-sender-requirements/)
+- [Trang đăng ký, tùy chọn và hủy đăng ký](/vi/forms/public-pages/)
+- [Danh sách chặn gửi](/vi/audience/suppressions/)
+- [URL và endpoint công khai](/vi/reference/public-urls/)

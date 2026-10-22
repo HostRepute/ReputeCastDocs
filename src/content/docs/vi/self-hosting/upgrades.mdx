@@ -1,0 +1,160 @@
+---
+title: Nâng cấp ReputeCast
+description: Cách nâng cấp ReputeCast lên bản phát hành mới bằng Docker Compose hoặc tệp nhị phân, áp dụng migration cơ sở dữ liệu, kiểm tra kết quả và quay lại an toàn.
+type: how-to
+audience: [operator]
+primaryKeyword: nâng cấp ReputeCast
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance'
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - .goreleaser.yaml
+  - internal/cli/migrate.go
+  - internal/cli/serve.go
+  - internal/db/db.go
+  - internal/version/version.go
+  - internal/instance/updates.go
+  - web/src/features/admin/instance/InstancePage.tsx
+sidebar:
+  order: 10
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Để nâng cấp ReputeCast, bạn thay image hoặc tệp nhị phân bằng một bản phát hành mới hơn và để nó áp dụng các migration
+cơ sở dữ liệu; mọi thứ khác (cấu hình, khóa bí mật, dữ liệu) giữ nguyên.
+
+## Xem phiên bản bạn đang chạy
+
+[Quản trị viên hệ thống](/vi/reference/glossary/#instance-admin) xem được phiên bản đã cài, bản phát hành mới nhất và
+changelog của nó trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, ở thẻ
+<UiPath path="admin.versionCard" />. Từ dòng lệnh, `reputecast version` in ra cùng thông tin đó:
+`reputecast <version> (<commit>) <Go version>`.
+
+<Screenshot
+  id="instance-settings"
+  alt="Thẻ Version & updates hiển thị phiên bản đã cài, bản phát hành mới nhất v1.5.0 kèm changelog, lệnh nâng cấp và việc kiểm tra bản phát hành hằng ngày đang bật."
+/>
+
+- Nhãn <UiPath path="admin.updateAvailable" /> xuất hiện khi bản phát hành mới nhất mới hơn phiên bản đã cài. Các bản
+  build không có số phiên bản phát hành (như `dev`) không bao giờ hiện nhãn này.
+- Trong mục <UiPath path="admin.upgradeOnServer" />, thẻ hiển thị lệnh Docker Compose
+  `cd /opt/reputecast && docker compose pull && docker compose up -d`. Hãy thay `/opt/reputecast` bằng thư mục chứa
+  `docker-compose.yml` của bạn.
+- Công tắc <UiPath path="admin.updateCheck" /> lấy bản phát hành mới nhất từ `api.github.com` mỗi ngày một lần. Yêu cầu
+  này không gửi kèm số phiên bản hay ID hệ thống; đây là lệnh gọi ra ngoài duy nhất ReputeCast tự thực hiện. Bạn có thể
+  tắt công tắc ở đây, hoặc đặt `updates.check: false` trong [cấu hình](/vi/reference/configuration/) để tắt cho toàn hệ
+  thống (khi đó công tắc bị khóa).
+
+## Trước khi bắt đầu
+
+- Đọc ghi chú phát hành của mọi phiên bản nằm giữa phiên bản của bạn và phiên bản mới, trên
+  [trang phát hành GitHub](https://github.com/hostrepute/reputecast/releases).
+- [Sao lưu cơ sở dữ liệu và khóa bí mật](/vi/self-hosting/backups/). Migration thay đổi schema, và bản sao lưu là cách
+  quay lại đáng tin cậy.
+- Dự tính một khoảng gián đoạn ngắn trong lúc ứng dụng khởi động lại.
+
+## Nâng cấp
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Vào thư mục chứa `docker-compose.yml` và tạo bản sao lưu:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. Nếu bạn ghim phiên bản trong `.env` (`REPUTECAST_VERSION=v1.4.2`), hãy đổi sang tag của bản phát hành mới. Tag của
+   image là tag phát hành, giữ nguyên chữ `v` ở đầu, cùng với `latest`. Nếu không có `REPUTECAST_VERSION`, tệp compose
+   dùng `latest`.
+
+3. Kéo image mới và tạo lại container của ứng dụng:
+
+   ```sh
+   docker compose pull && docker compose up -d
+   ```
+
+   Image khởi động với `serve --auto-migrate`, nên nó áp dụng các migration còn chờ trước khi phục vụ yêu cầu. Log
+   hiển thị một dòng `migration applied` cho mỗi migration.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Tệp nhị phân">
+
+<Steps>
+
+1. Tạo bản sao lưu (xem [sao lưu và khôi phục](/vi/self-hosting/backups/)).
+
+2. Tải tệp nén cho nền tảng của bạn và `checksums.txt` từ
+   [trang phát hành](https://github.com/hostrepute/reputecast/releases), rồi kiểm tra tệp đã tải:
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   ```
+
+3. Dừng mọi tiến trình ReputeCast, ví dụ `sudo systemctl stop reputecast`.
+
+4. Thay tệp nhị phân (ví dụ `/usr/local/bin/reputecast`) bằng tệp mới.
+
+5. Áp dụng migration một lần, với cùng môi trường mà dịch vụ sử dụng:
+
+   ```sh
+   reputecast migrate up
+   ```
+
+   Lệnh này áp dụng migration của ReputeCast, sau đó đến migration của hàng đợi công việc, và kết thúc bằng
+   `Database is up to date.`
+
+6. Khởi động lại mọi tiến trình. Nếu bạn chạy [nhiều vai trò](/vi/self-hosting/scaling/), hãy nâng cấp tất cả lên cùng
+   một phiên bản.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+  Một tiến trình khởi động không có `--auto-migrate` trên cơ sở dữ liệu còn migration chờ áp dụng vẫn tiếp tục chạy và
+  chỉ ghi log ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate``. Hãy chạy migration
+  trước khi dựa vào phiên bản mới.
+</Aside>
+
+## Kiểm tra kết quả
+
+- <UiPath path="admin.versionCard" /> hiển thị phiên bản mới là phiên bản đã cài.
+- `reputecast migrate status` liệt kê mọi migration kèm ngày áp dụng và không có migration nào ở trạng thái `pending`.
+  Trong Docker: `docker compose exec app /usr/local/bin/reputecast migrate status`.
+- `/readyz` trả về `ready` ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+
+## Quay lại phiên bản trước
+
+Chạy lại image hoặc tệp nhị phân cũ không hoàn tác migration: cơ sở dữ liệu vẫn giữ schema mới hơn.
+
+- **Khôi phục bản sao lưu** để trở về chính xác trạng thái trước khi nâng cấp: dừng ReputeCast, khôi phục bản dump bạn
+  đã tạo (xem [khôi phục](/vi/self-hosting/backups/#khôi-phục)), rồi khởi động phiên bản bạn chạy trước đó. Mọi thay đổi
+  sau khi nâng cấp sẽ mất.
+- **Ghim phiên bản trước** (`REPUTECAST_VERSION` trong `.env`, rồi `docker compose up -d`), như thẻ
+  <UiPath path="admin.versionCard" /> gợi ý, khi bạn muốn giữ dữ liệu đã ghi từ lúc nâng cấp.
+- `reputecast migrate down` chỉ hoàn tác migration mới nhất của ReputeCast, mỗi lần chạy một migration, và không đụng
+  đến các bảng của hàng đợi công việc. Nên ưu tiên khôi phục bản sao lưu.
+
+## Khắc phục sự cố
+
+- **Container mới thoát ngay khi khởi động**: đọc `docker compose logs app`. Migration thất bại sẽ dừng quá trình khởi
+  động với `migrate: …`; hãy khôi phục bản sao lưu và báo lỗi kèm phiên bản phát hành.
+- **Thẻ phiên bản báo kiểm tra cập nhật thất bại**: máy chủ không kết nối được `api.github.com`, hoặc GitHub trả về lỗi.
+  Không có gì khác bị ảnh hưởng; lần kiểm tra tiếp theo chạy vào ngày hôm sau.
+- **Bản phát hành mới nhất hiển thị dấu gạch ngang**: việc kiểm tra đang tắt hoặc chưa chạy lần nào.
+
+## Liên quan
+
+- [Sao lưu và khôi phục](/vi/self-hosting/backups/)
+- [Quản trị hệ thống](/vi/self-hosting/instance-admin/): các phần còn lại của <UiPath path="admin.instance" />.
+- [Tham chiếu CLI](/vi/reference/cli/): `migrate`, `version` và mọi lệnh khác.

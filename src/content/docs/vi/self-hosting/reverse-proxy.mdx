@@ -1,0 +1,322 @@
+---
+title: Reverse proxy và TLS
+description: 'Cấu hình reverse proxy cho ReputeCast đã kiểm thử với Caddy, nginx và Traefik: TLS, header Host, proxy tin cậy, SSE, MCP và tên miền tùy chỉnh.'
+type: how-to
+audience: [operator]
+primaryKeyword: cấu hình reverse proxy cho ReputeCast
+sources:
+  - internal/app/app.go
+  - internal/server/middleware.go
+  - internal/sending/engine/api.go
+  - internal/mcpserver/server.go
+  - internal/publicpages/publicpages.go
+  - internal/forms/domain.go
+  - internal/accounts/setup.go
+  - internal/smtprelay
+  - internal/app/wire_smtprelay.go
+  - internal/config/config.go
+  - README.md
+sidebar:
+  order: 6
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Khi cấu hình reverse proxy cho ReputeCast, proxy phải kết thúc TLS cho URL công khai của bạn và chuyển tiếp mọi yêu cầu
+đến cổng 8080 của ReputeCast với header `Host` gốc, đồng thời truyền các phản hồi streaming đi ngay mà không đệm. Các
+cấu hình dưới đây đã được kiểm thử với `caddy:2` (2.11), `nginx:stable-alpine` (1.30) và `traefik:v3` (3.7) đặt trước
+ReputeCast vào tháng 10/2026.
+
+## Proxy phải làm gì
+
+- **Kết thúc TLS** cho tên máy chủ của URL công khai, và cho [tên miền tùy chỉnh](#tên-miền-tùy-chỉnh) nếu các không
+  gian làm việc dùng chúng.
+- **Chuyển tiếp mọi đường dẫn** đến ReputeCast: ứng dụng và API, `/hooks/…` (webhook của nhà cung cấp gửi thư), `/p/…`
+  (trang công khai), `/t/…` (theo dõi lượt mở và lượt nhấp), `/mcp` và `/healthz`, đường dẫn mà kiểm tra URL công khai
+  gọi đến.
+- **Giữ nguyên header `Host`.** ReputeCast nhận diện tên miền tùy chỉnh dựa vào header này.
+- **Gửi `X-Forwarded-For`.** ReputeCast chỉ đọc header này từ
+  [proxy tin cậy](#đặt-url-công-khai-và-proxy-tin-cậy). ReputeCast không cần `X-Forwarded-Proto`: nó biết mình chạy
+  trên HTTPS nhờ `http.public_url`.
+- **Truyền không đệm** hai loại phản hồi:
+  - theo dõi trực tiếp, dùng Server-Sent Events tại
+    `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (heartbeat mỗi 15 giây,
+    `retry: 3000`);
+  - [endpoint MCP](/vi/developers/mcp/) `/mcp` (Streamable HTTP), có phản hồi dạng `text/event-stream`.
+- **Chấp nhận phần thân yêu cầu lớn.** ReputeCast đặt giới hạn riêng cho từng thao tác; lớn nhất là 105 MiB (nhập mẫu
+  giao dịch), còn nhập liên hệ chấp nhận 100 MiB.
+
+## Trước khi bắt đầu
+
+- ReputeCast chạy bằng [Docker Compose](/vi/self-hosting/docker/) hoặc [tệp nhị phân](/vi/self-hosting/binary/).
+- Tên máy chủ công khai (ở đây là `news.example.com`) trỏ đến máy chủ, và cổng 80, 443 đang mở cho tổ chức cấp chứng chỉ
+  và khách truy cập của bạn.
+
+## Cấu hình proxy
+
+Ví dụ Caddy và Traefik thêm proxy vào project Compose trong `docker-compose.override.yml`, nên proxy truy cập ReputeCast
+qua `app:8080`. Khi proxy chạy ngay trên máy chủ (cài bằng tệp nhị phân, hoặc Compose với
+`REPUTECAST_PORT=127.0.0.1:8080`), hãy dùng `127.0.0.1:8080`.
+
+<Tabs syncKey="proxy">
+<TabItem label="Caddy">
+
+Caddy tự lấy và gia hạn chứng chỉ, giữ header `Host`, đặt `X-Forwarded-For` và đẩy ngay các phản hồi
+`text/event-stream`, nên theo dõi trực tiếp và MCP không cần thêm dòng nào
+([tài liệu reverse_proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy), kiểm tra tháng 10/2026).
+
+```txt title="Caddyfile"
+{
+	email you@company.com
+	on_demand_tls {
+		ask http://app:8080/p/_/tls-check
+	}
+}
+
+news.example.com {
+	reverse_proxy app:8080
+}
+
+# Workspaces' custom domains for public pages: a certificate only for verified domains.
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy app:8080
+}
+```
+
+```yaml title="docker-compose.override.yml"
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+  app:
+    environment:
+      # The subnet of the reputecast_default network (see below).
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
+Hãy bỏ khối `https://` nếu không có không gian làm việc nào dùng tên miền tùy chỉnh.
+
+</TabItem>
+<TabItem label="nginx">
+
+Cấu hình này dành cho nginx 1.25.1 trở lên (chỉ thị `http2`) chạy ngay trên máy chủ, với chứng chỉ Let's Encrypt ở vị
+trí mặc định của Certbot. Mặc định nginx đệm các phản hồi được proxy, nên hai đường dẫn streaming tắt chế độ đệm.
+
+```nginx title="/etc/nginx/conf.d/reputecast.conf"
+upstream reputecast {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    server_name news.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name news.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/news.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/news.example.com/privkey.pem;
+
+    # ReputeCast enforces its own size limit per operation (largest: 105 MiB).
+    client_max_body_size 110m;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection "";
+
+    location / {
+        proxy_pass http://reputecast;
+    }
+
+    # Live monitor (Server-Sent Events) and the MCP endpoint: no buffering.
+    location ~ ^/api/v1/workspaces/[^/]+/campaigns/[^/]+/live/stream$ {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+}
+```
+
+- Khi bật chế độ đệm, các sự kiện của theo dõi trực tiếp đến trình duyệt muộn và rời rạc trong lúc kiểm thử; với cấu
+  hình trên, chúng đến đều đặn mỗi giây.
+- `client_max_body_size` mặc định của nginx là 1 MiB, quá nhỏ cho việc nhập liên hệ và tệp đính kèm.
+- Khi nginx chạy như một dịch vụ Compose, hãy dùng `server app:8080;` và khởi động nginx sau ứng dụng
+  (`depends_on: [app]`): nginx phân giải tên upstream lúc khởi động.
+
+</TabItem>
+<TabItem label="Traefik">
+
+Traefik đọc route từ label của container ứng dụng, lấy chứng chỉ từ Let's Encrypt, giữ header `Host`, đặt
+`X-Forwarded-For` và truyền Server-Sent Events mà không cần thiết lập thêm
+([tài liệu Traefik](https://doc.traefik.io/traefik/), kiểm tra tháng 10/2026).
+
+```yaml title="docker-compose.override.yml"
+services:
+  traefik:
+    image: traefik:v3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.email=you@company.com
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+  app:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.reputecast.rule=Host(`news.example.com`)
+      - traefik.http.routers.reputecast.entrypoints=websecure
+      - traefik.http.routers.reputecast.tls.certresolver=le
+      - traefik.http.services.reputecast.loadbalancer.server.port=8080
+    environment:
+      # The subnet of the reputecast_default network (see below).
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+
+volumes:
+  letsencrypt:
+```
+
+</TabItem>
+</Tabs>
+
+## Đặt URL công khai và proxy tin cậy
+
+<Steps>
+
+1. Đặt `http.public_url` thành địa chỉ HTTPS, không có dấu gạch chéo ở cuối:
+   `REPUTECAST_PUBLIC_URL=https://news.example.com` trong `.env` của Compose, hoặc `REPUTECAST_HTTP__PUBLIC_URL` với tệp
+   nhị phân. Khi URL công khai bắt đầu bằng `https://`, ReputeCast gửi HSTS và đánh dấu cookie phiên là Secure.
+
+2. Đặt `http.trusted_proxies` thành các địa chỉ mà proxy kết nối từ đó: `127.0.0.1` cho proxy trên cùng máy chủ với tệp
+   nhị phân, hoặc subnet của network Compose:
+
+   ```sh
+   docker network inspect reputecast_default --format '{{(index .IPAM.Config 0).Subnet}}'
+   ```
+
+3. Khởi động lại ReputeCast (`docker compose up -d`, hoặc khởi động lại dịch vụ).
+
+</Steps>
+
+ReputeCast đọc `X-Forwarded-For` từ phải sang trái và lấy địa chỉ đầu tiên không phải proxy tin cậy, nếu không có thì
+dùng `X-Real-IP`. Khi đứng sau một chuỗi proxy (một CDN, rồi đến nginx), hãy tin cậy mọi chặng. Nếu không có thiết lập
+này, phiên, giới hạn tốc độ và nhật ký kiểm tra sẽ hiện địa chỉ của proxy cho mọi người: khi kiểm thử, một phiên mở qua
+nginx hiện địa chỉ `172.19.0.6` của container proxy cho đến khi subnet được tin cậy.
+
+## Tên miền tùy chỉnh
+
+Một không gian làm việc có thể phục vụ trang đăng ký, trung tâm tùy chọn, trang lưu trữ và các trang công khai khác tại
+gốc tên miền riêng của nó, thiết lập trong <UiPath path="nav.forms > forms.tabs.branding" />
+([đặt thương hiệu cho trang và dùng tên miền riêng](/vi/forms/branding-and-domain/)). Tên miền trỏ đến máy chủ của bạn
+bằng một bản ghi `CNAME` tới tên máy chủ của URL công khai. Với proxy, điều đó có nghĩa là:
+
+- **Chuyển tiếp tên miền đến ReputeCast kèm header `Host` của nó.** ReputeCast tra tên máy chủ trong các tên miền đã xác
+  minh và phục vụ trang của không gian làm việc tương ứng; tên máy chủ không xác định sẽ nhận ứng dụng.
+- **Cung cấp chứng chỉ cho tên miền.** Với Caddy, khối `https://` cấp chứng chỉ theo yêu cầu. Trước mỗi lần cấp, Caddy
+  gọi `http://app:8080/p/_/tls-check?domain=<name>`, đường dẫn này trả về `200` cho tên miền tùy chỉnh đã xác minh và
+  `404` cho mọi trường hợp khác, nên chứng chỉ chỉ được cấp cho tên miền đã xác minh. Bạn có thể tự kiểm tra một tên
+  miền bằng `curl -i "http://127.0.0.1:8080/p/_/tls-check?domain=news.acme.io"`.
+- **nginx và Traefik** không có kiểm tra này: hãy thêm từng tên miền đã xác minh vào `server_name` cùng chứng chỉ của
+  nó (nginx), hoặc vào quy tắc router, như ``Host(`news.example.com`) || Host(`news.acme.io`)`` (Traefik).
+
+Email vẫn liên kết đến URL công khai; tên miền tùy chỉnh chỉ dành cho trang công khai.
+
+## Cổng SMTP relay
+
+[SMTP relay](/vi/transactional/smtp-relay/) tự nói giao thức SMTP trên cổng 587 (STARTTLS) và 465 (TLS), với chứng chỉ
+riêng, nên proxy HTTP không chuyển tiếp được:
+
+- Công bố các cổng trực tiếp từ container ứng dụng, ví dụ trong `docker-compose.override.yml`:
+
+  ```yaml title="docker-compose.override.yml"
+  services:
+    app:
+      ports:
+        - "587:587"
+        - "465:465"
+  ```
+
+  Hoặc chuyển tiếp chúng ở tầng 4 (TCP) mà không kết thúc TLS. Relay lấy địa chỉ client từ kết nối TCP và không đọc
+  PROXY protocol, nên khi đứng sau một bộ chuyển tiếp TCP, địa chỉ dùng gần nhất của khóa sẽ là địa chỉ của bộ chuyển
+  tiếp.
+- Với chứng chỉ Let's Encrypt, ReputeCast trả lời thử thách HTTP-01 cho tên máy chủ của relay tại
+  `/.well-known/acme-challenge/…` trên cổng web của nó. Let's Encrypt lấy thử thách qua cổng 80 và đi theo chuyển hướng
+  sang HTTPS ([các loại thử thách](https://letsencrypt.org/docs/challenge-types/), kiểm tra tháng 10/2026), nên
+  proxy phải chuyển tiếp đường dẫn đó cho tên máy chủ của relay. Nếu proxy của bạn tự trả lời đường dẫn đó, hãy cấp cho
+  relay các tệp chứng chỉ.
+
+## Kiểm tra kết quả
+
+- `curl -sI https://news.example.com/healthz` trả về `200` kèm header `Strict-Transport-Security`.
+- Kiểm tra URL công khai trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> cho thấy DNS, TLS và
+  Reachable đều đạt ([đăng nhập lần đầu](/vi/self-hosting/first-run/#kiểm-tra-url-công-khai)).
+- Stream của theo dõi trực tiếp gửi dữ liệu ngay lập tức. Với một khóa API có quyền `campaigns:view`:
+
+  ```sh
+  curl -N -H "Authorization: Bearer rc_live_…" \
+    https://news.example.com/api/v1/workspaces/acme-newsletter/campaigns/<campaign id>/live/stream
+  ```
+
+  Bạn thấy `retry: 3000` và `: connected` ngay lập tức, rồi `: heartbeat …` mỗi 15 giây.
+- Danh sách phiên đang hoạt động trong tài khoản của bạn hiện địa chỉ IP của chính bạn, không phải của proxy.
+
+## Khắc phục sự cố
+
+- **Theo dõi trực tiếp không cập nhật, hoặc vài giây mới nhảy một lần**: proxy đang đệm stream. Trong nginx, hãy thêm
+  `location` của live stream với `proxy_buffering off`.
+- **`413 Request Entity Too Large` khi nhập dữ liệu hoặc tải tệp lên**: hãy tăng `client_max_body_size` của nginx.
+- **Mọi người đều hiện địa chỉ của proxy**: `http.trusted_proxies` không chứa địa chỉ mà proxy kết nối từ đó.
+- **Tên miền tùy chỉnh mở ứng dụng ReputeCast thay vì trang công khai**: proxy thay header `Host`, hoặc tên miền chưa
+  được xác minh.
+- **Caddy từ chối TLS cho tên miền tùy chỉnh** (`tlsv1 alert internal error`): `/p/_/tls-check` trả về `404` vì tên
+  miền chưa được xác minh trong ReputeCast.
+- **`502 Bad Gateway` từ nginx trong Docker sau khi ứng dụng được tạo lại**: nginx vẫn giữ địa chỉ container cũ. Hãy
+  khởi động lại nginx (`docker compose restart nginx`).
+- **Kiểm tra URL công khai cảnh báo `Answered with HTTP …`**: proxy có trả lời nhưng không chuyển tiếp `/healthz` đến
+  ReputeCast.
+
+## Liên quan
+
+- [Cài đặt bằng Docker Compose](/vi/self-hosting/docker/)
+- [Mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/): chuyển `/hooks/` đến các tiến trình
+  ingest.
+- [Tham chiếu cấu hình](/vi/reference/configuration/#http): mọi khóa `http.*`.

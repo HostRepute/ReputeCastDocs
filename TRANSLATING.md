@@ -64,5 +64,6 @@ note "Ảnh chụp này hiển thị giao diện tiếng Anh." `pnpm upstream:ch
 
 The Vietnamese edition is reviewed by a native speaker (the project owner) before launch.
 
-| Reviewer | Date | Scope |
-| -------- | ---- | ----- |
+| Reviewer                 | Date | Scope                                                           |
+| ------------------------ | ---- | --------------------------------------------------------------- |
+| _pending: project owner_ | —    | all 170 Vietnamese pages and the `vi` text in `src/data/*.yaml` |

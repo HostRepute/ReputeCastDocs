@@ -1,0 +1,256 @@
+---
+title: Sao lưu và khôi phục
+description: Sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và thư mục tệp, rồi khôi phục cả ba theo đúng thứ tự và chạy thử bản khôi phục.
+type: how-to
+audience: [operator]
+primaryKeyword: sao lưu ReputeCast bằng pg_dump
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/accounts/signin.go
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - migrations/00300_composer.sql
+  - web/src/features/admin/instance/InstancePage.tsx
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Hãy sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và thư mục tệp: một lần khôi phục cần đủ cả ba, chỉ riêng cơ sở
+dữ liệu là không đủ.
+
+## Bản sao lưu gồm những gì
+
+| Phần                 | Nội dung                                                                                                                                                                                         | Vị trí                                                                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cơ sở dữ liệu PostgreSQL | Mọi thứ còn lại: không gian làm việc, liên hệ, chiến dịch, hình ảnh đã tải lên, hàng đợi công việc, [nhật ký kiểm tra](/vi/reference/glossary/#audit-log) và mọi thông tin xác thực đã lưu ở dạng mã hóa. | Cơ sở dữ liệu trong `database.url`.                                                                                                                                                                            |
+| Khóa bí mật          | Khóa AES-256-GCM dùng để mã hóa thông tin xác thực của nhà cung cấp, client secret OIDC, token HostRepute và seed của ứng dụng xác thực (TOTP) trong cơ sở dữ liệu.                                 | `REPUTECAST_SECRETS__KEY` nếu bạn đặt biến này; nếu không thì là tệp khóa `secrets.key_file`: `/var/lib/reputecast/secret.key` trong Docker, `data/secret.key` với tệp nhị phân (tính từ thư mục mà ReputeCast khởi động). |
+| Thư mục tệp          | Tệp của sản phẩm số và lead magnet, vốn quá lớn để lưu trong cơ sở dữ liệu.                                                                                                                          | `files.dir`; mặc định là thư mục `files` nằm cạnh tệp khóa (`/var/lib/reputecast/files` trong Docker). Thư mục này chỉ xuất hiện khi có người tải lên một tệp.                                                     |
+
+Hãy giữ cả cấu hình: tệp `.env` hoặc các biến shell bạn dùng để khởi động Docker Compose, hoặc tệp cấu hình YAML và tệp
+môi trường của tệp nhị phân. [Tham chiếu cấu hình](/vi/reference/configuration/) liệt kê mọi thiết lập.
+
+<Aside type="caution" title="Không thể thiếu khóa">
+  Nếu bạn khôi phục cơ sở dữ liệu mà không có khóa bí mật đi kèm, ReputeCast vẫn khởi động, ghi một khóa mới và ghi log
+  `generated a new secret key; back it up together with the database`. Khi đó mọi giá trị được mã hóa bằng khóa cũ đều
+  không đọc được nữa: đăng nhập bằng ứng dụng xác thực thất bại với lỗi `secrets: cannot decrypt value`, và mỗi không
+  gian làm việc phải nhập lại thông tin xác thực của nhà cung cấp. Các liên kết trong những email bạn đã gửi (hủy đăng
+  ký, trung tâm tùy chọn, theo dõi lượt mở và lượt nhấp) cũng ngừng hoạt động, vì chúng được ký bằng một khóa suy ra từ
+  khóa bí mật. Mã khôi phục và khóa truy cập vẫn dùng được, vì chúng không được mã hóa bằng khóa này.
+</Aside>
+
+<Aside type="danger" title="Cất khóa tách biệt với bản dump">
+  Một bản dump cơ sở dữ liệu cộng với khóa của nó mở được mọi thông tin xác thực đã lưu. Hãy cất khóa ở nơi khác với các
+  tệp dump, ví dụ trong trình quản lý mật khẩu, và hạn chế số người đọc được cả hai. Bản dump cũng chứa dữ liệu cá nhân
+  của các liên hệ.
+</Aside>
+
+## Trước khi bắt đầu
+
+- Quyền truy cập shell vào máy chủ, cùng thư mục dự án Docker Compose (thư mục chứa `docker-compose.yml`) hoặc tệp môi
+  trường của tệp nhị phân.
+- Với tệp nhị phân: `pg_dump`, `pg_restore` và `psql` cùng phiên bản chính với máy chủ PostgreSQL, hoặc mới hơn.
+- Đủ dung lượng đĩa bên ngoài volume dữ liệu để chứa các bản dump.
+
+## Sao lưu
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+Tệp compose đi kèm đặt tên dự án là `reputecast`, nên các volume của nó là `reputecast_pgdata` và
+`reputecast_appdata`. Volume của ứng dụng chứa tệp khóa và thư mục tệp.
+
+<Steps>
+
+1. Dump cơ sở dữ liệu từ bên trong container `postgres`, để phiên bản client và máy chủ luôn khớp nhau. `-T` tắt chế độ
+   terminal, nếu không bản dump dạng nhị phân sẽ bị hỏng:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-$(date +%F).dump
+   ```
+
+   `pg_dump` lấy một snapshot nhất quán trong lúc ReputeCast vẫn tiếp tục chạy.
+
+2. Nén volume của ứng dụng (khóa bí mật và thư mục tệp) bằng một container chạy tạm. Image nào có `tar` cũng dùng được:
+
+   ```sh title="Terminal"
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar czf /backup/appdata-$(date +%F).tar.gz -C /data .
+   ```
+
+   `tar` giữ nguyên chủ sở hữu (user 65532, user không phải root của image) và quyền `0600` của `secret.key`.
+
+3. Nếu bạn tự đặt `REPUTECAST_SECRETS__KEY` thay vì dùng tệp khóa, hãy lưu giá trị đó cùng bản sao lưu cấu hình.
+
+4. Sao chép bản dump và tệp nén ra khỏi máy chủ.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Tệp nhị phân">
+
+<Steps>
+
+1. Dump cơ sở dữ liệu. Dùng thông tin kết nối trong `REPUTECAST_DATABASE__URL`:
+
+   ```sh
+   pg_dump "postgres://reputecast:secret@localhost:5432/reputecast" -Fc -f reputecast-$(date +%F).dump
+   ```
+
+2. Sao chép tệp khóa và thư mục tệp. Với giá trị mặc định, cả hai nằm trong thư mục `data` của thư mục mà ReputeCast
+   chạy; nếu bạn đã đặt `secrets.key_file` hoặc `files.dir`, hãy sao chép các đường dẫn đó:
+
+   ```sh
+   tar czf reputecast-data-$(date +%F).tar.gz -C /path/to/reputecast data
+   ```
+
+3. Nếu bạn đặt `REPUTECAST_SECRETS__KEY` thay vì dùng tệp khóa, hãy sao lưu tệp môi trường chứa biến đó.
+
+4. Sao chép bản dump và tệp nén ra khỏi máy chủ.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Khôi phục
+
+Hãy khôi phục cơ sở dữ liệu trước khi ReputeCast khởi động. Image Docker chạy với `--auto-install`: khi khởi động trên
+một cơ sở dữ liệu trống, nó tạo một Chủ sở hữu đầu tiên mới, điều bạn không muốn có chồng lên bản khôi phục.
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Dừng ứng dụng và giữ PostgreSQL chạy. Trên máy chủ mới, chỉ khởi động PostgreSQL:
+
+   ```sh title="Terminal"
+   docker compose stop app
+   docker compose up -d --wait postgres
+   ```
+
+2. Thay cơ sở dữ liệu bằng một cơ sở dữ liệu trống:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres dropdb -U reputecast --force --if-exists reputecast
+   docker compose exec -T postgres psql -U reputecast -d postgres -c 'CREATE DATABASE reputecast'
+   ```
+
+3. Trên máy chủ PostgreSQL mới, hãy tạo role mà [phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql) dùng để
+   chạy. `pg_dump` sao chép một cơ sở dữ liệu chứ không sao chép các role của máy chủ, và nếu thiếu role này, quá trình
+   khôi phục sẽ dừng với lỗi `role "reputecast_segments" does not exist`:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres psql -U reputecast -d postgres \
+     -c 'CREATE ROLE reputecast_segments NOLOGIN NOINHERIT' \
+     -c 'GRANT reputecast_segments TO reputecast'
+   ```
+
+4. Khôi phục bản dump:
+
+   ```sh
+   docker compose exec -T postgres pg_restore -U reputecast -d reputecast --exit-on-error < reputecast-2026-10-22.dump
+   ```
+
+5. Đưa khóa bí mật và các tệp trở lại volume của ứng dụng. `docker compose create app` tạo container và volume của nó mà
+   không khởi động:
+
+   ```sh title="Terminal"
+   docker compose create app
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar xzf /backup/appdata-2026-10-22.tar.gz -C /data
+   ```
+
+6. Khởi động ReputeCast:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Nếu image mới hơn bản sao lưu, nó áp dụng các migration còn chờ ngay khi khởi động.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Tệp nhị phân">
+
+<Steps>
+
+1. Dừng ReputeCast, ví dụ `sudo systemctl stop reputecast`.
+
+2. Tạo lại cơ sở dữ liệu bằng một user có quyền tạo cơ sở dữ liệu:
+
+   ```sh title="Terminal"
+   dropdb --force --if-exists reputecast
+   psql -d postgres -c 'CREATE DATABASE reputecast OWNER reputecast'
+   ```
+
+3. Trên máy chủ PostgreSQL mới, trước tiên hãy tạo role cho phân khúc SQL và cấp role đó cho user của ứng dụng (ở đây
+   là `reputecast`):
+
+   ```sql title="segments-role.sql"
+   CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+4. Khôi phục bản dump bằng user của ứng dụng:
+
+   ```sh
+   pg_restore -d "postgres://reputecast:secret@localhost:5432/reputecast" --exit-on-error reputecast-2026-10-22.dump
+   ```
+
+5. Đưa tệp khóa và thư mục tệp về đúng nơi `secrets.key_file` và `files.dir` trỏ tới, và chỉ cho user chạy ReputeCast
+   đọc được:
+
+   ```sh
+   tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
+   ```
+
+6. Nếu tệp nhị phân mới hơn bản sao lưu, hãy chạy `reputecast migrate up`, rồi khởi động lại ReputeCast.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Kiểm tra kết quả
+
+- `curl -s http://localhost:8080/readyz` trả về `ready`. Xem [health check, metrics và log](/vi/self-hosting/monitoring/).
+- Log của ứng dụng không chứa `generated a new secret key`. Nếu có, nghĩa là ReputeCast không tìm thấy khóa đã khôi
+  phục: hãy dừng nó, đặt lại khóa rồi khởi động lại.
+- Đăng nhập bằng mật khẩu và ứng dụng xác thực. Đăng nhập bằng ứng dụng xác thực thành công chứng tỏ khóa khớp với cơ sở
+  dữ liệu.
+- Mở <UiPath path="nav.providers" /> trong một không gian làm việc: các nhà cung cấp gửi thư đã kết nối vẫn giữ trạng
+  thái thay vì đòi nhập thông tin xác thực.
+
+Hãy thử khôi phục trước khi bạn thật sự cần đến nó: khôi phục bản sao lưu mới nhất vào một dự án Compose thứ hai trên
+một cổng khác (ví dụ `docker compose -p reputecast-restore-test` với `REPUTECAST_PORT=8090`) rồi đăng nhập vào đó.
+
+## Khắc phục sự cố
+
+- **`role "reputecast_segments" does not exist` khi chạy `pg_restore`**: đây là máy chủ mới. Hãy tạo role (bước 3 của
+  phần khôi phục), tạo lại cơ sở dữ liệu trống và khôi phục lại.
+- **Đăng nhập bằng ứng dụng xác thực thất bại với `secrets: cannot decrypt value`**: cơ sở dữ liệu được khôi phục mà
+  không có khóa, hoặc với khóa sai. Hãy đặt lại khóa gốc. Nếu khóa đã mất, mọi người đăng nhập bằng mã khôi phục hoặc
+  khóa truy cập, quản trị viên hệ thống gỡ ứng dụng xác thực của họ bằng
+  [`reputecast user reset-2fa`](/vi/self-hosting/account-recovery/), và mỗi không gian làm việc nhập lại thông tin xác
+  thực của nhà cung cấp.
+- **Log xuất hiện một Chủ sở hữu mới với mật khẩu tạm thời**: ứng dụng đã khởi động trước khi cơ sở dữ liệu được khôi
+  phục. Hãy dừng nó, tạo lại cơ sở dữ liệu và khôi phục lại.
+- **`pg_restore: error: unsupported version` hoặc lỗi tương tự**: `pg_restore` của bạn cũ hơn `pg_dump` đã ghi tệp.
+  Hãy chạy lệnh khôi phục bên trong container `postgres`, hoặc cài client mới hơn.
+
+## Liên quan
+
+- [Nâng cấp ReputeCast](/vi/self-hosting/upgrades/): hãy sao lưu trước mỗi lần nâng cấp.
+- [Bảo mật và gia cố hệ thống](/vi/self-hosting/security/): cách khóa bí mật bảo vệ thông tin xác thực, và cách xoay
+  vòng khóa.
+- [PostgreSQL](/vi/self-hosting/postgres/): phiên bản, kích thước pool và role cho phân khúc SQL.
+- [Khôi phục quyền truy cập từ dòng lệnh](/vi/self-hosting/account-recovery/).

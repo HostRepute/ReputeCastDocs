@@ -1,0 +1,453 @@
+---
+title: Gửi email giao dịch bằng API
+description: Dùng API gửi email giao dịch để gửi một thư hoặc một lô tối đa 100 thư, kèm khóa idempotency, hẹn giờ gửi, tệp đính kèm, khóa thử nghiệm và mã lỗi.
+type: how-to
+audience: [developer]
+permissions: ['transactional:send']
+uiPath: 'nav.transactional > transactional.common.tabSetup'
+primaryKeyword: API gửi email giao dịch
+sources:
+  - internal/transactional/send.go
+  - internal/transactional/sendapi.go
+  - internal/transactional/transactional.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/events.go
+  - internal/transactional/preview.go
+  - internal/apikeys/transactional.go
+  - internal/authn/tokens.go
+  - internal/server/ratelimit.go
+  - web/src/features/transactional
+  - src/data/api-samples/send-transactional-message.yaml
+  - src/data/api-samples/send-transactional-batch.yaml
+sidebar:
+  order: 7
+---
+
+import { Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+API gửi email giao dịch gửi thư đặt lại mật khẩu, biên lai và các thư một-một khác từ một
+[mẫu giao dịch](/vi/reference/glossary/#transactional-template) đã xuất bản: mỗi lệnh gọi một thư, hoặc một lô tối đa
+100 thư. Mỗi lệnh gọi trả lời ngay lập tức bằng một ID thư, và thư được gửi đi trên
+[luồng Giao dịch](/vi/reference/glossary/#stream) qua tuyến và cơ chế chuyển dự phòng riêng của luồng này.
+
+## Trước khi bắt đầu
+
+- Một mẫu giao dịch đã xuất bản. **ID mẫu** của nó (ví dụ `password-reset`) là giá trị API nhận. Xem
+  [Tạo và xuất bản mẫu giao dịch](/vi/transactional/templates/).
+- Một người gửi đã xác minh trên một tên miền dùng cho thư Giao dịch. Xem
+  [Thêm tên miền gửi thư và người gửi](/vi/providers/senders-and-domains/).
+- Một tuyến cho luồng Giao dịch đến một nhà cung cấp gửi thư đã kết nối. Xem
+  [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
+- Một khóa có `transactional:send`. Phù hợp nhất là một
+  [khóa chỉ gửi](/vi/reference/glossary/#send-only-key), tạo trong
+  <UiPath path="nav.transactional > transactional.common.tabSetup" /> bằng
+  <UiPath path="transactional.setup.createKey" />. Khóa này chỉ có `transactional:send`, có thể bị giới hạn trong một
+  số mẫu hoặc danh mục, và có tốc độ gửi riêng. Mọi khóa API khác có `transactional:send` cũng dùng được
+  ([Xác thực và khóa API](/vi/developers/api-authentication/)).
+
+Nếu bạn chưa có những thứ này, [hướng dẫn gửi lần đầu](/vi/transactional/first-send/) sẽ dẫn bạn qua cả bốn bước trong
+ứng dụng.
+
+<Screenshot
+  id="transactional-setup"
+  alt="Trang Setup của Giao dịch liệt kê các đường dẫn của HTTP API, quy tắc xác thực, idempotency, kích thước, tốc độ và hẹn giờ, cùng ba loại khóa có thể gửi thư: một khóa chỉ gửi chính thức, một khóa chế độ thử nghiệm và một thông tin xác thực SMTP."
+/>
+
+## Gửi một thư
+
+<Steps>
+
+1. Sao chép URL công khai, slug không gian làm việc và khóa của bạn. Các ví dụ đọc khóa từ biến môi trường
+   `REPUTECAST_API_KEY`; hãy thay `reputecast.example.com` và `your-workspace` bằng giá trị của bạn.
+
+2. Gửi `POST /api/v1/workspaces/<workspace>/transactional/messages` với ID mẫu, người nhận và các biến của mẫu trong
+   `data`. Gửi kèm header `Idempotency-Key` để một lần thử lại không bao giờ gửi hai lần.
+
+   <Tabs syncKey="lang">
+   <TabItem label="cURL">
+
+   ```sh title="send.sh"
+   # REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   # Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   curl --request POST \
+     --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages \
+     --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+     --header 'Content-Type: application/json' \
+     --header 'Idempotency-Key: password-reset-8f14e45f' \
+     --data '{
+       "template": "password-reset",
+       "to": { "email": "sam.rivera@outlook.com", "name": "Sam Rivera" },
+       "data": {
+         "first_name": "Sam",
+         "reset_url": "https://app.example.com/reset/8f14e45f",
+         "expires_in": "30 minutes"
+       },
+       "tags": ["password-reset"]
+     }'
+   ```
+
+   </TabItem>
+   <TabItem label="Node.js">
+
+   ```js title="send.mjs"
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   const response = await fetch(
+     'https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages',
+     {
+       method: 'POST',
+       headers: {
+         Authorization: `Bearer ${process.env.REPUTECAST_API_KEY}`,
+         'Content-Type': 'application/json',
+         // A retry with the same key within 24 hours never sends twice.
+         'Idempotency-Key': 'password-reset-8f14e45f',
+       },
+       body: JSON.stringify({
+         template: 'password-reset',
+         to: { email: 'sam.rivera@outlook.com', name: 'Sam Rivera' },
+         data: {
+           first_name: 'Sam',
+           reset_url: 'https://app.example.com/reset/8f14e45f',
+           expires_in: '30 minutes',
+         },
+         tags: ['password-reset'],
+       }),
+     },
+   )
+   const result = await response.json()
+   if (!response.ok) throw new Error(`${response.status} ${result.code}: ${result.detail}`)
+   console.log(result.id, result.status) // status: queued
+   ```
+
+   </TabItem>
+   <TabItem label="Python">
+
+   ```python title="send.py"
+   # REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   # Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   import os
+
+   import requests
+
+   response = requests.post(
+       "https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages",
+       headers={
+           "Authorization": f"Bearer {os.environ['REPUTECAST_API_KEY']}",
+           # A retry with the same key within 24 hours never sends twice.
+           "Idempotency-Key": "password-reset-8f14e45f",
+       },
+       json={
+           "template": "password-reset",
+           "to": {"email": "sam.rivera@outlook.com", "name": "Sam Rivera"},
+           "data": {
+               "first_name": "Sam",
+               "reset_url": "https://app.example.com/reset/8f14e45f",
+               "expires_in": "30 minutes",
+           },
+           "tags": ["password-reset"],
+       },
+       timeout=10,
+   )
+   result = response.json()
+   if not response.ok:
+       raise RuntimeError(f"{response.status_code} {result.get('code')}: {result.get('detail')}")
+   print(result["id"], result["status"])  # status: queued
+   ```
+
+   </TabItem>
+   <TabItem label="Go">
+
+   ```go title="main.go"
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   package main
+
+   import (
+   	"bytes"
+   	"encoding/json"
+   	"fmt"
+   	"log"
+   	"net/http"
+   	"os"
+   )
+
+   func main() {
+   	body, err := json.Marshal(map[string]any{
+   		"template": "password-reset",
+   		"to":       map[string]string{"email": "sam.rivera@outlook.com", "name": "Sam Rivera"},
+   		"data": map[string]string{
+   			"first_name": "Sam",
+   			"reset_url":  "https://app.example.com/reset/8f14e45f",
+   			"expires_in": "30 minutes",
+   		},
+   		"tags": []string{"password-reset"},
+   	})
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	req, err := http.NewRequest(http.MethodPost,
+   		"https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages", bytes.NewReader(body))
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	req.Header.Set("Authorization", "Bearer "+os.Getenv("REPUTECAST_API_KEY"))
+   	req.Header.Set("Content-Type", "application/json")
+   	// A retry with the same key within 24 hours never sends twice.
+   	req.Header.Set("Idempotency-Key", "password-reset-8f14e45f")
+
+   	resp, err := http.DefaultClient.Do(req)
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	defer resp.Body.Close()
+
+   	var result struct {
+   		ID     string `json:"id"`
+   		Status string `json:"status"`
+   		Code   string `json:"code"`
+   		Detail string `json:"detail"`
+   	}
+   	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+   		log.Fatal(err)
+   	}
+   	if resp.StatusCode >= 300 {
+   		log.Fatalf("%d %s: %s", resp.StatusCode, result.Code, result.Detail)
+   	}
+   	fmt.Println(result.ID, result.Status) // status: queued
+   }
+   ```
+
+   </TabItem>
+   <TabItem label="PHP">
+
+   ```php title="send.php"
+   <?php
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   $payload = [
+       'template' => 'password-reset',
+       'to' => ['email' => 'sam.rivera@outlook.com', 'name' => 'Sam Rivera'],
+       'data' => [
+           'first_name' => 'Sam',
+           'reset_url' => 'https://app.example.com/reset/8f14e45f',
+           'expires_in' => '30 minutes',
+       ],
+       'tags' => ['password-reset'],
+   ];
+
+   $ch = curl_init('https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages');
+   curl_setopt_array($ch, [
+       CURLOPT_POST => true,
+       CURLOPT_RETURNTRANSFER => true,
+       CURLOPT_HTTPHEADER => [
+           'Authorization: Bearer ' . getenv('REPUTECAST_API_KEY'),
+           'Content-Type: application/json',
+           // A retry with the same key within 24 hours never sends twice.
+           'Idempotency-Key: password-reset-8f14e45f',
+       ],
+       CURLOPT_POSTFIELDS => json_encode($payload, JSON_THROW_ON_ERROR),
+   ]);
+   $body = curl_exec($ch);
+   if ($body === false) {
+       throw new RuntimeException(curl_error($ch));
+   }
+   $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+   $result = json_decode($body, true, flags: JSON_THROW_ON_ERROR);
+   if ($status >= 300) {
+       throw new RuntimeException("{$status} {$result['code']}: {$result['detail']}");
+   }
+   echo $result['id'], ' ', $result['status'], PHP_EOL; // status: queued
+   ```
+
+   </TabItem>
+   </Tabs>
+
+3. Đọc phản hồi. ReputeCast trả về `202 Accepted` khi thư đã được kiểm tra, kết xuất và đưa vào hàng đợi:
+
+   ```json title="202 Accepted"
+   { "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44", "status": "queued" }
+   ```
+
+   `status` là `queued`, `scheduled` (kèm `send_at`) hoặc `not_delivered` (thư của khóa chế độ thử nghiệm gửi đến một
+   địa chỉ mà khóa không được phép gửi tới). Hãy giữ lại `id`: nhật ký thư, API và mọi sự kiện webhook `message.*` đều
+   dùng giá trị này.
+
+</Steps>
+
+Ví dụ Node.js cần Node.js 18 trở lên (có sẵn `fetch`), còn ví dụ Python cần gói `requests`.
+[Tham chiếu thao tác](/api/operations/send-transactional-message/) liệt kê mọi trường và phản hồi.
+
+## Body của yêu cầu
+
+<TableScroll label="Các trường của một lượt gửi giao dịch">
+
+| Trường                      | Bắt buộc | Tác dụng                                                                                                                                                |
+| --------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `template`                  | Có       | ID mẫu, tối đa 64 ký tự. ReputeCast gửi phiên bản đang chạy (đã xuất bản) của mẫu.                                                                     |
+| `to`                        | Có       | `{ "email": "…", "name": "…" }`. `name` không bắt buộc.                                                                                                 |
+| `data`                      | Không    | Các biến của mẫu. Lệnh gọi thiếu một biến mà mẫu đánh dấu bắt buộc sẽ nhận `422 missing_variables`.                                                     |
+| `from`                      | Không    | Một người gửi Giao dịch đã xác minh, dạng `address` hoặc `Name <address>`. Nếu không có: người gửi của mẫu, rồi người gửi mặc định của không gian làm việc, rồi người gửi Giao dịch đã xác minh đầu tiên. |
+| `reply_to`                  | Không    | Một địa chỉ. Nếu không có, địa chỉ trả lời của mẫu hoặc của người gửi được áp dụng.                                                                    |
+| `subject`, `preheader`      | Không    | Thay tiêu đề hoặc dòng xem trước của mẫu cho thư này. Cả hai đều nhận Liquid.                                                                          |
+| `language`                  | Không    | Phiên bản ngôn ngữ cần gửi, chẳng hạn `es` hoặc `pt-BR`. Nếu không có: ngôn ngữ của liên hệ được liên kết, rồi ngôn ngữ dự phòng của không gian làm việc. |
+| `cc`, `bcc`                 | Không    | Mỗi trường tối đa 20 địa chỉ, cùng cấu trúc với `to`.                                                                                                   |
+| `attachments`               | Không    | Tối đa 20 tệp: `filename`, `content` (base64 chuẩn), `content_type` không bắt buộc (đoán từ tên tệp) và `content_id` cho ảnh nhúng (`cid:`).          |
+| `tags`                      | Không    | Tối đa 10 chuỗi. Chúng được trả lại cùng mọi sự kiện webhook của thư.                                                                                   |
+| `metadata`                  | Không    | Tối đa 20 cặp chuỗi (khóa tối đa 100 ký tự, giá trị tối đa 500). Chúng được trả lại cùng mọi sự kiện webhook.                                           |
+| `send_at`                   | Không    | Một thời điểm RFC 3339 trong vòng 72 giờ tới. Xem [Lên lịch gửi một thư](#lên-lịch-gửi-một-thư).                                                      |
+
+</TableScroll>
+
+Trường không xác định bị từ chối với `422 validation_failed`. Nếu người nhận trùng với một liên hệ, thư sẽ hiện trong
+hoạt động của liên hệ đó; API không bao giờ tạo liên hệ.
+
+## Gửi theo lô
+
+`POST …/transactional/messages/batch` nhận `{ "messages": [ … ] }` với 1 đến 100 thư, mỗi thư có cùng cấu trúc với
+một lượt gửi đơn lẻ. Hơn 100 thư sẽ bị từ chối; hãy chia lượt gửi lớn hơn thành nhiều lệnh gọi.
+
+```sh title="send-batch.sh"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send. Up to 100 messages per call.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages/batch \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: welcome-2026-10-22-0900' \
+  --data '{
+    "messages": [
+      {
+        "template": "welcome",
+        "to": { "email": "priya.shah@gmail.com", "name": "Priya Shah" },
+        "data": { "first_name": "Priya", "dashboard_url": "https://app.example.com/" }
+      },
+      {
+        "template": "welcome",
+        "to": { "email": "sam.rivera@outlook.com" },
+        "data": { "dashboard_url": "https://app.example.com/" }
+      }
+    ]
+  }'
+```
+
+Lô trả về `200 OK` với một kết quả cho mỗi thư, theo đúng thứ tự gửi, kèm số tổng:
+
+```json title="200 OK"
+{
+  "accepted": 1,
+  "failed": 1,
+  "results": [
+    { "index": 0, "id": "0192f1c4-8a10-7d3e-b4f2-6c1d9e0a7b55", "status": "queued" },
+    {
+      "index": 1,
+      "status": "error",
+      "error": {
+        "status": 422,
+        "title": "Missing variables",
+        "code": "missing_variables",
+        "detail": "welcome v3 needs first_name. Add it to data and call again.",
+        "missing": ["first_name"]
+      }
+    }
+  ]
+}
+```
+
+Lỗi của một thư không bao giờ chặn các thư khác.
+[Tham chiếu thao tác gửi theo lô](/api/operations/send-transactional-batch/) có cùng ví dụ bằng Node.js, Python, Go và
+PHP.
+
+## Thử lại an toàn với Idempotency-Key
+
+Gửi header `Idempotency-Key` (tối đa 255 ký tự) với mọi lượt gửi, ví dụ ID sự kiện hoặc ID đơn hàng của riêng bạn.
+
+- Một lần thử lại với cùng khóa và cùng body trong vòng 24 giờ nhận lại phản hồi đầu tiên và không gửi gì cả.
+- Cùng khóa nhưng body khác trong vòng 24 giờ nhận `409 idempotency_key_reused`. Hãy dùng khóa mới cho thư mới.
+- Sau 24 giờ, khóa bị quên và có thể dùng lại.
+- Khóa của một lô áp dụng cho cả lô; mỗi thư trong lô được ghi nhận dưới `<key>#<index>`.
+
+Hãy thử lại khi gặp lỗi mạng, `429` và `503` với cùng khóa. Đừng thử lại phản hồi `422` nếu chưa sửa yêu cầu.
+
+## Lên lịch gửi một thư
+
+Đặt `send_at` để gửi sau, tối đa 72 giờ tới. Thời điểm xa hơn sẽ nhận `422 validation_failed` ("send_at can be at most
+72 hours ahead"); hãy lên lịch các lượt gửi xa hơn trong ứng dụng của bạn. Thời điểm trong quá khứ, hoặc chưa tới một
+giây nữa, sẽ được gửi ngay. Phản hồi có `"status": "scheduled"` và giá trị `send_at` sẽ được dùng.
+
+## Thử nghiệm mà không gửi email cho khách hàng
+
+Khóa chỉ gửi ở chế độ thử nghiệm bắt đầu bằng `rc_test_`. Khóa này kết xuất và ghi nhật ký mọi thư, nhưng chỉ gửi đến
+các thành viên của không gian làm việc và các địa chỉ thử được phép của khóa (mẫu như `qa+*@example.com`). Mọi người
+nhận khác nhận `"status": "not_delivered"` và `"test": true`, và không có gì được gửi đi. Hãy dùng khóa này trong
+staging và CI.
+
+Để kiểm tra tiêu đề, HTML và văn bản mà không gửi hay ghi nhật ký gì, hãy gọi
+`POST …/transactional/templates/<template>/render` với cùng `to`, `data` và `language`
+([thao tác render](/api/operations/render-transactional-template/)).
+
+## Lỗi
+
+Lỗi là [problem document theo RFC 9457](/vi/developers/api-errors/), trong đó `detail` cho biết cần sửa gì. Các mã
+một lượt gửi có thể nhận:
+
+- `422 template_not_found`, `422 template_not_published`: kiểm tra ID mẫu, hoặc xuất bản mẫu.
+- `422 missing_variables`: thêm các biến liệt kê trong `missing` vào `data`.
+- `422 invalid_recipient`: kiểm tra địa chỉ trong ứng dụng của bạn trước khi gọi.
+- `422 recipient_suppressed`: địa chỉ đã bị trả thư, đã khiếu nại hoặc là bẫy spam, hoặc người nhận đã tắt danh mục
+  Tùy chọn của thư này. Thư vẫn có trong nhật ký, kèm một sự kiện `message.rejected`. Việc hủy đăng ký bản tin không
+  chặn thư giao dịch.
+- `422 sender_not_verified`: `from` không phải người gửi Giao dịch đã xác minh, hoặc chưa có người gửi nào như vậy.
+- `422 attachments_too_large`: thư lớn hơn mức nhà cung cấp gửi thư của tuyến chấp nhận; detail nêu giới hạn đó.
+- `422 template_does_not_render`: phiên bản đang chạy bị lỗi với dữ liệu này; detail cho biết lý do.
+- `403 template_not_allowed`: khóa bị giới hạn trong các mẫu hoặc danh mục khác.
+- `409 idempotency_key_reused`: xem [Thử lại an toàn với Idempotency-Key](#thử-lại-an-toàn-với-idempotency-key).
+- `429 rate_limited`: khóa đã dùng hết tốc độ gửi. Hãy chờ số giây trong `Retry-After` rồi gửi lại với cùng khóa
+  idempotency.
+- `503 no_healthy_route`: mọi nhà cung cấp gửi thư trong tuyến đều ngừng hoạt động. Hãy thử lại với cùng khóa
+  idempotency.
+
+## Giới hạn tốc độ
+
+Mỗi khóa có tốc độ gửi riêng: 50 thư mỗi giây, trừ khi khóa đặt một tốc độ khác (1–10.000). Một lô được tính bằng số
+thư trong lô. Khi gửi từ ứng dụng, mỗi người dùng có một mức chung 50 thư mỗi giây cho mọi lượt gửi của mình. Các
+endpoint này không tính vào giới hạn API chung là 600 yêu cầu mỗi phút ([Giới hạn tốc độ
+API](/vi/developers/api-rate-limits/)).
+
+Mỗi tiến trình máy chủ giữ bộ đếm riêng, nên nhiều node web phía sau một bộ cân bằng tải cùng cho phép tối đa số node
+nhân với tốc độ đó.
+
+## Kiểm tra kết quả
+
+- Mở <UiPath path="nav.transactional > transactional.common.tabMessages" /> và tìm thư theo người nhận, hoặc gọi
+  `GET …/transactional/messages/<id>` để xem dòng thời gian của thư. Xem [Nhật ký thư và cảnh báo](/vi/transactional/message-log/).
+- Đăng ký một endpoint cho `message.delivered`, `message.bounced` và `message.failed` để được báo về từng thư ngay khi
+  sự việc xảy ra ([Nhận webhook](/vi/developers/webhooks/)). `data` của các sự kiện này chứa `message_id`, `template`,
+  `to`, `status`, `provider`, cùng `tags` và `metadata` của bạn.
+
+## Khắc phục sự cố
+
+- **`401 unauthenticated`**: gửi khóa dưới dạng `Authorization: Bearer <key>`; kiểm tra khóa chưa bị thu hồi hoặc hết
+  hạn.
+- **`403 permission_denied`**: khóa thiếu `transactional:send`, hoặc người tạo khóa không còn quyền đó.
+- **`422 sender_not_verified` ở mọi lệnh gọi**: thêm một người gửi trên tên miền Giao dịch trong
+  <UiPath path="nav.settings > settings.senders" /> và xác minh các bản ghi DNS của nó.
+- **`status: not_delivered`**: bạn đang dùng khóa chế độ thử nghiệm (`rc_test_`); hãy gửi bằng khóa chính thức, hoặc
+  thêm địa chỉ vào danh sách địa chỉ thử của khóa.
+- **Thư bị gửi trùng sau khi hết thời gian chờ**: gửi `Idempotency-Key`, và dùng lại đúng khóa đó ở mọi lần thử lại.
+
+## Giới hạn
+
+<LimitsTable area="transactional" />
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Email giao dịch trong ReputeCast" href="/vi/transactional/overview/" description="Luồng, danh mục, danh sách chặn gửi và thời gian lưu giữ." />
+  <LinkCard title="Gửi email giao dịch đầu tiên" href="/vi/transactional/first-send/" description="Hướng dẫn năm bước trong ứng dụng." />
+  <LinkCard title="Gửi qua SMTP relay" href="/vi/transactional/smtp-relay/" description="Dành cho ứng dụng chỉ dùng được SMTP." />
+  <LinkCard title="Sự kiện webhook" href="/vi/reference/webhook-events/" description="Mọi sự kiện message.* và payload của chúng." />
+</CardGrid>

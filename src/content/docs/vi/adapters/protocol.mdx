@@ -1,0 +1,340 @@
+---
+title: Giao thức adapter v1
+description: 'Tài liệu tham chiếu giao thức adapter phiên bản 1: yêu cầu và câu trả lời JSON có ký, thao tác, kiểu dữ liệu, mã lỗi, thời gian chờ và circuit breaker.'
+type: reference
+audience: [developer, operator]
+primaryKeyword: giao thức adapter
+sources:
+  - docs/adapters.md
+  - internal/providers/remote/protocol.go
+  - internal/providers/remote/sign.go
+  - internal/providers/remote/client.go
+  - internal/providers/remote/breaker.go
+  - internal/providers/remote/provider.go
+  - internal/providers/remote/manifest.go
+  - internal/providers/remote/runtime.go
+  - internal/ingest/handler.go
+  - sdk/adapter-sdk/src
+sidebar:
+  order: 4
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Giao thức adapter phiên bản 1 là cách ReputeCast gọi một [adapter cộng đồng](/vi/reference/glossary/#community-adapter) chạy trong tiến trình riêng: JSON có ký qua HTTP, mỗi yêu cầu một thao tác. SDK TypeScript (`@reputecast/adapter-sdk`) triển khai mọi quy tắc trên trang này; hãy đọc trang này khi bạn viết adapter bằng ngôn ngữ khác hoặc khi gỡ lỗi một adapter. Để xây dựng adapter bằng SDK, hãy làm theo [viết adapter cộng đồng](/vi/adapters/community/).
+
+## Truyền tải
+
+- ReputeCast gửi `POST <adapter URL>/v1/<operation>` với nội dung JSON (`Content-Type: application/json`, UTF-8) và chờ một câu trả lời JSON có `Content-Type: application/json`.
+- Cả HTTP/1.1 và HTTP/2 đều dùng được. Chuyển hướng không bao giờ được đi theo.
+- ReputeCast gọi một adapter đồng thời (tối đa 64 lệnh gọi cùng lúc cho mỗi adapter đã cài), nên adapter phải xử lý được các yêu cầu đồng thời.
+- URL của adapter do người vận hành đặt (`reputecast adapter install --url` hoặc `reputecast adapter set-url`). `http://` không mã hóa chỉ được chấp nhận cho địa chỉ loopback và địa chỉ riêng, và các địa chỉ này cần `providers.allow_private_networks`. Địa chỉ link-local và metadata của đám mây luôn bị từ chối.
+
+## Header của yêu cầu
+
+| Header                   | Giá trị                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `X-ReputeCast-Protocol`  | `1`                                                                                                             |
+| `X-ReputeCast-Timestamp` | Thời gian Unix tính bằng giây.                                                                                  |
+| `X-ReputeCast-Signature` | `v1=<hex>`. Trong 24 giờ sau khi xoay vòng khóa bí mật, có hai mục cách nhau bằng dấu phẩy, khóa mới đứng trước. |
+| `X-ReputeCast-Operation` | `operation` trong nội dung, dùng cho nhật ký.                                                                   |
+| `Idempotency-Key`        | `idempotencyKey` trong nội dung.                                                                                |
+| `User-Agent`             | `ReputeCast/<version> (adapter-protocol 1)`                                                                     |
+
+## Chữ ký
+
+Mỗi mục `v1` là HMAC-SHA256 dạng hex chữ thường của `<timestamp>.<raw body>`, với khóa là khóa bí mật để ký của bản cài đặt: toàn bộ chuỗi `rcas_…` dưới dạng byte. ReputeCast tạo khóa bí mật khi adapter được cài (`rcas_` và 32 byte ngẫu nhiên), niêm phong nó khi lưu trữ và chỉ in ra một lần.
+
+Adapter phải:
+
+1. Từ chối yêu cầu không có mục `v1` khớp, hoặc có timestamp lệch quá 300 giây so với đồng hồ của adapter, bằng HTTP 401 và mã lỗi `unauthenticated`. Câu trả lời này có thể không ký.
+2. Kiểm tra rằng `operation` trong nội dung khớp với đường dẫn URL và `adapter` là id của chính nó, nếu không thì trả lời `400 invalid_request`.
+3. Ký mọi câu trả lời theo cùng cách, bằng khóa bí mật hiện tại: `X-ReputeCast-Timestamp` và `X-ReputeCast-Signature: v1=<hex HMAC-SHA256 of "<timestamp>.<body>">`, và gửi lại `idempotencyKey` của yêu cầu trong nội dung.
+
+ReputeCast từ chối các câu trả lời không ký, ký bằng khóa bí mật khác, lệch quá năm phút, có content type khác, hoặc dành cho yêu cầu khác. Vì thao tác, khóa idempotency, kết nối và đầu vào đều nằm trong nội dung, chữ ký bao trùm tất cả các phần này.
+
+```ts title="signing.ts"
+import { createHmac, timingSafeEqual } from 'node:crypto'
+
+const MAX_SKEW_SECONDS = 300
+
+/** Lowercase hex HMAC-SHA256 of "<timestamp>.<body>" with the whole rcas_… secret. */
+export function sign(secret: string, timestamp: number, body: Buffer | string): string {
+  return createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex')
+}
+
+/** True when one v1 entry of X-ReputeCast-Signature matches one of the secrets. */
+export function verify(
+  secrets: string[],
+  timestamp: string | undefined,
+  header: string | undefined,
+  rawBody: Buffer,
+  now = Date.now(),
+): boolean {
+  const ts = Number(timestamp)
+  if (!header || !/^\d+$/.test(timestamp ?? '') || Math.abs(now / 1000 - ts) > MAX_SKEW_SECONDS) return false
+  const got = header
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => p.startsWith('v1='))
+    .map((p) => Buffer.from(p.slice(3)))
+  return secrets.some((s) => {
+    const want = Buffer.from(sign(s, ts, rawBody))
+    return got.some((g) => g.length === want.length && timingSafeEqual(g, want))
+  })
+}
+```
+
+Trong lúc xoay vòng, hãy giữ cả hai khóa bí mật (`REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old` với SDK) và ký câu trả lời bằng khóa mới.
+
+## Nội dung yêu cầu
+
+```json title="POST /v1/send"
+{
+  "protocol": 1,
+  "operation": "send",
+  "adapter": "example-esp",
+  "idempotencyKey": "send-8c3f0a6e2b9d4c71a5e0f3b6d2c1a9e8",
+  "deadline": "2026-10-13T09:00:30.000Z",
+  "connection": {
+    "providerId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+    "workspaceId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e00",
+    "settings": { "region": "eu" },
+    "credentials": { "api_key": "…", "webhook_signing_key": "…" },
+    "webhookSecret": "…"
+  },
+  "input": { "messages": [] }
+}
+```
+
+| Trường                | Quy tắc                                                                                                                                                                                                                    |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deadline`            | Thời điểm ReputeCast ngừng chờ (thời gian chờ của thao tác). Hãy dừng các lệnh gọi tới nhà cung cấp trước thời điểm đó.                                                                                                   |
+| `connection`          | Nhà cung cấp đã kết nối mà lệnh gọi dành cho; không có với `health`. `settings` chứa các giá trị kết nối không bí mật, `credentials` chứa các giá trị bí mật. Chỉ những khóa được khai báo trong `config` của manifest mới được gửi. |
+| `webhookSecret`       | Khóa bí mật webhook của nhà cung cấp do ReputeCast tạo. Chỉ được gửi cho adapter khai báo `webhooks`, và chỉ khi kết nối có khóa này.                                                                                     |
+| Trường không xác định | Hãy bỏ qua chúng, trong cả yêu cầu và câu trả lời: trường tùy chọn mới không làm thay đổi phiên bản giao thức.                                                                                                             |
+
+## Nội dung câu trả lời
+
+```json title="Câu trả lời"
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "result": { "results": [] } }
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "error": { "code": "provider_unavailable", "message": "Example ESP answered 503.", "status": 503, "providerCode": "service_unavailable", "retryAfter": 30 } }
+```
+
+`result` đi kèm HTTP 200, `error` đi kèm trạng thái trong bảng dưới đây. `message` là một câu dùng cho nhật ký sự kiện (không bao giờ chứa thông tin xác thực; văn bản dài hơn 2.000 ký tự bị cắt). `status` và `providerCode` là những gì nhà cung cấp trả lời, còn `retryAfter` tính bằng giây.
+
+<TableScroll label="Mã lỗi của giao thức adapter">
+
+| `error.code`           | HTTP | Ý nghĩa                                              | ReputeCast làm gì                                                                                  |
+| ---------------------- | ---- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `invalid_request`      | 400  | ReputeCast gửi thứ mà adapter không đọc được.        | Đánh dấu lệnh gọi thất bại và tính một lỗi adapter.                                                |
+| `unauthenticated`      | 401  | Chữ ký hoặc timestamp bị từ chối.                    | Adapter không khả dụng: hãy cấp khóa bí mật mới hoặc chỉnh đồng hồ.                                |
+| `too_large`            | 413  | Nội dung vượt quá giới hạn của adapter.              | Đánh dấu lệnh gọi thất bại và tính một lỗi adapter.                                                |
+| `bad_signature`        | 422  | Chữ ký webhook của nhà cung cấp không hợp lệ.        | Từ chối webhook (trả lời nhà cung cấp 401).                                                        |
+| `provider_throttled`   | 429  | Nhà cung cấp đang giới hạn tốc độ.                   | Tạm thời: thử lại sau.                                                                             |
+| `provider_auth`        | 502  | Nhà cung cấp từ chối thông tin xác thực.             | Nhà cung cấp hiển thị là ngừng hoạt động do xác thực thất bại và yêu cầu thông tin xác thực mới.  |
+| `provider_error`       | 502  | Nhà cung cấp từ chối yêu cầu vĩnh viễn.              | Lỗi vĩnh viễn, kèm mã của nhà cung cấp.                                                            |
+| `provider_unavailable` | 503  | Nhà cung cấp ngừng hoạt động hoặc hết thời gian chờ. | Sự cố ngừng hoạt động của nhà cung cấp: chuyển dự phòng theo chính sách của từng luồng.           |
+| `not_supported`        | 501  | Adapter không triển khai thao tác này.               | Được coi là "nhà cung cấp này không hỗ trợ".                                                       |
+| `internal`             | 500  | Adapter gặp lỗi.                                     | Adapter không khả dụng, sẽ thử lại.                                                                |
+
+</TableScroll>
+
+## Idempotency
+
+Mọi yêu cầu đều có một `idempotencyKey` dài 1 đến 128 ký tự gồm `A-Z a-z 0-9 . _ : -`. Với `send`, khóa được suy ra từ mã thư, nên lần thử lại cùng một lô mang cùng khóa. Các thao tác khác nhận khóa mới cho mỗi lệnh gọi, và khóa được giữ nguyên khi ReputeCast thử lại một yêu cầu do kết nối bị đứt.
+
+Adapter phải trả về cùng kết quả cho một khóa mà nó đã trả lời thành công (trong ít nhất 15 phút) và không được chạy một khóa hai lần cùng lúc. Chính điều này giữ cho một lô được thử lại không bị gửi hai lần. Lỗi không được ghi nhớ: lần thử lại sau một lỗi sẽ chạy lại từ đầu.
+
+## Thao tác
+
+ReputeCast chỉ gọi các thao tác mà khả năng trong manifest đã cài khai báo. `health`, `verify` và `send` luôn có sẵn.
+
+<TableScroll label="Các thao tác của giao thức adapter">
+
+| Thao tác            | Cần                                     | Đầu vào                                          | Kết quả                                                          | Câu trả lời lớn nhất |
+| ------------------- | --------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------- | -------------------- |
+| `health`            | —                                       | `{}`                                             | `{ adapter, version, protocol, sdk?, capabilities? }`            | 64 KiB               |
+| `verify`            | —                                       | `{}`                                             | một [Quota](#đối-tượng-quota), mọi trường đều không bắt buộc     | 64 KiB               |
+| `send`              | —                                       | `{ messages: [Message] }`                        | `{ results: [SendResult] }`                                      | 4 MiB                |
+| `webhooks/verify`   | `webhooks`                              | `{ request: WebhookRequest }`                    | `{}` hoặc `{ handshake: { body } }`                              | 64 KiB               |
+| `webhooks/parse`    | `webhooks`                              | `{ request: WebhookRequest, verified }`          | `{ events: [Event] }`                                            | 16 MiB               |
+| `webhooks/register` | `registerWebhooks`                      | `{ url }`                                        | `{}`                                                             | 64 KiB               |
+| `domains/add`       | `domainSetup`                           | `{ domain }`                                     | `{ records: [DNSRecord] }`                                       | 1 MiB                |
+| `domains/status`    | `domainSetup`                           | `{ domain }`                                     | `{ records: [DNSRecord] }`                                       | 1 MiB                |
+| `quota`             | `quotaDiscovery`                        | `{}`                                             | một [Quota](#đối-tượng-quota) có `kind`, `max`, `used`           | 64 KiB               |
+| `suppressions/list` | `suppressionSync` `pull` hoặc `two-way` | `{ since, cursor }` (cả hai có thể là `null`)    | `{ suppressions: [Suppression], nextCursor }`                    | 8 MiB                |
+| `suppressions/add`  | `suppressionSync` `push` hoặc `two-way` | `{ emails: [string] }`                           | `{}`                                                             | 64 KiB               |
+
+</TableScroll>
+
+Thời gian chờ của từng thao tác có trong phần [giới hạn](#giới-hạn). Mọi thao tác trừ `health` đều mang `connection`.
+
+### `health`
+
+Được gọi bởi `reputecast adapter check` và lệnh kiểm tra của API quản trị hệ thống. Thao tác này vẫn đi qua ngay cả khi circuit breaker đang mở, và một lần thành công sẽ đóng circuit breaker. ReputeCast kiểm tra rằng `adapter` là id đã cài và `protocol` là `1`, và báo khi `version` đang chạy khác với manifest đã cài.
+
+### `verify`
+
+Kiểm tra thông tin xác thực của kết nối với nhà cung cấp: trong trình hướng dẫn kết nối, khi thông tin xác thực được thay thế, và từ tác vụ kiểm tra tình trạng khi adapter không có `quotaDiscovery`. Adapter không kiểm tra được thông tin xác thực mà không gửi thư thì trả về `{}`.
+
+### `send`
+
+Gửi từ 1 đến `batch` thư. Kết quả chứa đúng một SendResult cho mỗi thư, theo cùng thứ tự, mỗi kết quả gửi lại `messageId` của thư đó. Người nhận bị nhà cung cấp từ chối là lỗi riêng của thư đó, còn toàn bộ lệnh gọi vẫn thành công. Chỉ đánh dấu cả lệnh gọi thất bại (`provider_auth`, `provider_unavailable`, `provider_throttled`) khi không thư nào trong lô được chấp nhận; nếu không, hãy báo các thư còn lại là lỗi tạm thời theo từng thư, để lần thử lại không bao giờ gửi một thư hai lần.
+
+### `webhooks/verify`
+
+ReputeCast nhận được một webhook của nhà cung cấp tại `/hooks/community:<id>/<token>` và hỏi adapter xem webhook đó có thật sự đến từ nhà cung cấp không, trước khi lưu và trả lời nhà cung cấp. Hãy xử lý nhanh: nhà cung cấp đang chờ.
+
+- `{}`: hợp lệ. ReputeCast lưu webhook và trả lời nhà cung cấp 200.
+- `{ "handshake": { "body": "<text>" } }`: một lần bắt tay đăng ký mà adapter đã hoàn tất (như `SubscriptionConfirmation` của SNS). ReputeCast trả lời nhà cung cấp 200 kèm `body` (tối đa 16 KiB) và không lưu gì.
+- Lỗi `bad_signature`: ReputeCast trả lời nhà cung cấp 401 và giữ 2 KiB đầu tiên để chẩn đoán.
+
+Khi không kết nối được tới adapter, ReputeCast trả lời nhà cung cấp 429 với `Retry-After: 30`, để nhà cung cấp thử lại. Yêu cầu chưa xác minh không bao giờ được lưu là đã xác minh.
+
+### `webhooks/parse`
+
+Chuyển một webhook đã lưu thành các sự kiện chuẩn hóa, trong tác vụ nền chạy sau `webhooks/verify`. Với `"verified": true`, đừng xác minh lại: yêu cầu đã lưu không còn các header mà ReputeCast không bao giờ lưu (`Authorization`, `Cookie`), và các phép kiểm tra khoảng thời gian sẽ thất bại. Với `false`, hãy xác minh trước và trả lời `bad_signature` khi xác minh thất bại. Trả về `[]` cho payload không có gì để ghi nhận. Nếu không kết nối được tới adapter, tác vụ sẽ thử lại sau; không sự kiện nào bị mất.
+
+### `webhooks/register`
+
+Đăng ký URL webhook của ReputeCast tại nhà cung cấp (ví dụ `https://reputecast.acme.io/hooks/community:example-esp/<token>`). Dùng `connection.webhookSecret` làm khóa bí mật phía nhà cung cấp khi nhà cung cấp cho phép bạn tự chọn. Đăng ký các sự kiện gửi thành công, trả thư, khiếu nại và hủy đăng ký; ReputeCast tự theo dõi lượt mở và lượt nhấp.
+
+### `domains/add` và `domains/status`
+
+Thiết lập một tên miền gửi tại nhà cung cấp và đọc các bản ghi DNS của tên miền đó kèm trạng thái.
+
+### `quota`
+
+Hạn mức và mức sử dụng của tài khoản. Tác vụ kiểm tra tình trạng gọi thao tác này 5 phút một lần, và mỗi phút khi nhà cung cấp đang ngừng hoạt động.
+
+### `suppressions/list` và `suppressions/add`
+
+`suppressions/list` kéo các địa chỉ bị chặn gửi của nhà cung cấp về [danh sách chặn gửi](/vi/audience/suppressions/) dùng chung: tối đa 1.000 mục mỗi trang, và ReputeCast đi theo `nextCursor` tối đa 100 trang mỗi lần đồng bộ. `suppressions/add` đẩy địa chỉ từ danh sách dùng chung sang nhà cung cấp, tối đa 500 địa chỉ mỗi lệnh gọi.
+
+## Kiểu dữ liệu
+
+### Đối tượng `Message`
+
+```json title="Message"
+{
+  "id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+  "stream": "broadcast",
+  "from": { "name": "Acme Newsletter", "address": "news@news.acme.io" },
+  "replyTo": { "name": "", "address": "help@acme.io" },
+  "to": { "name": "Linh Nguyen", "address": "linh@example.com" },
+  "subject": "October product notes",
+  "html": "<p>…</p>",
+  "text": "…",
+  "headers": {
+    "List-Unsubscribe": "<https://news.acme.io/p/acme/unsubscribe/…>",
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    "X-ReputeCast-Message": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40"
+  },
+  "tags": { "campaign": "0199…" }
+}
+```
+
+`stream` là `broadcast`, `automation` hoặc `system`. `replyTo`, `html`, `text` và `tags` có thể vắng mặt. Thư đã được kết xuất và cá nhân hóa: hãy gửi nguyên trạng cùng mọi header (nhà cung cấp hộp thư yêu cầu các header [hủy đăng ký một lần nhấp](/vi/deliverability/one-click-unsubscribe/)), và trả `id` hoặc header `X-ReputeCast-Message` lại trong sự kiện để sự kiện khớp với thư. Hãy tắt tính năng theo dõi lượt mở và lượt nhấp của nhà cung cấp.
+
+### Đối tượng `SendResult`
+
+```json title="SendResult"
+{ "messageId": "0199…40", "providerMessageId": "msg_7fa3" }
+{ "messageId": "0199…41", "error": { "code": "recipient_suppressed", "message": "The recipient is on Example ESP's suppression list.", "temporary": false, "throttled": false } }
+```
+
+`providerMessageId` là bắt buộc khi thành công. Lỗi `temporary` (hoặc `throttled`) được thử lại; lỗi vĩnh viễn thì không.
+
+### Đối tượng `WebhookRequest`
+
+```json title="WebhookRequest"
+{
+  "method": "POST",
+  "url": "https://reputecast.acme.io/hooks/community:example-esp/9f2c…",
+  "headers": { "content-type": ["application/json"], "x-example-signature": ["t=1760346062,v1=5b1d…"] },
+  "body": "<base64 of the raw body>"
+}
+```
+
+Tên header được viết thường. Header hop-by-hop và `Cookie` bị loại bỏ.
+
+### Đối tượng `Event`
+
+```json title="Event"
+{
+  "type": "hard_bounce",
+  "recipient": "john@example.com",
+  "providerMessageId": "msg_7fa3",
+  "messageId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e41",
+  "occurredAt": "2026-10-12T13:41:02Z",
+  "originalType": "bounced · hard",
+  "originalCode": "550 5.1.1",
+  "diagnostic": "The email account that you tried to reach does not exist.",
+  "bounceClass": "mailbox_unknown",
+  "raw": { "event": "bounced" }
+}
+```
+
+| Trường                                       | Quy tắc                                                                                                                                                                                                        |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`                                       | `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` hoặc `unsubscribe`.                                                                                           |
+| `recipient`                                  | Bắt buộc. ReputeCast chuyển sang chữ thường.                                                                                                                                                                  |
+| `providerMessageId`, `messageId`             | Mã của nhà cung cấp, và mã của ReputeCast khi nhà cung cấp gửi lại mã này (một UUID). Sự kiện được khớp với thư theo một trong hai mã.                                                                       |
+| `occurredAt`                                 | Bắt buộc, RFC 3339.                                                                                                                                                                                            |
+| `originalType`, `originalCode`, `diagnostic` | Loại và mã riêng của nhà cung cấp, cùng lời giải thích của họ. Được giữ bên cạnh sự kiện chuẩn hóa.                                                                                                           |
+| `bounceClass`                                | Không bắt buộc: `mailbox_unknown`, `mailbox_full`, `domain_invalid`, `policy_block`, `spam_block`, `reputation`, `temporary` hoặc `other`. Khi để trống, ReputeCast phân loại thư trả lại từ `originalCode` và `diagnostic`. |
+| `url`, `userAgent`                           | Cho lượt mở và lượt nhấp.                                                                                                                                                                                      |
+| `raw`                                        | Bắt buộc: sự kiện của nhà cung cấp dưới dạng JSON.                                                                                                                                                            |
+
+Chỉ lỗi về địa chỉ mới là trả thư vĩnh viễn: các trường hợp trả thư vĩnh viễn và khiếu nại được đưa vào danh sách chặn gửi dùng chung. Hãy báo việc bị chặn do phía người gửi gây ra (spam, uy tín, chính sách) là trả thư tạm thời.
+
+### Đối tượng `DNSRecord`
+
+```json title="DNSRecord"
+{ "purpose": "dkim", "type": "CNAME", "name": "rc1._domainkey.news.acme.io", "value": "rc1.dkim.example-esp.com", "status": "pending" }
+```
+
+`purpose` là `dkim`, `spf`, `return_path`, `dmarc` hoặc `verification`. `type` là `CNAME`, `TXT` hoặc `MX`. `status` không bắt buộc: `pending`, `verified`, `wrong_value` hoặc `missing`.
+
+### Đối tượng `Quota`
+
+```json title="Quota"
+{ "kind": "monthly_plan", "max": 50000, "used": 1234, "maxRate": 14, "sandbox": false, "account": "Growth · 50,000 per month" }
+```
+
+`kind` là `rolling_24h` hoặc `monthly_plan`. `max` bằng 0 nghĩa là không xác định hoặc không giới hạn. `maxRate` là số thư mỗi giây (0 khi không xác định). `sandbox` là true khi tài khoản chỉ gửi được tới địa chỉ đã xác minh. Các giá trị không được âm.
+
+### Đối tượng `Suppression`
+
+```json title="Suppression"
+{ "email": "john@example.com", "reason": "hard_bounce", "code": "bounce", "createdAt": "2026-10-11T08:00:00Z" }
+```
+
+`reason` là `hard_bounce`, `complaint`, `unsubscribe` hoặc `manual`. `code` là lý do riêng của nhà cung cấp.
+
+## Lỗi và circuit breaker
+
+Adapter cộng đồng báo cáo qua cùng cơ chế tình trạng nhà cung cấp như adapter có sẵn: mọi lệnh gọi thất bại đều được ghi lại, tác vụ kiểm tra tình trạng đánh dấu nhà cung cấp ngừng hoạt động sau nhiều lần thất bại liên tiếp, định tuyến chuyển dự phòng theo chính sách của từng luồng, và thư Gửi hàng loạt chờ bạn quyết định (xem [tình trạng nhà cung cấp và sự cố](/vi/providers/health-and-outages/)).
+
+Một adapter hoạt động sai không thể làm đình trệ việc gửi:
+
+- Mọi lệnh gọi đều có thời gian chờ và giới hạn kích thước câu trả lời.
+- Mỗi adapter đã cài có một circuit breaker. Năm lỗi adapter liên tiếp sẽ mở circuit breaker: lỗi kết nối, hết thời gian chờ, câu trả lời `internal`, `unauthenticated`, `invalid_request` hoặc `too_large`, và câu trả lời không ký hoặc không hợp lệ. Khi circuit breaker mở, mọi lệnh gọi thất bại ngay với lỗi "adapter không khả dụng", mà cơ chế tình trạng nhà cung cấp coi là sự cố ngừng hoạt động. Sau khoảng tạm dừng (30 giây, nhân đôi đến tối đa 5 phút khi các lần thăm dò vẫn thất bại), một lệnh gọi được cho qua, và một lần thành công sẽ đóng circuit breaker.
+- Lỗi của nhà cung cấp (`provider_*`), `bad_signature` và `not_supported` không được tính: chúng mô tả nhà cung cấp, không phải adapter.
+- Tối đa 64 lệnh gọi chạy cùng lúc với một adapter; lệnh gọi nào không giành được chỗ trước hạn chót sẽ thất bại với trạng thái bận.
+
+## Giới hạn
+
+<LimitsTable area="adapters" />
+
+Một yêu cầu `send` mang tối đa `batch` thư và tối đa 24 MiB; ReputeCast tách lô lớn hơn thành nhiều lệnh gọi. Webhook được chuyển tiếp có kích thước tối đa 5 MiB, là giới hạn của endpoint tiếp nhận. Định danh trong câu trả lời (`providerMessageId`, người nhận, URL, tên bản ghi) dài hơn 512 ký tự làm câu trả lời không hợp lệ. Văn bản dài hơn (`message`, `diagnostic`, `originalType`) bị cắt ở 2.000 ký tự.
+
+## Mô hình bảo mật
+
+- **Ký theo cả hai chiều** bằng khóa bí mật riêng của từng bản cài đặt, được niêm phong khi lưu trữ bằng khóa bí mật của hệ thống và chỉ hiển thị một lần. Sau khi xoay vòng, khóa bí mật trước đó vẫn dùng được thêm 24 giờ.
+- **Địa chỉ chỉ người vận hành đặt được**, được gọi qua cùng HTTP client có bảo vệ SSRF như adapter có sẵn: địa chỉ loopback và địa chỉ riêng chỉ khi bật `providers.allow_private_networks`, địa chỉ metadata và link-local thì không bao giờ, không đi theo chuyển hướng. Mọi địa chỉ truy cập qua internet phải dùng `https://`, vì thông tin xác thực đi kèm mỗi lệnh gọi.
+- **Đặc quyền tối thiểu.** ReputeCast chỉ gọi các thao tác đã khai báo và chỉ gửi các giá trị kết nối đã khai báo của đúng nhà cung cấp mà lệnh gọi dành cho. SDK từ chối các lệnh gọi mạng tới host không có trong `permissions.network` của manifest.
+- **Thông tin xác thực chỉ ghi.** Thông tin xác thực của nhà cung cấp và khóa bí mật để ký không bao giờ được API trả về và không bao giờ được ghi vào nhật ký, bởi cả ReputeCast lẫn SDK.
+- **Webhook** chỉ được lưu là đã xác minh sau khi adapter đã xác minh chúng.

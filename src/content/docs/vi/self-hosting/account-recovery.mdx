@@ -1,0 +1,184 @@
+---
+title: Khôi phục quyền truy cập từ dòng lệnh
+description: Đặt lại mật khẩu admin, xác thực hai lớp và gỡ khóa đăng nhập ngay trên máy chủ bằng các lệnh reputecast user, trong Docker hoặc với tệp nhị phân.
+type: how-to
+audience: [operator]
+primaryKeyword: đặt lại mật khẩu admin
+sources:
+  - internal/cli/user.go
+  - internal/cli/root.go
+  - internal/accounts/reset.go
+  - internal/accounts/signin.go
+  - internal/store/queries/users.sql
+  - internal/store/queries/throttle.sql
+  - internal/instance/users.go
+  - web/src/features/admin/users/UsersPage.tsx
+  - web/src/features/admin/users/UserDialogs.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Khi không ai sửa được một tài khoản trong ứng dụng, hãy đặt lại mật khẩu admin, xác thực hai lớp và gỡ khóa đăng nhập
+từ máy chủ bằng các lệnh `reputecast user`. Các lệnh này làm việc trực tiếp với cơ sở dữ liệu, nên dùng được cả trước
+khi kết nối bất kỳ nhà cung cấp gửi thư nào và khi mọi quản trị viên đều bị khóa ở ngoài.
+
+## Trước khi bắt đầu
+
+- Quyền truy cập shell vào máy chủ chạy ReputeCast.
+- Các lệnh cần cùng cấu hình với máy chủ, ít nhất là URL cơ sở dữ liệu:
+  - **Docker Compose:** chạy lệnh bên trong container ứng dụng đang chạy, vốn đã có sẵn môi trường:
+    `docker compose exec app /usr/local/bin/reputecast user …`
+  - **Tệp nhị phân:** trước tiên hãy nạp môi trường mà dịch vụ dùng, ví dụ `set -a; . /etc/reputecast/env; set +a`,
+    rồi chạy `reputecast user …`.
+- Email tài khoản của người cần khôi phục. Lệnh nào cũng nhận `--email`.
+
+Mỗi lệnh ghi một mục [nhật ký kiểm tra](/vi/reference/glossary/#audit-log) với tác nhân **CLI (server)**. Các lệnh
+thoát với mã `0` khi thành công, `2` khi dùng sai cú pháp (thiếu `--reason`, mật khẩu quá ngắn) và `1` với các lỗi
+khác, chẳng hạn `Error: no account for <email>`.
+
+| Tình huống                                          | Lệnh                                                            |
+| --------------------------------------------------- | --------------------------------------------------------------- |
+| Quên mật khẩu                                       | `reputecast user reset-password --email <address>`              |
+| Quên mật khẩu và không có cách nào gửi liên kết     | `reputecast user reset-password --email <address> --password …` |
+| Mất ứng dụng xác thực                               | `reputecast user reset-2fa --email <address> --reason "…"`      |
+| Bị khóa sau các lần đăng nhập thất bại              | Xem [gỡ khóa đăng nhập](#gỡ-khóa-đăng-nhập)                     |
+| Không còn quản trị viên hệ thống nào                | `reputecast user make-admin --email <address>`                  |
+
+## Đặt lại mật khẩu bị quên
+
+<Steps>
+
+1. In ra một liên kết đặt lại dùng một lần:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io
+   ```
+
+   ```txt title="Kết quả"
+   One-time password reset link for aisha@acme.io (works once, until 12:39 UTC):
+
+     https://reputecast.acme.io/reset-password/<token>
+
+   Send it to them privately. Their current password keeps working until they use it.
+   ```
+
+   Liên kết dùng URL công khai đã lưu trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, hoặc
+   `http.public_url` khi chưa lưu URL nào. Tài khoản đã bị vô hiệu hóa sẽ bị từ chối:
+   `<email> is deactivated; reactivate the account first`.
+
+2. Gửi liên kết cho người đó qua một kênh riêng tư. Liên kết chỉ dùng được một lần, trong 15 phút.
+
+3. Họ mở liên kết và chọn mật khẩu mới. Chính sách mật khẩu của hệ thống được áp dụng (độ dài, dùng lại, kiểm tra mật
+   khẩu bị lộ). Việc đặt mật khẩu sẽ đăng xuất mọi phiên và gỡ khóa đăng nhập; lần đăng nhập tiếp theo vẫn hỏi yếu tố
+   xác thực thứ hai của họ.
+
+</Steps>
+
+Khi chưa có nhà cung cấp gửi thư nào gửi được trên luồng Hệ thống, liên kết <UiPath path="auth.forgotPassword" /> trên
+trang đăng nhập sẽ hiển thị chính lệnh này thay vì gửi email.
+
+### Đặt mật khẩu trực tiếp
+
+Với `--password`, lệnh đặt mật khẩu ngay thay vì in ra liên kết:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io --password 'a long passphrase here'
+```
+
+Lệnh trả lời `Password set for aisha@acme.io. Every session was signed out.` và hủy các liên kết đặt lại đang mở. Mật
+khẩu phải đáp ứng `auth.password_min_length` trong [cấu hình](/vi/reference/configuration/) (mặc định 12 ký tự), chứ
+không phải chính sách trong Quản trị hệ thống; mật khẩu ngắn hơn sẽ dừng với
+`Error: Use at least 12 characters. Passphrases are fine.`
+
+<Aside type="caution">
+  Mật khẩu nhập trên dòng lệnh sẽ nằm lại trong lịch sử shell. Hãy ưu tiên liên kết đặt lại, hoặc yêu cầu người đó đổi
+  mật khẩu ngay sau khi đăng nhập.
+</Aside>
+
+## Gỡ ứng dụng xác thực bị mất
+
+<Steps>
+
+1. Xác nhận yêu cầu đến từ chính người đó, ví dụ qua một cuộc gọi, chứ không phải từ một email đề nghị làm việc này.
+
+2. Gỡ ứng dụng xác thực của họ kèm một lý do; lý do này được ghi vào nhật ký kiểm tra:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-2fa --email aisha@acme.io --reason "lost phone, verified by video call"
+   ```
+
+   Lệnh trả lời `Two-factor reset for aisha@acme.io. They have 72 hours to set it up again.` Nếu thiếu `--reason`, lệnh
+   dừng với `Error: --reason is required; it's written to the audit log`.
+
+3. Người đó đăng nhập bằng mật khẩu. Lệnh đã gỡ ứng dụng xác thực và mã khôi phục của họ, đồng thời đăng xuất các phiên;
+   khóa truy cập vẫn giữ nguyên. Họ được yêu cầu thêm lại khóa truy cập hoặc ứng dụng xác thực, và phải làm việc đó
+   trong vòng 72 giờ.
+
+</Steps>
+
+Người vẫn còn [mã khôi phục](/vi/reference/glossary/#recovery-code) thì không cần bước này: họ chọn tùy chọn mã khôi
+phục ở bước đăng nhập thứ hai. Trong ứng dụng, quản trị viên hệ thống có thể đặt lại tương tự bằng
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, rồi **⋯** › <UiPath path="admin.resetTwoFactor" />. Cách
+đó yêu cầu mật khẩu của quản trị viên, gửi thông báo cho người đó và dùng thời gian gia hạn của chính sách thay vì 72
+giờ.
+
+## Gỡ khóa đăng nhập
+
+Sau quá nhiều lần nhập sai mật khẩu (mặc định 10 lần), đăng nhập cho email đó trả lời
+`Sign-in is locked after too many attempts. Try again after <time>, reset your password, or use a passkey.`
+
+- **Trong ứng dụng:** <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, rồi **⋯** ›
+  <UiPath path="admin.unlockSignIn" /> gỡ khóa ngay lập tức.
+- **Bằng liên kết đặt lại:** đặt mật khẩu mới qua một liên kết từ `reputecast user reset-password` sẽ gỡ khóa.
+- **Chờ hết thời gian khóa:** khóa tự hết sau thời gian khóa (mặc định 15 phút).
+
+`reputecast user unlock --email <address>` trả lời `<email> can sign in again.` và xóa bộ đếm số lần thất bại của tài
+khoản. Ở phiên bản này, lệnh không gỡ khóa mà bước đăng nhập bằng mật khẩu kiểm tra trước tiên, nên đăng nhập bằng mật
+khẩu vẫn bị khóa cho đến khi hết thời gian khóa. Hãy dùng một trong ba cách ở trên.
+
+## Cấp quyền quản trị viên hệ thống cho một người
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user make-admin --email linh@acme.io
+```
+
+Lệnh trả lời `linh@acme.io is now an instance admin.` Lệnh này chỉ cấp cờ. Để thu hồi, hãy dùng
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, rồi **⋯** › <UiPath path="admin.removeInstanceAdmin" />.
+
+<Aside type="tip" title="Khi đăng nhập một lần gặp sự cố">
+  Trên tên miền [bắt buộc SSO](/vi/self-hosting/sso/), đăng nhập bằng mật khẩu bị tắt, nên đặt lại mật khẩu không giúp
+  được gì. Các Chủ sở hữu ở tên miền đó được đánh dấu là tài khoản khẩn cấp, bao gồm Chủ sở hữu đầu tiên do
+  `reputecast install` tạo, vẫn giữ đăng nhập bằng mật khẩu và xác thực hai lớp. Nếu không ai trong số họ đăng nhập
+  được, hãy cấp quyền quản trị viên hệ thống cho một tài khoản ở tên miền khác và tắt chế độ bắt buộc trong
+  <UiPath path="shell.userMenuInstanceAdmin > admin.sso" />.
+</Aside>
+
+## Kiểm tra kết quả
+
+- Người đó đăng nhập được, hoặc mở được liên kết đặt lại trước khi liên kết hết hạn.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> liệt kê lệnh với tác nhân **CLI (server)**.
+
+## Khắc phục sự cố
+
+- **`Error: no account for <email>`**: email không khớp với tài khoản nào. Các lệnh so khớp địa chỉ không phân biệt
+  chữ hoa chữ thường; hãy kiểm tra lỗi gõ hoặc địa chỉ cũ.
+- **Liên kết đặt lại trỏ đến `http://localhost:8080`**: chưa lưu URL công khai nào, và `http.public_url` đang ở giá trị
+  mặc định. Hãy đặt URL công khai, hoặc thay host trong liên kết bằng địa chỉ mọi người vẫn dùng.
+- **Lệnh không kết nối được cơ sở dữ liệu** khi dùng tệp nhị phân: lệnh không có URL cơ sở dữ liệu của máy chủ nên quay
+  về giá trị mặc định `localhost:5432`. Hãy nạp môi trường của dịch vụ trước.
+- **Vẫn bị khóa sau `reputecast user unlock`**: đây là hành vi đã biết ở phiên bản này. Hãy dùng
+  <UiPath path="admin.unlockSignIn" /> trong ứng dụng, một liên kết đặt lại, hoặc chờ khóa hết hạn.
+
+## Mặc định và giới hạn
+
+<LimitsTable area="authentication" />
+
+## Liên quan
+
+- [Quản trị hệ thống](/vi/self-hosting/instance-admin/): các thao tác tương tự trong ứng dụng.
+- [Bảo mật tài khoản](/vi/team/account-security/): mật khẩu, khóa truy cập, ứng dụng xác thực và mã khôi phục.
+- [Tham chiếu CLI](/vi/reference/cli/): mọi lệnh và tùy chọn của `reputecast`.

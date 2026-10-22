@@ -1,0 +1,149 @@
+---
+title: Gửi thư bằng Azure Communication Services
+description: Gửi email bằng Azure Communication Services từ ReputeCast, nhận báo cáo gửi qua Event Grid subscription, dùng connection string hoặc ứng dụng Entra ID.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: gửi email bằng Azure Communication Services
+sources:
+  - internal/providers/azureacs
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/ingest/handler.go
+  - web/src/features/connect
+sidebar:
+  order: 11
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast gửi email bằng Azure Communication Services qua Email Communication resource của bạn và đọc báo cáo gửi từ
+một Azure Event Grid subscription. ReputeCast không tạo được gì trong Azure thay bạn: bạn tự thiết lập tên miền email
+và Event Grid subscription trong Azure portal, còn ReputeCast cung cấp URL webhook và kiểm tra tính xác thực của từng
+yêu cầu mà Event Grid gửi tới.
+
+<ProviderMatrix family="email" id="azureacs" />
+
+<Aside type="caution" title="Azure Communication Services Email sắp ngừng hoạt động">
+  Microsoft ngừng cung cấp Azure Communication Services dưới dạng dịch vụ độc lập vào ngày 30/9/2028, và ACS Email nằm
+  trong danh sách các dịch vụ bị ngừng. Từ ngày 23/10/2026, Microsoft hạn chế việc đăng ký mới với các khách hàng chưa
+  có Communication Services resource
+  ([Microsoft Learn: Retirement and breaking changes guide](https://learn.microsoft.com/en-us/azure/communication-services/acs-retirement-and-breaking-changes-guide),
+  kiểm tra tháng 10/2026). Hãy chuẩn bị một nhà cung cấp gửi thư thứ hai trước khi phụ thuộc vào Azure.
+</Aside>
+
+## Trước khi bắt đầu
+
+- **Một Communication Services resource có custom email domain đã xác minh** được kết nối với nó, cùng các sender
+  username bạn dùng để gửi
+  ([Microsoft Learn: Add custom verified email domains](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/add-custom-verified-domains),
+  kiểm tra tháng 10/2026). Tên hiển thị From lấy từ sender username trong Azure, không phải từ ReputeCast.
+- **Thông tin xác thực.** Hoặc connection string của resource (Azure portal › Communication Services resource của bạn ›
+  Keys), hoặc một Microsoft Entra ID app registration có client secret và vai trò Communication and Email Service
+  Owner trên resource.
+- **Quyền.** Kết nối cần `providers:manage`; thêm tên miền gửi mới cần `domains:manage`.
+- **Một địa chỉ HTTPS công khai.** Event Grid gửi tới `<public URL>/hooks/azureacs/<token>`. Không thể hỏi định kỳ
+  Azure để lấy các sự kiện đã qua, nên địa chỉ phải truy cập được từ internet.
+
+## Kết nối Azure Communication Services
+
+<Steps>
+
+1. Mở <UiPath path="nav.providers" />, chọn <UiPath path="providers.overview.addProvider" /> rồi chọn Azure
+   Communication Services trong danh mục. [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/) giải thích các bước
+   chung của mọi nhà cung cấp.
+
+2. Nhập một bộ thông tin xác thực:
+   - <UiPath path="providers.fields.azureacs.connectionString" /> (`endpoint=https://…/;accesskey=…`), hoặc
+   - trong phần thiết lập thêm của Azure, <UiPath path="providers.fields.azureacs.endpoint" />
+     (`https://<resource>.communication.azure.com`), <UiPath path="providers.fields.azureacs.tenantId" />,
+     <UiPath path="providers.fields.azureacs.clientId" /> và <UiPath path="providers.fields.azureacs.clientSecret" />.
+     Khi cả hai được điền, Entra ID sẽ được dùng.
+
+   Đồng thời nhập các giới hạn Azure cấp cho tên miền của bạn: <UiPath path="providers.fields.azureacs.perMinute" />
+   trở thành tốc độ gửi của ReputeCast cho Azure (biểu mẫu đề xuất 30 cho một custom domain mới cho đến khi Azure nâng
+   giới hạn), còn <UiPath path="providers.fields.azureacs.perHour" /> được hiển thị trên thẻ.
+
+3. Chọn <UiPath path="connect.connection.connect" />. ReputeCast thực hiện một lệnh gọi chỉ đọc tới resource của bạn
+   và lưu thông tin xác thực ở dạng mã hóa. Thẻ hiển thị "Communication Services · reachable" và các giới hạn của bạn.
+
+4. Trong <UiPath path="connect.connection.webhooksTitle" />, ReputeCast kiểm tra URL công khai của chính nó, rồi hiển
+   thị URL webhook cần thêm trong Azure. Chọn <UiPath path="connect.connection.copyUrl" />.
+
+5. Chọn cách Event Grid chứng minh mỗi yêu cầu đến từ subscription của bạn:
+   - **Một khóa bí mật dùng chung.** Chọn <UiPath path="connect.connection.createSecret" /> và sao chép khóa; khóa chỉ
+     hiển thị một lần, và khóa mới sẽ thay thế khóa cũ. Event Grid sẽ gửi khóa này dưới dạng custom delivery header
+     `X-ReputeCast-Secret` (hoặc dưới dạng `Authorization: Bearer <secret>`).
+   - **Microsoft Entra ID.** Nhập <UiPath path="providers.fields.azureacs.eventGridAudience" /> (application ID hoặc
+     URI `api://` của nó) và, khi ứng dụng đó nằm ở tenant khác,
+     <UiPath path="providers.fields.azureacs.eventGridTenant" />. Khi đó ReputeCast chỉ chấp nhận Entra token được cấp
+     cho ứng dụng đó với vai trò `AzureEventGridSecureWebhookSubscriber`.
+
+6. Trong Azure portal, mở Communication Services resource của bạn › Events › Add Event Subscription và tạo một
+   subscription với:
+   - event type **Email Delivery Report Received** (`Microsoft.Communication.EmailDeliveryReportReceived`);
+   - event schema **Event Grid Schema**;
+   - endpoint type **Web Hook**, với URL bạn đã sao chép;
+   - với khóa bí mật dùng chung: một delivery property (custom header) `X-ReputeCast-Secret` đặt bằng khóa bí mật, có
+     đánh dấu "Is secret?"; với Entra ID: Microsoft Entra authentication với ứng dụng ở bước 5.
+
+   ReputeCast tự trả lời validation handshake của Event Grid, nên subscription được tạo ngay. Xem
+   [Microsoft Learn: Handle email events](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/handle-email-events),
+   [Set custom headers on delivered events](https://learn.microsoft.com/en-us/azure/event-grid/delivery-properties)
+   và [Deliver events to Microsoft Entra protected endpoints](https://learn.microsoft.com/en-us/azure/event-grid/secure-webhook-delivery)
+   (kiểm tra tháng 10/2026).
+
+7. Chọn <UiPath path="connect.connection.continueDomain" />. Các bản ghi DKIM và bản ghi xác minh của Azure đến từ
+   Azure portal, nên bước tên miền chỉ kiểm tra những gì ReputeCast kiểm tra được (DMARC được đề xuất nếu tên miền chưa
+   có).
+
+8. Trong <UiPath path="connect.stepTest" />, gửi thư thử. Trình hướng dẫn cho phép bạn tiếp tục trước khi thiết lập
+   xong Event Grid, nên bước này là bằng chứng: dòng thời gian chờ báo cáo gửi đầu tiên từ Azure.
+
+9. Hoàn tất <UiPath path="connect.stepStreams" /> và <UiPath path="connect.stepContacts" />. Không có gì để kéo về:
+   ReputeCast không đọc hay ghi danh sách chặn gửi của Azure.
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- Dòng thời gian của thư thử hiển thị báo cáo gửi từ Azure.
+- Thẻ Azure trên <UiPath path="nav.providers > providers.tabProviders" /> hiển thị
+  <UiPath path="providers.statusHealthy" />.
+- Trong Azure portal, metrics của event subscription hiển thị các sự kiện đã chuyển đi và không có lỗi chuyển.
+
+ReputeCast gửi mỗi thư bằng một lệnh gọi API với engagement tracking của Azure tắt; ReputeCast tự theo dõi lượt mở và
+lượt nhấp. Báo cáo gửi được ánh xạ sang sự kiện ReputeCast: Delivered thành gửi thành công, Bounced thành trả thư vĩnh
+viễn (trả thư tạm thời khi máy chủ nhận chặn người gửi), Suppressed thành bị từ chối, còn FilteredSpam, Quarantined và
+Failed thành trả thư tạm thời. Azure không báo khiếu nại hay hủy đăng ký, nên những sự kiện này chỉ đến từ liên kết hủy
+đăng ký của chính ReputeCast. [Danh sách chặn gửi](/vi/reference/glossary/#suppression-list) dùng chung được áp dụng
+trước mỗi lần gửi.
+
+## Khắc phục sự cố
+
+- **"These settings can't be used: … the connection string needs endpoint= and accesskey=".** Hãy sao chép toàn bộ
+  connection string từ trang Keys của resource.
+- **"Azure Communication Services rejected this key".** Access key đã được tạo lại, hoặc client secret hay các ID của
+  ứng dụng Entra bị sai. Với Entra ID, hãy kiểm tra thêm ứng dụng có vai trò Communication and Email Service Owner hay
+  không.
+- **Thư thử chờ mãi sự kiện đầu tiên.** Hãy kiểm tra subscription trong Azure: event type, Event Grid schema, URL
+  webhook chính xác, và header `X-ReputeCast-Secret` (hoặc Entra authentication). Các yêu cầu không có xác thực hợp lệ
+  nhận `401` từ ReputeCast.
+- **Yêu cầu bắt đầu thất bại sau khi bạn tạo khóa bí mật mới.** Mỗi khóa mới thay thế khóa cũ ngay lập tức. Hãy dán
+  khóa mới vào delivery header của subscription.
+- **Thư đến với tên From sai.** Azure dùng tên hiển thị của sender username được cấu hình trong Azure. Hãy đổi ở đó.
+- **Thư giao dịch có Cc, Bcc hoặc tệp đính kèm bị lỗi.** Adapter Azure không gửi được bản sao hay tệp đính kèm; hãy
+  định tuyến các mẫu đó qua nhà cung cấp khác.
+- **Bạn đã đổi URL công khai hoặc ngắt kết nối Azure.** ReputeCast không thay đổi gì trong Azure. Hãy tự cập nhật hoặc
+  xóa event subscription.
+
+## Liên quan
+
+- [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/)
+- [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/)
+- [Sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)
+- [Cấu hình SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/)
+- [Chọn nhà cung cấp gửi thư](/vi/providers/choose/)

@@ -1,0 +1,135 @@
+---
+title: 'Gmail 550 5.7.26: thư chưa xác thực bị chặn'
+description: 'Lỗi Gmail 550 5.7.26 chặn thư không vượt qua SPF và DKIM hoặc chính sách DMARC của tên miền From. Xem nguyên nhân và cách sửa xác thực trong ReputeCast.'
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: lỗi Gmail 550 5.7.26
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - internal/audience/suppressions.go
+  - internal/providers/{ses,resend,postal,smtp,postmark,sendgrid,mailjet,sparkpost,mailgun,brevo,azureacs,httpgeneric}
+  - web/src/features/senders
+sidebar:
+  label: Gmail 550 5.7.26
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Lỗi Gmail 550 5.7.26 là một lời từ chối vĩnh viễn: thư không vượt qua bước xác thực email, nên Gmail chặn thư. Cách khắc
+phục nằm ở các bản ghi DNS, không nằm ở danh sách của bạn. Trang này hướng dẫn cách đọc phản hồi và làm cho SPF, DKIM và
+DMARC đạt với mọi nhà cung cấp gửi thư bạn dùng.
+
+## Gmail muốn nói gì
+
+Gmail gửi mã này kèm một trong ba văn bản:
+
+> This email has been blocked because the sender is unauthenticated. Gmail requires all senders to authenticate with
+> either SPF or DKIM. Authentication results: DKIM = did not pass SPF [_domain-name_] with ip: [_ip-address_] = did not
+> pass.
+
+> The (E)MAIL FROM domain [_domain-name_] has an SPF record with a hard fail policy (-all) but it fails to pass SPF checks
+> with the ip: [_ip-address_]. To best protect our users from spam and phishing, the message has been blocked.
+
+> Unauthenticated email from _domain-name_ is not accepted due to domain's DMARC policy. Contact the administrator of
+> _domain-name_ domain if this was legitimate email.
+
+Văn bản thứ nhất nghĩa là người gửi chưa xác thực: Gmail yêu cầu mọi người gửi xác thực bằng SPF hoặc DKIM, và cả hai đều
+không đạt. Văn bản thứ hai nghĩa là tên miền (E)MAIL FROM có bản ghi SPF với chính sách từ chối cứng (`-all`) nhưng địa
+chỉ IP gửi thư không vượt qua SPF. Văn bản thứ ba nghĩa là chính sách DMARC của tên miền không chấp nhận thư chưa xác
+thực.
+
+Gmail cũng có các phiên bản tạm thời: 421 4.7.26 giới hạn tốc độ thư chưa xác thực thay vì chặn hẳn, còn 451 4.7.26 nghĩa
+là lỗi DNS tạm thời đã khiến bước kiểm tra DMARC không thực hiện được. Nguồn:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Google Workspace Help. Kiểm tra tháng 10/2026.
+
+## Vì sao lỗi xảy ra
+
+- **Cả SPF lẫn DKIM đều không đạt.** Các bản ghi DKIM của nhà cung cấp gửi thư chưa được công bố, hoặc SPF không liệt kê
+  nhà cung cấp gửi thư đó.
+- **SPF bị từ chối cứng.** Bản ghi SPF của bạn kết thúc bằng `-all` và không bao gồm máy chủ đã gửi thư, ví dụ một nhà
+  cung cấp gửi thư bạn thêm vào [tuyến](/vi/reference/glossary/#route) sau này.
+- **DMARC không đạt.** Chính sách DMARC của bạn là `quarantine` hoặc `reject`, và cả SPF lẫn DKIM đều không
+  [căn chỉnh](/vi/reference/glossary/#alignment) với tên miền From. Điều này xảy ra khi nhà cung cấp gửi thư ký DKIM bằng
+  tên miền của chính họ và dùng return-path của chính họ.
+
+## ReputeCast phân loại lỗi này thế nào
+
+- [Loại thư trả lại](/vi/reference/glossary/#bounce-class): `policy_block` với văn bản thứ nhất và thứ ba. Văn bản về SPF
+  bị từ chối cứng có nhắc đến spam, nên là `spam_block`. Mã đứng một mình không kèm văn bản là `policy_block`.
+- Hàng trong báo cáo: <UiPath path="reports.bounceType.blocked" />.
+- Chặn gửi: lời từ chối nói về tên miền của bạn, không phải về địa chỉ. Phần lớn adapter tích hợp sẵn ghi nhận đây là trả
+  thư tạm thời, nên không địa chỉ nào bị chặn gửi. Với Amazon SES, Resend, Postal, SendGrid, Mailjet và hộp thư nhận thư
+  trả lại của SMTP, lỗi có thể được ghi nhận là trả thư vĩnh viễn, tùy cách nhà cung cấp gửi thư báo về, và khi đó địa
+  chỉ bị chặn gửi. Xem
+  [khi nào ReputeCast chặn gửi một địa chỉ](/vi/smtp-errors/#khi-nào-reputecast-chặn-gửi-một-địa-chỉ).
+
+Độ sẵn sàng gửi kiểm tra chính các bản ghi này trước mỗi chiến dịch. Trong nhóm <UiPath path="review.groupAuthentication" />,
+việc thiếu bản ghi SPF, bản ghi SPF không cho phép một trong các nhà cung cấp gửi thư của chiến dịch, DKIM chưa được xác
+minh, hoặc bản ghi DMARC bị thiếu hay không hợp lệ sẽ chặn lần gửi. Nếu dưới 90% thư được căn chỉnh DMARC trong 7 ngày
+qua thì đó là một cảnh báo.
+
+## Trước khi bắt đầu
+
+- `domains:manage` để xem và kiểm tra các bản ghi DNS của một tên miền gửi.
+- Quyền truy cập vào nơi quản lý DNS của tên miền.
+- `providers:view` để đọc nhật ký sự kiện.
+
+## Sửa xác thực
+
+<Steps>
+
+1. Đọc văn bản của Gmail. Mở <UiPath path="nav.providers > providers.tabEvents" />, lọc
+   <UiPath path="providers.events.typeFilter" /> theo <UiPath path="providers.events.optionSoftBounce" /> hoặc
+   <UiPath path="providers.events.optionHardBounce" /> rồi tìm một người nhận dùng Gmail.
+   Cột <UiPath path="providers.events.colCode" /> cho biết bước kiểm tra nào không đạt và, trong văn bản thứ nhất, tên
+   miền cùng địa chỉ IP mà Gmail đã kiểm tra.
+2. Mở <UiPath path="nav.settings > settings.senders" /> rồi mở tên miền gửi. Trang bản ghi của tên miền liệt kê chính xác
+   các bản ghi DNS mà từng nhà cung cấp gửi thư cần cho tên miền, mỗi bản ghi kèm một trạng thái
+   (<UiPath path="connect.domain.statusVerified" />, <UiPath path="connect.domain.statusPending" /> hoặc
+   <UiPath path="connect.domain.statusMissing" />), và kiểm tra lại chúng mỗi 30 giây khi trang đang mở.
+3. Công bố các bản ghi còn thiếu hoặc sai tại nơi quản lý DNS. Một tên miền chỉ được có một bản ghi SPF
+   ([RFC 7208, mục 3.2](https://www.rfc-editor.org/rfc/rfc7208#section-3.2), kiểm tra tháng 10/2026), vì vậy hãy gộp
+   những gì trang bản ghi yêu cầu vào bản ghi hiện có. Làm theo [cấu hình SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/)
+   để biết các bước cụ thể.
+4. Nếu nhà cung cấp gửi thư hỗ trợ tên miền MAIL FROM (return-path) riêng, hãy thiết lập nó để SPF cũng căn chỉnh với tên
+   miền From, chứ không chỉ DKIM.
+5. Chờ đến khi các bản ghi hiển thị <UiPath path="connect.domain.statusVerified" />. ReputeCast cũng kiểm tra DNS mỗi 30
+   phút, và thay đổi sẽ hiện trong Độ sẵn sàng gửi trong vòng một giờ. Sau đó mở <UiPath path="composer.reviewSend" />
+   của chiến dịch tiếp theo: nhóm <UiPath path="review.groupAuthentication" /> của
+   [Độ sẵn sàng gửi](/vi/campaigns/send-readiness/) phải đạt.
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- Mọi bản ghi trên trang của tên miền gửi đều hiển thị <UiPath path="connect.domain.statusVerified" />.
+- Nhóm <UiPath path="review.groupAuthentication" /> của Độ sẵn sàng gửi đạt cho chiến dịch.
+- Báo cáo của chiến dịch tiếp theo không còn 550 5.7.26 trong cột <UiPath path="reports.colCodes" />.
+
+## Khắc phục sự cố
+
+- **Lỗi chỉ xảy ra với một nhà cung cấp gửi thư.** Các bản ghi DKIM hoặc mục `include:` trong SPF của nhà cung cấp đó còn
+  thiếu. Tuyến chia thư cho nhiều nhà cung cấp, nên hãy kiểm tra mọi nhà cung cấp gửi thư trên tuyến của chiến dịch.
+- **DMARC đạt với một phần thư và không đạt với phần còn lại.** Đọc [báo cáo tổng hợp DMARC](/vi/deliverability/dmarc-reports/)
+  để tìm các nguồn không căn chỉnh.
+- **Một số địa chỉ đã bị chặn gửi vì thư trả lại này.** Sau khi sửa xác thực, bạn có thể gỡ chúng khỏi
+  <UiPath path="nav.audience > audience.tabSuppressions" /> bằng <UiPath path="audience.suppressions.removeButton" />.
+
+<Aside type="caution">
+Một liên hệ được gỡ khỏi danh sách chặn gửi sau khi trả thư vĩnh viễn sẽ quay về trạng thái đang chờ xác nhận. Liên hệ đó
+chỉ nhận thư trở lại sau một lần xác nhận đăng ký mới.
+</Aside>
+
+## Liên quan
+
+- [Mã lỗi SMTP](/vi/smtp-errors/)
+- [Outlook 550 5.7.515](/vi/smtp-errors/outlook-550-5-7-515/), yêu cầu xác thực của Microsoft
+- [Yêu cầu dành cho người gửi số lượng lớn của Gmail, Yahoo và Microsoft](/vi/deliverability/bulk-sender-requirements/)
+- [Thêm tên miền gửi và người gửi](/vi/providers/senders-and-domains/)

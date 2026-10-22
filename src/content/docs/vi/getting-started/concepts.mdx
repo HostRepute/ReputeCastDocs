@@ -1,0 +1,162 @@
+---
+title: Cách ReputeCast hoạt động
+description: Kiến trúc gửi email phía sau ReputeCast, từ không gian làm việc và luồng thư đến tuyến, chuyển dự phòng, sự kiện gửi thư và danh sách chặn gửi dùng chung.
+type: explanation
+audience: [publisher, admin, operator]
+primaryKeyword: kiến trúc gửi email
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - README.md
+  - internal/providers/provider.go
+  - internal/routing/routing.go
+  - internal/ingest
+  - internal/suppressions
+  - internal/readiness
+  - internal/sending/engine
+  - internal/authz
+sidebar:
+  order: 4
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+
+Trang này giải thích kiến trúc gửi email phía sau ReputeCast: ai làm việc ở đâu, có những loại thư nào, mỗi email tìm
+đến nhà cung cấp gửi thư của nó ra sao, và kết quả gửi thư quay về như thế nào để bảo vệ lần gửi tiếp theo của bạn. Các
+thuật ngữ dùng ở đây xuất hiện khắp ứng dụng và phần còn lại của tài liệu.
+
+## Hệ thống, không gian làm việc và thành viên
+
+- Một [hệ thống](/vi/reference/glossary/#instance) là một bản cài đặt ReputeCast: máy chủ, cơ sở dữ liệu PostgreSQL của
+  nó và mọi không gian làm việc trên đó. [Quản trị viên hệ thống](/vi/reference/glossary/#instance-admin) quản lý người
+  dùng, phương thức đăng nhập, đăng nhập một lần (SSO) và việc cập nhật cho toàn bộ hệ thống.
+- Một [không gian làm việc](/vi/reference/glossary/#workspace) là một không gian riêng với danh sách, chiến dịch, quy
+  trình tự động, nhà cung cấp gửi thư và nhóm của riêng nó. Một hệ thống có thể có bao nhiêu không gian làm việc tùy ý,
+  chẳng hạn mỗi ấn phẩm, thương hiệu hoặc khách hàng một không gian.
+- Một [thành viên](/vi/reference/glossary/#member) là một người trong không gian làm việc, có đúng một
+  [vai trò](/vi/reference/glossary/#role) ở đó. Các vai trò có sẵn là Chủ sở hữu, Quản trị viên, Biên tập viên và
+  Người xem; bạn có thể thêm vai trò tùy chỉnh với bộ quyền của riêng bạn. Khóa API và tác tử AI nhận quyền theo cùng
+  cách và không bao giờ có nhiều quyền hơn người đã tạo ra chúng. Xem [Vai trò và quyền](/vi/team/roles-and-permissions/).
+
+## Nhà cung cấp gửi thư và nhà cung cấp hộp thư
+
+ReputeCast luôn nói rõ đang nói đến loại nào trong hai loại:
+
+- Một [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) chuyển thư của bạn đi: Amazon SES, Postmark,
+  Mailgun, một máy chủ Postal, mọi máy chủ SMTP và các nhà cung cấp khác trong
+  [Chọn nhà cung cấp gửi thư](/vi/providers/choose/).
+- Một [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider) là nơi người đọc mở thư: Gmail, Outlook, Yahoo,
+  iCloud và các nhà cung cấp khác.
+
+Báo cáo và màn hình theo dõi trực tiếp hiển thị kết quả theo từng nhà cung cấp hộp thư và từng nhà cung cấp gửi thư
+cạnh nhau, vì vấn đề có thể nằm ở bất kỳ phía nào.
+
+## Bốn luồng
+
+Một [luồng](/vi/reference/glossary/#stream) là một loại thư. Mỗi luồng có tuyến và chính sách chuyển dự phòng riêng, nên
+một chiến dịch có vấn đề không bao giờ chặn email đặt lại mật khẩu.
+
+| Luồng          | Nội dung                                                                                              |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| Gửi hàng loạt  | Chiến dịch.                                                                                           |
+| Tự động hóa    | Email do các quy trình tự động gửi.                                                                   |
+| Hệ thống       | Email xác nhận hai bước, liên kết tới trung tâm tùy chọn, lời mời tham gia nhóm và email đặt lại mật khẩu. |
+| Giao dịch      | Email sản phẩm do ứng dụng của bạn gửi qua API giao dịch hoặc SMTP relay.                             |
+
+Lời mời, đặt lại mật khẩu và thông báo qua email chỉ hoạt động khi đã có một nhà cung cấp gửi thư đảm nhận luồng Hệ
+thống. Thư giao dịch được ưu tiên đi trước khi dùng chung nhà cung cấp gửi thư với luồng Gửi hàng loạt. Xem
+[Email giao dịch trong ReputeCast](/vi/transactional/overview/).
+
+## Tuyến, chia theo tỷ trọng và chuyển dự phòng
+
+Một [tuyến](/vi/reference/glossary/#route) quyết định nhà cung cấp gửi thư nào chuyển một email. Mỗi luồng có một quy tắc
+mặc định, và bạn có thể thêm quy tắc cho từng danh sách, tên miền người gửi hoặc nhà cung cấp hộp thư của người nhận.
+Một quy tắc có thể gửi toàn bộ thư qua một nhà cung cấp hoặc chia thư theo
+[tỷ trọng](/vi/reference/glossary/#weighted-split), chẳng hạn 90/10 trong lúc bạn chuyển sang nhà cung cấp mới hoặc khởi
+động một địa chỉ IP mới.
+
+Khi một nhà cung cấp gặp sự cố, chính sách [chuyển dự phòng](/vi/reference/glossary/#failover) của luồng quyết định điều
+gì xảy ra:
+
+- **Tự động**: thư chuyển sang nhà cung cấp dự phòng. Đây là mặc định cho Tự động hóa, Hệ thống và Giao dịch.
+- **Tạm dừng và hỏi**: những người nhận còn lại chờ cho đến khi có người quyết định. Đây là mặc định cho Gửi hàng loạt,
+  vì chuyển một lần gửi lớn sang một nhà cung cấp chưa khởi động khi đang gửi dở có thể làm hại uy tín của bạn.
+- **Tự động, chỉ sang nhà cung cấp đã khởi động xong**: thư chỉ chuyển sang nhà cung cấp dự phòng không còn trong quá
+  trình khởi động; nếu không, ReputeCast tạm dừng và hỏi.
+
+Xem [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
+
+## Một mô hình sự kiện và một danh sách chặn gửi
+
+Mỗi nhà cung cấp gửi thư báo cáo kết quả gửi, thư trả lại và khiếu nại theo định dạng riêng. ReputeCast nhận các báo cáo
+này tại URL công khai của nó (`/hooks/<adapter>/<token>`), kiểm tra chữ ký, lưu payload gốc và trả lời ngay; sau đó một
+tác vụ nền chuyển từng báo cáo thành một [sự kiện chuẩn hóa](/vi/reference/glossary/#normalized-event): gửi thành công,
+hoãn nhận, trả thư vĩnh viễn, trả thư tạm thời, khiếu nại, bị từ chối, mở, nhấp hoặc hủy đăng ký. Mã gốc của nhà cung
+cấp được giữ lại cùng sự kiện. Máy chủ SMTP không có webhook, nên ReputeCast đọc thư trả lại của chúng từ một hộp thư
+nhận thư trả lại.
+
+Thư trả lại vĩnh viễn, khiếu nại và hủy đăng ký được đưa vào một
+[danh sách chặn gửi](/vi/reference/glossary/#suppression-list) duy nhất, dùng chung cho mọi nhà cung cấp gửi thư: một thư
+trả lại ở một nhà cung cấp sẽ dừng việc gửi tới địa chỉ đó ở mọi nơi. Mỗi mục áp dụng cho mọi thư hoặc chỉ cho thư
+marketing. Xem [Sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/) và
+[Danh sách chặn gửi](/vi/audience/suppressions/).
+
+## Sự đồng ý
+
+ReputeCast ghi lại [sự đồng ý](/vi/reference/glossary/#consent) theo từng danh sách, kèm bằng chứng: liên hệ đã đăng ký
+bằng cách nào, khi nào và đã đồng ý với nội dung chính xác ra sao. Biểu mẫu đăng ký có thể dùng
+[xác nhận hai bước](/vi/reference/glossary/#double-opt-in), còn khi nhập dữ liệu, trạng thái đồng ý từ nền tảng bạn rời
+đi được giữ nguyên: các liên hệ đã hủy đăng ký, bị trả thư hoặc đã khiếu nại được đưa vào danh sách chặn gửi và không
+bao giờ được đăng ký lại. Xem [Danh sách, sự đồng ý và xác nhận hai bước](/vi/audience/lists-and-consent/).
+
+## Gửi có bảo vệ từ đầu đến cuối
+
+<SendFlowDiagram />
+
+Độ sẵn sàng gửi kiểm tra chiến dịch trước khi bắt đầu, định tuyến giao từng người nhận cho một nhà cung cấp gửi thư, sự
+kiện gửi thư quay về qua webhook, và các ngưỡng quyết định lần gửi tiếp tục hay tạm dừng.
+
+1. **Độ sẵn sàng gửi.** [Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) kiểm tra uy tín, xác thực, nội dung,
+   ngôn ngữ, khả năng tiếp cận, nội dung có điều kiện, liên kết, tuân thủ, chất lượng người nhận và định tuyến, rồi đưa
+   ra kết luận: “Sẵn sàng”, “Sẵn sàng, có cảnh báo” hoặc “Bị chặn”. Độ sẵn sàng gửi chạy lại 15 phút trước giờ gửi đã
+   lên lịch và khi lần gửi bắt đầu; một mục Chặn sẽ dừng lần gửi.
+2. **Định tuyến.** Lần gửi dựng danh sách người nhận theo từng trang và định tuyến từng người nhận. Các lô thư đến mỗi
+   nhà cung cấp trong giới hạn tốc độ của nhà cung cấp đó và giới hạn tốc độ của từng nhà cung cấp hộp thư. Mỗi thư đều
+   được đánh dấu nhận xử lý trước khi gửi đi, nên không thư nào bị gửi hai lần.
+3. **Sự kiện gửi thư.** Các nhà cung cấp báo cáo kết quả gửi, thư trả lại và khiếu nại, và ReputeCast chuẩn hóa chúng.
+4. **Ngưỡng.** Trong lúc gửi, ReputeCast kiểm tra tỷ lệ trả thư, tỷ lệ khiếu nại và tỷ lệ hoãn nhận mỗi 2 giây. Khi một
+   tỷ lệ vượt ngưỡng và có đủ bằng chứng, ReputeCast [tự động tạm dừng](/vi/reference/glossary/#auto-pause) chỉ riêng
+   nhà cung cấp hộp thư hoặc nhà cung cấp gửi thư liên quan, hoặc cả chiến dịch nếu bạn đã chọn phạm vi đó.
+5. **Quyết định.** Màn hình theo dõi trực tiếp giải thích điều gì đã kích hoạt việc tạm dừng. Một người có quyền sẽ tiếp
+   tục, tiếp tục kèm thay đổi hoặc hủy lần gửi.
+
+## Mặc định và giới hạn
+
+Đây là các mặc định tự động tạm dừng của [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending):
+
+<LimitsTable area="auto-pause" />
+
+Mọi mặc định khác có trong [Giới hạn và mặc định](/vi/reference/limits-and-defaults/).
+
+## Khi nào nên thay đổi
+
+- **Hạ ngưỡng** cho một danh sách bạn đã lâu không gửi thư, hoặc cho một tên miền gửi thư mới, để một phân khúc có vấn
+  đề được tạm dừng sớm hơn.
+- **Nâng ngưỡng một chút** chỉ khi một nguyên nhân đã biết làm tăng tỷ lệ, chẳng hạn một danh sách bạn biết có địa chỉ
+  cũ và bạn đang chủ động làm sạch.
+- **Tạm dừng cả chiến dịch** thay vì một tuyến khi bất kỳ vấn đề nào cũng phải dừng mọi thứ, chẳng hạn một thông báo phải
+  đến được với tất cả mọi người hoặc không ai cả.
+
+Đổi mặc định của không gian làm việc trong Cài đặt › Nhà cung cấp và giá trị của một chiến dịch trong Kiểm tra và gửi;
+xem [Mặc định gửi thư của không gian làm việc](/vi/providers/workspace-defaults/) và
+[Theo dõi lần gửi và tự động tạm dừng](/vi/campaigns/live-monitor/).
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="ReputeCast là gì" href="/vi/getting-started/introduction/" />
+  <LinkCard title="Độ sẵn sàng gửi: kiểm tra trước khi gửi" href="/vi/campaigns/send-readiness/" />
+  <LinkCard title="Định tuyến thư qua nhiều nhà cung cấp" href="/vi/providers/routing/" />
+  <LinkCard title="Bảng thuật ngữ" href="/vi/reference/glossary/" />
+</CardGrid>

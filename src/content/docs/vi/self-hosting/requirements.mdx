@@ -1,0 +1,60 @@
+---
+title: Yêu cầu hệ thống
+description: 'Yêu cầu hệ thống ReputeCast khi tự triển khai: hệ điều hành, Docker image, PostgreSQL 16 đến 18, truy cập mạng, cổng và dữ liệu cần lưu giữ.'
+type: reference
+audience: [operator]
+primaryKeyword: yêu cầu hệ thống ReputeCast
+sources:
+  - .goreleaser.yaml
+  - Dockerfile
+  - deploy/Dockerfile.release
+  - deploy/docker-compose.yml
+  - .github/workflows/ci.yml
+  - internal/config/config.go
+  - internal/app/app.go
+sidebar:
+  order: 1
+---
+
+import UiPath from '~/components/UiPath.astro'
+
+Đây là yêu cầu hệ thống ReputeCast: những gì một máy chủ cần để chạy một [hệ thống](/vi/reference/glossary/#instance)
+ReputeCast bằng tệp nhị phân hoặc Docker image.
+
+## Phần mềm
+
+| Thành phần      | Yêu cầu                                                                                                                                                                                                                                                         |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tệp nhị phân    | Linux, macOS hoặc Windows trên `amd64` hoặc `arm64`. Một tệp tĩnh duy nhất (build không dùng cgo) chứa ứng dụng web và các migration cơ sở dữ liệu. Mỗi bản phát hành cung cấp tệp này dưới dạng `.tar.gz` (`.zip` cho Windows) kèm `checksums.txt`.            |
+| Container image | `ghcr.io/hostrepute/reputecast` cho `linux/amd64` và `linux/arm64`. Xây dựng trên `gcr.io/distroless/static-debian13:nonroot`: không có shell, chạy với người dùng `nonroot` (uid 65532), lắng nghe ở cổng 8080, lưu dữ liệu trong volume `/var/lib/reputecast`. |
+| Cơ sở dữ liệu   | PostgreSQL 16, 17 hoặc 18. Bộ kiểm thử của ReputeCast chạy trên cả ba phiên bản; tệp Compose đi kèm dùng PostgreSQL 18. Không cần extension nào. Tác vụ nền được xếp hàng ngay trong PostgreSQL, nên không cần thêm dịch vụ nào khác.                            |
+| Môi trường chạy | Không cần gì thêm. Bạn chỉ cần Node.js và Go khi [build ReputeCast từ mã nguồn](/vi/developers/contributing/).                                                                                                                                                   |
+
+## Mạng
+
+| Chiều | Nội dung                                                                                                                                                                                                                                                                                    |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vào   | Một địa chỉ HTTPS công khai (`http.public_url`) mà các nhà cung cấp gửi thư truy cập được: họ gửi sự kiện đến `<public URL>/hooks/…`, và Zapier, Make cũng gọi đến địa chỉ này. Hãy kết thúc TLS ở một [reverse proxy](/vi/self-hosting/reverse-proxy/).                                      |
+| Vào   | Cổng 8080 (`http.addr`), chỉ mở cho reverse proxy. Cổng 587 và 465 khi bật [SMTP relay](/vi/transactional/smtp-relay/); mặc định hai cổng này tắt.                                                                                                                                           |
+| Ra    | HTTPS đến API của các nhà cung cấp gửi thư và đến mọi dịch vụ khác bạn kết nối (thanh toán, cửa hàng, mô hình AI, HostRepute).                                                                                                                                                              |
+| Ra    | Truy vấn DNS cho các kiểm tra xác thực và danh sách chặn. Spamhaus từ chối truy vấn đi qua resolver công cộng, nên hãy trỏ `dns.servers` đến resolver của riêng bạn nếu bạn dựa vào kiểm tra danh sách chặn (xem [danh sách chặn](/vi/deliverability/blocklists/)).                           |
+| Ra    | `https://api.github.com` mỗi ngày một lần để kiểm tra bản phát hành mới. Tắt bằng `updates.check: false` hoặc trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />.                                                                                                       |
+
+## Lưu trữ
+
+| Dữ liệu                          | Vị trí                                                                                                                                                                                                                                                                                    |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Dữ liệu PostgreSQL               | Liên hệ, chiến dịch, sự kiện, hàng đợi tác vụ và nhật ký kiểm tra. Hãy chọn dung lượng theo số liên hệ và lượng sự kiện; [giới hạn và mặc định](/vi/reference/limits-and-defaults/) cho biết mỗi loại dữ liệu được giữ bao lâu.                                                          |
+| Khóa bí mật (`secrets.key_file`) | `/var/lib/reputecast/secret.key` trong image, `data/secret.key` trong thư mục làm việc khi dùng tệp nhị phân. Khóa được tạo ở lần khởi động đầu tiên, trừ khi bạn đặt `secrets.key`. Thiếu khóa này, thông tin xác thực của nhà cung cấp đã lưu không giải mã được: [hãy sao lưu nó](/vi/self-hosting/backups/). |
+| Tệp tải lên (`files.dir`)        | Thư mục `files` cạnh khóa bí mật (`/var/lib/reputecast/files` trong image): sản phẩm số và tệp tặng kèm khi đăng ký (lead magnet). Mọi tiến trình web và worker cần dùng chung thư mục này.                                                                                              |
+
+## Ghi chú
+
+- Image PostgreSQL 18 lưu dữ liệu trong `/var/lib/postgresql`, không phải `/var/lib/postgresql/data`; hãy gắn volume vào
+  đúng đường dẫn đó.
+- Image không có shell và không có `HEALTHCHECK`. Hãy kiểm tra `/healthz` và `/readyz` qua HTTP
+  ([kiểm tra sức khỏe, metrics và log](/vi/self-hosting/monitoring/)).
+- Mặc định, một tiến trình chạy mọi vai trò. Hãy [mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/)
+  khi bạn cần thông lượng cao hơn.
+- [PostgreSQL](/vi/self-hosting/postgres/) nói về cơ sở dữ liệu được quản lý, pool kết nối và role PostgreSQL mà phân khúc
+  SQL cần.

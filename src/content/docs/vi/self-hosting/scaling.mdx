@@ -1,0 +1,134 @@
+---
+title: Mở rộng với các vai trò web, ingest và worker
+description: 'Mở rộng quy mô ReputeCast bằng cách tách một tiến trình thành các vai trò web, ingest và worker sau proxy, kèm ví dụ Compose, tệp dùng chung và kích thước pool.'
+type: how-to
+audience: [operator]
+primaryKeyword: mở rộng quy mô ReputeCast
+sources:
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/app/register.go
+  - internal/app/wire_smtprelay.go
+  - internal/app/wire_publicurl.go
+  - internal/cli/serve.go
+  - internal/jobs/jobs.go
+  - internal/providers/remote/runtime.go
+  - README.md
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ArchitectureDiagram from '~/components/diagrams/ArchitectureDiagram.astro'
+
+Để mở rộng quy mô ReputeCast, bạn chạy cùng một tệp nhị phân thành nhiều tiến trình, mỗi tiến trình đảm nhận một số
+trong ba vai trò, tất cả dùng chung một cơ sở dữ liệu PostgreSQL. Mặc định, một tiến trình chạy mọi vai trò, và như vậy
+là đủ cho hầu hết hệ thống; hãy tách các vai trò khi việc gửi thư, lưu lượng webhook hoặc ứng dụng web cần nhiều năng
+lực hơn mức một máy đáp ứng được.
+
+<ArchitectureDiagram />
+
+Một tệp nhị phân duy nhất phục vụ trình duyệt, API, tác tử MCP và webhook của nhà cung cấp, đồng thời chạy các tác vụ
+nền; PostgreSQL giữ dữ liệu và hàng đợi tác vụ, còn các nhà cung cấp gửi thư chuyển thư đến người nhận.
+
+## Các vai trò
+
+| Vai trò  | Những gì vai trò này chạy                                                                                                                                                                                          |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `web`    | Ứng dụng web, API dưới `/api/`, trang công khai (`/p/…`, `/t/…`, `/r/…`), `/mcp`, callback đăng nhập, thử thách Let's Encrypt và [SMTP relay](/vi/transactional/smtp-relay/).                                        |
+| `ingest` | Webhook từ nhà cung cấp gửi thư và các dịch vụ đã kết nối dưới `/hooks/…`: vai trò này kiểm tra từng webhook, lưu lại và trả về `200` ngay.                                                                         |
+| `worker` | Hàng đợi tác vụ trong PostgreSQL: gửi thư, xử lý sự kiện, đồng bộ, kiểm tra tình trạng, khởi động, tự động hóa, nhập dữ liệu, báo cáo và dọn dữ liệu hết hạn lưu giữ. Tác vụ định kỳ chỉ chạy trong tiến trình worker. |
+
+- `reputecast serve` chạy cả ba; `serve --role=web,ingest` (hoặc `REPUTECAST_ROLES=web,ingest`) chạy một phần;
+  `reputecast worker` tương đương `serve --role=worker`.
+- Một tiến trình chỉ có HTTP listener (với `/healthz`, `/readyz` và `/metrics`) khi nó chạy `web` hoặc `ingest`. Hãy đặt
+  `metrics.addr` cho tiến trình chỉ chạy worker, ví dụ `:9090`, để công bố metrics của nó.
+
+## Trước khi bắt đầu
+
+- ReputeCast đang chạy thành một tiến trình, được cài bằng [Docker Compose](/vi/self-hosting/docker/) hoặc
+  [tệp nhị phân](/vi/self-hosting/binary/), và bạn đã có [bản sao lưu](/vi/self-hosting/backups/).
+- PostgreSQL của bạn nhận được số kết nối tăng thêm
+  ([chọn kích thước pool](/vi/self-hosting/postgres/#chọn-kích-thước-pool-kết-nối)).
+
+## Tách các vai trò
+
+<Steps>
+
+1. Cấp cho mọi tiến trình cùng một cấu hình: `database.url`, `http.public_url`, `http.trusted_proxies` và cùng một
+   khóa bí mật. Trên nhiều máy, hãy đặt `secrets.key` (`REPUTECAST_SECRETS__KEY`) trên tất cả các máy thay vì dùng tệp
+   khóa; với Docker, sao chép khóa hiện có ra bằng `docker compose cp app:/var/lib/reputecast/secret.key .` rồi dùng nội
+   dung của nó.
+
+2. Cấp cho các tiến trình web và worker cùng một `files.dir` (tệp sản phẩm và lead magnet), trên một volume dùng chung
+   hoặc một hệ thống tệp mạng.
+
+3. Chạy một hoặc nhiều tiến trình `serve --role=web,ingest` sau [reverse proxy](/vi/self-hosting/reverse-proxy/), và ít
+   nhất một `worker`. Nhiều worker dùng chung hàng đợi qua PostgreSQL. Để tăng năng lực nhận webhook một cách riêng
+   biệt, hãy chạy các tiến trình `--role=ingest` và chuyển `/hooks/` đến chúng trong proxy.
+
+4. Chỉ áp dụng migration từ một nơi: một tiến trình có `--auto-migrate`, hoặc `reputecast migrate up` trước khi bạn khởi
+   động phiên bản mới ở mọi nơi. `worker` không bao giờ chạy migration.
+
+5. Chạy cùng một phiên bản ReputeCast trong mọi tiến trình.
+
+</Steps>
+
+Ví dụ Compose này chạy vai trò web và ingest trong `app` và các tác vụ trong một container `worker` riêng, trên một máy
+chủ, dùng chung volume `appdata` (khóa bí mật và tệp):
+
+```yaml title="docker-compose.override.yml"
+services:
+  app:
+    command: ["serve", "--role=web,ingest", "--auto-migrate", "--auto-install"]
+
+  worker:
+    image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+    restart: unless-stopped
+    command: ["worker"]
+    depends_on:
+      - app
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+      REPUTECAST_METRICS__ADDR: ":9090"
+    volumes:
+      - appdata:/var/lib/reputecast
+```
+
+<Aside type="caution">
+  Hãy tách hệ thống sau lần khởi động đầu tiên, khi tệp khóa bí mật đã tồn tại. Một worker khởi động trên volume trống
+  trước ứng dụng có thể tạo ra một khóa khác.
+</Aside>
+
+## Những gì các tiến trình dùng chung
+
+- **PostgreSQL**: dữ liệu, hàng đợi tác vụ và lịch chạy tác vụ. Mỗi tiến trình mở tối đa `database.max_conns` kết nối
+  (mặc định 20), và `worker.concurrency` (mặc định 50) quyết định một worker chạy bao nhiêu tác vụ cùng lúc.
+- **Thiết lập lưu trong ứng dụng**: mọi tiến trình đọc lại URL công khai đã lưu trong Quản trị hệ thống mỗi 30 giây, và
+  danh sách adapter cộng đồng đã cài mỗi 15 giây.
+- **Tệp**: `files.dir`, như ở trên.
+
+## Kiểm tra kết quả
+
+- `curl http://<web process>:8080/readyz` trả về `ready` trên mọi tiến trình web và ingest.
+- `curl http://<worker>:9090/metrics` có phản hồi trên worker được đặt `metrics.addr`.
+- Dòng log `http listening` của mỗi tiến trình web hiện các vai trò của nó, và mỗi worker ghi log `workers started` kèm
+  mức đồng thời.
+- Các lượt gửi đã lên lịch bắt đầu chạy và theo dõi trực tiếp có cập nhật: các worker đang xử lý hàng đợi.
+
+## Khắc phục sự cố
+
+- **Không có thư nào được gửi và việc nhập dữ liệu không bao giờ xong**: không tiến trình nào chạy vai trò `worker`.
+- **Một tiến trình không giải mã được thông tin xác thực của nhà cung cấp đã lưu**: khóa bí mật của tiến trình đó khác;
+  hãy cấp cho mọi tiến trình cùng `secrets.key` hoặc cùng tệp khóa.
+- **Tải sản phẩm thất bại ở một số tiến trình**: `files.dir` không được dùng chung.
+- **`FATAL: sorry, too many clients already`**: hãy giảm `database.max_conns` cho mỗi tiến trình.
+- **Worker không có `/healthz`**: đây là điều bình thường, vì worker không có HTTP listener. Hãy theo dõi `metrics.addr`
+  của nó.
+
+## Liên quan
+
+- [Kiểm tra sức khỏe, metrics và log](/vi/self-hosting/monitoring/)
+- [Cấu hình ReputeCast](/vi/self-hosting/configuration/)
+- [Cách ReputeCast hoạt động](/vi/getting-started/concepts/)

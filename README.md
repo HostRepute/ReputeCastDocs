@@ -45,6 +45,23 @@ English (root URLs) and Vietnamese (`/vi/`); the REST API reference is generated
   `scripts/screenshots/manifest.ts`. Use `--only id,id`, `--locale en|vi`, `--no-reseed`. The dev database is left
   reseeded with the Acme demo when the run ends.
 
+## Deployment
+
+CI (`.github/workflows/ci.yml`) builds once, runs every gate (lint, content check, Vale, unit tests, build with link
+validation, built-site link check, Playwright SEO/accessibility/responsive/search tests, Lighthouse CI) and deploys
+the same `dist/` artifact to Cloudflare Pages with Wrangler (Direct Upload). Pushes to `main` deploy production;
+pull-request branches deploy previews built with `DOCS_PREVIEW=1`, which adds `X-Robots-Tag: noindex` to every
+response. `.github/workflows/upstream-drift.yml` runs `pnpm upstream:check` against `hostrepute/reputecast` every
+Monday (set the `UPSTREAM_TOKEN` secret while that repository is private).
+
+One-time setup by the owner:
+
+1. Cloudflare: create the Pages project `reputecast-docs` with **Direct Upload**, add the custom domain
+   `docs.reputecast.com` (CNAME in the `reputecast.com` zone) and an API token with "Cloudflare Pages: Edit".
+2. GitHub: add the repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+3. Search engines: verify the domain in Google Search Console and Bing Webmaster Tools with DNS TXT records and
+   submit `https://docs.reputecast.com/sitemap-index.xml`.
+
 ## Writing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) (page types, voice, components, SEO rules) and, for Vietnamese,

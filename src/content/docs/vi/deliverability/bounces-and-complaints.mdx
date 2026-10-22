@@ -1,0 +1,179 @@
+---
+title: Thư trả lại, khiếu nại và giới hạn của nhà cung cấp
+description: ReputeCast xử lý từng thư trả lại và khiếu nại ra sao, địa chỉ nào bị chặn gửi ngay, và ngưỡng tỷ lệ bounce email mà nhà cung cấp gửi thư và ReputeCast áp dụng.
+type: explanation
+audience: [publisher, admin]
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: tỷ lệ bounce email
+sources:
+  - internal/providers/provider.go
+  - internal/providers/bounce/bounce.go
+  - internal/providers/ses/sns.go
+  - internal/ingest/normalize.go
+  - internal/suppressions/sync.go
+  - internal/reports/bounces.go
+  - internal/providers/state/state.go
+  - internal/providers/manage/usage.go
+  - internal/connect/connection.go
+  - internal/deliverability/providers.go
+  - internal/sending/engine/loop.go
+  - web/src/features/reports/messages.ts
+sidebar:
+  order: 8
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+[Thư trả lại](/vi/reference/glossary/#bounce) (bounce) là thư mà máy chủ nhận đã từ chối;
+[khiếu nại](/vi/reference/glossary/#complaint) là khi người đọc đánh dấu email của bạn là spam. Cả hai đều bị tính vào
+ngưỡng tỷ lệ bounce email và giới hạn khiếu nại mà nhà cung cấp gửi thư áp lên tài khoản của bạn, cũng như vào các
+ngưỡng ReputeCast áp dụng trong lúc một chiến dịch đang gửi. Trang này giải thích từng loại được ghi nhận thế nào, địa
+chỉ nào bị chặn gửi ngay lập tức, và các giới hạn đó nằm ở đâu.
+
+## Trả thư vĩnh viễn, trả thư tạm thời và khiếu nại
+
+- [Trả thư vĩnh viễn](/vi/reference/glossary/#hard-bounce) (hard bounce) là lỗi lâu dài: địa chỉ không tồn tại, tên
+  miền không có máy chủ thư, hoặc máy chủ nhận từ chối thư hẳn. Phản hồi SMTP của các trường hợp này bắt đầu bằng 5
+  (ví dụ `550 5.1.1`).
+- [Trả thư tạm thời](/vi/reference/glossary/#soft-bounce) (soft bounce) là lỗi tạm thời, chẳng hạn hộp thư đầy hoặc
+  máy chủ nhận yêu cầu thử lại sau. Phản hồi bắt đầu bằng 4 (ví dụ `452 4.2.2`). Nhà cung cấp gửi thư sẽ thử lại; thư
+  nào cuối cùng vẫn không gửi được sẽ được báo là trả thư tạm thời.
+- [Hoãn nhận](/vi/reference/glossary/#deferral) (deferral) là một lần gửi bị trì hoãn mà nhà cung cấp gửi thư sẽ thử
+  lại. Nhiều lần hoãn nhận tại cùng một nhà cung cấp hộp thư thường có nghĩa là nhà cung cấp đó đang giới hạn tốc độ
+  nhận thư của bạn.
+- Khiếu nại đến với bạn qua [vòng phản hồi](/vi/reference/glossary/#feedback-loop) (feedback loop):
+  [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider) báo một lượt nhấp "Report spam" (Báo cáo spam) cho
+  [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) của bạn, và nhà cung cấp này chuyển tiếp báo cáo đó.
+- Thư bị từ chối (rejected) là thư mà nhà cung cấp gửi thư từ chối ngay trước khi gửi, ví dụ vì địa chỉ nằm trong danh
+  sách chặn gửi riêng của nhà cung cấp hoặc nội dung bị gắn cờ.
+
+Nhà cung cấp gửi thư quyết định một thư trả lại là vĩnh viễn hay tạm thời. ReputeCast giữ nguyên quyết định đó, cùng
+với loại sự kiện gốc và mã lỗi của nhà cung cấp.
+
+## Cách ReputeCast xử lý từng sự kiện
+
+1. Nhà cung cấp gửi thư báo sự kiện đến webhook của ReputeCast; với máy chủ SMTP, ReputeCast đọc sự kiện từ
+   [hộp thư nhận thư trả lại](/vi/reference/glossary/#bounce-mailbox). Payload gốc được lưu trước mọi bước khác.
+2. ReputeCast ánh xạ sự kiện sang một loại [sự kiện chuẩn hóa](/vi/reference/glossary/#normalized-event): `delivered`,
+   `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` hoặc `unsubscribe`. Loại gốc
+   ("Bounce · Permanent · General") và mã ("550 5.1.1") vẫn đi kèm sự kiện.
+3. Mỗi thư trả lại còn được gán một [loại thư trả lại](/vi/reference/glossary/#bounce-class), đọc từ mã trạng thái mở
+   rộng (enhanced status code) và nội dung chẩn đoán, để cùng một phản hồi mang cùng một ý nghĩa ở mọi nhà cung cấp gửi
+   thư.
+4. Trả thư vĩnh viễn, khiếu nại và hủy đăng ký do nhà cung cấp báo về sẽ đưa địa chỉ vào
+   [danh sách chặn gửi dùng chung](/vi/reference/glossary/#suppression-list) ngay lập tức, và trạng thái của liên hệ
+   chuyển thành đã trả thư (bounced) hoặc đã khiếu nại (complained).
+   [Đồng bộ danh sách chặn gửi](/vi/reference/glossary/#suppression-sync) sau đó đẩy địa chỉ sang mọi nhà cung cấp gửi
+   thư đã kết nối có nhận danh sách chặn gửi, nên chỉ một lần trả thư là thư ngừng gửi đến địa chỉ đó ở mọi nơi.
+5. Trả thư tạm thời và hoãn nhận không bao giờ khiến một địa chỉ bị chặn gửi. Chúng được tính trong báo cáo và trong
+   [theo dõi trực tiếp](/vi/campaigns/live-monitor/).
+6. Tỷ lệ trả thư và tỷ lệ khiếu nại là dữ liệu đầu vào của [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending):
+   khi tỷ lệ của một chiến dịch vượt [ngưỡng tự động tạm dừng](#ngưỡng-tự-động-tạm-dừng), ReputeCast tạm giữ phần bị
+   ảnh hưởng.
+
+Ngoại lệ duy nhất là các bản gửi của một [kiểm tra vị trí thư](/vi/deliverability/placement-tests/) đến hộp thư mẫu của
+chính bạn: thư trả lại và khiếu nại từ các bản gửi đó không bao giờ khiến hộp thư mẫu bị chặn gửi.
+
+Mọi sự kiện gốc và dạng chuẩn hóa của nó hiện cạnh nhau trong
+<UiPath path="nav.providers > providers.tabEvents" />.
+
+<Screenshot
+  id="providers-events"
+  alt="Nhật ký sự kiện trong Sự kiện và đồng bộ: mỗi sự kiện gốc của nhà cung cấp, chẳng hạn một Bounce · Permanent · General của Amazon SES, nằm cạnh loại chuẩn hóa, mã và nội dung chẩn đoán gốc, người nhận và chiến dịch đã gửi thư."
+/>
+
+### Loại thư trả lại
+
+Báo cáo chiến dịch loại thư trả lại theo loại trong bảng thư trả lại, kèm mã gốc của từng nhà cung cấp gửi thư, và cho
+biết điều gì đã xảy ra với các địa chỉ. Tên dòng trong báo cáo hiện bằng tiếng Anh, đúng như trong ứng dụng.
+
+<TableScroll label="Loại thư trả lại">
+
+| Loại              | Máy chủ nhận nói gì                                              | Dòng trong báo cáo             | Điều gì xảy ra                                       |
+| ----------------- | ---------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------- |
+| `mailbox_unknown` | Địa chỉ không tồn tại (`5.1.1`, "user unknown")                  | Hard · unknown user            | Tự động chặn gửi                                     |
+| `domain_invalid`  | Tên miền không tồn tại hoặc không có máy chủ thư                 | Hard · domain not found        | Tự động chặn gửi                                     |
+| `mailbox_full`    | Hộp thư đã vượt hạn mức (`4.2.2`, `5.2.2`)                       | Soft · mailbox full            | Thử lại ở lần gửi sau                                |
+| `temporary`       | Một lỗi tạm thời mãi không hết                                   | Soft · deferral expired        | Thử lại ở lần gửi sau                                |
+| `policy_block`    | Bị từ chối theo chính sách, thường do xác thực (`5.7.1`, `5.7.26`) | Blocked · policy or reputation | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
+| `spam_block`      | Bị từ chối vì bị coi là spam, hoặc vì bị liệt kê trong danh sách chặn | Blocked · policy or reputation | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
+| `reputation`      | Bị từ chối hoặc bị giới hạn tốc độ vì uy tín người gửi           | Blocked · policy or reputation | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
+| `other`           | Không có mã nào ReputeCast phân loại được                        | Other                          | Bạn tự xem xét                                       |
+
+</TableScroll>
+
+Một thư trả lại dạng blocked mà nhà cung cấp gửi thư báo là vĩnh viễn vẫn là trả thư vĩnh viễn, nên địa chỉ bị chặn gửi
+ngay như mọi trường hợp khác. Báo cáo cho biết địa chỉ nào của mỗi dòng đã nằm trong danh sách và đề nghị thêm những
+địa chỉ còn lại. Thư trả lại dạng blocked thường chỉ ra vấn đề ở thiết lập gửi thư của bạn hơn là ở địa chỉ: hãy kiểm
+tra [SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/) và
+[việc bị liệt kê trong danh sách chặn](/vi/deliverability/blocklists/), rồi tra mã lỗi trong
+[Mã lỗi SMTP](/vi/smtp-errors/).
+
+### Khiếu nại và vòng phản hồi của Gmail
+
+Hầu hết nhà cung cấp hộp thư gửi một báo cáo cho mỗi khiếu nại đến nhà cung cấp gửi thư của bạn, và ReputeCast nhận báo
+cáo đó dưới dạng sự kiện `complaint`. Gmail làm khác: vòng phản hồi của Gmail báo tỷ lệ spam tổng hợp theo từng mã định
+danh trong Google Postmaster Tools, dựa trên header `Feedback-ID` trong thư
+([Gmail Help, "Feedback Loop"](https://support.google.com/mail/answer/6254652), kiểm tra tháng 10/2026). ReputeCast
+thêm header đó vào thư của các luồng Gửi hàng loạt, Tự động hóa và Giao dịch:
+
+```text title="Header Feedback-ID"
+Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
+```
+
+Các mã định danh này nhóm dữ liệu của Gmail theo từng chiến dịch, từng không gian làm việc và từng luồng. Khi đã kết nối
+[HostRepute](/vi/deliverability/hostrepute/), số liệu Postmaster Tools, gồm cả các chiến dịch bị gắn cờ, hiện trong mục
+Khả năng vào hộp thư.
+
+## Giới hạn tài khoản của nhà cung cấp gửi thư
+
+Nhà cung cấp gửi thư theo dõi tỷ lệ trả thư và tỷ lệ khiếu nại của tài khoản bạn và có thể chặn bạn gửi khi các tỷ lệ
+này quá cao. Ví dụ, Amazon SES công bố hai mức cho mỗi tỷ lệ
+([Amazon SES sending review process FAQs](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), kiểm tra
+tháng 10/2026):
+
+| Tỷ lệ           | Tài khoản bị xem xét | Có thể bị tạm dừng gửi |
+| --------------- | -------------------- | ---------------------- |
+| Tỷ lệ trả thư   | Từ 5% trở lên        | Từ 10% trở lên         |
+| Tỷ lệ khiếu nại | Từ 0,1% trở lên      | Từ 0,5% trở lên        |
+
+Amazon SES chỉ tính trả thư vĩnh viễn đến những tên miền bạn chưa xác minh, và chỉ tính khiếu nại từ những nhà cung cấp
+hộp thư có gửi phản hồi, đo trên một "lượng thư đại diện" (representative volume) của bạn thay vì một khoảng thời gian
+cố định. AWS khuyên giữ tỷ lệ trả thư dưới 2% và tỷ lệ khiếu nại dưới 0,1%.
+
+ReputeCast lưu hai mức của Amazon SES cùng mỗi kết nối SES và hiển thị tỷ lệ trả thư và tỷ lệ khiếu nại trong 7 ngày gần
+nhất của từng nhà cung cấp gửi thư trong
+[Giám sát tình trạng tên miền và nhà cung cấp](/vi/deliverability/health/), cạnh giới hạn áp dụng cho nhà cung cấp đó.
+Thanh tỷ lệ bắt đầu cảnh báo khi chạm một nửa giới hạn thứ nhất. Máy chủ tự triển khai như Postal hay một máy chủ SMTP
+không có giới hạn tài khoản; đường hiển thị ở đó là ngưỡng bảo vệ do ReputeCast đặt, hoặc ngưỡng bảo vệ khởi động khi
+máy chủ đang [khởi động](/vi/providers/warm-up/).
+
+## Ngưỡng tự động tạm dừng
+
+Các ngưỡng riêng của ReputeCast áp dụng trong từng chiến dịch, theo từng nhà cung cấp hộp thư và nhà cung cấp gửi thư.
+Chúng bằng hoặc thấp hơn các mức khiến một tài khoản Amazon SES bị xem xét, nên một lần gửi có vấn đề sẽ dừng lại trước
+khi gây hại cho tài khoản.
+
+<LimitsTable area="auto-pause" />
+
+## Khi nào nên thay đổi
+
+- Giữ mặc định khi bạn khởi động một tên miền hoặc IP mới, hoặc sau khi chuyển nền tảng: các ngưỡng này phát hiện một
+  danh sách kém chất lượng trước khi nhà cung cấp gửi thư phát hiện.
+- Chỉ nâng một ngưỡng cho một chiến dịch trong [Kiểm tra và gửi](/vi/reference/glossary/#review-and-send) khi bạn biết vì
+  sao tỷ lệ sẽ cao, ví dụ một chiến dịch xin phép lại gửi đến một danh sách cũ, và hãy gửi cho một phân khúc nhỏ trước.
+- Hạ ngưỡng trả thư nếu giới hạn riêng của một nhà cung cấp gửi thư chặt hơn mặc định của ReputeCast.
+
+Xem [Theo dõi lần gửi và tự động tạm dừng](/vi/campaigns/live-monitor/) để biết điều gì xảy ra khi một ngưỡng bị vượt,
+và [Mặc định gửi thư của không gian làm việc](/vi/providers/workspace-defaults/) để biết nơi đặt các mặc định của không
+gian làm việc.
+
+## Liên quan
+
+- [Sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)
+- [Danh sách chặn gửi](/vi/audience/suppressions/)
+- [Đọc báo cáo chiến dịch](/vi/campaigns/reports/)
+- [Mã lỗi SMTP](/vi/smtp-errors/)

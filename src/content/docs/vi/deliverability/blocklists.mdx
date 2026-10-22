@@ -1,0 +1,193 @@
+---
+title: Kiểm tra và gỡ tên khỏi danh sách chặn
+description: Kiểm tra danh sách chặn email cho tên miền gửi thư và IP riêng, đọc kết quả của tám danh sách chặn có sẵn và yêu cầu gỡ khỏi danh sách khi bị liệt kê.
+type: how-to
+audience: [publisher, admin]
+permissions: ['deliverability:view']
+uiPath: 'nav.deliverability > placement.health'
+primaryKeyword: kiểm tra danh sách chặn email
+sources:
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/deliverability/checks.go
+  - internal/deliverability/blocklists.go
+  - internal/readiness/assemble.go
+  - internal/contentcheck/contentcheck.go
+  - internal/config/config.go
+  - web/src/features/deliverability
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast tự kiểm tra danh sách chặn email mỗi ngày một lần cho [tên miền gửi thư](/vi/reference/glossary/#sending-domain)
+và [IP riêng](/vi/reference/glossary/#dedicated-ip) của bạn, hiển thị kết quả trong
+<UiPath path="nav.deliverability > placement.health" />, và biến việc bị liệt kê thành một kết quả của
+[Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) trước khi chiến dịch tiếp theo được gửi đi. Hướng dẫn này chỉ
+cách chạy kiểm tra khi cần, đọc kết quả và yêu cầu gỡ tên khỏi một danh sách chặn (blocklist, thường gọi là blacklist).
+
+## Các danh sách ReputeCast kiểm tra
+
+Khi không có [HostRepute](/vi/reference/glossary/#hostrepute), ReputeCast tự truy vấn tám
+[danh sách chặn](/vi/reference/glossary/#blocklist) công khai (DNSBL). Danh sách IP được truy vấn cho các IP riêng của
+bạn, danh sách tên miền cho các tên miền gửi thư của bạn. Thư gửi qua nhóm IP dùng chung của nhà cung cấp gửi thư, chẳng
+hạn Amazon SES khi không dùng IP riêng, chỉ được kiểm tra ở cấp tên miền, vì nhà cung cấp gửi thư quản lý các IP đó.
+
+<TableScroll label="Danh sách chặn có sẵn">
+
+| Danh sách      | Kiểm tra | Mức ảnh hưởng | Trang gỡ khỏi danh sách                                                      |
+| -------------- | -------- | ------------- | ---------------------------------------------------------------------------- |
+| Spamhaus ZEN   | IP       | Cao           | [check.spamhaus.org](https://check.spamhaus.org/)                            |
+| Spamhaus DBL   | Tên miền | Cao           | [check.spamhaus.org](https://check.spamhaus.org/)                            |
+| SURBL          | Tên miền | Cao           | [surbl.org](https://surbl.org/surbl-analysis)                                |
+| URIBL          | Tên miền | Cao           | [admin.uribl.com](https://admin.uribl.com/)                                  |
+| Barracuda BRBL | IP       | Cao           | [barracudacentral.org](https://www.barracudacentral.org/rbl/removal-request) |
+| SpamCop        | IP       | Trung bình    | [spamcop.net](https://www.spamcop.net/bl.shtml)                              |
+| Mailspike      | IP       | Trung bình    | [mailspike.org](https://mailspike.org/anubis/lookup.html)                    |
+| PSBL           | IP       | Thấp          | [psbl.org](https://psbl.org/)                                                |
+
+</TableScroll>
+
+Mức ảnh hưởng quyết định cách nhóm <UiPath path="review.groupReputation" /> của Độ sẵn sàng gửi xử lý khi tên miền hoặc
+IP mà một chiến dịch gửi đi bị liệt kê: bị liệt kê trong một danh sách có mức ảnh hưởng cao là
+<UiPath path="review.statusBlock" />, trong một danh sách có mức ảnh hưởng trung bình hoặc thấp là
+<UiPath path="review.statusWarn" />. Các liên kết trong email cũng được kiểm tra: trình soạn thảo và Độ sẵn sàng gửi chặn
+một chiến dịch có liên kết đến tên miền nằm trong danh sách chặn URI (xem
+[Sửa cảnh báo nội dung trước khi gửi](/vi/campaigns/content-checks/)).
+
+Khi đã kết nối HostRepute, HostRepute kiểm tra 84 nguồn mỗi giờ thay cho kiểm tra có sẵn, và kiểm tra có sẵn được bỏ qua
+trong lúc kết nối đó hoạt động bình thường. Nếu không kết nối được HostRepute, kiểm tra có sẵn chạy làm phương án dự
+phòng. Xem [Kết nối HostRepute](/vi/deliverability/hostrepute/).
+
+### Khi nào kiểm tra chạy
+
+<LimitsTable area="deliverability" />
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `deliverability:view` để mở trang và chạy kiểm tra. Chủ sở hữu, Quản trị viên, Biên tập viên và Người
+  xem đều có quyền này.
+- Hãy [kết nối một nhà cung cấp gửi thư](/vi/providers/connect/) và
+  [thêm tên miền gửi thư](/vi/providers/senders-and-domains/) trước. Khi chưa có chúng, sẽ không có gì để kiểm tra.
+- Nếu bạn vận hành máy chủ: hệ thống cần một DNS resolver mà các danh sách chặn chịu trả lời. Hãy thiết lập resolver
+  trước khi dựa vào kết quả.
+
+<Aside type="caution" title="Resolver DNS công cộng bị từ chối">
+Spamhaus từ chối các truy vấn DNSBL đi qua resolver công cộng hoặc resolver mở như 1.1.1.1 hay 8.8.8.8 và trả về mã lỗi
+`127.255.255.254` thay vì kết quả liệt kê
+([Spamhaus, "Using our public mirrors? Check your return codes now"](https://www.spamhaus.org/resource-hub/dnsbl/using-our-public-mirrors-check-your-return-codes-now/),
+kiểm tra tháng 10/2026). SURBL và URIBL cũng từ chối theo cách tương tự với `127.0.0.1`. ReputeCast không bao giờ coi
+các câu trả lời này là bị liệt kê hay sạch: lần tra cứu được hiển thị là không rõ. Hãy trỏ
+[`dns.servers`](/vi/reference/configuration/#dns) đến một recursive resolver do chính bạn vận hành.
+</Aside>
+
+```yaml title="config.yaml"
+dns:
+  servers:
+    - 10.0.0.53
+    - 10.0.0.54:53
+```
+
+Khi dùng biến môi trường, hãy phân tách các máy chủ bằng dấu phẩy:
+
+```sh title="Biến môi trường"
+REPUTECAST_DNS__SERVERS=10.0.0.53,10.0.0.54:53
+```
+
+Khi `dns.servers` để trống, ReputeCast dùng resolver của hệ điều hành trong `/etc/resolv.conf`. Nếu máy chủ hoặc
+container của bạn chuyển tiếp DNS đến một resolver công cộng, các tra cứu Spamhaus và URIBL sẽ thất bại dù các kiểm tra
+xác thực (SPF, DKIM, DMARC) vẫn hoạt động.
+
+## Chạy kiểm tra danh sách chặn
+
+<Steps>
+
+1. Mở <UiPath path="nav.deliverability > placement.health" />.
+
+2. Chọn <UiPath path="deliverability.runChecks" />. Khi đã kết nối HostRepute, nút này có tên
+   <UiPath path="deliverability.runAll" /> và yêu cầu HostRepute kiểm tra lại luôn.
+
+   Một dòng tiến trình cho biết đã có bao nhiêu nguồn trả lời. Một lần chạy bắt đầu chưa đến một phút sau lần trước sẽ
+   trả về lần chạy trước đó thay vì bắt đầu lần mới.
+
+3. Khi chạy xong, hãy đọc bảng danh sách chặn. Mỗi danh sách cho biết nó đã kiểm tra gì, trạng thái
+   (<UiPath path="deliverability.listed" /> hoặc <UiPath path="deliverability.clean" />), một tài sản bị liệt kê từ khi
+   nào, và với tài sản bị liệt kê thì có <UiPath path="deliverability.delistingPage" /> của danh sách đó.
+
+4. Để lưu một bản cho phiếu hỗ trợ hoặc bảng tính, chọn <UiPath path="deliverability.exportReport" />: mỗi lần kiểm tra
+   là một dòng CSV.
+
+</Steps>
+
+<Screenshot
+  id="deliverability"
+  alt="Trang Khả năng vào hộp thư khi đã kết nối HostRepute: thẻ tên miền và IP ở trên cùng, tình trạng tài khoản nhà cung cấp ở giữa, và bảng danh sách chặn trong đó 203.0.113.25 bị liệt kê trên UCEPROTECT Level 3."
+>
+  1. Tình trạng của từng tên miền gửi thư và IP riêng, kèm số danh sách đang liệt kê mỗi tài sản.
+  2. Bảng danh sách chặn: các nguồn đang liệt kê đứng trước, sau đó là các nguồn sạch, kèm liên kết gỡ khỏi danh sách.
+  3. Tình trạng tài khoản của từng nhà cung cấp gửi thư, đo theo giới hạn riêng của mỗi nhà cung cấp.
+</Screenshot>
+
+Một lần bị liệt kê mới do kiểm tra có sẵn phát hiện cũng xuất hiện trong dòng thời gian sự cố trên cùng trang và trong
+thông báo của mọi thành viên xem được Khả năng vào hộp thư, kèm trang gỡ khỏi danh sách của danh sách đó. Bị liệt kê
+trên một danh sách có mức ảnh hưởng cao được đánh dấu là nghiêm trọng.
+
+## Yêu cầu gỡ khỏi danh sách
+
+<Steps>
+
+1. Tìm hiểu vì sao tài sản bị liệt kê. Mở <UiPath path="deliverability.delistingPage" /> của danh sách và tra tài sản
+   ở đó. Nguyên nhân thường gặp là gửi thư đến những địa chỉ cũ hoặc mua về đã trở thành
+   [bẫy spam](/vi/reference/glossary/#spam-trap), và lượng gửi tăng vọt từ một IP mới.
+
+2. Khắc phục nguyên nhân trước khi yêu cầu gỡ. Loại bỏ những địa chỉ gây ra vấn đề (xem
+   [Giữ danh sách khỏe mạnh](/vi/audience/list-health/) và [Danh sách chặn gửi](/vi/audience/suppressions/)), giảm tốc
+   một IP mới bằng [kế hoạch khởi động](/vi/providers/warm-up/), và kiểm tra
+   [bản ghi SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/) của tên miền gửi thư.
+
+3. Gửi yêu cầu gỡ trên trang riêng của danh sách; mỗi danh sách mô tả quy trình của mình ở đó. Khi đã kết nối
+   HostRepute, <UiPath path="deliverability.requestDelisting" /> gửi yêu cầu ngay từ ReputeCast và HostRepute sẽ theo
+   dõi tiếp.
+
+4. Nếu IP bị liệt kê thuộc về nhà cung cấp gửi thư chứ không phải của bạn, hãy liên hệ nhà cung cấp gửi thư, vì họ kiểm
+   soát IP đó và việc gửi thư từ IP đó. Trong lúc chờ, hãy định tuyến luồng bị ảnh hưởng qua một nhà cung cấp khác
+   ([Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/)).
+
+5. Chạy kiểm tra lại khi danh sách cho biết tài sản đã được gỡ.
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- Danh sách hiện <UiPath path="deliverability.clean" /> cho tài sản sau lần chạy tiếp theo.
+- Nhóm uy tín của Độ sẵn sàng gửi đạt cho tên miền gửi thư và các IP của chiến dịch
+  ([Độ sẵn sàng gửi: kiểm tra trước khi gửi](/vi/campaigns/send-readiness/)).
+
+## Khắc phục sự cố
+
+- **Lần chạy báo một số tra cứu không có trả lời.** Các tra cứu đó hiện là không rõ, không phải sạch. Nguyên nhân thường
+  gặp là resolver DNS công cộng: đặt `dns.servers` như trong [Trước khi bắt đầu](#trước-khi-bắt-đầu). Resolver chậm cũng
+  có thể hết thời gian chờ; thời gian chờ của mỗi lần tra cứu là `dns.timeout` (mặc định 4 giây).
+- **Spamhaus ZEN hoặc DBL không bao giờ xuất hiện trong bảng.** Spamhaus đã từ chối mọi truy vấn, nên không có kết quả
+  nào được lưu. Cách khắc phục cũng vậy: dùng resolver của riêng bạn.
+- **Nút không chạy lần mới.** Một lần chạy đang diễn ra, hoặc mới bắt đầu chưa đến một phút, được hiển thị thay cho lần
+  mới. Hãy chờ lần đó hoàn tất.
+- **Xuất hiện thông báo "Hãy kết nối nhà cung cấp gửi thư trước".** Chưa có tên miền gửi thư hoặc IP riêng nào. Hãy hoàn
+  tất [kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
+- **Một IP trong nhóm IP dùng chung bị liệt kê ở nơi khác.** ReputeCast không kiểm tra IP dùng chung; nhà cung cấp gửi
+  thư giám sát các IP này. Hãy hỏi nhà cung cấp gửi thư, hoặc chuyển luồng sang một nhà cung cấp có nhóm IP sạch.
+- **Tài sản bị liệt kê lại sau khi đã gỡ.** Nguyên nhân vẫn còn. Hãy xem thư trả lại và khiếu nại theo nhà cung cấp hộp
+  thư trong [báo cáo chiến dịch](/vi/campaigns/reports/) và ngừng gửi cho những liên hệ không bao giờ tương tác.
+
+## Liên quan
+
+- [Kết nối HostRepute](/vi/deliverability/hostrepute/) để kiểm tra 84 nguồn mỗi giờ và gửi yêu cầu gỡ khỏi danh sách
+  ngay từ ReputeCast
+- [Giám sát tình trạng tên miền và nhà cung cấp](/vi/deliverability/health/)
+- [Thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/)
+- [Tham chiếu cấu hình](/vi/reference/configuration/#dns)

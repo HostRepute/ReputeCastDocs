@@ -1,0 +1,195 @@
+---
+title: Cấu hình ReputeCast
+description: 'Cách cấu hình ReputeCast hoạt động: giá trị mặc định, tệp YAML, biến môi trường REPUTECAST_ và cờ dòng lệnh, thứ tự ưu tiên, cách đặt tên, kiểm tra và ví dụ.'
+type: explanation
+audience: [operator]
+primaryKeyword: cấu hình ReputeCast
+sources:
+  - internal/config/config.go
+  - internal/cli/root.go
+  - internal/cli/serve.go
+  - internal/app/app.go
+  - internal/app/wire_publicurl.go
+  - deploy/docker-compose.yml
+  - README.md
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Cấu hình ReputeCast được đọc một lần, khi một tiến trình khởi động: giá trị mặc định có sẵn, rồi một tệp YAML không bắt
+buộc, rồi biến môi trường, rồi cờ dòng lệnh. Cấu hình bao gồm những gì máy chủ cần trước khi có ai đăng nhập: địa chỉ,
+cơ sở dữ liệu, khóa bí mật, log và các vai trò mà một tiến trình chạy. Mọi thứ người dùng thay đổi trong lúc ReputeCast
+chạy, từ chính sách đăng nhập đến nhà cung cấp gửi thư, thì được quản lý trong ứng dụng.
+
+## Cách ReputeCast đọc cấu hình
+
+Mỗi lớp ghi đè lớp trước nó:
+
+1. **Giá trị mặc định** có sẵn trong tệp nhị phân. [Tham chiếu cấu hình](/vi/reference/configuration/) liệt kê các giá
+   trị này.
+2. **Một tệp YAML**, khi bạn truyền `--config /etc/reputecast/config.yaml` hoặc đặt `REPUTECAST_CONFIG` thành đường dẫn
+   của tệp.
+3. **Biến môi trường** bắt đầu bằng `REPUTECAST_`.
+4. **`DATABASE_URL`**, biến mà nhiều nền tảng hosting đặt sẵn, nhưng chỉ khi `REPUTECAST_DATABASE__URL` chưa được đặt.
+5. **Cờ** mà bạn truyền rõ ràng: `--role` (đặt `roles`), `--addr` (`http.addr`), `--database-url` (`database.url`) và
+   `--log-level` (`log.level`). Cờ bạn không truyền thì không thay đổi gì.
+
+Với `log.level: info` trong tệp, `REPUTECAST_LOG__LEVEL=debug` trong môi trường và `--log-level=error` trên dòng lệnh,
+tiến trình ghi log ở mức `error`.
+
+## Tên biến môi trường
+
+Lấy khóa cấu hình, viết hoa, thêm `REPUTECAST_` ở đầu và dùng hai dấu gạch dưới giữa các cấp. Dấu gạch dưới đơn vẫn là
+một phần của tên khóa:
+
+| Khóa                               | Biến môi trường                                |
+| ---------------------------------- | ---------------------------------------------- |
+| `env`                              | `REPUTECAST_ENV`                               |
+| `http.public_url`                  | `REPUTECAST_HTTP__PUBLIC_URL`                  |
+| `database.max_conns`               | `REPUTECAST_DATABASE__MAX_CONNS`               |
+| `providers.allow_private_networks` | `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS` |
+
+- **Danh sách**: `roles`, `http.trusted_proxies`, `secrets.previous_keys` và `dns.servers` nhận các giá trị phân cách
+  bằng dấu phẩy khi đặt qua biến môi trường, như `REPUTECAST_HTTP__TRUSTED_PROXIES=10.0.0.0/8,192.168.1.10`.
+- **Khoảng thời gian** dùng định dạng của Go kèm đơn vị: `30s`, `5m`, `12h`. Giá trị không có đơn vị như `30` bị từ
+  chối.
+- **Boolean**: `true` hoặc `false`.
+- Một số biến không phải khóa cấu hình: `REPUTECAST_CONFIG`, `REPUTECAST_AUTO_MIGRATE`, `REPUTECAST_AUTO_INSTALL` và
+  `REPUTECAST_ADMIN_EMAIL`, `_NAME` và `_PASSWORD` (do `serve` và `install` đọc), cùng các biến riêng của tệp Compose
+  như `REPUTECAST_PUBLIC_URL`, mà tệp này ánh xạ sang `REPUTECAST_HTTP__PUBLIC_URL`. Đặt `REPUTECAST_PUBLIC_URL` cho tệp
+  nhị phân không có tác dụng gì. Trang tham chiếu liệt kê các biến này trong mục
+  [biến chỉ đặt qua môi trường](/vi/reference/configuration/#environment-only-variables).
+
+## Một tệp YAML đầy đủ
+
+Mọi khóa đều không bắt buộc. Tệp này đặt các giá trị mà một máy chủ production thường thay đổi và hiện giá trị mặc định
+của phần còn lại:
+
+```yaml title="/etc/reputecast/config.yaml"
+env: production
+
+# Roles this process runs: web, worker, ingest (default: all three).
+roles: [web, worker, ingest]
+
+http:
+  addr: 127.0.0.1:8080
+  # The address people and sending providers reach. Use https in production.
+  public_url: https://news.example.com
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  trusted_proxies: [127.0.0.1]
+  rate_limit_auth: 30 # sign-in requests per minute per client IP
+  rate_limit_api: 600 # API requests per minute per key
+  read_timeout: 30s
+  write_timeout: 60s
+  shutdown_timeout: 20s
+
+database:
+  # Or set REPUTECAST_DATABASE__URL / DATABASE_URL to keep the password out of the file.
+  url: postgres://reputecast:change-me@localhost:5432/reputecast?sslmode=disable
+  max_conns: 20 # pool size of this process
+
+secrets:
+  # A base64 32-byte key from `reputecast secrets generate-key`; better set by environment.
+  # key: ""
+  # Old keys while you rotate.
+  # previous_keys: []
+  # Used when key is empty; created with a new key on first start. Back it up.
+  key_file: /var/lib/reputecast/secret.key
+
+files:
+  # Product files and lead magnets; shared by every web and worker process.
+  dir: /var/lib/reputecast/files
+
+log:
+  level: info # debug, info, warn or error
+  format: json # text or json; logs go to standard error
+
+auth:
+  cookie_name: rc_session
+  cookie_secure: true
+  password_min_length: 12 # for `install` and `user reset-password --password`
+
+worker:
+  concurrency: 50
+
+updates:
+  check: true # daily release check against GitHub (version number only)
+  repo: hostrepute/reputecast
+
+metrics:
+  enabled: true
+  addr: "" # empty: /metrics on the main listener
+
+webhooks:
+  allow_private_networks: false # outgoing webhooks and the audit stream
+
+providers:
+  allow_private_networks: false # provider URLs and community adapters on your network
+
+dns:
+  servers: [] # empty: the system resolvers
+  timeout: 4s
+```
+
+Hãy giữ các bí mật (mật khẩu cơ sở dữ liệu, `secrets.key`) trong biến môi trường hoặc trong một tệp biến môi trường chỉ
+dịch vụ đọc được, còn phần còn lại để trong tệp YAML.
+
+## ReputeCast kiểm tra gì khi khởi động
+
+Một tiến trình từ chối khởi động và in `Error: …` khi:
+
+- một giá trị không phân tích được, như khoảng thời gian thiếu đơn vị
+  (`'http.read_timeout' time: missing unit in duration`);
+- một vai trò không phải `web`, `worker` hoặc `ingest` (`unknown role "mailer" (want web, worker or ingest)`);
+- `http.public_url` không phải URL tuyệt đối (`http.public_url must be an absolute URL, got "news.example.com"`);
+- `secrets.key` được đặt nhưng không phải chuỗi base64 mã hóa đúng 32 byte;
+- `auth.password_min_length` nhỏ hơn 8.
+
+<Aside type="caution">
+  ReputeCast bỏ qua các khóa mà nó không biết, không kèm cảnh báo nào. Một biến viết sai như
+  `REPUTECAST_HTTP__PUBLIK_URL` để nguyên giá trị mặc định, nên hãy kiểm tra dòng log `http listening`: dòng này hiện
+  địa chỉ, URL công khai và các vai trò mà tiến trình đang dùng.
+</Aside>
+
+## Mặc định và giới hạn
+
+Các giới hạn cố định của máy chủ HTTP và những thời gian chờ bạn có thể thay đổi:
+
+<LimitsTable area="server" />
+
+## Khi nào nên thay đổi
+
+- **Đứng sau reverse proxy**: đặt `http.public_url` thành địa chỉ https và `http.trusted_proxies` thành địa chỉ của
+  proxy ([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+- **Nhiều tiến trình**: tách `roles` và chọn `database.max_conns` sao cho tổng số kết nối luôn dưới `max_connections`
+  của PostgreSQL ([mở rộng quy mô](/vi/self-hosting/scaling/) và [PostgreSQL](/vi/self-hosting/postgres/)).
+- **Công cụ thu thập log**: `log.format: json` (Docker image đã dùng sẵn giá trị này).
+- **Kiểm tra danh sách chặn**: `dns.servers` trỏ đến resolver của riêng bạn, vì Spamhaus từ chối resolver công cộng.
+- **Nhà cung cấp hoặc nơi nhận webhook nằm trong mạng của bạn** (một máy chủ Postal, n8n):
+  `providers.allow_private_networks` hoặc `webhooks.allow_private_networks`. Địa chỉ link-local và địa chỉ metadata của
+  đám mây vẫn bị chặn.
+- **Không lưu tệp khóa trên đĩa**: `secrets.key` lấy từ `reputecast secrets generate-key`, đặt trước lần khởi động đầu
+  tiên ([bảo mật và tăng cường an toàn](/vi/self-hosting/security/)).
+- **Máy chủ không có internet**: `updates.check: false`.
+
+## Thiết lập được quản lý trong ứng dụng
+
+- Phương thức đăng nhập, chính sách mật khẩu, bắt buộc xác thực hai lớp, thời hạn phiên và thời gian chờ khi không hoạt
+  động, khóa tài khoản và SSO nằm trong <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />
+  ([quản trị hệ thống](/vi/self-hosting/instance-admin/)).
+- Tên hệ thống, logo, múi giờ và ngôn ngữ mặc định, cùng URL công khai nằm trong
+  <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. URL công khai lưu ở đó thay thế `http.public_url` cho
+  liên kết, trang công khai và webhook của nhà cung cấp trong vòng 30 giây trên mọi tiến trình. Cookie chỉ dùng qua HTTPS
+  và HSTS vẫn theo `http.public_url`, nên hãy giữ hai giá trị giống nhau.
+- Nhà cung cấp gửi thư, người gửi, nhóm và mọi thứ khác thuộc về từng không gian làm việc.
+
+## Liên quan
+
+- [Tham chiếu cấu hình](/vi/reference/configuration/): mọi khóa, biến môi trường và giá trị mặc định của khóa.
+- [Cài đặt bằng Docker Compose](/vi/self-hosting/docker/): nơi tệp Compose đặt các biến này.
+- [Cài đặt bằng tệp nhị phân](/vi/self-hosting/binary/): một tệp biến môi trường cho systemd.
+- [Tham chiếu CLI](/vi/reference/cli/): các cờ của từng lệnh.

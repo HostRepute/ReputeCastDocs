@@ -1,0 +1,241 @@
+---
+title: Xây dựng tích hợp
+description: "Xây dựng tích hợp email marketing trên API ReputeCast giống các ứng dụng Zapier, Make, n8n và WordPress: khóa, trình kích hoạt, hành động và giữ sự đồng ý."
+type: how-to
+audience: [developer]
+permissions: ['webhooks:manage', 'subscribers:create', 'subscribers:edit']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: xây dựng tích hợp email marketing
+sources:
+  - docs/integrations/hub.md
+  - internal/integrations/api.go
+  - internal/integrations/actions.go
+  - internal/integrations/catalog.go
+  - internal/integrations/hub.go
+  - internal/api/integrations.go
+  - internal/api/api.go
+  - internal/webhooks/webhooks.go
+  - src/data/api-samples/upsert-contact.yaml
+  - src/data/api-samples/add-contact-to-list.yaml
+sidebar:
+  order: 10
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Các ứng dụng Zapier, Make, n8n và plugin WordPress do ReputeCast phát hành chỉ dùng REST API công khai. Trang này
+hướng dẫn xây dựng tích hợp email marketing theo đúng cách đó: xác thực, xác định không gian làm việc, đăng ký nhận sự
+kiện và gọi năm hành động mà các ứng dụng chính thức cung cấp, mà không bao giờ làm mất sự đồng ý của một liên hệ.
+
+## Trước khi bắt đầu
+
+- Một hệ thống ReputeCast truy cập được qua HTTPS từ nơi tích hợp của bạn chạy, cùng URL công khai của nó ("URL hệ
+  thống"). Mọi đường dẫn bên dưới đều bắt đầu bằng `/api/v1`.
+- Một khóa API. Với ứng dụng hoặc dịch vụ của riêng bạn, hãy tạo khóa trong
+  <UiPath path="nav.settings > settings.keys" /> bằng <UiPath path="keys.createApiKey" /> và chỉ cấp những gì tích hợp
+  cần: `webhooks:manage` cho trình kích hoạt, `subscribers:create` và `subscribers:edit` cho các hành động với liên
+  hệ, `transactional:send` để gửi email giao dịch. Xem [Xác thực và khóa API](/vi/developers/api-authentication/).
+- Các ứng dụng chính thức nhận một loại khóa khác, [khóa tích hợp](/vi/reference/glossary/#integration-key), từ
+  <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.connect" />. ReputeCast chỉ tạo
+  khóa tích hợp cho Zapier, Make, n8n và WordPress ([Kết nối công cụ khác](/vi/integrations/overview/)).
+
+## Kết nối và kiểm tra
+
+<Steps>
+
+1. Hỏi người dùng URL hệ thống và khóa. Lưu khóa ở dạng mã hóa; gửi nó dưới dạng
+   `Authorization: Bearer rc_live_…` trong mọi lệnh gọi.
+
+2. Gọi `GET /api/v1/integration`. Mọi khóa API đều gọi được thao tác này mà không cần quyền nào, và phản hồi cho biết
+   khóa thuộc không gian làm việc nào:
+
+   ```sh title="Terminal"
+   curl https://reputecast.example.com/api/v1/integration \
+     --header "Authorization: Bearer $REPUTECAST_API_KEY"
+   ```
+
+   ```json title="200 OK"
+   {
+     "workspace": "acme-newsletter",
+     "workspaceName": "Acme Newsletter",
+     "integration": "",
+     "key": "CRM sync",
+     "triggers": [],
+     "actions": [],
+     "permissions": ["subscribers:create", "subscribers:edit", "webhooks:manage"]
+   }
+   ```
+
+3. Dùng `workspace` trong mọi đường dẫn khác (`/api/v1/workspaces/acme-newsletter/…`) và kiểm tra `permissions` trước
+   khi cung cấp một tính năng. `integration`, `triggers` và `actions` chỉ có giá trị với khóa tích hợp.
+
+</Steps>
+
+## Trình kích hoạt: đăng ký nhận sự kiện
+
+Tích hợp của bạn biết về các thay đổi qua [webhook gửi đi](/vi/developers/webhooks/). Khi người dùng bật một trình
+kích hoạt, hãy tạo endpoint cho nó; khi họ tắt, hãy xóa endpoint đó.
+
+```sh title="Terminal"
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/acme-newsletter/webhooks \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{ "name": "CRM sync · unsubscribes", "url": "https://crm.example.com/hooks/reputecast", "events": ["contact.unsubscribed"] }'
+```
+
+Phản hồi `201` chứa endpoint trong `webhook` và khóa bí mật ký của nó trong `secret`, chỉ xuất hiện trong phản hồi
+này. Hãy lưu khóa bí mật cùng lượt đăng ký và dùng nó để xác minh mọi lần gửi
+([xác minh chữ ký](/vi/developers/webhooks/#xác-minh-chữ-ký)). `DELETE …/webhooks/<webhookId>` hủy đăng ký. Các sự
+kiện mà hầu hết tích hợp dùng làm trình kích hoạt:
+
+| Trình kích hoạt              | Sự kiện                | Khóa cần có          |
+| ---------------------------- | ---------------------- | -------------------- |
+| Liên hệ đăng ký              | `contact.subscribed`   | `subscribers:view`   |
+| Liên hệ hủy đăng ký          | `contact.unsubscribed` | `subscribers:view`   |
+| Liên hệ được cập nhật        | `contact.updated`      | `subscribers:view`   |
+| Biểu mẫu được gửi            | `form.submitted`       | `subscribers:view`   |
+| Chiến dịch đã gửi xong       | `campaign.completed`   | `campaigns:view`     |
+| Thư giao dịch bị trả lại     | `message.bounced`      | `transactional:view` |
+
+Mọi sự kiện khác trong [Sự kiện webhook](/vi/reference/webhook-events/) đều hoạt động theo cách tương tự.
+`form.submitted` phát ra khi một lượt đăng ký được xác nhận (ngay lập tức với xác nhận một bước) và mang ID của biểu
+mẫu, để ứng dụng của bạn lọc theo biểu mẫu.
+
+Các ứng dụng chính thức dùng REST hook thay thế: `POST …/integration/hooks` với `{ "event", "url" }` tạo một endpoint
+được quản lý, và endpoint nào trả lời `410 Gone` sẽ bị xóa. Các thao tác này, cùng các thao tác tra cứu dữ liệu mẫu,
+danh sách, trường và mẫu trong `…/integration/`, chỉ chấp nhận khóa tích hợp
+([tài liệu Integration API](/api/operations/tags/integration-api/)).
+
+## Hành động
+
+<TableScroll label="Các hành động tích hợp">
+
+| Hành động                  | Lệnh gọi                                                  | Khóa cần có                                                    |
+| -------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| Tạo hoặc cập nhật liên hệ  | `POST …/contacts/upsert`                                  | `subscribers:create`; `subscribers:edit` để cập nhật liên hệ   |
+| Thêm liên hệ vào danh sách | `POST …/lists/<listId>/contacts`                          | `subscribers:edit`                                             |
+| Thêm thẻ cho liên hệ       | `POST …/contacts/tags`                                    | `subscribers:edit`                                             |
+| Ghi nhận sự kiện           | `POST …/automations/events`                               | `subscribers:edit`                                             |
+| Gửi email giao dịch        | `POST …/transactional/messages`                           | `transactional:send` ([nhạy cảm](/vi/reference/glossary/#sensitive-permission)) |
+
+</TableScroll>
+
+**Tạo hoặc cập nhật liên hệ** khớp theo email, nên gọi lại sẽ cập nhật đúng liên hệ đó thay vì tạo thêm một liên hệ
+thứ hai:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:create (and subscribers:edit to update contacts).
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# List IDs come from GET /api/v1/workspaces/your-workspace/lists.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/contacts/upsert \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "email": "sam.rivera@outlook.com",
+    "firstName": "Sam",
+    "lastName": "Rivera",
+    "language": "en-US",
+    "tags": ["trial"],
+    "lists": ["0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f"],
+    "consent": "double"
+  }'
+```
+
+- `consent: "single"` thêm liên hệ vào danh sách ngay; `"double"` gửi email xác nhận trước, và danh sách hiển thị
+  `pending` cho đến khi người đó nhấp vào liên kết. Nếu không có `consent`, cài đặt riêng của từng danh sách được áp
+  dụng.
+- `language` nhận mã BCP 47. Các giá trị như `Spanish` hoặc `es_MX` được chuẩn hóa (`es`, `es-MX`); giá trị không
+  nhận diện được sẽ trả về `422`, kèm tên giá trị gần nhất nếu có.
+- Mỗi lệnh gọi nhận tối đa 20 ID danh sách và 50 thẻ. Lấy ID danh sách từ `GET …/lists` và khóa của trường tùy chỉnh
+  cho `fields` từ `GET …/fields` (cả hai đều cần `subscribers:view`).
+- Phản hồi cho biết liên hệ có được tạo mới không (`created`), đã tham gia những danh sách nào với trạng thái nào, và
+  email xác nhận có được gửi đi không (`confirmationSent`).
+
+**Thêm liên hệ vào danh sách** cần một liên hệ đã tồn tại; địa chỉ mới sẽ trả về `404`, nên hãy gọi upsert trước.
+**Ghi nhận sự kiện** được trình bày trong [Ghi nhận sự kiện và chuyển đổi](/vi/developers/events-and-conversions/),
+còn **Gửi email giao dịch** trong [Gửi email giao dịch bằng API](/vi/developers/transactional-api/).
+
+## Sự đồng ý luôn được giữ
+
+Một hành động không bao giờ thêm lại ai đó vào danh sách họ đã rời và không bao giờ thêm một địa chỉ bị chặn gửi. Thay
+vào đó, nó trả lời `409`:
+
+```json title="409 Conflict"
+{
+  "status": 409,
+  "title": "Conflict",
+  "code": "unsubscribed",
+  "detail": "rob@example.net left Beta Program on 2 Oct. ReputeCast doesn't add people back to a list they left.",
+  "meta": { "list": "Beta Program", "listId": "0192…", "leftAt": "2026-10-02T13:41:00Z" }
+}
+```
+
+`409 suppressed` mang `meta.reason` và `meta.since`. Hãy coi cả hai trường hợp là "bỏ qua" cho bản ghi đó, không phải
+một quy trình thất bại: báo cho người dùng và tiếp tục với các bản ghi còn lại.
+
+## Thử lại và idempotency
+
+- Lệnh gửi giao dịch và API chuyển đổi nhận header `Idempotency-Key`: lần thử lại với cùng khóa nhận lại phản hồi đầu
+  tiên và không gửi hay ghi nhận hai lần. Hãy đưa ID lần chạy hoặc ID bản ghi của nền tảng vào khóa, như các ứng dụng
+  chính thức làm (`make-<scenario ID>-<value>`, `n8n-<workflow ID>-<value>`).
+- Các hành động khác không nhận khóa này. Chỉ thử lại chúng sau lỗi mạng hoặc phản hồi `429`/`5xx`, và không bao giờ
+  sau phản hồi `2xx`.
+- Khi nhận `429`, hãy chờ theo `Retry-After`. Giới hạn chung là 600 yêu cầu mỗi phút cho mỗi khóa
+  ([Giới hạn tốc độ](/vi/developers/api-rate-limits/)).
+
+## Khóa tích hợp và tên quy trình
+
+Nếu bạn duy trì một trong các ứng dụng chính thức, khóa của ứng dụng đó đến từ
+<UiPath path="nav.settings > settings.integrations" /> và tuân theo thêm các quy tắc sau:
+
+- Khóa chỉ dùng được cho các thao tác của những trình kích hoạt và hành động mà người dùng đã bật, ngay cả khi quyền
+  của khóa cho phép nhiều hơn. Mọi lệnh gọi khác trả về `403 integration_operation_denied`.
+- <UiPath path="integrations.rotateKey" /> giữ khóa cũ hoạt động thêm 24 giờ, để ứng dụng được cập nhật mà không có
+  lần chạy nào bị lỗi; <UiPath path="integrations.stopOldKey" /> kết thúc khoảng chồng lấn đó.
+- Khi người sở hữu khóa bị vô hiệu hóa hoặc bị xóa, lệnh gọi trả về `403 owner_deactivated` cho đến khi một thành viên
+  có `integrations:manage` chọn <UiPath path="integrations.takeOver" />. Khóa bị thu hồi hoặc hết hạn trả về
+  `401 key_revoked` hoặc `401 key_expired`.
+- Mọi lệnh gọi được lưu 7 ngày trong nhật ký lệnh gọi của tích hợp. Hãy gửi tên và ID của quy trình kèm mỗi lệnh gọi
+  để nhật ký hiển thị được chúng:
+
+  ```http title="Header của yêu cầu"
+  X-ReputeCast-Workflow: Beta application (Typeform) → ReputeCast contact; id=284113907
+  ```
+
+  Hãy mã hóa phần trăm (UTF-8) các ký tự nằm ngoài bảng ASCII in được, cùng `%`, `;`, `=` và `"`; ReputeCast sẽ giải
+  mã chúng. Dạng `name="…"` và dạng RFC 8187 `name*=UTF-8''…` cũng được chấp nhận.
+
+<LimitsTable area="integrations" />
+
+## Kiểm tra kết quả
+
+- `GET /api/v1/integration` trả lời `200` với không gian làm việc và các quyền đúng như bạn mong đợi.
+- Sau khi tạo endpoint, <UiPath path="nav.settings > settings.webhooks" /> liệt kê endpoint đó, và
+  <UiPath path="webhooks.sendTestEvent" /> của nó tới được bộ nhận của bạn.
+- Sau một lệnh upsert, liên hệ xuất hiện trong <UiPath path="nav.audience" /> với danh sách, thẻ và sự đồng ý mà bạn
+  đã gửi.
+
+## Khắc phục sự cố
+
+- **`403 permission_denied`**: khóa thiếu quyền được nêu trong `permission`; trường `helpers` nêu tên các thành viên
+  có thể cấp quyền đó.
+- **`422 private_address` khi tạo endpoint**: URL trỏ tới mạng riêng. Hãy dùng địa chỉ công khai, hoặc nhờ quản trị
+  viên hệ thống đặt `webhooks.allow_private_networks`.
+- **`404` khi thêm vào danh sách**: liên hệ chưa tồn tại; hãy upsert trước.
+- **`409 unsubscribed` hoặc `409 suppressed`**: đây là hành vi dự kiến; hãy bỏ qua bản ghi đó.
+- **`403 integration_operation_denied`**: khóa tích hợp không được phép thực hiện lệnh gọi này. Hãy thay đổi những gì
+  tích hợp được làm trong <UiPath path="nav.settings > settings.integrations" />.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Nhận webhook" href="/vi/developers/webhooks/" description="Envelope, header, chữ ký và cơ chế thử lại." />
+  <LinkCard title="Kết nối công cụ khác" href="/vi/integrations/overview/" description="Danh mục tích hợp trong ứng dụng." />
+  <LinkCard title="Lỗi" href="/vi/developers/api-errors/" description="Tài liệu lỗi dạng problem và mọi mã lỗi." />
+  <LinkCard title="Tài liệu API" href="/api/" description="Mọi thao tác mà khóa API có thể gọi." />
+</CardGrid>

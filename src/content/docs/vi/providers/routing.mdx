@@ -1,0 +1,157 @@
+---
+title: Định tuyến thư qua nhiều nhà cung cấp
+description: Định tuyến từng luồng qua đúng nhà cung cấp gửi thư, chia lưu lượng theo tỷ trọng, thiết lập failover email nhiều nhà cung cấp rồi thử với một địa chỉ.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabRouting'
+primaryKeyword: failover email nhiều nhà cung cấp
+sources:
+  - internal/routing
+  - internal/sending/engine/audience.go
+  - internal/providers/manage/health.go
+  - internal/connect/streams.go
+  - web/src/features/providers/RoutingPage.tsx
+  - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing.messages.ts
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Định tuyến quyết định [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) nào chuyển từng email: theo luồng,
+theo danh sách, tên miền người gửi hoặc nhà cung cấp hộp thư của người nhận, kèm chia theo tỷ trọng và nhà cung cấp dự
+phòng. Trang này hướng dẫn bạn thiết lập tuyến và failover email nhiều nhà cung cấp, rồi kiểm tra kết quả bằng
+[công cụ thử tuyến](/vi/reference/glossary/#route-tester) trước khi lưu.
+
+## Trước khi bắt đầu
+
+- Kết nối ít nhất một nhà cung cấp; chuyển dự phòng và chia tỷ trọng cần hai nhà cung cấp. Hãy đọc
+  [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
+- Bạn cần quyền `providers:manage` để thay đổi định tuyến. Với `providers:view`, bạn có thể mở trang và dùng công cụ thử
+  tuyến.
+
+## Một tuyến quyết định như thế nào
+
+Mỗi email thuộc một trong bốn [luồng](/vi/reference/glossary/#stream): Gửi hàng loạt (chiến dịch), Tự động hóa, Hệ thống
+(thư xác nhận hai bước, liên kết tùy chọn nhận thư, lời mời vào nhóm) và Giao dịch (thư từ sản phẩm của bạn). Với mỗi
+người nhận, ReputeCast:
+
+1. Lấy bộ quy tắc của luồng.
+2. Xét lần lượt các điều kiện của luồng. Điều kiện đầu tiên khớp sẽ quyết định nhà cung cấp.
+3. Nếu không có điều kiện nào khớp, dùng tuyến mặc định của luồng: nhà cung cấp chính, hoặc
+   [chia theo tỷ trọng](/vi/reference/glossary/#weighted-split). Khi chia, mỗi địa chỉ được xếp vào một trong 100 nhóm dựa
+   trên giá trị băm của địa chỉ, nên cùng một người nhận luôn rơi vào cùng một nhà cung cấp.
+4. Kiểm tra danh sách chặn gửi dùng chung. Địa chỉ bị chặn gửi không nhận được gì, dù đã được định tuyến đến nhà cung cấp
+   nào.
+5. Nếu nhà cung cấp được chọn không nhận được thư, áp dụng chính sách chuyển dự phòng của luồng.
+
+Nhà cung cấp hộp thư (Gmail, Outlook, Yahoo, iCloud hoặc Khác) được xác định từ bản ghi máy chủ thư của liên hệ khi liên
+hệ đã tồn tại, và từ tên miền của địa chỉ trong các trường hợp còn lại.
+
+## Thiết lập tuyến
+
+<Steps>
+
+1. Mở <UiPath path="nav.providers > providers.tabRouting" />. Mỗi luồng có một thẻ.
+
+   <Screenshot
+     id="providers-routing"
+     alt="Định tuyến và chuyển dự phòng cho Gửi hàng loạt: Amazon SES là nhà cung cấp chính, chia theo tỷ trọng 90/10 với Postal, hai điều kiện, chính sách chuyển dự phòng là tạm dừng và hỏi, và công cụ thử tuyến trả lời Amazon SES cho một địa chỉ Outlook."
+   />
+
+2. Với mỗi luồng, chọn nhà cung cấp <UiPath path="providers.routing.primary" /> và, nếu bạn có nhà cung cấp thứ hai, nhà
+   cung cấp <UiPath path="providers.routing.fallback" />. Nhà cung cấp dự phòng tiếp quản khi nhà cung cấp chính ngừng
+   hoạt động; nó không thể đồng thời nằm trong phần chia tỷ trọng.
+
+3. Điều chỉnh <UiPath path="providers.routing.weightedSplit" /> nếu luồng có phần chia. Phần chia được tạo khi bạn kết nối
+   một nhà cung cấp và giao cho nó vai trò Chia theo tỷ trọng ở bước Luồng (chỉ với Gửi hàng loạt). Ở đây bạn đổi tỷ
+   trọng của từng nhà cung cấp; nhà cung cấp chính nhận phần còn lại. Đặt tỷ trọng về 0 để đưa nhà cung cấp ra khỏi phần
+   chia. Trong lúc một nhà cung cấp trong phần chia đang [khởi động](/vi/providers/warm-up/), trình lập kế hoạch khởi động
+   tăng tỷ trọng của nó theo lịch và thẻ cho biết thời điểm tăng.
+
+4. Thêm điều kiện ở những chỗ một loại thư luôn phải dùng một nhà cung cấp: <UiPath path="providers.routing.addCondition" />.
+   Gửi hàng loạt và Tự động hóa có thể khớp theo danh sách, tên miền người gửi hoặc nhà cung cấp hộp thư của người nhận;
+   Giao dịch khớp theo danh mục giao dịch hoặc nhà cung cấp hộp thư. Thư Hệ thống không có điều kiện. Mỗi điều kiện gửi
+   đến đúng một nhà cung cấp, và nội dung bạn nhập ở <UiPath path="providers.routing.why" /> được hiển thị cạnh điều kiện
+   đó, ví dụ "Outlook và iCloud khắt khe với IP mới".
+
+5. Chọn <UiPath path="providers.routing.failoverPolicy" /> cho Gửi hàng loạt:
+   - **Tạm dừng và hỏi** (mặc định): nếu nhà cung cấp chính gặp lỗi trong lúc gửi, những người nhận còn lại được tạm giữ và
+     bạn nhận được thông báo. Chuyển một lần gửi hàng loạt sang nhà cung cấp chưa khởi động có thể làm hại uy tín của nhà
+     cung cấp đó.
+   - <UiPath path="providers.routing.warmOnly" />: tự động chuyển lần gửi sang nhà cung cấp dự phòng khi nhà cung cấp dự
+     phòng đã khởi động xong; trước đó, tùy chọn này hoạt động như tạm dừng và hỏi.
+   - <UiPath path="providers.routing.automatic" />.
+
+   Thư Tự động hóa, Hệ thống và Giao dịch tự động chuyển sang nhà cung cấp dự phòng của chúng, vì các thư này phải tiếp tục
+   được gửi đi. Nếu không có nhà cung cấp dự phòng, thư chờ đến khi nhà cung cấp hồi phục.
+
+6. Với thư Giao dịch, <UiPath path="providers.routing.firstInLine" /> cho thư giao dịch đi trước trên một nhà cung cấp
+   đang đồng thời gửi một chiến dịch, trong giới hạn tốc độ của nhà cung cấp.
+
+7. Thử vài địa chỉ trong <UiPath path="providers.routing.testerTitle" />: chọn luồng, một danh sách, một tên miền người
+   gửi (hoặc một mẫu giao dịch) và nhập một người nhận. Công cụ trả lời bằng nhà cung cấp, nhà cung cấp hộp thư, selector
+   DKIM, chi phí của một thư, từng bước của quá trình quyết định và điều sẽ xảy ra nếu nhà cung cấp gặp lỗi. Công cụ thử
+   cả những thay đổi chưa lưu của bạn.
+
+8. Chọn <UiPath path="providers.routing.saveRouting" />. Các lần gửi mới dùng định tuyến này ngay; các lần gửi đang chạy
+   giữ nguyên tuyến của chúng.
+
+</Steps>
+
+Trên điện thoại, các thẻ luồng xếp chồng lên nhau và công cụ thử tuyến nằm bên dưới:
+
+<Screenshot
+  id="providers-routing-mobile"
+  alt="Trang định tuyến trên điện thoại: thẻ Gửi hàng loạt với nhà cung cấp chính, nhà cung cấp dự phòng, phần chia theo tỷ trọng và điều kiện đầu tiên, phía trên thanh tab dưới cùng."
+/>
+
+<Aside type="caution">
+Trước khi lưu, ReputeCast kiểm tra điều khoản của mọi nhà cung cấp trên tuyến Gửi hàng loạt có cho phép tiếp thị hàng loạt
+hay không. Nếu có nhà cung cấp không cho phép, ReputeCast đề xuất cách khắc phục (tạo luồng Broadcast của Postmark, dùng
+nhà cung cấp khác hoặc lưu mà không có dự phòng). Nếu bạn vẫn giữ nguyên, lựa chọn đó được ghi vào nhật ký kiểm tra, và
+[Độ sẵn sàng gửi](/vi/campaigns/send-readiness/) chặn mọi lần gửi hàng loạt cho đến khi tuyến thay đổi. Hãy đọc
+[Chọn nhà cung cấp gửi thư](/vi/providers/choose/#điều-khoản-tiếp-thị-hàng-loạt).
+</Aside>
+
+## Kiểm tra kết quả
+
+- Phần đầu trang cho biết định tuyến được lưu lúc nào và bởi ai.
+- <UiPath path="nav.providers > providers.tabProviders" /> hiển thị định tuyến của từng luồng dưới dạng một thanh với tỷ
+  trọng của từng nhà cung cấp, nhà cung cấp dự phòng và chính sách chuyển dự phòng.
+- Công cụ thử tuyến trả về đúng nhà cung cấp bạn mong đợi cho một địa chỉ thuộc từng danh sách và từng nhà cung cấp hộp
+  thư có điều kiện.
+- Trong lúc gửi, màn hình [theo dõi trực tiếp](/vi/campaigns/live-monitor/) hiển thị phần của chiến dịch trên từng nhà
+  cung cấp.
+
+## Khắc phục sự cố
+
+- **"The Broadcasts split adds up to 95%; it must add up to 100%"** (tổng tỷ trọng của Gửi hàng loạt là 95%, phải là
+  100%): đổi một tỷ trọng để tổng bằng 100.
+- **"A provider appears twice in the split"** (một nhà cung cấp xuất hiện hai lần trong phần chia) hoặc **"The fallback is
+  already part of the split"** (nhà cung cấp dự phòng đã nằm trong phần chia): chọn một nhà cung cấp khác, hoặc không chọn
+  nhà cung cấp nào, làm dự phòng.
+- **"Broadcasts has no primary provider"** (Gửi hàng loạt chưa có nhà cung cấp chính): mọi luồng trừ Giao dịch đều cần nhà
+  cung cấp chính. Giao dịch có thể chưa có tuyến khi sản phẩm của bạn chưa gửi thư nào.
+- **Cảnh báo rằng nhà cung cấp dự phòng đang khởi động**: chuyển một lần gửi hàng loạt sang nhà cung cấp còn đang khởi
+  động có thể làm hại uy tín của nó. Với chính sách chỉ chuyển sang nhà cung cấp đã khởi động xong, Gửi hàng loạt không
+  chuyển dự phòng sang nhà cung cấp đó cho đến khi quá trình khởi động kết thúc; với chính sách tự động thì có. Cảnh báo
+  này không ngăn việc lưu.
+- **Công cụ thử tuyến cho biết email sẽ phải chờ**: nhà cung cấp đang ngừng hoạt động hoặc webhook của nó đang im lặng,
+  nên phần của nó phải chờ nhà cung cấp đó hoặc nhà cung cấp dự phòng. Hãy đọc
+  [Tình trạng và sự cố của nhà cung cấp](/vi/providers/health-and-outages/).
+- **Công cụ thử cho biết địa chỉ bị chặn gửi**: không có gì được gửi đến địa chỉ đó trên bất kỳ nhà cung cấp nào. Hãy đọc
+  [Danh sách chặn gửi](/vi/audience/suppressions/).
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Tình trạng và sự cố của nhà cung cấp" href="/vi/providers/health-and-outages/" />
+  <LinkCard title="Khởi động nhà cung cấp hoặc IP mới" href="/vi/providers/warm-up/" />
+  <LinkCard title="Theo dõi lần gửi và tự động tạm dừng" href="/vi/campaigns/live-monitor/" />
+  <LinkCard title="Cách ReputeCast hoạt động" href="/vi/getting-started/concepts/" />
+</CardGrid>

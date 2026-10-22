@@ -1,0 +1,261 @@
+---
+title: Cài đặt bằng Docker Compose
+description: 'Cài đặt ReputeCast bằng Docker Compose cho production: PostgreSQL, tệp .env cho URL công khai, mật khẩu của Chủ sở hữu đầu tiên và proxy tin cậy.'
+type: how-to
+audience: [operator]
+primaryKeyword: cài đặt ReputeCast bằng Docker Compose
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - Dockerfile
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/config/config.go
+  - internal/server/middleware.go
+  - README.md
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Hướng dẫn này giúp bạn cài đặt ReputeCast bằng Docker Compose, gồm PostgreSQL và ứng dụng, trên một máy chủ và chuẩn bị
+sẵn cho reverse proxy. Nếu chỉ muốn dùng thử mười phút trên máy tính của mình, hãy làm theo
+[hướng dẫn bắt đầu nhanh](/vi/getting-started/quickstart/).
+
+## Trước khi bắt đầu
+
+- Một máy chủ đáp ứng [yêu cầu hệ thống](/vi/self-hosting/requirements/), có Docker Engine và plugin Docker Compose
+  (`docker compose`).
+- Một tên DNS cho ReputeCast, ví dụ `news.example.com`, trỏ đến máy chủ.
+- Một reverse proxy kết thúc TLS, hoặc kế hoạch dựng một reverse proxy: [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)
+  có cấu hình cho Caddy, nginx và Traefik.
+
+## Cài đặt ReputeCast
+
+<Steps>
+
+1. Tạo một thư mục cho ReputeCast và tải tệp Compose vào đó:
+
+   ```sh
+   mkdir -p /opt/reputecast && cd /opt/reputecast
+   curl -fsSL https://raw.githubusercontent.com/hostrepute/reputecast/main/deploy/docker-compose.yml -o docker-compose.yml
+   ```
+
+2. Tạo tệp `.env` bên cạnh, chứa ít nhất URL công khai, email của Chủ sở hữu đầu tiên và mật khẩu cơ sở dữ liệu
+   (xem [thiết lập production trong .env](#thiết-lập-production-trong-env)).
+
+3. Khởi động stack:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Compose khởi động PostgreSQL, chờ đến khi nó ở trạng thái healthy, rồi khởi động ứng dụng. Ở lần khởi động đầu tiên,
+   ứng dụng tạo khóa bí mật, áp dụng các migration cơ sở dữ liệu và tạo Chủ sở hữu đầu tiên.
+
+4. Đọc mật khẩu tạm thời của Chủ sở hữu đầu tiên trong log:
+
+   ```sh
+   docker compose logs app | grep -A4 "ReputeCast is installed"
+   ```
+
+   ```txt title="Đầu ra"
+   app-1  |   ReputeCast is installed.
+   app-1  |
+   app-1  |   Sign in at  https://news.example.com
+   app-1  |   Email       you@company.com
+   app-1  |   Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Thông báo này chỉ được in một lần, khi Chủ sở hữu đầu tiên được tạo.
+
+5. Đặt [reverse proxy](/vi/self-hosting/reverse-proxy/) trước cổng 8080, mở URL công khai và đăng nhập.
+   [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu tạm thời, thêm khóa truy cập hoặc ứng
+   dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo không gian làm việc đầu tiên.
+
+</Steps>
+
+## Tệp Compose qua từng dòng
+
+Đây là `deploy/docker-compose.yml` đúng như bản được phát hành:
+
+```yaml title="docker-compose.yml"
+# Production-style stack: `docker compose -f deploy/docker-compose.yml up -d`
+# Set REPUTECAST_PUBLIC_URL and REPUTECAST_ADMIN_EMAIL (in .env next to this
+# file or your shell) before the first start; the first Owner's temporary
+# password is printed in the logs: docker compose logs app | grep Password
+name: reputecast
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reputecast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reputecast}
+      POSTGRES_DB: reputecast
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    # REPUTECAST_IMAGE=reputecast with REPUTECAST_VERSION=local runs an image
+    # built from a checkout (make docker VERSION=local).
+    image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${REPUTECAST_PORT:-8080}:8080"
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+      REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:-admin@example.com}
+      REPUTECAST_AUTO_MIGRATE: "true"
+      REPUTECAST_AUTO_INSTALL: "true"
+      # Set when ReputeCast runs behind a reverse proxy (CIDRs or IPs):
+      # REPUTECAST_HTTP__TRUSTED_PROXIES: 172.16.0.0/12
+    volumes:
+      - appdata:/var/lib/reputecast
+
+volumes:
+  pgdata:
+  appdata:
+```
+
+- **Chú thích đầu tệp.** `grep Password` chỉ in dòng mật khẩu; `grep -A4 "ReputeCast is installed"` hiện toàn bộ thông
+  báo, kèm địa chỉ đăng nhập và email.
+- **`name: reputecast`** cố định tên project, bất kể thư mục tên là gì. Docker đặt tên volume là `reputecast_pgdata` và
+  `reputecast_appdata`, còn network là `reputecast_default`.
+- **`postgres`** chạy PostgreSQL 18 với một cơ sở dữ liệu và một người dùng cùng tên `reputecast`.
+  `restart: unless-stopped` cho dịch vụ chạy lại sau khi máy khởi động lại. Mật khẩu lấy từ `POSTGRES_PASSWORD` (mặc
+  định `reputecast`: hãy đổi nó).
+- **`pgdata:/var/lib/postgresql`** là nơi image PostgreSQL 18 lưu dữ liệu (các image cũ hơn dùng
+  `/var/lib/postgresql/data`).
+- **`healthcheck`** chạy `pg_isready` mỗi 5 giây, tối đa 20 lần. `depends_on … condition: service_healthy` khiến ứng
+  dụng chờ đến khi kiểm tra này đạt.
+- **`image`** là `ghcr.io/hostrepute/reputecast:latest`, trừ khi bạn đặt `REPUTECAST_IMAGE` hoặc `REPUTECAST_VERSION`. Tag
+  của image là tag bản phát hành (có chữ `v` ở đầu) và `latest`.
+- **`ports`** công bố cổng 8080 của ứng dụng ra cổng của máy chủ trong `REPUTECAST_PORT` (mặc định `8080`).
+- **`REPUTECAST_DATABASE__URL`** trỏ ứng dụng đến dịch vụ `postgres` với cùng mật khẩu.
+- **`REPUTECAST_HTTP__PUBLIC_URL`** được đặt từ `REPUTECAST_PUBLIC_URL`. ReputeCast dùng giá trị này cho webhook của nhà
+  cung cấp, chuyển hướng SSO, khóa truy cập, trang công khai và mọi liên kết trong email. Với giá trị mặc định
+  `http://localhost:8080`, không thứ nào trong số đó hoạt động từ bên ngoài máy chủ.
+- **`REPUTECAST_ADMIN_EMAIL`** là email của Chủ sở hữu đầu tiên, chỉ được dùng khi cơ sở dữ liệu chưa có người dùng nào.
+- **`REPUTECAST_AUTO_MIGRATE`** và **`REPUTECAST_AUTO_INSTALL`** bật việc chạy migration khi khởi động và việc tạo Chủ sở
+  hữu đầu tiên. Lệnh mặc định của image, `serve --auto-migrate --auto-install`, vốn đã truyền cả hai cờ.
+- **`REPUTECAST_HTTP__TRUSTED_PROXIES`** đang bị comment lại; xem [proxy tin cậy](#proxy-tin-cậy).
+- **`appdata:/var/lib/reputecast`** giữ khóa bí mật (`secret.key`) và tệp tải lên (`files/`). Image trỏ
+  `REPUTECAST_SECRETS__KEY_FILE` vào đó, ghi log dạng JSON (`REPUTECAST_LOG__FORMAT=json`) và chạy với người dùng
+  `nonroot` (uid 65532).
+
+## Thiết lập production trong .env
+
+Compose đọc `.env` trong thư mục project để điền các chỗ giữ chỗ `${…}` trong tệp:
+
+```sh title=".env"
+# The address people and sending providers use, without a trailing slash.
+REPUTECAST_PUBLIC_URL=https://news.example.com
+# The first Owner (used only on the first start).
+REPUTECAST_ADMIN_EMAIL=you@company.com
+# Database password: letters and digits only, because it is part of a URL.
+POSTGRES_PASSWORD=replace-with-the-output-of-openssl-rand-hex-24
+# Listen on the loopback interface only, for a reverse proxy on this server.
+REPUTECAST_PORT=127.0.0.1:8080
+# Pin the release you run instead of latest.
+REPUTECAST_VERSION=v1.4.2
+```
+
+- Tạo mật khẩu cơ sở dữ liệu bằng `openssl rand -hex 24`. Hãy đặt nó trước lần khởi động đầu tiên: image PostgreSQL chỉ
+  áp dụng `POSTGRES_PASSWORD` khi tạo một volume dữ liệu trống
+  ([tài liệu image postgres](https://hub.docker.com/_/postgres), kiểm tra tháng 10/2026).
+- `REPUTECAST_PORT=127.0.0.1:8080` công bố `127.0.0.1:8080:8080`, nên chỉ proxy trên cùng máy chủ mới truy cập được ứng
+  dụng. Hãy để trống biến này khi proxy chạy như một dịch vụ khác trong chính project Compose này.
+- `.env` chỉ điền các chỗ giữ chỗ. Một biến mà tệp Compose không nhắc đến, như `REPUTECAST_LOG__LEVEL`, sẽ không bao giờ
+  đi từ `.env` vào container. Hãy thêm những biến đó vào `docker-compose.override.yml`.
+
+### Các thiết lập khác trong docker-compose.override.yml
+
+Compose tự động gộp tệp `docker-compose.override.yml` trong cùng thư mục vào `docker-compose.yml`
+([quy tắc gộp](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/), kiểm tra tháng 10/2026). Giữ
+các thay đổi của bạn ở đó giúp bạn thay `docker-compose.yml` bằng bản mới hơn mà không phải sửa lại:
+
+```yaml title="docker-compose.override.yml"
+services:
+  app:
+    environment:
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+      REPUTECAST_DNS__SERVERS: 10.0.0.53:53
+```
+
+Mọi thiết lập đều có biến môi trường tương ứng: xem [tham chiếu cấu hình](/vi/reference/configuration/) và
+[cấu hình ReputeCast](/vi/self-hosting/configuration/).
+
+## Proxy tin cậy
+
+ReputeCast dùng địa chỉ IP của client cho giới hạn tốc độ đăng nhập, khóa tài khoản, phiên và nhật ký kiểm tra. Khi đứng
+sau proxy, mọi yêu cầu đều đến từ proxy, nên ReputeCast đọc `X-Forwarded-For` (hoặc `X-Real-IP`), nhưng chỉ từ các địa
+chỉ trong `http.trusted_proxies`. Header này bị bỏ qua khi đến từ bất kỳ địa chỉ nào khác, nên không thể bị giả mạo.
+
+<Steps>
+
+1. Tìm subnet của network trong project:
+
+   ```sh
+   docker network inspect reputecast_default --format '{{(index .IPAM.Config 0).Subnet}}'
+   ```
+
+   Một proxy chạy như container trong network này kết nối từ một địa chỉ thuộc subnet đó. Một proxy chạy ngay trên máy
+   chủ đi đến cổng đã công bố qua gateway của Docker, cũng nằm trong subnet đó.
+
+2. Đặt giá trị đó vào `REPUTECAST_HTTP__TRUSTED_PROXIES` trong `docker-compose.override.yml` (nhiều giá trị thì phân cách
+   bằng dấu phẩy, như `172.18.0.0/16,10.0.0.5`).
+
+3. Áp dụng bằng `docker compose up -d`.
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- `docker compose ps` cho thấy `postgres` ở trạng thái `healthy` và `app` đang chạy.
+- `curl http://127.0.0.1:8080/readyz` trả về `ready` (`503 database unavailable` khi không kết nối được PostgreSQL).
+- `docker compose exec app /usr/local/bin/reputecast migrate status` không liệt kê migration nào là `pending`.
+- URL công khai mở trang đăng nhập ReputeCast qua proxy của bạn.
+
+## Khắc phục sự cố
+
+- **Thông báo ghi `Sign in at http://localhost:8080`**: chưa đặt `REPUTECAST_PUBLIC_URL`. Hãy thêm biến này vào `.env`
+  rồi chạy `docker compose up -d`; bạn cũng có thể sửa URL công khai trong lần đăng nhập đầu tiên, ở bước
+  <UiPath path="setup.instanceBasics" />.
+- **`grep` không tìm thấy thông báo**: cơ sở dữ liệu đã có người dùng, ví dụ vì volume `reputecast_pgdata` còn lại từ lần
+  cài trước. Hãy đặt lại mật khẩu của Chủ sở hữu từ máy chủ:
+  `docker compose exec app /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)).
+- **Container ứng dụng dừng với `Error: owner email: missing (pass --email or set REPUTECAST_ADMIN_EMAIL)`**: cơ sở dữ
+  liệu trống và container không nhận được email Chủ sở hữu nào. Hãy đặt `REPUTECAST_ADMIN_EMAIL` rồi khởi động lại.
+- **Ứng dụng không kết nối được PostgreSQL sau khi bạn đổi `POSTGRES_PASSWORD`**: volume vẫn giữ mật khẩu cũ. Hãy đặt
+  lại giá trị cũ, hoặc đổi mật khẩu của người dùng trong PostgreSQL cho khớp
+  (`docker compose exec postgres psql -U reputecast -c "ALTER USER reputecast PASSWORD '…'"`).
+- **`Bind for 0.0.0.0:8080 failed: port is already allocated`**: một dịch vụ khác đang dùng cổng 8080. Hãy đặt
+  `REPUTECAST_PORT` sang một cổng trống và trỏ proxy đến cổng đó.
+- **Mọi người truy cập đều hiện địa chỉ của proxy trong phiên và nhật ký kiểm tra**: hãy đặt
+  [proxy tin cậy](#proxy-tin-cậy).
+
+<Aside type="caution">
+  `docker compose down -v` xóa volume `reputecast_pgdata` và `reputecast_appdata`, tức là cơ sở dữ liệu và khóa bí mật.
+  Hãy [sao lưu chúng](/vi/self-hosting/backups/) trước.
+</Aside>
+
+## Liên quan
+
+- [Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)
+- [Đăng nhập lần đầu và thiết lập hệ thống](/vi/self-hosting/first-run/)
+- [Sao lưu và khôi phục](/vi/self-hosting/backups/) và [nâng cấp ReputeCast](/vi/self-hosting/upgrades/)
+- [Cài đặt bằng tệp nhị phân](/vi/self-hosting/binary/) để chạy ReputeCast không cần Docker

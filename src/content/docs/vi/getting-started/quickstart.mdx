@@ -1,0 +1,238 @@
+---
+title: 'Bắt đầu nhanh: chạy ReputeCast bằng Docker'
+description: Hướng dẫn bắt đầu nhanh để tự host newsletter bằng Docker với ReputeCast, hoàn tất thiết lập ban đầu và gửi một email thử trong khoảng 15 phút.
+type: tutorial
+audience: [operator, admin]
+primaryKeyword: tự host newsletter bằng Docker
+sources:
+  - deploy/docker-compose.yml
+  - Dockerfile
+  - Makefile
+  - README.md
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/accounts/setup_state.go
+  - web/src/features/auth/SetupPage.tsx
+  - web/src/features/connect
+  - internal/connect
+  - internal/providers/smtp
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Trong hướng dẫn này, bạn tự host nền tảng newsletter ReputeCast bằng Docker trên máy tính của mình, hoàn tất thiết lập
+ban đầu và gửi một email thử tới một máy chủ thư thử nghiệm chạy cục bộ. Toàn bộ mất khoảng 15 phút. Mọi thứ chạy
+trong container, và cuối cùng bạn có thể gỡ bỏ tất cả bằng một lệnh.
+
+## Trước khi bắt đầu
+
+- Docker với Compose v2 (Docker Desktop, hoặc Docker Engine có plugin Compose). Kiểm tra bằng `docker compose version`.
+- Cổng 8080 (ReputeCast) và cổng 8025 (hộp thư của máy chủ thư thử nghiệm) còn trống trên máy tính của bạn.
+- Một khóa truy cập (Touch ID, Face ID, Windows Hello hoặc khóa bảo mật) hoặc một ứng dụng xác thực như 1Password,
+  Google Authenticator hay Authy. Chủ sở hữu đầu tiên bắt buộc phải đăng nhập bằng xác thực hai lớp.
+
+Ngoài ứng dụng, ReputeCast chỉ cần PostgreSQL; tệp compose khởi động cả hai.
+
+## Khởi động ReputeCast
+
+<Steps>
+
+1. **Tải tệp compose** vào một thư mục trống:
+
+   ```sh
+   mkdir reputecast && cd reputecast
+   curl -fsSL https://raw.githubusercontent.com/hostrepute/reputecast/main/deploy/docker-compose.yml -o docker-compose.yml
+   ```
+
+   Tệp này định nghĩa hai dịch vụ: `postgres` (PostgreSQL 18) và `app` (ReputeCast). Khi khởi động, ứng dụng tự áp
+   dụng các migration cơ sở dữ liệu và tạo Chủ sở hữu đầu tiên.
+
+2. **Thêm máy chủ thư thử nghiệm cho lần dùng thử này.** Một hệ thống thật gửi thư qua
+   [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) của bạn. Với lần dùng thử cục bộ này, hãy thêm
+   [Mailpit](https://mailpit.axllent.org), một máy chủ thư thử nghiệm giữ mọi thư trong một hộp thư trên web. ReputeCast
+   đọc thư trả lại từ một hộp thư qua TLS, nên trước tiên hãy tạo chứng chỉ cho Mailpit:
+
+   ```sh
+   docker run --rm -v "$PWD/mailpit-tls:/tls" alpine:3.22 sh -c 'apk add --no-cache openssl >/dev/null && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=mailpit" -addext "subjectAltName=DNS:mailpit" -keyout /tls/mailpit.key -out /tls/mailpit.crt'
+   ```
+
+   Sau đó lưu tệp sau cạnh `docker-compose.yml`. Compose tự động đọc tệp này:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     mailpit:
+       image: axllent/mailpit:v1.31.5
+       restart: unless-stopped
+       ports:
+         - "8025:8025" # Mailpit's inbox: http://localhost:8025
+       environment:
+         MP_SMTP_AUTH_ACCEPT_ANY: "1"
+         MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+         MP_SMTP_BIND_ADDR: 0.0.0.0:2525
+         MP_POP3_BIND_ADDR: 0.0.0.0:995
+         MP_POP3_AUTH: "bounces:bounces-password"
+         MP_POP3_TLS_CERT: /tls/mailpit.crt
+         MP_POP3_TLS_KEY: /tls/mailpit.key
+       volumes:
+         - ./mailpit-tls:/tls:ro
+
+     app:
+       environment:
+         # Mailpit runs on the private Docker network.
+         REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS: "true"
+         # Trust Mailpit's certificate next to the system certificates.
+         SSL_CERT_DIR: /etc/ssl/certs:/trust
+       volumes:
+         - ./mailpit-tls/mailpit.crt:/trust/mailpit.crt:ro
+   ```
+
+   <Aside type="caution">
+     Tệp ghi đè này chỉ dành cho việc dùng thử trên máy tính của bạn. Hãy xóa nó trước khi gửi thư thật:
+     `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS` cho phép ReputeCast kết nối tới các địa chỉ trong mạng riêng.
+   </Aside>
+
+3. **Khởi động hệ thống** với địa chỉ email của bạn làm Chủ sở hữu đầu tiên:
+
+   ```sh
+   REPUTECAST_ADMIN_EMAIL=you@company.com docker compose up -d
+   ```
+
+4. **Đọc mật khẩu tạm thời.** Lần khởi động đầu tiên mất khoảng 20 giây để chạy các migration. Sau đó chạy:
+
+   ```sh
+   docker compose logs app | grep -A4 "ReputeCast is installed"
+   ```
+
+   ```text title="Kết quả"
+   app-1  |   ReputeCast is installed.
+   app-1  |
+   app-1  |   Sign in at  http://localhost:8080
+   app-1  |   Email       you@company.com
+   app-1  |   Password    aEkq-cFUR-E5js-vfyU   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Nếu lệnh không in ra gì, hãy chờ vài giây rồi chạy lại.
+
+</Steps>
+
+<Aside type="note" title="Tự build image">
+  Trước bản phát hành đầu tiên, hoặc khi muốn chạy thay đổi của riêng bạn, hãy build image từ bản checkout của kho mã
+  ReputeCast và trỏ tệp compose tới image đó:
+
+```sh
+make docker VERSION=local
+REPUTECAST_IMAGE=reputecast REPUTECAST_VERSION=local REPUTECAST_ADMIN_EMAIL=you@company.com \
+  docker compose -f deploy/docker-compose.yml up -d
+```
+
+`REPUTECAST_IMAGE` và `REPUTECAST_VERSION` cũng dùng được với tệp compose bạn đã tải về. `REPUTECAST_PORT` đổi cổng trên
+máy tính của bạn, còn `REPUTECAST_PUBLIC_URL` đổi địa chỉ mà ReputeCast đặt vào các liên kết.
+
+</Aside>
+
+## Hoàn tất thiết lập ban đầu
+
+<Steps>
+
+1. **Đăng nhập.** Mở http://localhost:8080, nhập email của bạn, chọn **Tiếp tục**, rồi nhập mật khẩu tạm thời.
+
+   <Screenshot
+     id="sign-in"
+     alt="Trang đăng nhập ReputeCast hỏi email công việc trước, bên dưới là tùy chọn đăng nhập bằng khóa truy cập."
+   />
+
+2. **Đi qua sáu bước thiết lập.** ReputeCast lưu từng bước, nên bạn có thể dừng lại và quay lại sau.
+
+   <Screenshot
+     id="setup-password"
+     alt="Bước 1/6 của quá trình thiết lập: thay mật khẩu tạm thời, các bước còn lại được liệt kê ở bên trái."
+   />
+
+   - Ở bước <UiPath path="setup.stepPassword" />, nhập mật khẩu tạm thời và một mật khẩu mới dài ít nhất 12 ký tự.
+   - <UiPath path="setup.stepSecondFactor" />: thêm khóa truy cập, hoặc quét mã QR bằng ứng dụng xác thực và nhập mã
+     ứng dụng hiển thị.
+   - <UiPath path="setup.stepRecoveryCodes" />: tải xuống, in hoặc sao chép 10 mã. Mỗi mã giúp bạn đăng nhập một lần
+     nếu bạn mất khóa truy cập hoặc ứng dụng xác thực; bạn chỉ thấy các mã này vào lúc này.
+   - <UiPath path="setup.instanceBasics" />: đặt tên cho hệ thống, chọn múi giờ và ngôn ngữ mặc định, rồi kiểm tra URL
+     công khai. Trên máy tính của bạn, dòng TLS sẽ cảnh báo về `http` không mã hóa, và kiểm tra khả năng truy cập có thể
+     thất bại; bạn vẫn có thể lưu. Bật hoặc tắt <UiPath path="setup.updateCheck" /> tùy bạn; tùy chọn này chỉ lấy số
+     phiên bản mới nhất.
+   - <UiPath path="setup.stepWorkspace" />: đặt tên cho [không gian làm việc](/vi/reference/glossary/#workspace) đầu
+     tiên, chẳng hạn theo tên bản tin của bạn.
+   - <UiPath path="setup.stepProvider" />: chọn bước này để mở trình hướng dẫn kết nối nhà cung cấp.
+
+</Steps>
+
+## Kết nối máy chủ thư thử nghiệm và gửi thử
+
+<Steps>
+
+1. **Chọn nhà cung cấp.** Trình hướng dẫn liệt kê mọi nhà cung cấp gửi thư có sẵn cùng những gì mỗi nhà cung cấp làm
+   được. Chọn **Any SMTP server**.
+
+   <Screenshot
+     id="providers-catalog"
+     alt="Danh mục nhà cung cấp với Amazon SES, Postmark, Mailgun, SendGrid và các nhà cung cấp khác, mỗi nhà cung cấp có huy hiệu khả năng và nút Kết nối."
+   />
+
+2. **Kết nối máy chủ gửi đi.** Nhập máy chủ `mailpit`, cổng `2525` và mã hóa **Không có**; để trống tên người dùng và
+   mật khẩu. Chọn <UiPath path="connect.connection.smtp.testConnection" />: kết quả hiển thị
+   “Đã kết nối lúc … · No TLS · no authentication”.
+
+3. **Kết nối hộp thư nhận thư trả lại.** SMTP không có webhook, nên ReputeCast đọc thư trả lại từ một hộp thư. Nhập địa
+   chỉ return-path `bounces@example.com`, giao thức **POP3**, máy chủ thư `mailpit`, cổng **995 · TLS**, tên người dùng
+   `bounces` và mật khẩu `bounces-password`. Chọn <UiPath path="connect.connection.smtp.testMailbox" />, rồi tiếp tục
+   tới bước xác minh tên miền.
+
+4. **Nhập tên miền gửi thư.** Gõ `example.com`, chọn **Xem các bản ghi DNS**, rồi tiếp tục tới bước gửi thử. Với tên
+   miền thật, bạn thêm các bản ghi này tại nhà cung cấp DNS của mình; xem
+   [Cấu hình SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/).
+
+5. **Thêm người gửi.** Thư thử cần một địa chỉ From. Trong một tab trình duyệt mới, mở
+   <UiPath path="nav.settings > settings.senders" />, chọn <UiPath path="senders.addSender" />, nhập tên và
+   `news@example.com`, đánh dấu Gửi hàng loạt, Tự động hóa và Hệ thống, rồi thêm người gửi. Quay lại trình hướng dẫn và
+   tải lại trang.
+
+6. **Gửi thử.** Chọn <UiPath path="connect.steps.sendTest" />. Dòng thời gian gửi thư được cập nhật khi Mailpit nhận
+   thư. Mở http://localhost:8025 để đọc thư trong hộp thư của Mailpit.
+
+7. **Hoàn tất trình hướng dẫn.** Giữ cả bốn luồng trên máy chủ SMTP, rồi chọn **Bắt đầu trống và hoàn tất** (hoặc nhập
+   liên hệ). Phần tóm tắt liệt kê những gì đã được cấu hình.
+
+</Steps>
+
+## Bạn đã làm được gì
+
+ReputeCast và PostgreSQL đang chạy trên máy tính của bạn, tài khoản Chủ sở hữu được bảo vệ bằng xác thực hai lớp, hệ
+thống và không gian làm việc đầu tiên đã được thiết lập, và một email thử đã đi từ ReputeCast qua máy chủ SMTP vào một
+hộp thư.
+
+Để gỡ bỏ mọi thứ, kể cả cơ sở dữ liệu, hãy chạy `docker compose down -v` trong thư mục đó.
+
+Để gửi thư thật, hãy chạy ReputeCast trên một máy chủ có địa chỉ HTTPS công khai, để các nhà cung cấp gửi thư có thể
+báo lại kết quả gửi, thư trả lại và khiếu nại, rồi kết nối nhà cung cấp của bạn. Xem
+[Cài đặt bằng Docker Compose](/vi/self-hosting/docker/) và [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
+
+## Bước tiếp theo
+
+<CardGrid>
+  <LinkCard
+    title="Gửi bản tin đầu tiên"
+    description="Nhập liên hệ, viết chiến dịch và vượt qua Độ sẵn sàng gửi."
+    href="/vi/getting-started/first-campaign/"
+  />
+  <LinkCard
+    title="Gửi thư bằng Amazon SES"
+    description="Kết nối SES bằng stack CloudFormation hoặc khóa IAM."
+    href="/vi/providers/amazon-ses/"
+  />
+  <LinkCard
+    title="Reverse proxy và TLS"
+    description="Đặt ReputeCast sau Caddy, nginx hoặc Traefik với HTTPS."
+    href="/vi/self-hosting/reverse-proxy/"
+  />
+</CardGrid>

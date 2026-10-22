@@ -1,0 +1,131 @@
+---
+title: Theo dõi lần gửi và tự động tạm dừng
+description: 'Cách ReputeCast bảo vệ lần gửi: tự động tạm dừng chiến dịch email khi tỷ lệ bounce hoặc khiếu nại vượt ngưỡng, tạm giữ khi có sự cố và lựa chọn của bạn sau đó.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:pause', 'campaigns:send']
+uiPath: 'nav.campaigns > campaigns.liveMonitor'
+primaryKeyword: tự động tạm dừng chiến dịch email
+sources:
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/actions.go
+  - internal/sending/engine/analysis.go
+  - internal/sending/engine/live.go
+  - internal/sending/engine/api.go
+  - internal/providers/manage/health.go
+  - web/src/features/live
+sidebar:
+  order: 14
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Khi một chiến dịch bắt đầu, màn hình <UiPath path="live.title" /> hiển thị lần gửi theo thời gian thực, và cơ chế [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending) theo dõi các tỷ lệ. Khi tỷ lệ trả thư (bounce) hoặc tỷ lệ khiếu nại của một chiến dịch email vượt ngưỡng, ReputeCast tự động tạm dừng chỉ phần của lần gửi gây ra vấn đề, chẳng hạn những người nhận dùng Outlook, còn phần còn lại vẫn tiếp tục. Khi một nhà cung cấp gửi thư ngừng phản hồi, phần của nó bị tạm giữ hoặc được chuyển đi. Trong cả hai trường hợp, một người sẽ quyết định bước tiếp theo.
+
+<Screenshot
+  id="live-monitor"
+  alt="Màn hình theo dõi trực tiếp sau 20 phút gửi Weekly Digest #142: đã gửi 64%, 118 thư trả lại (0,60%) và 8 khiếu nại (0,04%), mọi nhà cung cấp hộp thư đều ổn, và mọi thanh ngưỡng đều dưới giới hạn."
+/>
+
+Trang cho biết tiến độ và thời điểm dự kiến hoàn tất, năm ô số liệu (gửi thành công, trả lại, khiếu nại, đã mở với lượt mở bởi người đọc và lượt mở tự động được tách riêng, đã nhấp), một bảng <UiPath path="live.perMailbox" /> và một bảng <UiPath path="live.perProvider" />, phần <UiPath path="live.thresholds" /> với một thanh cho mỗi tỷ lệ, và danh sách <UiPath path="live.liveEvents" />. Số liệu đến từ webhook báo trạng thái gửi của các nhà cung cấp gửi thư (xem [sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)) và cập nhật khoảng mỗi giây qua một luồng server-sent events.
+
+## Cách tự động tạm dừng ra quyết định
+
+1. **Tỷ lệ được tính theo từng thư.** Tỷ lệ trả thư là số thư trả lại vĩnh viễn cộng tạm thời trên mỗi thư đã gửi. Tỷ lệ khiếu nại là số khiếu nại trên mỗi thư gửi thành công. Tỷ lệ hoãn nhận là số thư bị hoãn nhận trên mỗi thư đã gửi.
+2. **Cứ mỗi 2 giây** ReputeCast kiểm tra các tỷ lệ theo thứ tự sau: với từng nhà cung cấp hộp thư (Gmail, Outlook, Yahoo, iCloud, khác) là tỷ lệ khiếu nại, tỷ lệ trả thư và tỷ lệ hoãn nhận; với từng nhà cung cấp gửi thư là tỷ lệ trả thư; sau đó là tỷ lệ trả thư và tỷ lệ khiếu nại của cả chiến dịch. Tỷ lệ đầu tiên vượt ngưỡng sẽ quyết định.
+3. **Một tỷ lệ chỉ vượt ngưỡng khi có đủ bằng chứng.** Một nhà cung cấp hộp thư hoặc nhà cung cấp gửi thư cần 500 thư trước khi các tỷ lệ của nó được tính; cả chiến dịch cần 1.000 thư. Phải có ít nhất 5 thư trả lại, khiếu nại hoặc hoãn nhận, tỷ lệ phải vượt giới hạn, và ReputeCast phải tin chắc khoảng 90% rằng tỷ lệ thật vượt giới hạn, để một khiếu nại không may lúc đầu lần gửi không làm dừng cả lần gửi.
+4. **Phạm vi quyết định phần nào tạm dừng.** Với phạm vi mặc định, chỉ người nhận của nhà cung cấp hộp thư bị ảnh hưởng (hoặc phần của nhà cung cấp gửi thư bị ảnh hưởng) bị tạm giữ, mọi phần khác vẫn tiếp tục gửi. Với phạm vi chiến dịch, cả chiến dịch tạm dừng.
+5. **Các ngưỡng được cố định khi lần gửi bắt đầu.** Chúng lấy từ mặc định của không gian làm việc, cộng với những thay đổi bạn đã làm cho chiến dịch này trong Kiểm tra và gửi, nếu có.
+
+Ngưỡng hoãn nhận (5,0% theo nhà cung cấp hộp thư) là cố định và không có ô cài đặt trong ứng dụng.
+
+## Điều gì xảy ra khi tạm dừng
+
+- Người nhận bị tạm giữ chờ trong hàng đợi. Không thư nào bị bỏ.
+- Mọi người trong không gian làm việc có quyền `campaigns:send` nhận thông báo khẩn trong ứng dụng và qua email, ví dụ "Outlook complaint rate reached 0.18% (limit 0.10%). 2,522 held, everything else still sending."
+- [Webhook](/vi/reference/webhook-events/) `campaign.paused` được gửi với `paused_by: auto_pause`, chỉ số, giá trị và giới hạn của chỉ số, phạm vi và số người nhận bị tạm giữ.
+- Màn hình theo dõi trực tiếp mở một bảng quyết định: <UiPath path="live.whatTripped" />, các nguyên nhân có thể, một đề xuất và <UiPath path="live.chooseTitle" />.
+
+<Screenshot
+  id="live-monitor-paused"
+  alt="Weekly Digest #142 tự tạm dừng với Outlook: tỷ lệ khiếu nại đạt 0,32% (giới hạn 0,10%) sau 5 khiếu nại trên 1.564 thư gửi thành công. ReputeCast tạm giữ 4.642 người nhận dùng Outlook trong khi Gmail, Yahoo, iCloud và nhóm Khác vẫn tiếp tục."
+/>
+
+### Quyết định sau khi tạm dừng vì vượt ngưỡng
+
+- **Tiếp tục như cũ** gửi cho mọi người còn đang bị tạm giữ. Ngưỡng vẫn được kích hoạt và sẽ tạm dừng lại ngay ở lần khiếu nại (hoặc trả thư) tiếp theo cùng loại.
+- **Tiếp tục với thay đổi** được đề xuất cho lần tạm dừng theo nhà cung cấp hộp thư khi ReputeCast tìm ra nguyên nhân. Lựa chọn này có thể loại nhóm gây ra phần lớn khiếu nại (chẳng hạn liên hệ được nhập vào nhưng chưa từng tương tác, hoặc liên hệ thuộc nhóm Có nguy cơ và Ngừng gửi dần), giảm một nửa tốc độ gửi tới nhà cung cấp hộp thư đó trong phần còn lại của lần gửi, và, khi có một tự động hóa xin phép lại hoặc tái tương tác phù hợp đang chạy, thêm các liên hệ bị loại vào đó. Lựa chọn này liệt kê chính xác những gì nó sẽ làm trước khi bạn chọn. Với lần tạm dừng theo nhà cung cấp gửi thư, nó tiếp tục mà không thay đổi gì.
+- **Hủy phần này** bỏ qua những người nhận bị tạm giữ; phần còn lại của chiến dịch hoàn tất bình thường.
+- **Hủy cả chiến dịch** bằng <UiPath path="live.cancelWhole" /> dừng mọi thứ chưa được gửi.
+
+Với phạm vi chiến dịch, các lựa chọn là Tiếp tục như cũ và hủy chiến dịch.
+
+## Sự cố của nhà cung cấp gửi thư
+
+Thanh <UiPath path="live.model.thresholdErrors" /> cho biết tỷ lệ lệnh gọi thất bại cao nhất trong 3 phút gần nhất giữa các nhà cung cấp gửi thư trên tuyến (thanh này tính mọi lệnh gọi tới nhà cung cấp đó, không chỉ của lần gửi này). Thanh chỉ để theo dõi; nó không bao giờ tạm dừng lần gửi, kể cả khi chuyển sang màu đỏ. Phần của một nhà cung cấp bị tách khỏi lần gửi khi:
+
+- mọi lệnh gọi của lần gửi này tới nhà cung cấp đều thất bại trong 3 phút, với ít nhất 5 lệnh gọi thất bại (phản hồi giới hạn tốc độ không được tính, và chỉ cần một lệnh gọi thành công là việc đếm giờ bắt đầu lại),
+- kiểm tra tình trạng nhà cung cấp đánh dấu nhà cung cấp là ngừng hoạt động, hoặc
+- nhà cung cấp từ chối thông tin xác thực, khi đó phần của nó bị tách ra ngay lập tức.
+
+Điều xảy ra sau đó phụ thuộc vào [chính sách chuyển dự phòng](/vi/providers/routing/) của luồng Gửi hàng loạt. Với chính sách tự động, ReputeCast chuyển phần còn lại sang một nhà cung cấp đang hoạt động, cho phép thư hàng loạt và không trong giai đoạn khởi động (ưu tiên nhà cung cấp dự phòng của luồng, sau đó là nhà cung cấp có tỷ trọng lớn nhất trong phân bổ), và ghi lại việc chuyển. Với chính sách "tạm dừng và hỏi", khi thông tin xác thực bị từ chối, hoặc khi không có nhà cung cấp nào đủ điều kiện, phần đó bị tạm giữ và mọi người có quyền `campaigns:send` được yêu cầu quyết định.
+
+<Screenshot
+  id="live-monitor-outage"
+  alt="Postal trả về lỗi kết nối trong 3 phút, nên phần của Postal đang bị tạm giữ với 739 người nhận còn lại trong khi Amazon SES vẫn tiếp tục gửi. Chuyển phần này sang SES tốn thêm 0,07 US$, thêm 53 giây và có rủi ro uy tín thấp."
+/>
+
+### Quyết định sau khi tạm giữ vì sự cố
+
+- **Thử lại** giữ người nhận ở nhà cung cấp cũ và thử lại. Nếu sau thêm 15 phút vẫn thất bại, bạn sẽ được hỏi lại.
+- **Chuyển phần còn lại** gửi những người nhận bị tạm giữ qua một nhà cung cấp khác. Bảng cho biết chi phí tăng thêm, thời gian tăng thêm theo tốc độ của nhà cung cấp đó, hạn mức của nó sau khi chuyển và rủi ro uy tín ("Low · SES is warm"). Thư đã gửi vẫn giữ nguyên dữ liệu theo dõi.
+- **Hủy phần này** bỏ qua những người nhận bị tạm giữ. Họ được đánh dấu là chưa gửi ("not sent") trong báo cáo và có thể được gửi sau.
+
+Thư thất bại tạm thời được thử lại tối đa 10 lần, sau 5, 10, 20 và 40 giây rồi mỗi 60 giây. Mỗi lần thử mang một khóa idempotency, nên không thư nào bị gửi hai lần.
+
+## Tạm dừng và tiếp tục thủ công
+
+<TableScroll label="Các thao tác trên màn hình theo dõi trực tiếp và quyền mỗi thao tác cần">
+
+| Thao tác                                            | Cần quyền         | Ghi chú                                                                                 |
+| --------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                        | `campaigns:pause` | Hiện khi chiến dịch đang gửi. Mọi thứ dừng lại cho đến khi có người tiếp tục.           |
+| <UiPath path="live.resumeSending" />                | `campaigns:send`  | Áp dụng cho cả mọi quyết định tiếp tục, chuyển và thử lại.                              |
+| <UiPath path="live.cancelSend" />                   | `campaigns:send`  | Hộp thoại đề xuất <UiPath path="live.pauseInstead" /> nếu bạn có quyền `campaigns:pause`. |
+| Xem màn hình theo dõi                               | `campaigns:view`  |                                                                                         |
+
+</TableScroll>
+
+Tạm dừng được cố ý đặt là quyền thấp hơn: người phát hiện vấn đề có thể dừng lần gửi, còn người được phép gửi quyết định cách tiếp tục. Chủ sở hữu, Quản trị viên và Biên tập viên có cả hai quyền; Người xem không có quyền nào. Xem [vai trò và quyền](/vi/team/roles-and-permissions/).
+
+## Trên điện thoại
+
+<Screenshot
+  id="live-monitor-mobile"
+  alt="Màn hình theo dõi trực tiếp trên điện thoại: đầu trang riêng với trạng thái Trực tiếp · sự kiện 1 giây trước, đã gửi 64% kèm thời gian dự kiến hoàn tất và tốc độ, năm ô số liệu xếp hai cột với lượt mở bởi người đọc hiện trước, và các thanh ngưỡng."
+/>
+
+Dưới 768 px, màn hình trực tiếp có bố cục riêng: đầu trang ngắn gọn với trạng thái kết nối ("Trực tiếp · sự kiện 1 giây trước"), các ô số liệu xếp hai cột, các dòng ngưỡng và nhà cung cấp thu gọn, và nút Tạm dừng (hoặc Tiếp tục) cùng nút Hủy ở cuối màn hình. Bảng quyết định dùng bố cục như trên máy tính.
+
+Nếu luồng sự kiện bị ngắt, màn hình theo dõi tự kết nối lại (tối đa 10 lần thử) và đề xuất <UiPath path="live.reconnectNow" />. Màn hình theo dõi không bao giờ cập nhật khi chạy sau reverse proxy thường là do proxy đệm luồng dữ liệu; xem [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+
+## Mặc định và giới hạn
+
+<LimitsTable area="auto-pause" />
+
+## Khi nào nên thay đổi
+
+- **Mặc định của không gian làm việc** trong [mặc định gửi thư của không gian làm việc](/vi/providers/workspace-defaults/) (<UiPath path="nav.settings > settings.providers" />) đặt ngưỡng trả thư, ngưỡng khiếu nại và <UiPath path="senders.providers.pauseScope" /> cho mọi lần gửi mới.
+- **Một chiến dịch** có thể dùng ngưỡng khác hoặc phạm vi chiến dịch trong <UiPath path="composer.reviewSend" />, cho đến khi bắt đầu gửi. Hãy hạ ngưỡng với danh sách đã lâu bạn không gửi hoặc với nhà cung cấp mới; chọn phạm vi chiến dịch khi việc chỉ gửi một phần sẽ khiến người đọc bối rối, chẳng hạn với một ưu đãi có thời hạn.
+- Nâng ngưỡng cao hơn mức nhà cung cấp gửi thư của bạn chấp nhận nghĩa là đổi một lần gửi bị tạm dừng lấy một tài khoản bị đình chỉ. Hãy so sánh với giới hạn riêng của nhà cung cấp trong [thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/).
+
+## Liên quan
+
+- [Lên lịch và gửi chiến dịch](/vi/campaigns/schedule-and-send/) là nơi đặt ngưỡng cho từng chiến dịch.
+- [Tình trạng nhà cung cấp và sự cố ngừng hoạt động](/vi/providers/health-and-outages/) nói về phần Gửi hàng loạt bị tạm giữ trên màn hình Nhà cung cấp gửi thư.
+- [Đọc báo cáo chiến dịch](/vi/campaigns/reports/) cho biết số liệu cuối cùng theo nhà cung cấp hộp thư và nhà cung cấp gửi thư.
+- [Giới hạn và mặc định](/vi/reference/limits-and-defaults/) liệt kê mọi con số cố định.

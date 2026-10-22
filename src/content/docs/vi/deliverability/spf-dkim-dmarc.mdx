@@ -1,0 +1,338 @@
+---
+title: Cấu hình SPF, DKIM và DMARC
+description: Cấu hình SPF DKIM DMARC cho tên miền gửi thư trong ReputeCast, với đúng các bản ghi mỗi nhà cung cấp cần, trên Cloudflare, Route 53 hay DNS bất kỳ.
+type: how-to
+audience: [admin]
+permissions: ['domains:manage']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: cấu hình SPF DKIM DMARC
+sources:
+  - internal/connect/domainstep.go
+  - internal/domains/records.go
+  - internal/domains/attach.go
+  - internal/domains/check.go
+  - internal/domains/detail.go
+  - internal/domains/cloudflare.go
+  - internal/domains/api.go
+  - internal/dnscheck/auth.go
+  - internal/dnscheck/domain.go
+  - internal/readiness/assemble.go
+  - internal/providers/ses/ses.go
+  - web/src/features/connect/DomainStep.tsx
+  - web/src/features/connect/DomainRecords.tsx
+  - web/src/features/connect/domain.messages.ts
+  - web/src/features/senders
+sidebar:
+  order: 3
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[SPF](/vi/reference/glossary/#spf), [DKIM](/vi/reference/glossary/#dkim) và [DMARC](/vi/reference/glossary/#dmarc)
+chứng minh với các nhà cung cấp hộp thư rằng thư mang tên miền của bạn thật sự do bạn gửi. Hướng dẫn cấu hình SPF DKIM
+DMARC này cho thấy các bản ghi ReputeCast yêu cầu bạn công bố cho một
+[tên miền gửi thư](/vi/reference/glossary/#sending-domain), cách thêm chúng trên Cloudflare, Amazon Route 53 hoặc bất kỳ
+nhà cung cấp DNS nào khác, và cách đọc trạng thái trực tiếp của chúng.
+
+## Mỗi bản ghi làm gì
+
+<TableScroll label="Bản ghi SPF, DKIM và DMARC">
+
+| Bản ghi | Loại DNS       | Công bố tại                                            | Chứng minh điều gì                                                                       |
+| ------- | -------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| SPF     | TXT            | Tên miền trong địa chỉ người gửi phong bì (MAIL FROM)  | Máy chủ đã chuyển giao thư được phép gửi thư thay cho tên miền đó.                       |
+| DKIM    | CNAME hoặc TXT | `<selector>._domainkey.<domain>`                       | Thư được nhà cung cấp gửi thư ký bằng khóa bạn đã công bố và không bị sửa đổi.           |
+| DMARC   | TXT            | `_dmarc.<domain>`, hoặc tên miền tổ chức               | Bên nhận xử lý ra sao khi cả SPF lẫn DKIM đều không đạt theo cách căn chỉnh với địa chỉ From. |
+
+</TableScroll>
+
+DMARC đạt khi SPF hoặc DKIM đạt **và** tên miền của nó căn chỉnh với tên miền trong địa chỉ From. Ở chế độ nới lỏng
+(relaxed), là chế độ mặc định, hai tên miền cần có cùng tên miền tổ chức: `bounce.news.acme.io` căn chỉnh với
+`news.acme.io`. Ở chế độ nghiêm ngặt (strict), hai tên miền phải giống hệt nhau
+([RFC 7489, mục 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), kiểm tra tháng 10/2026).
+
+Vì vậy, ReputeCast yêu cầu một return path (MAIL FROM) tùy chỉnh trên tên miền của bạn ở mọi nơi nhà cung cấp gửi thư
+hỗ trợ: SPF được kiểm tra theo return path, nên với return path mặc định của nhà cung cấp gửi thư thì chỉ DKIM có thể
+căn chỉnh. Độ sẵn sàng gửi cảnh báo trường hợp này ("uses the default MAIL FROM, so SPF doesn't align") nhưng không
+chặn, vì DMARC vẫn đạt nhờ DKIM.
+
+## Các bản ghi ReputeCast hiển thị
+
+ReputeCast liệt kê các bản ghi ở hai nơi, với cùng một bảng:
+
+- Trong trình hướng dẫn kết nối, ở bước 3, <UiPath path="connect.stepDomain" /> (xem
+  [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/)).
+- Về sau, tại <UiPath path="nav.settings > settings.senders" />: chọn <UiPath path="senders.records" /> cạnh một tên
+  miền. Khi nhiều nhà cung cấp gửi thư dùng tên miền đó, mỗi nhà cung cấp có một tab để lọc bảng.
+
+Mỗi nhà cung cấp gửi thư ký bằng khóa DKIM riêng, nên mỗi nhà cung cấp cần bản ghi riêng. Các nhà cung cấp gửi thư có
+API tên miền (Amazon SES, Mailgun, SendGrid, Resend, Mailjet, Brevo, SparkPost, và Postmark khi có account token) trả
+về đúng các bản ghi cần thiết, còn ReputeCast thêm các dòng SPF và DMARC dùng chung cho cả tên miền. Với Amazon SES trên
+`news.acme.io`, bảng trông như sau:
+
+<TableScroll label="Bản ghi cho Amazon SES trên news.acme.io">
+
+| Mục đích                         | Loại  | Tên                               | Giá trị                                                        |
+| -------------------------------- | ----- | --------------------------------- | -------------------------------------------------------------- |
+| DKIM 1 trên 3 (2 và 3 tương tự)  | CNAME | `<token>._domainkey.news.acme.io` | `<token>.dkim.amazonses.com`                                   |
+| Return path / MAIL FROM          | MX    | `bounce.news.acme.io`             | `10 feedback-smtp.us-east-1.amazonses.com`                     |
+| SPF cho MAIL FROM                | TXT   | `bounce.news.acme.io`             | `v=spf1 include:amazonses.com ~all`                            |
+| SPF cho tên miền gửi thư         | TXT   | `news.acme.io`                    | Bản ghi SPF hiện tại của bạn, có thêm `include:amazonses.com`  |
+| DMARC                            | TXT   | `_dmarc.news.acme.io`             | `v=DMARC1; p=quarantine; adkim=s; aspf=r` (gợi ý)              |
+
+</TableScroll>
+
+<Screenshot
+  id="connect-domain"
+  alt="Bước xác minh tên miền cho Amazon SES trên news.acme.io: bảy bản ghi, từ ba CNAME DKIM đến DMARC, tất cả đều đã xác minh, với nút Cloudflare và nút tệp zone phía trên bảng."
+>
+  1. Bản ghi đầu tiên trong ba bản ghi DKIM mà Amazon SES dùng để ký, mỗi bản ghi là một khóa 2048 bit.
+  2. Return path (MAIL FROM) trên `bounce.news.acme.io`, để thư trả lại và SPF căn chỉnh với tên miền của bạn.
+  3. Bản ghi SPF của tên miền gửi thư, được gộp với bản ghi bạn đang công bố.
+  4. DMARC: ở đây `news.acme.io` theo chính sách của `acme.io`, nên bản ghi nằm tại `_dmarc.acme.io`.
+  5. Dòng trạng thái trực tiếp: khi mọi bản ghi đã xác minh, dòng này hiển thị thời điểm của lần kiểm tra gần nhất.
+</Screenshot>
+
+Một số nhà cung cấp gửi thư chưa có API tên miền trong ReputeCast: máy chủ SMTP, Postal, Azure Communication Services,
+adapter HTTP chung (generic HTTP adapter) và Postmark khi không có account token.
+Với các nhà cung cấp này, bảng chỉ gồm dòng SPF của tên miền gửi thư và DMARC. Hãy thêm tên miền ngay trong nhà cung
+cấp gửi thư đó và công bố bản ghi DKIM mà nó hiển thị; ReputeCast kiểm tra SPF và DMARC ngay lập tức, còn DKIM ở lần
+gửi đầu tiên. Với máy chủ SMTP hoặc Postal, dòng SPF cho phép tên máy chủ bằng `a:<host>`.
+
+### Cách ReputeCast tạo giá trị SPF
+
+Một tên miền chỉ được có một bản ghi SPF, nên ReputeCast không bao giờ yêu cầu bản ghi thứ hai. Nó đọc bản ghi bạn đang
+công bố và chèn các cơ chế (mechanism) mà mỗi nhà cung cấp gửi thư cần vào trước phần kết thúc `all`, `redirect=` hoặc
+`exp=`. Các phần bạn đã có được giữ nguyên; nếu không thiếu gì, giá trị chính là bản ghi của bạn, không thay đổi. Khi
+chưa có bản ghi nào, ReputeCast đề xuất `v=spf1 <mechanisms> -all`.
+
+```txt title="Ví dụ gộp SPF"
+Published:  v=spf1 include:_spf.google.com ~all
+Proposed:   v=spf1 include:_spf.google.com include:amazonses.com ~all
+
+Published:  v=spf1 mx
+Proposed:   v=spf1 mx include:spf.mtasv.net -all
+```
+
+### Dòng DMARC
+
+Khi cả tên miền lẫn tên miền tổ chức của nó đều chưa có bản ghi DMARC, ReputeCast gợi ý
+`v=DMARC1; p=quarantine; adkim=s; aspf=r`, kèm `rua=mailto:` với địa chỉ nhận báo cáo của HostRepute khi đã kết nối
+[HostRepute](/vi/reference/glossary/#hostrepute). Dòng này được tính là đã xác minh ngay khi có bất kỳ bản ghi DMARC
+hợp lệ nào được công bố tại `_dmarc.<domain>` hoặc tại tên miền tổ chức, kể cả `p=none`. Hãy đọc
+[Chọn chính sách DMARC](#chọn-chính-sách-dmarc) trước khi công bố bản ghi gợi ý.
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `domains:manage` để thêm tên miền và thay đổi bản ghi của chúng (Chủ sở hữu và Quản trị viên có quyền
+  này). Trong trình hướng dẫn kết nối, bạn cũng cần `providers:manage`. Xem
+  [Quyền và vai trò](/vi/reference/permissions/).
+- Bạn cần quyền truy cập DNS của tên miền, tại nhà cung cấp DNS mà máy chủ tên miền của nó trỏ đến.
+- Liệt kê mọi dịch vụ khác đang gửi thư dưới tên miền này, như thư văn phòng, hệ thống hỗ trợ khách hàng hoặc CRM. Các
+  cơ chế SPF của chúng phải được giữ trong bản ghi, và mỗi dịch vụ nên ký bằng khóa DKIM riêng.
+
+## Mở bảng bản ghi
+
+<Steps>
+
+1. Mở <UiPath path="nav.settings > settings.senders" /> và chọn <UiPath path="senders.records" /> cạnh tên miền. Nếu
+   tên miền chưa có trong danh sách, hãy thêm nó trước
+   ([Thêm tên miền gửi thư và người gửi](/vi/providers/senders-and-domains/)). Nếu đang ở trình hướng dẫn kết nối, bạn
+   đã ở đúng màn hình.
+
+2. Nếu có nhiều nhà cung cấp gửi thư dùng tên miền, hãy chọn tab của một nhà cung cấp hoặc giữ tất cả.
+
+3. Xem huy hiệu phía trên bảng. Khi ReputeCast nhận ra nhà cung cấp DNS của bạn qua máy chủ tên miền, nó hiển thị tên
+   nhà cung cấp đó, ví dụ **Máy chủ tên miền: Cloudflare**. Hãy chọn tab tương ứng bên dưới.
+
+</Steps>
+
+<Screenshot
+  id="settings-sender-domain"
+  alt="Bản ghi DNS của news.acme.io trong Cài đặt, Người gửi: các tab cho tất cả nhà cung cấp, Amazon SES, Postmark và Postal, huy hiệu Máy chủ tên miền: Cloudflare, và 11 trên 11 bản ghi đã xác minh."
+/>
+
+## Công bố bản ghi tại nhà cung cấp DNS
+
+<Tabs syncKey="dns">
+<TabItem label="Cloudflare">
+
+Khi máy chủ tên miền là của Cloudflare, ReputeCast có thể thêm bản ghi giúp bạn qua API Cloudflare.
+
+<Steps>
+
+1. Trong bảng điều khiển Cloudflare, vào **My Profile** > **API Tokens**, chọn **Create Token** và dùng mẫu **Edit zone
+   DNS**. Ở phần zone resources, chọn zone của tên miền, rồi chọn **Continue to summary** và **Create Token**
+   ([Cloudflare, "Create API token"](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/),
+   kiểm tra tháng 10/2026).
+
+2. Trong ReputeCast, chọn <UiPath path="connect.domain.addViaCloudflare" />, dán token và chọn
+   <UiPath path="connect.domain.addRecords" />. Token cần quyền **Zone › DNS › Edit** trên zone này. ReputeCast chỉ dùng
+   token cho đúng yêu cầu này và không bao giờ lưu lại.
+
+3. Đọc kết quả. ReputeCast thêm các bản ghi còn thiếu và sửa các bản ghi có giá trị sai; các bản ghi nó không cần đến
+   được giữ nguyên:
+
+   - Bản ghi SPF hiện có được sửa tại chỗ, nên zone không bao giờ có hai bản ghi SPF.
+   - Bản ghi DMARC hiện có được giữ nguyên.
+   - Bản ghi CNAME được tạo ở chế độ **DNS only** (không proxy) với TTL tự động.
+
+   Các bản ghi bị Cloudflare từ chối được liệt kê trong thông báo; hãy thêm chúng thủ công.
+
+</Steps>
+
+Để tự thêm bản ghi, vào **DNS** > **Records** trong bảng điều khiển Cloudflare, chọn **Add record**, chọn loại bản ghi,
+điền tên và giá trị, rồi chọn **Save**
+([Cloudflare, "Manage DNS records"](https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/),
+kiểm tra tháng 10/2026). Đặt **Proxy status** thành **DNS only** cho các bản ghi CNAME: Cloudflare khuyên dùng DNS only
+cho các bản ghi email ([Cloudflare, "Proxy status"](https://developers.cloudflare.com/dns/proxy-status/), kiểm tra
+tháng 10/2026).
+
+Thêm bản ghi qua API cần một thành viên đã đăng nhập có quyền `domains:manage`. Khóa API và tác tử AI không dùng được
+tính năng này.
+
+</TabItem>
+<TabItem label="Amazon Route 53">
+
+ReputeCast không tích hợp với Route 53; hãy thêm bản ghi trong bảng điều khiển Route 53.
+
+<Steps>
+
+1. Mở bảng điều khiển Route 53, chọn **Hosted zones** rồi chọn zone của tên miền.
+
+2. Với mỗi dòng trong bảng của ReputeCast, chọn **Create record**:
+
+   - **Record name**: phần tên đứng trước hosted zone. Trong zone `acme.io`, các bản ghi MAIL FROM là
+     `bounce.news`. Để trống với bản ghi nằm ngay tại zone.
+   - **Record type**: loại bản ghi trong bảng.
+   - **Value**: giá trị trong bảng. Đặt giá trị TXT trong dấu ngoặc kép. Giá trị TXT dài hơn 255 ký tự được nhập thành
+     nhiều chuỗi trong ngoặc kép trên cùng một dòng: `"first part" "second part"`.
+
+3. Nếu tên đó đã có bản ghi TXT (ví dụ một bản ghi SPF ngay tại zone), hãy sửa bản ghi đó thay vì tạo bản ghi mới.
+   Route 53 giữ mọi giá trị TXT của một tên trong cùng một bản ghi, mỗi giá trị một dòng; hãy thay giá trị `v=spf1` cũ
+   bằng giá trị đã gộp thay vì thêm dòng `v=spf1` thứ hai.
+
+4. Chọn **Create records**. Thay đổi thường đến mọi máy chủ tên miền của Route 53 trong vòng 60 giây
+   ([AWS, "Creating records by using the Amazon Route 53 console"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating.html)
+   và ["Supported DNS record types"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html#TXTFormat),
+   kiểm tra tháng 10/2026).
+
+</Steps>
+
+Route 53 cũng có thể nhập tệp zone (<UiPath path="connect.domain.copyZone" /> cho bạn nội dung đó), nhưng việc nhập sẽ
+thất bại khi zone đã có bất kỳ bản ghi nào trong tệp, và khi đó không bản ghi nào được tạo
+([AWS, "Creating records by importing a zone file"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating-import.html),
+kiểm tra tháng 10/2026). Với zone đã có sẵn bản ghi, hãy tạo từng bản ghi một.
+
+</TabItem>
+<TabItem label="Nhà cung cấp DNS bất kỳ">
+
+<Steps>
+
+1. Chọn <UiPath path="connect.domain.copyZone" />. ReputeCast sao chép mọi dòng của bảng vào bộ nhớ tạm dưới dạng các
+   dòng tệp zone với TTL 3600 giây. Nó không tải xuống tệp nào.
+
+   ```txt title="Các dòng tệp zone (ví dụ)"
+   bounce.news.acme.io. 3600 IN MX 10 feedback-smtp.us-east-1.amazonses.com.
+   bounce.news.acme.io. 3600 IN TXT "v=spf1 include:amazonses.com ~all"
+   ```
+
+2. Nếu nhà cung cấp DNS của bạn hỗ trợ nhập tệp zone, hãy dán hoặc tải các dòng này lên đó. Nếu không, hãy tạo từng
+   bản ghi thủ công và dùng nút **Sao chép** trên mỗi dòng để lấy giá trị.
+
+3. Kiểm tra cách nhà cung cấp DNS của bạn nhận tên bản ghi. Nhiều nơi tự thêm tên zone, nên `bounce.news.acme.io` được
+   nhập là `bounce.news` trong zone `acme.io`. Nhập tên đầy đủ ở đó sẽ tạo ra `bounce.news.acme.io.acme.io`.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Chờ bản ghi được xác minh
+
+ReputeCast kiểm tra các bản ghi trong lúc bảng đang mở: cứ 30 giây một lần cho đến khi tất cả đã xác minh, với dòng
+"Kiểm tra mỗi 30 giây · lần cuối lúc …". Mở trang sẽ kiểm tra lại nếu lần kiểm tra gần nhất đã quá 20 giây, và một tác
+vụ nền kiểm tra mọi tên miền mỗi 30 phút, nên thay đổi bạn thực hiện sau đó cũng xuất hiện trong
+[Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) trong vòng một giờ.
+
+| Trạng thái                          | Ý nghĩa                                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------------------------ |
+| Verified                            | Bản ghi đã được công bố với giá trị đúng.                                                  |
+| Pending                             | Chưa tìm thấy, hoặc chưa được kiểm tra.                                                    |
+| Pending · old value still cached    | Một bản ghi TXT vẫn trả về giá trị cũ; trạng thái sẽ cập nhật khi hết TTL đang hiển thị.  |
+| Wrong value                         | Bản ghi CNAME hoặc MX trỏ đến nơi khác; giá trị tìm thấy hiển thị bên dưới.                |
+| Missing                             | Không có bản ghi loại đó tại tên đó.                                                       |
+| Couldn't check                      | Truy vấn DNS thất bại. ReputeCast thử lại ở lần kiểm tra tiếp theo.                        |
+
+Hầu hết nhà cung cấp DNS công bố thay đổi trong vài phút; một số mất đến 48 giờ. Cho đến khi SPF cho phép nhà cung cấp
+gửi thư và DKIM được xác minh, Độ sẵn sàng gửi chặn các chiến dịch từ tên miền này, và việc thiếu bản ghi DMARC cũng
+chặn chúng.
+
+## Chọn chính sách DMARC
+
+`p=none` yêu cầu bên nhận vẫn chuyển thư không đạt DMARC như bình thường và chỉ gửi báo cáo cho bạn. `p=quarantine`
+đưa thư đó vào spam, còn `p=reject` từ chối thư. Gmail, Yahoo và Microsoft chấp nhận `p=none` từ người gửi hàng loạt
+([Yêu cầu gửi thư hàng loạt của Gmail, Yahoo và Microsoft](/vi/deliverability/bulk-sender-requirements/)).
+
+- **Có dịch vụ khác gửi thư dưới tên miền, hoặc bạn không chắc:** hãy bắt đầu với `p=none` và một địa chỉ `rua` để thu
+  thập báo cáo tổng hợp. Mẹo DMARC của ReputeCast cũng khuyên như vậy khi bản ghi gợi ý của nó quá nghiêm ngặt.
+- **Chỉ các nhà cung cấp gửi thư trong ReputeCast gửi thư dưới tên miền:** bản ghi gợi ý của ReputeCast, `p=quarantine`,
+  là an toàn khi mọi bản ghi trong bảng đã được xác minh.
+
+```txt title="_dmarc.news.acme.io TXT (chính sách khởi đầu)"
+v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
+```
+
+Sau đó, hãy đọc báo cáo trong vài tuần và nâng chính sách khi mọi nguồn hợp lệ đều đạt, như mô tả trong
+[Đọc báo cáo tổng hợp DMARC](/vi/deliverability/dmarc-reports/). Bản ghi DMARC tại tên miền tổ chức (`_dmarc.acme.io`)
+cũng áp dụng cho các tên miền con như `news.acme.io`; thẻ `sp=` của bản ghi đặt chính sách cho các tên miền con, và
+ReputeCast đọc thẻ này khi tên miền con không có bản ghi riêng.
+
+## Kiểm tra kết quả
+
+- Tên bảng hiển thị "Bản ghi · đã xác minh 7 trên 7" (với số lượng của bạn), và dòng trạng thái ghi "Mọi bản ghi đã xác
+  minh".
+- Trong bảng tên miền tại <UiPath path="nav.settings > settings.senders" />, SPF hiển thị `pass`, DKIM hiển thị
+  `Verified` (hoặc, khi có nhiều nhà cung cấp gửi thư, một số đếm như `3 of 3 providers`) và DMARC hiển thị chính sách,
+  như `p=quarantine`. `p=none` hiển thị là cảnh báo, không phải lỗi.
+- Nhóm Xác thực trong [Độ sẵn sàng gửi](/vi/campaigns/send-readiness/) đạt với chiến dịch từ tên miền này: "SPF
+  authorizes …", "DKIM signing on …", "DMARC p=…" và, nếu nhà cung cấp gửi thư hỗ trợ, "Custom MAIL FROM domain
+  verified".
+- Một lần [kiểm tra vị trí thư](/vi/deliverability/placement-tests/) cho thấy kết quả SPF, DKIM và DMARC mà các hộp thư
+  thật đã ghi nhận cho các bản sao.
+
+## Khắc phục sự cố
+
+- **SPF hiển thị Invalid.** Tên miền công bố hai bản ghi `v=spf1`, khiến SPF thất bại với lỗi vĩnh viễn
+  ([RFC 7208, mục 4.5](https://www.rfc-editor.org/rfc/rfc7208#section-4.5), kiểm tra tháng 10/2026). Hãy gộp chúng
+  thành một bản ghi với giá trị ReputeCast hiển thị và xóa bản ghi còn lại.
+- **SPF hiển thị Too many lookups.** SPF cho phép tối đa 10 truy vấn DNS qua các phần `include`, `a`, `mx`, `ptr`,
+  `exists` và `redirect`, kể cả các include lồng nhau
+  ([RFC 7208, mục 4.6.4](https://www.rfc-editor.org/rfc/rfc7208#section-4.6.4), kiểm tra tháng 10/2026). Hãy bỏ include
+  của các dịch vụ bạn không còn dùng; các phần `ip4` và `ip6` không được tính. ReputeCast không đếm số truy vấn của giá
+  trị đã gộp trước khi bạn công bố, nên hãy xem trạng thái sau khi công bố.
+- **SPF kết thúc bằng `+all`.** ReputeCast coi bản ghi này là không hợp lệ, vì nó cho phép bất kỳ ai gửi thư dưới tên
+  miền. Hãy dùng `~all` hoặc `-all`.
+- **Một bản ghi vẫn Missing dù bạn đã thêm.** Kiểm tra xem tên có bị lặp tên zone không (`news.acme.io.acme.io`) và bạn
+  đã sửa zone tại đúng nhà cung cấp DNS mà máy chủ tên miền trỏ đến chưa.
+- **Bản ghi CNAME DKIM trên Cloudflare vẫn Pending.** Kiểm tra bản ghi đang ở chế độ **DNS only**, không phải proxy.
+- **Độ sẵn sàng gửi cảnh báo khóa DKIM ngắn hơn 1024 bit.** Các nhà cung cấp hộp thư yêu cầu khóa tối thiểu 1024 bit;
+  hãy tạo khóa dài hơn ở nhà cung cấp gửi thư và công bố bản ghi mới.
+- **"Cloudflare rejected this token."** Token thiếu quyền **Zone › DNS › Edit** trên zone này. Hãy tạo token bằng mẫu
+  **Edit zone DNS** cho đúng zone.
+- **"No Cloudflare zone … is visible to this token."** Phần zone resources của token không bao gồm zone của tên miền.
+- **Không thấy nút Cloudflare.** Máy chủ tên miền không phải của Cloudflare, hoặc ReputeCast chưa tra cứu chúng. Hãy
+  dùng tệp zone.
+- **Gmail từ chối thư với 550 5.7.26.** Thư không đạt xác thực; xem
+  [Gmail 550 5.7.26](/vi/smtp-errors/gmail-550-5-7-26/).
+
+## Liên quan
+
+- [Đọc báo cáo tổng hợp DMARC](/vi/deliverability/dmarc-reports/)
+- [Cấu hình BIMI](/vi/deliverability/bimi/)
+- [Yêu cầu gửi thư hàng loạt của Gmail, Yahoo và Microsoft](/vi/deliverability/bulk-sender-requirements/)
+- [Thêm tên miền gửi thư và người gửi](/vi/providers/senders-and-domains/)
+- [Giám sát tình trạng tên miền và nhà cung cấp](/vi/deliverability/health/)

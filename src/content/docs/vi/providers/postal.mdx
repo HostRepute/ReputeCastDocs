@@ -1,0 +1,137 @@
+---
+title: Gửi thư bằng máy chủ Postal của riêng bạn
+description: 'Gửi newsletter bằng máy chủ Postal qua ReputeCast: kết nối API của máy chủ, thêm webhook có ký trong Postal và khởi động IP mới trước khi gửi hàng loạt.'
+type: how-to
+audience: [admin, operator]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: gửi newsletter bằng máy chủ Postal
+sources:
+  - internal/providers/postal
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/netguard/netguard.go
+  - internal/config/config.go
+  - web/src/features/connect
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Nếu bạn tự vận hành máy chủ mail Postal, ReputeCast có thể gửi newsletter qua HTTP API của Postal và đọc các webhook có
+ký của nó, nên khi gửi newsletter bằng máy chủ Postal, bạn có cùng cách xử lý thư trả lại, tự động tạm dừng và báo cáo
+như với mọi nhà cung cấp gửi thư khác. Bạn tự thêm webhook trong Postal, công bố các bản ghi DNS của Postal, và khởi
+động IP của máy chủ trước khi để nó gửi thư của luồng Gửi hàng loạt.
+
+<ProviderMatrix family="email" id="postal" />
+
+## Trước khi bắt đầu
+
+- **Một Postal mail server** và một API credential cho nó (Postal › mail server của bạn › Credentials, loại API; SMTP
+  credential không dùng được) ([Postal: Using the API](https://docs.postalserver.io/developer/api/), kiểm tra tháng
+  10/2026).
+- **Truy cập mạng theo cả hai chiều.** ReputeCast gọi API của Postal và đọc public signing key của nó từ
+  `<Server URL>/.well-known/jwks.json`; Postal gửi webhook tới `<public URL>/hooks/postal/<token>`.
+- **Với máy chủ Postal trong mạng nội bộ của bạn**, quản trị viên hệ thống bật `providers.allow_private_networks`
+  (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`) và khởi động lại ReputeCast. Nếu không bật, ReputeCast từ chối
+  địa chỉ loopback và địa chỉ riêng. Địa chỉ cloud metadata và link-local luôn bị từ chối. Xem
+  [tham chiếu cấu hình](/vi/reference/configuration/).
+- **Quyền.** Kết nối cần `providers:manage`; thêm tên miền gửi mới cần `domains:manage`.
+
+## Kết nối Postal
+
+<Steps>
+
+1. Mở <UiPath path="nav.providers" />, chọn <UiPath path="providers.overview.addProvider" /> rồi chọn Postal trong
+   danh mục. [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/) giải thích các bước chung của mọi nhà cung cấp.
+
+2. Nhập <UiPath path="providers.fields.postal.serverUrl" /> (địa chỉ giao diện web của Postal, ví dụ
+   `https://mta.acme.io`) và <UiPath path="providers.fields.apiKey" />. Chọn
+   <UiPath path="connect.connection.connect" />. ReputeCast kiểm tra khóa bằng một lệnh gọi API vô hại và lưu khóa ở
+   dạng mã hóa; sau đó thẻ ghi "Postal · reachable".
+
+3. Trong <UiPath path="connect.connection.webhooksTitle" />, ReputeCast kiểm tra URL công khai của chính nó, rồi hiển
+   thị URL webhook. Chọn <UiPath path="connect.connection.copyUrl" />. Trình hướng dẫn cũng có
+   <UiPath path="connect.connection.createSecret" />: hãy bỏ qua. Postal ký webhook bằng khóa RSA riêng, và ReputeCast
+   kiểm tra chữ ký đó.
+
+4. Trong Postal, mở mail server › Webhooks và thêm một webhook với URL đó cho tất cả sự kiện. ReputeCast dùng
+   `MessageSent`, `MessageDelayed`, `MessageDeliveryFailed`, `MessageHeld` và `MessageBounced`, cùng
+   `MessageLinkClicked` và `MessageLoaded` nếu Postal gửi chúng
+   ([Postal: Webhooks](https://docs.postalserver.io/developer/webhooks/), kiểm tra tháng 10/2026).
+
+5. Chọn <UiPath path="connect.connection.continueDomain" /> và nhập tên miền gửi. ReputeCast không thêm được tên miền
+   vào Postal: hãy thêm tên miền trong Postal và công bố các bản ghi DKIM và return-path mà Postal hiển thị. ReputeCast
+   đề xuất một bản ghi SPF với `a:<your Postal host>`, gộp với bản ghi SPF hiện có, và DMARC nếu tên miền chưa có.
+
+6. Trong <UiPath path="connect.stepTest" />, gửi thư thử. Dòng thời gian chờ webhook `MessageSent` của Postal.
+
+7. Trong <UiPath path="connect.stepStreams" />, chọn các luồng. IP mới chưa có uy tín, nên hãy bắt đầu với thư Hệ
+   thống hoặc Tự động hóa, hoặc một tỷ trọng nhỏ của luồng Gửi hàng loạt.
+
+8. Mở <UiPath path="nav.providers > providers.tabWarmup" />, chọn <UiPath path="providers.warmup.newPlan" /> cho máy
+   chủ Postal và bắt đầu kế hoạch. Kế hoạch tăng dần lượng gửi mỗi ngày, gửi cho các liên hệ tương tác nhiều nhất
+   trước và giảm tốc khi thư trả lại hoặc khiếu nại tăng.
+
+   <Screenshot
+     id="providers-warmup"
+     alt="IP riêng của một máy chủ Postal ở ngày 9 trong kế hoạch khởi động 21 ngày: giới hạn hôm nay là 6.000, tỷ lệ trả thư và tỷ lệ khiếu nại dưới ngưỡng bảo vệ, cùng mức tăng lượng gửi mỗi ngày."
+   />
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- Thẻ Postal trên <UiPath path="nav.providers > providers.tabProviders" /> hiển thị
+  <UiPath path="providers.statusWarmingUp" /> trong khi kế hoạch chạy.
+- Sự kiện của Postal xuất hiện trong <UiPath path="nav.providers > providers.tabEvents" /> bên cạnh sự kiện chuẩn hóa
+  của ReputeCast và phản hồi SMTP gốc.
+
+  <Screenshot
+    id="providers-events"
+    alt="Nhật ký sự kiện: MessageDeliveryFailed của Postal với HardFail được chuẩn hóa thành trả thư vĩnh viễn, SoftFail thành trả thư tạm thời, kèm mã SMTP gốc."
+  />
+
+ReputeCast gửi mỗi lệnh gọi API một thư thô (raw message) và gắn thẻ cho thư để webhook của Postal tìm được đường về.
+Bản sao và tệp đính kèm đều dùng được. Postal không báo hạn mức hay tốc độ, nên ReputeCast gửi tối đa 20 thư mỗi giây
+tới Postal, và ít hơn khi giới hạn hằng ngày và tốc độ của kế hoạch khởi động được áp dụng. `MessageDeliveryFailed`
+với lỗi vĩnh viễn là trả thư vĩnh viễn và khiến địa chỉ bị chặn gửi; `MessageBounced` (thư trả lại mà Postal nhận được
+về sau) được tính là trả thư tạm thời. Postal không có sự kiện khiếu nại hay hủy đăng ký, nên ReputeCast không nhận được
+khiếu nại qua Postal, và lượt hủy đăng ký chỉ đến từ liên kết của chính ReputeCast.
+
+## Khắc phục sự cố
+
+- **"ReputeCast won't connect to that address".** Server URL phân giải tới một địa chỉ riêng hoặc loopback. Hãy bật
+  `providers.allow_private_networks`, hoặc dùng địa chỉ công khai của Postal.
+- **"Postal (self-hosted) rejected this key"** kèm `InvalidServerAPIKey`. Hãy dùng API credential của cùng mail
+  server, không phải SMTP credential.
+- **"Postal (self-hosted) didn't answer the check".** ReputeCast không truy cập được server URL, URL chuyển hướng
+  (ReputeCast không đi theo chuyển hướng), hoặc máy chủ đang bị tạm ngưng. Hãy dùng chính xác địa chỉ HTTPS của giao
+  diện web.
+- **Webhook nhận `401`.** ReputeCast không xác minh được chữ ký của Postal: không đọc được
+  `<Server URL>/.well-known/jwks.json`, hoặc webhook đến từ một máy chủ Postal khác. Hãy kiểm tra URL JWKS có tải được
+  từ máy chủ ReputeCast hay không.
+- **Kiểm tra endpoint thất bại vì bản thân ReputeCast chỉ có địa chỉ riêng.** Postal không gửi tới đó được. Hãy cấp
+  cho ReputeCast một URL công khai truy cập được, hoặc chọn <UiPath path="connect.connection.usePolling" /> sau khi kết
+  nối: chế độ hỏi định kỳ chỉ đọc trạng thái gửi mới nhất của từng thư, không có thư trả lại, lượt mở hay lượt nhấp.
+- **Lượt mở hoặc lượt nhấp có vẻ bị nhân đôi.** Tính năng theo dõi lượt nhấp và lượt mở riêng của Postal đang bật cho
+  máy chủ. Hãy tắt trong Postal; ReputeCast không đọc được thiết lập đó.
+- **Bạn đã đổi URL công khai hoặc ngắt kết nối Postal.** ReputeCast không thay đổi gì trong Postal. Hãy cập nhật hoặc
+  xóa webhook ở đó.
+
+<Aside type="tip">
+  Postal cũng có SMTP endpoint. Kết nối Postal qua [bất kỳ máy chủ SMTP nào](/vi/providers/smtp/) cũng được, nhưng khi
+  đó thư trả lại đến từ hộp thư nhận thư trả lại thay vì qua webhook.
+</Aside>
+
+## Liên quan
+
+- [Khởi động nhà cung cấp hoặc IP mới](/vi/providers/warm-up/)
+- [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/)
+- [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/)
+- [Cấu hình SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/)
+- [Kiểm tra và gỡ tên khỏi danh sách chặn](/vi/deliverability/blocklists/)

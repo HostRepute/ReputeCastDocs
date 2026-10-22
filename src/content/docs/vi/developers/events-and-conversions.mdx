@@ -1,0 +1,222 @@
+---
+title: Ghi nhận sự kiện và chuyển đổi
+description: Dùng API theo dõi chuyển đổi để ghi nhận lượt nâng cấp và đơn hàng cho email đã mang chúng về, và gửi sự kiện API để khởi động tự động hóa.
+type: how-to
+audience: [developer]
+permissions: ['conversions:create', 'subscribers:edit']
+uiPath: 'nav.earn > earn.tabSettings > earn.settings.tabAttribution'
+primaryKeyword: API theo dõi chuyển đổi
+sources:
+  - internal/automations/events.go
+  - internal/automations/graph.go
+  - internal/automations/api.go
+  - internal/revenue/conversions.go
+  - internal/revenue/attribution.go
+  - internal/revenue/api.go
+  - internal/clicktoken/clicktoken.go
+  - internal/earn/hooks.go
+  - web/src/features/earn/revenue/attribution.messages.ts
+  - web/src/features/keys/CreateKeyDialog.tsx
+  - src/data/api-samples/send-automation-event.yaml
+  - src/data/api-samples/create-conversion.yaml
+sidebar:
+  order: 11
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Sản phẩm của bạn biết những điều ReputeCast không biết: một bản dùng thử vừa bắt đầu, một gói vừa được nâng cấp, một
+đơn hàng vừa được thanh toán. Hai endpoint đưa những dữ kiện đó vào ReputeCast. **Sự kiện API** khởi động và điều
+hướng [tự động hóa](/vi/reference/glossary/#automation). **API theo dõi chuyển đổi** ghi lại giá trị của một hành động
+và ghi nhận nó cho email chiến dịch hoặc email tự động hóa mà người đọc đã nhấp, để doanh thu hiển thị ngay cạnh các
+email của bạn.
+
+## Trước khi bắt đầu
+
+- Một khóa API. Sự kiện API cần `subscribers:edit`. Chuyển đổi cần `conversions:create`; mẫu khóa
+  <UiPath path="keys.presetConversions" /> trong <UiPath path="nav.settings > settings.keys" /> chỉ chứa đúng quyền đó
+  và mặc định hết hạn sau 1 năm. <UiPath path="earn.attribution.createKey" /> trong
+  <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" /> mở cùng hộp thoại đó.
+- Liên hệ phải tồn tại sẵn trong không gian làm việc. Không endpoint nào tạo liên hệ; hãy dùng
+  [Tạo hoặc cập nhật liên hệ](/vi/developers/integration-api/#hành-động) trước.
+
+## Gửi sự kiện API
+
+`POST /api/v1/workspaces/<workspace>/automations/events` ghi lại một sự kiện cho một liên hệ:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:edit.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/automations/events \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "event": "trial.started",
+    "email": "sam.rivera@outlook.com",
+    "properties": { "plan": "team", "trial_days": 14 }
+  }'
+```
+
+- `event` là tên sự kiện: gồm chữ cái, chữ số và `. _ : -`, bắt đầu bằng chữ cái hoặc chữ số, tối đa 100 ký tự
+  (`trial.started`, `workspace.created`).
+- Cho biết sự kiện liên quan đến ai bằng `email` hoặc `contactId`. Địa chỉ không xác định sẽ trả về `404`: hãy thêm
+  liên hệ trước.
+- `properties` là một đối tượng JSON bất kỳ, tối đa 16 KB.
+
+Phản hồi là `202` kèm liên hệ và số tự động hóa đang chạy mà sự kiện khởi động:
+
+```json title="202 Accepted"
+{ "accepted": true, "contactId": "0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f", "flows": 1 }
+```
+
+### Dùng sự kiện trong tự động hóa
+
+<Steps>
+
+1. Trong <UiPath path="nav.automations" />, mở một luồng và đặt trình kích hoạt của nó là
+   <UiPath path="automations.graph.kindApiEvent" />.
+
+2. Nhập đúng <UiPath path="automations.panels.eventName" /> mà sản phẩm của bạn gửi, ví dụ `trial.started`. Tên phải
+   khớp chính xác.
+
+3. Xuất bản luồng. Liên hệ được đưa vào luồng trong vài giây sau mỗi sự kiện.
+
+</Steps>
+
+Mục tiêu và nhánh cũng có thể chờ một sự kiện, bằng điều kiện <UiPath path="automations.panels.condEvent" />. Danh sách
+đầy đủ các trình kích hoạt và bước nằm trong [Trình kích hoạt và bước](/vi/automations/triggers-and-steps/).
+
+Sự kiện là hoạt động của liên hệ, giống lượt mở và lượt nhấp, nên chúng không xuất hiện trong nhật ký kiểm tra. Mỗi
+lệnh gọi ghi một sự kiện mới: đừng thử lại lệnh gọi đã nhận phản hồi `202`.
+
+## Ghi nhận chuyển đổi
+
+`POST /api/v1/workspaces/<workspace>/conversions` ghi lại một việc có giá trị mà người đọc đã làm trong sản phẩm của
+bạn:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with conversions:create.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# Add "click_token" with the rc_click value of the link the reader followed, when you have it.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/conversions \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: order-1042' \
+  --data '{
+    "name": "Upgraded to Team plan",
+    "value": "29.00",
+    "currency": "USD",
+    "email": "sam.rivera@outlook.com",
+    "metadata": { "order_id": "1042" }
+  }'
+```
+
+<TableScroll label="Các trường của chuyển đổi">
+
+| Trường        | Bắt buộc          | Nội dung                                                                                       |
+| ------------- | ----------------- | ---------------------------------------------------------------------------------------------- |
+| `name`        | Có                | Việc đã xảy ra, tối đa 120 ký tự: "Upgraded to Team plan".                                     |
+| `value`       | Có                | Một **chuỗi** số thập phân, `"29.00"`, không phải `29`. Số chữ số thập phân không vượt quá số mà đơn vị tiền tệ có. |
+| `currency`    | Có                | Mã ISO 4217 gồm ba chữ cái: `USD`, `EUR`, `JPY`.                                               |
+| `email`       | Một trong hai     | Địa chỉ của người đọc.                                                                         |
+| `click_token` | Một trong hai     | Giá trị `rc_click` từ liên kết mà người đọc đã nhấp. Xem [Truyền token lượt nhấp](#truyền-token-lượt-nhấp). |
+| `occurred_at` | Không             | Thời điểm xảy ra, theo RFC 3339. Lùi lại tối đa 30 ngày; nếu bỏ trống thì lấy thời điểm hiện tại. |
+| `metadata`    | Không             | Các trường riêng của bạn, được lưu cùng chuyển đổi (tối đa 8 KB).                              |
+
+</TableScroll>
+
+Hãy gửi header `Idempotency-Key` (tối đa 200 ký tự), chẳng hạn ID đơn hàng của bạn. Gửi lại cùng khóa với cùng phần
+thân sẽ nhận lại chuyển đổi đầu tiên thay vì ghi thêm một chuyển đổi nữa; cùng khóa nhưng phần thân khác sẽ trả về
+`409 idempotency_key_reused`. Khóa được ghi nhớ riêng cho từng khóa API.
+
+Phản hồi là `202` và cho biết chuyển đổi được khớp như thế nào:
+
+```json title="202 Accepted"
+{
+  "id": "0192f1c4-9e21-7a40-8c3b-2d4f6a8b0c1e",
+  "matched": "click_token",
+  "credited": { "kind": "campaign", "id": "0192f0aa-1b2c-7d3e-9f40-5a6b7c8d9e0f", "name": "Weekly Digest #142" }
+}
+```
+
+## Cách ghi nhận một chuyển đổi
+
+ReputeCast ghi nhận chuyển đổi cho email chiến dịch hoặc email tự động hóa cuối cùng mà người đọc đã nhấp trong
+**khung thời gian phân bổ**: mặc định 7 ngày, có thể đặt từ 1 đến 30 ngày trong
+<UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution > earn.attribution.windowTitle" />.
+
+1. Với `click_token` hợp lệ: email chứa liên kết đã được nhấp, khi lượt nhấp nằm trong khung thời gian trước
+   `occurred_at`. `matched` là `click_token`.
+2. Nếu không, với `email` khớp một liên hệ: `matched` là `email`, và chuyển đổi được ghi nhận cho email cuối cùng mà
+   liên hệ đó đã nhấp trong khung thời gian, nếu có.
+3. Nếu không, `matched` là `none`. Chuyển đổi vẫn được lưu nhưng không được ghi nhận cho email nào.
+
+Khi không có gì được ghi nhận, phản hồi không có trường `credited`.
+
+Một chuyển đổi được ghi nhận sẽ phát sự kiện webhook `conversion.recorded`
+([Sự kiện webhook](/vi/reference/webhook-events/)). Chuyển đổi xuất hiện trong
+<UiPath path="earn.attribution.logTitle" /> và dưới dạng chuyển đổi sản phẩm trên trang tổng quan doanh thu; chúng
+không được tính vào MRR ([Giải thích các chỉ số doanh thu](/vi/earn/revenue/)).
+
+### Truyền token lượt nhấp
+
+Khớp theo email chỉ hoạt động khi người đọc là liên hệ đã biết và đã nhấp. Token lượt nhấp vẫn hoạt động cả khi người
+đọc đăng ký bằng một địa chỉ khác:
+
+<Steps>
+
+1. Bật <UiPath path="earn.attribution.tokenTitle" /> và thêm các tên miền của sản phẩm, chẳng hạn
+   `app.example.com`.
+
+2. Khi đó, liên kết trong email trỏ tới các tên miền này sẽ mang `rc_click=…`. Token không thể đọc nội dung (opaque) và
+   có chữ ký, và không bao giờ được thêm vào liên kết tới tên miền khác, kể cả liên kết của nhà tài trợ.
+
+3. Trong sản phẩm, đọc `rc_click` từ URL trang đích và lưu nó cùng khách truy cập (ví dụ trong phiên của họ hoặc
+   trong bản ghi đăng ký).
+
+4. Gửi nó dưới dạng `click_token` khi chuyển đổi xảy ra. Token cũ hơn khung thời gian phân bổ không còn ghi nhận được
+   gì.
+
+</Steps>
+
+## Lỗi và giới hạn
+
+- `422 missing_identity`: gửi `email`, `click_token` hoặc cả hai.
+- `422 invalid_value`: gửi giá trị dưới dạng chuỗi thập phân, với số chữ số thập phân không vượt quá mức đơn vị tiền tệ
+  cho phép.
+- `422 invalid_currency`: dùng mã ISO 4217 gồm ba chữ cái.
+- `422 occurred_at_out_of_range`: `occurred_at` cách đây hơn 30 ngày hoặc nằm ở tương lai.
+- `409 idempotency_key_reused`: khóa đi kèm một phần thân khác.
+- `429 rate_limited`: mỗi khóa ghi nhận tối đa 600 chuyển đổi mỗi phút; hãy chờ theo `Retry-After`.
+
+Mọi mã lỗi được liệt kê trong [Lỗi](/vi/developers/api-errors/).
+
+## Kiểm tra kết quả
+
+- Trong <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" />,
+  <UiPath path="earn.attribution.sendTest" /> ghi một chuyển đổi thử cho địa chỉ của chính bạn. Chuyển đổi từ sản phẩm
+  của bạn hiển thị trong <UiPath path="earn.attribution.logTitle" />, mới nhất ở trên cùng.
+- Phản hồi của sự kiện API cho biết số luồng đang chạy mà nó đã khởi động (`flows`). Số liệu theo bước của tự động hóa
+  cho thấy liên hệ đi vào luồng.
+
+## Khắc phục sự cố
+
+- **`matched: "none"` hoặc không có `credited`**: người đọc không nhấp email nào trong khung thời gian, hoặc địa chỉ
+  không phải là liên hệ. Hãy truyền token lượt nhấp, hoặc mở rộng khung thời gian.
+- **`flows: 0`**: không có tự động hóa đang chạy nào có trình kích hoạt sự kiện API với đúng tên sự kiện này. Hãy kiểm
+  tra chính tả và xem luồng đã được xuất bản chưa.
+- **`404` với sự kiện API**: liên hệ không tồn tại; hãy tạo liên hệ trước.
+- **Chuyển đổi bị trùng**: gửi `Idempotency-Key` và dùng lại khóa đó khi thử lại.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Kiếm tiền từ bản tin" href="/vi/earn/overview/" description="Gói trả phí, doanh thu và phân bổ." />
+  <LinkCard title="Xây dựng tự động hóa" href="/vi/automations/overview/" description="Các luồng phản ứng với sự kiện từ sản phẩm của bạn." />
+  <LinkCard title="Xây dựng tích hợp" href="/vi/developers/integration-api/" description="Liên hệ, danh sách, thẻ và sự kiện từ các công cụ khác." />
+  <LinkCard title="Tài liệu API" href="/api/operations/create-conversion/" description="Thao tác create-conversion, đầy đủ chi tiết." />
+</CardGrid>

@@ -1,0 +1,197 @@
+---
+title: Khắc phục sự cố
+description: 'Khắc phục sự cố ReputeCast: triệu chứng, nguyên nhân và cách sửa, từ thiếu mật khẩu đầu tiên đến webhook im lặng và màn hình theo dõi trực tiếp đứng yên.'
+type: how-to
+audience: [operator]
+primaryKeyword: khắc phục sự cố ReputeCast
+sources:
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/app/app.go
+  - internal/accounts/service.go
+  - internal/accounts/reset.go
+  - internal/config/config.go
+  - internal/segments/sqlmode.go
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/netguard/netguard.go
+  - internal/connect/connection.go
+  - internal/sending/engine/api.go
+  - internal/linktoken/linktoken.go
+  - deploy/docker-compose.yml
+sidebar:
+  order: 17
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Trang khắc phục sự cố ReputeCast này liệt kê những lỗi thường gặp nhất trên một hệ thống tự triển khai, nguyên nhân và
+cách sửa. Mỗi mục bắt đầu bằng những gì bạn nhìn thấy.
+
+## Trước khi bắt đầu
+
+<Steps>
+
+1. Đọc log của ứng dụng. Với Docker Compose: `docker compose logs app --since 1h`. Với tệp nhị phân chạy dưới systemd:
+   `journalctl -u reputecast --since "1 hour ago"`.
+
+2. Kiểm tra tiến trình và cơ sở dữ liệu: `curl -s http://localhost:8080/readyz` trả về `ready` khi ReputeCast kết nối
+   được PostgreSQL ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+
+3. Kiểm tra schema: `docker compose exec app /usr/local/bin/reputecast migrate status` (hoặc `reputecast migrate status`)
+   liệt kê mọi migration đang ở trạng thái `pending`.
+
+4. Để có thêm chi tiết, hãy khởi động lại với `REPUTECAST_LOG__LEVEL=debug`, rồi đặt lại như cũ sau đó.
+
+</Steps>
+
+## Cài đặt và khởi động
+
+### Mật khẩu tạm thời không có trong log
+
+Chủ sở hữu đầu tiên và mật khẩu tạm thời của họ chỉ được tạo ở lần khởi động đầu tiên trên một cơ sở dữ liệu trống. Hãy
+chạy:
+
+```sh
+docker compose logs app | grep -A4 "ReputeCast is installed"
+```
+
+- **Không tìm thấy gì, và volume cơ sở dữ liệu đã có từ trước:** người dùng đã tồn tại, nên không có gì được tạo. Hãy
+  dùng tài khoản bạn đã tạo khi đó, hoặc đặt mật khẩu mới cho tài khoản đó từ máy chủ (bên dưới).
+- **Không tìm thấy gì, và container đã được tạo lại:** `docker compose logs` chỉ hiển thị log của container hiện tại.
+  Hãy đặt mật khẩu mới từ máy chủ.
+- **Bạn không biết email của Chủ sở hữu:** nếu không có `REPUTECAST_ADMIN_EMAIL`, tệp compose đi kèm dùng
+  `admin@example.com`.
+
+Để đặt mật khẩu từ máy chủ:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email admin@example.com --password 'a long passphrase here'
+```
+
+Xem [khôi phục quyền truy cập từ dòng lệnh](/vi/self-hosting/account-recovery/).
+
+### Container ứng dụng liên tục khởi động lại
+
+Đọc những dòng cuối của `docker compose logs app`. Quá trình khởi động dừng với `Error: …`:
+
+- `Error: previous secret key: key must be 32 bytes, got 0`: `REPUTECAST_SECRETS__PREVIOUS_KEYS` được đặt nhưng để
+  trống. Hãy xóa biến này.
+- `Error: secret key: key must be 32 bytes, got …` hoặc `key must be base64-encoded`: khóa trong
+  `REPUTECAST_SECRETS__KEY` hoặc trong tệp khóa không phải khóa 32 byte mã hóa base64. Hãy dùng nguyên giá trị mà
+  `reputecast secrets generate-key` in ra, không sửa gì.
+- `Error: owner email: … (pass --email or set REPUTECAST_ADMIN_EMAIL)`: cơ sở dữ liệu trống và email của Chủ sở hữu đầu
+  tiên bị thiếu hoặc không phải địa chỉ hợp lệ.
+- `Error: migrate: …`: một migration thất bại. Hãy khôi phục bản sao lưu đã tạo trước khi nâng cấp và báo lỗi kèm phiên
+  bản ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+### Log cảnh báo có migration đang chờ
+
+Tệp nhị phân mới hơn schema của cơ sở dữ liệu và tiến trình được khởi động mà không có `--auto-migrate`. Hãy chạy
+`reputecast migrate up` một lần với môi trường của máy chủ, rồi khởi động lại mọi tiến trình. Image Docker tự chạy
+migration khi khởi động.
+
+### `/readyz` trả về `503 database unavailable`
+
+ReputeCast không kết nối được PostgreSQL trong vòng 2 giây. Hãy kiểm tra rằng cơ sở dữ liệu đang chạy, rằng
+`REPUTECAST_DATABASE__URL` trỏ đúng tới nó, và rằng `database.max_conns` mỗi tiến trình nhân với số tiến trình vẫn nhỏ
+hơn `max_connections` của PostgreSQL ([PostgreSQL](/vi/self-hosting/postgres/)).
+
+## Đăng nhập
+
+### Đăng nhập qua `http://` đưa bạn quay lại trang đăng nhập
+
+Ngoài môi trường phát triển, cookie phiên được đánh dấu `Secure`, và trình duyệt không giữ cookie `Secure` do một trang
+`http://` thường đặt, trừ trên `localhost`
+([MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie), kiểm tra tháng
+10/2026). Hãy đặt ReputeCast phía sau TLS và đặt `http.public_url` thành địa chỉ `https://`
+([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)). Chỉ để thử nhanh trong mạng nội bộ, bạn có thể đặt
+`REPUTECAST_AUTH__COOKIE_SECURE=false`.
+
+### "Sign-in is locked after too many attempts"
+
+Email đó đã bị nhập sai mật khẩu quá nhiều lần. Hãy gỡ khóa trong
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, đặt mật khẩu mới qua liên kết đặt lại, hoặc chờ khóa hết
+hạn (mặc định 15 phút). Ở phiên bản hiện tại, `reputecast user unlock` không gỡ được khóa này. Xem
+[gỡ khóa đăng nhập](/vi/self-hosting/account-recovery/#gỡ-khóa-đăng-nhập).
+
+### Mã từ ứng dụng xác thực thất bại với `secrets: cannot decrypt value`
+
+Khóa bí mật không khớp với cơ sở dữ liệu, thường xảy ra sau khi khôi phục mà không có khóa hoặc sau khi tệp khóa bị
+mất. Hãy đặt lại khóa gốc. Nếu khóa đã mất, xem [sao lưu và khôi phục](/vi/self-hosting/backups/): mọi người đăng nhập
+bằng mã khôi phục hoặc khóa truy cập, và một quản trị viên đặt lại ứng dụng xác thực của họ.
+
+### Email đặt lại mật khẩu không bao giờ đến
+
+Email đặt lại mật khẩu được gửi trên luồng Hệ thống. Cho đến khi có một nhà cung cấp gửi thư phục vụ luồng này, ứng
+dụng hiển thị lệnh cần chạy thay vì gửi email: `reputecast user reset-password --email <address>` in liên kết ra trên
+máy chủ.
+
+## Nhà cung cấp gửi thư và webhook
+
+### Webhook của nhà cung cấp không bao giờ đến
+
+Sự kiện gửi thư vẫn trống, và một nhà cung cấp gửi thư hiển thị "Degraded · webhooks silent" ("Suy giảm · webhook im
+lặng" trong giao diện tiếng Việt) ở <UiPath path="nav.providers" />. Nhà cung cấp gửi sự kiện đến
+`<public URL>/hooks/…`, nên:
+
+- URL công khai phải truy cập được từ internet. Hãy chạy <UiPath path="admin.publicUrlCheck" /> trong
+  <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />: dòng kiểm tra khả năng truy cập phải đạt. Một URL như
+  `http://localhost:8080` không thể nhận webhook.
+- Reverse proxy của bạn phải chuyển nguyên vẹn các đường dẫn `/hooks/` đến ReputeCast.
+- Nếu bạn tách vai trò, ít nhất một tiến trình phải chạy vai trò `ingest` phía sau địa chỉ đó
+  ([mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/)).
+
+Sau khi đổi URL công khai, các nhà cung cấp hỗ trợ việc này tự động nhận địa chỉ webhook mới; trang sẽ liệt kê các nhà
+cung cấp còn lại, nơi bạn tự dán địa chỉ. Xem [tình trạng nhà cung cấp và sự cố](/vi/providers/health-and-outages/).
+
+### Yêu cầu đến địa chỉ riêng bị từ chối
+
+ReputeCast từ chối các yêu cầu gửi ra địa chỉ riêng và loopback, ví dụ
+`address not allowed: 10.0.0.5 is a private or loopback address`. Với máy chủ Postal, máy chủ SMTP hoặc một dịch vụ
+khác trong mạng của bạn, hãy đặt `providers.allow_private_networks: true`; với endpoint webhook, n8n và luồng nhật ký
+kiểm tra, hãy đặt `webhooks.allow_private_networks: true`. Địa chỉ link-local và địa chỉ metadata của cloud vẫn bị
+chặn. Xem [bảo mật và gia cố hệ thống](/vi/self-hosting/security/#mạng-nội-bộ).
+
+## Theo dõi trực tiếp không bao giờ cập nhật
+
+Màn hình theo dõi trực tiếp của một lượt gửi đang chạy cứ đứng ở các con số đầu tiên cho đến khi bạn tải lại trang. Nó
+đọc một luồng server-sent events tại `/api/v1/workspaces/<workspace>/campaigns/<campaign>/live/stream`, luồng này gửi
+heartbeat mỗi 15 giây. Proxy có bật buffer phản hồi sẽ giữ các sự kiện lại. Hãy tắt buffer cho đường dẫn đó, như hướng
+dẫn trong [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+
+## Phân khúc SQL bị tắt
+
+Khi tạo một phân khúc SQL, ứng dụng trả lời `SQL segments are turned off on this database.` Role PostgreSQL
+`reputecast_segments` bị thiếu, hoặc user cơ sở dữ liệu của ứng dụng không phải thành viên của role đó, thường gặp trên
+PostgreSQL được quản lý, nơi user không thể tạo role. Hãy làm theo
+[các bước cho phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql): trên cơ sở dữ liệu đã được migrate trước khi role
+tồn tại, chỉ chạy `reputecast migrate up` là chưa đủ để bật tính năng này.
+
+## Kiểm tra danh sách chặn thất bại
+
+Kết quả danh sách chặn của Spamhaus hoặc URIBL báo lỗi như
+`Spamhaus answered 127.255.255.254 (use your own resolver, not a public one)` hoặc
+`the list refused queries from this resolver`. Các danh sách này từ chối truy vấn đi qua resolver công cộng (1.1.1.1,
+8.8.8.8). Hãy trỏ `dns.servers` đến resolver đệ quy của riêng bạn, ví dụ `REPUTECAST_DNS__SERVERS=10.0.0.53`. Xem
+[kiểm tra và xử lý khi bị đưa vào danh sách chặn](/vi/deliverability/blocklists/).
+
+## Liên kết trong email đã gửi ngừng hoạt động
+
+Liên kết hủy đăng ký, liên kết tùy chọn và liên kết theo dõi trong các email gửi trước đó dẫn đến trang lỗi. Các liên
+kết được ký bằng một khóa suy ra từ khóa bí mật, nên chúng hỏng khi khóa thay đổi (xoay vòng khóa, hoặc khôi phục mà
+không có khóa gốc). Email mới vẫn hoạt động bình thường. Hãy khôi phục khóa gốc nếu bạn vẫn còn giữ
+([bảo mật và gia cố hệ thống](/vi/self-hosting/security/#khóa-bí-mật)).
+
+<Aside type="tip">
+  Vẫn chưa giải quyết được? Hãy tìm hoặc mở một issue tại [github.com/hostrepute/reputecast](https://github.com/hostrepute/reputecast/issues)
+  kèm phiên bản (`reputecast version`) và các dòng log quanh thời điểm xảy ra sự cố. Riêng sự cố bảo mật, hãy báo đến
+  security@hostrepute.com.
+</Aside>
+
+## Liên quan
+
+- [Health check, metrics và log](/vi/self-hosting/monitoring/)
+- [Khôi phục quyền truy cập từ dòng lệnh](/vi/self-hosting/account-recovery/)
+- [Tham chiếu cấu hình](/vi/reference/configuration/)

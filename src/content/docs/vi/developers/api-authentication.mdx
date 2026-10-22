@@ -1,0 +1,131 @@
+---
+title: Xác thực và khóa API
+description: Cách xác thực API key cho REST API của ReputeCast. Tiền tố khóa, header Bearer, quyền và phạm vi danh sách, hạn dùng, xoay vòng và các phản hồi 401.
+type: reference
+audience: [developer, admin]
+permissions: ['apikeys:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: xác thực API key
+sources:
+  - internal/api/auth.go
+  - internal/api/api.go
+  - internal/apikeys
+  - internal/authn/tokens.go
+  - internal/authz/authz.go
+  - internal/app/app.go
+  - internal/smtprelay/relay.go
+  - web/src/features/keys
+sidebar:
+  order: 3
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Trang này trình bày cách xác thực API key (khóa API) cho REST API của ReputeCast: những thông tin xác thực API chấp
+nhận, những gì một khóa được phép làm, và cách khóa được tạo, xoay vòng, thu hồi và bị từ chối. Để thực hiện lệnh gọi
+đầu tiên, hãy làm theo [thực hiện lệnh gọi API đầu tiên](/vi/developers/api-quickstart/).
+
+## Gửi khóa
+
+Gửi khóa trong header `Authorization` theo lược đồ `Bearer` ở mọi yêu cầu:
+
+```http title="Yêu cầu"
+GET /api/v1/workspaces/acme-newsletter/campaigns HTTP/1.1
+Host: reputecast.example.com
+Authorization: Bearer rc_live_…
+```
+
+- Khi yêu cầu có bearer token, chỉ riêng khóa quyết định ai đang gọi; cookie phiên bị bỏ qua.
+- Một khóa thuộc về một [không gian làm việc](/vi/reference/glossary/#workspace). Dùng khóa trong đường dẫn của không
+  gian làm việc khác sẽ nhận `403` với detail "This key belongs to another workspace."
+- Thao tác duy nhất không cần không gian làm việc trong đường dẫn là
+  [`GET /api/v1/integration`](/api/operations/get-integration/): thao tác này trả về slug, tên không gian làm việc và
+  các quyền của khóa đang gọi.
+
+## Thông tin xác thực
+
+Mỗi chuỗi bí mật gồm một tiền tố theo sau là 64 ký tự thập lục phân. ReputeCast chỉ hiển thị chuỗi này một lần, khi
+tạo hoặc xoay vòng, và chỉ lưu giá trị băm SHA-256 của nó.
+
+| Thông tin xác thực                                                            | Tạo ở đâu                                                                                                                                                          | Dùng cho                                                                                                                                  |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [Khóa API](/vi/reference/glossary/#api-key) <br /> `rc_live_`                 | <UiPath path="nav.settings > settings.keys > keys.createApiKey" />                                                                                                 | REST API.                                                                                                                                 |
+| [Khóa tích hợp](/vi/reference/glossary/#integration-key) <br /> `rc_live_`    | <UiPath path="nav.settings > settings.integrations" />, khi bạn kết nối Zapier, Make, n8n hoặc WordPress                                                           | REST API, giới hạn trong các trình kích hoạt và hành động được bật cho tích hợp đó.                                                       |
+| [Khóa chỉ gửi](/vi/reference/glossary/#send-only-key) <br /> `rc_live_`       | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createKey" />, hoặc <UiPath path="keys.presetSendOnly" /> trong hộp thoại tạo khóa | API gửi email giao dịch. Khóa này có `transactional:send` và không có quyền nào khác.                                                  |
+| Khóa chỉ gửi ở chế độ thử nghiệm <br /> `rc_test_`                            | Cùng hộp thoại đó, với <UiPath path="transactional.setup.mode" /> đặt thành <UiPath path="transactional.setup.modeTest" />                                         | API gửi email giao dịch. Khóa chỉ gửi đến các thành viên của không gian làm việc và các địa chỉ thử được phép của khóa.                  |
+| Thông tin xác thực SMTP <br /> `rc_smtp_`                                     | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createCredential" />                                                         | Mật khẩu cho [SMTP relay](/vi/transactional/smtp-relay/); tên đăng nhập là ID của khóa.                                                   |
+| Token [tác tử MCP](/vi/reference/glossary/#mcp-agent) <br /> `rc_agent_`      | <UiPath path="nav.settings > settings.keys > keys.addAgent" />                                                                                                     | Máy chủ MCP tại `/mcp` (xem [kết nối tác tử AI bằng MCP](/vi/developers/mcp/)). REST API cũng chấp nhận token này, với quyền của tác tử. |
+
+Ứng dụng web đăng nhập cho người dùng bằng cookie `rc_session`. Script và dịch vụ dùng khóa.
+
+## Một khóa được phép làm gì
+
+- **Quyền.** Bạn chọn từ 1 đến 60 khóa [quyền](/vi/reference/glossary/#permission), cũng là các khóa mà vai trò sử
+  dụng. Bạn chỉ có thể cấp những quyền chính bạn đang có; yêu cầu nhiều hơn sẽ nhận `403` với mã
+  `escalation_denied`. Những quyền chỉ con người được giữ không bao giờ đến được khóa (xem quy tắc người giữ quyền trong
+  [quyền và vai trò](/vi/reference/permissions/)).
+- **Không bao giờ vượt quá người tạo.** Ở mỗi lệnh gọi, quyền của khóa bị cắt bớt cho bằng những gì thành viên tạo ra
+  khóa đang có vào thời điểm đó. Khi người tạo mất một quyền, khóa cũng mất quyền đó. Khi người tạo rời không gian làm
+  việc, khóa vẫn xác thực được nhưng mọi thao tác cần quyền đều trả về `403`; riêng khóa tích hợp trả về
+  `owner_deactivated`, và người có `integrations:manage` có thể tiếp quản khóa đó.
+- **Phạm vi danh sách.** Một khóa có thể bị giới hạn trong một số danh sách (tối đa 100; không chọn danh sách nào
+  nghĩa là mọi danh sách). Khóa không thể truy cập danh sách nằm ngoài phạm vi của chính người tạo.
+- **Khóa tích hợp** chỉ dùng được cho các thao tác của những trình kích hoạt và hành động được bật cho tích hợp của
+  nó; mọi lệnh gọi khác trả về `403` với mã `integration_operation_denied`. Mười hai thao tác chỉ chấp nhận khóa của
+  một tích hợp (hoặc của một trang WordPress).
+- **Chỉ con người.** Tạo và xoay vòng khóa, phê duyệt lượt gửi, bảo mật tài khoản và Quản trị hệ thống cần một người
+  đã đăng nhập. Khóa gọi các thao tác này sẽ nhận `403` với mã `humans_only`. Các thao tác này không có trong
+  [tài liệu API](/api/).
+
+Quyền mà mỗi thao tác cần được ghi trên trang của thao tác đó trong tài liệu API và trong `x-permission` của tài liệu
+OpenAPI.
+
+## Vòng đời của khóa
+
+Quản lý khóa cần quyền `apikeys:manage` (tác tử MCP: `mcp:manage`). Việc tạo và xoay vòng diễn ra trong ứng dụng,
+khi đã đăng nhập.
+
+<TableScroll label="Vòng đời của khóa">
+
+| Thao tác                              | Điều gì xảy ra                                                                                                                                                                                                                                                         |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tạo                                   | Chuỗi bí mật hiển thị một lần. Nhật ký kiểm tra ghi `apikey.created` cùng các quyền và phạm vi, không bao giờ ghi chuỗi bí mật.                                                                                                                                     |
+| <UiPath path="keys.rotate" />         | Một chuỗi bí mật mới với cùng tên, quyền và phạm vi được hiển thị một lần. **Chuỗi bí mật cũ ngừng hoạt động ngay lập tức.** Khóa có hạn dùng được cấp lại cùng thời hạn, tính từ hôm nay. Xoay vòng một khóa đã hết hạn sẽ thay thế khóa đó.                     |
+| Xoay vòng khóa tích hợp               | Dùng <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: khóa cũ vẫn hoạt động thêm 24 giờ. Xoay vòng khóa này trong Khóa và MCP sẽ nhận `409` với mã `managed_by_integration`.                                     |
+| <UiPath path="keys.revoke" />         | Khóa ngừng hoạt động ngay lập tức; các lệnh gọi nhận `401`. Bạn có thể tạo khóa thay thế với cùng quyền và phạm vi ngay trong hộp thoại đó.                                                                                                                         |
+| Hết hạn                               | Sau ngày hết hạn, khóa trả về `401`. Khóa đã hết hạn vẫn nằm trong danh sách, kèm số lệnh gọi vẫn đang cố dùng nó, để bạn tìm ra chỗ cần cập nhật.                                                                                                                 |
+| Xóa                                   | Gỡ một khóa đã hết hạn hoặc đã thu hồi khỏi danh sách. Khóa đang hoạt động phải được thu hồi trước.                                                                                                                                                                |
+
+</TableScroll>
+
+Danh sách khóa hiển thị lần cuối mỗi khóa được dùng và từ địa chỉ IP nào. Các hành động một khóa thực hiện xuất hiện
+trong [nhật ký kiểm tra](/vi/team/audit-log/) với khóa là tác nhân.
+
+## Giới hạn
+
+<LimitsTable area="api-keys" />
+
+## Khóa bị từ chối
+
+Khóa bị từ chối trả về `401` với mã `unauthenticated` và header `WWW-Authenticate: Bearer realm="reputecast"`.
+`detail` cho biết lý do:
+
+| Tình huống                                       | `detail`                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------ |
+| Không có header `Authorization` và không có phiên | `Sign in to continue.`                                                  |
+| Token không có tiền tố khóa của ReputeCast       | `Unknown API key.`                                                       |
+| Khóa không tồn tại hoặc đã bị thu hồi            | `This API key is revoked or unknown.`                                    |
+| Khóa đã hết hạn                                  | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
+
+Khóa tích hợp trả về `401` với mã `key_revoked` và `key_expired` thay vào đó, và detail của chúng nêu tên tích hợp
+cần kết nối lại. Khi cơ sở dữ liệu không xác nhận được ai đang gọi, phản hồi là `503` với mã `unavailable`: hãy thử
+lại, khóa vẫn hợp lệ. Mọi mã lỗi được liệt kê trong [lỗi API](/vi/developers/api-errors/).
+
+## Liên quan
+
+- [Thực hiện lệnh gọi API đầu tiên](/vi/developers/api-quickstart/)
+- [Giới hạn tốc độ API](/vi/developers/api-rate-limits/)
+- [Vai trò và quyền](/vi/team/roles-and-permissions/)
+- [Bảo mật và gia cố hệ thống](/vi/self-hosting/security/)

@@ -1,0 +1,153 @@
+---
+title: Xây dựng trên ReputeCast
+description: REST API newsletter của chính hệ thống ReputeCast của bạn, tài liệu OpenAPI 3.1, khóa API, webhook, máy chủ MCP, các tích hợp và adapter.
+type: explanation
+audience: [developer]
+primaryKeyword: REST API newsletter
+sources:
+  - internal/api/api.go
+  - internal/api/auth.go
+  - internal/app/app.go
+  - internal/cli/openapi.go
+  - internal/apikeys
+  - internal/webhooks/webhooks.go
+  - internal/mcpserver
+  - internal/integrations
+  - docs/adapters.md
+sidebar:
+  order: 1
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Mỗi [hệ thống](/vi/reference/glossary/#instance) ReputeCast cung cấp một REST API newsletter dưới `/api/v1` tại URL
+công khai của chính nó, được mô tả bằng một tài liệu OpenAPI 3.1 do máy chủ tự sinh ra từ mã nguồn. Người dùng,
+[khóa API](/vi/reference/glossary/#api-key) và [tác tử MCP](/vi/reference/glossary/#mcp-agent) đều đi qua cùng một bước
+kiểm tra [quyền](/vi/reference/glossary/#permission), nên một khóa chỉ làm được những gì quyền của nó cho phép, không
+hơn. Lỗi được trả về dưới dạng problem document theo RFC 9457, kèm một `code` cố định.
+
+## Một yêu cầu được xử lý thế nào
+
+1. Mã của bạn gọi `https://<public URL>/api/v1/…` với header `Authorization: Bearer <key>`. Các thao tác trên một
+   [không gian làm việc](/vi/reference/glossary/#workspace) nhận slug của nó trong đường dẫn, ví dụ
+   `/api/v1/workspaces/acme-newsletter/campaigns`.
+2. ReputeCast tìm khóa theo giá trị băm của nó, từ chối với `401` khi khóa không tồn tại, đã bị thu hồi hoặc đã hết
+   hạn, và giới hạn quyền của khóa ở mức mà thành viên tạo ra nó đang có vào đúng thời điểm đó.
+3. Quyền của thao tác (`x-permission` trong tài liệu OpenAPI) được kiểm tra. Khi thiếu quyền, phản hồi là `403` kèm
+   khóa quyền và tối đa hai thành viên đang có quyền đó.
+4. Phản hồi là JSON (`application/json`), hoặc một problem document (`application/problem+json`) khi lệnh gọi thất
+   bại. Phản hồi có các header `X-RateLimit-*` (xem [giới hạn tốc độ](/vi/developers/api-rate-limits/)).
+
+[Thực hiện lệnh gọi API đầu tiên](/vi/developers/api-quickstart/) đi qua từng bước này bằng `curl`, còn [xác thực và
+khóa API](/vi/developers/api-authentication/) mô tả chi tiết về khóa.
+
+## Lấy tài liệu OpenAPI
+
+Hệ thống của bạn công bố tài liệu OpenAPI mà không cần xác thực, ở bốn dạng:
+
+| Đường dẫn               | Định dạng          |
+| ----------------------- | ------------------ |
+| `/api/openapi.json`     | OpenAPI 3.1, JSON  |
+| `/api/openapi.yaml`     | OpenAPI 3.1, YAML  |
+| `/api/openapi-3.0.json` | OpenAPI 3.0, JSON  |
+| `/api/openapi-3.0.yaml` | OpenAPI 3.0, YAML  |
+
+Lệnh `reputecast openapi` in ra cùng tài liệu đó mà không cần cơ sở dữ liệu hay tệp cấu hình (`--yaml` để lấy YAML),
+nên bạn có thể sinh nó trong CI từ đúng phiên bản bạn đang chạy:
+
+```sh title="Terminal"
+curl -o reputecast-openapi.json https://reputecast.example.com/api/openapi.json
+reputecast openapi --yaml > reputecast-openapi.yaml
+```
+
+Những điều cần biết về tài liệu này:
+
+- Tài liệu mô tả mọi thao tác của máy chủ, kể cả những thao tác chỉ ứng dụng web gọi bằng phiên đăng nhập (đăng nhập,
+  bảo mật tài khoản, Quản trị hệ thống). [Tài liệu API](/api/) trên trang này chỉ liệt kê các thao tác mà khóa API gọi
+  được.
+- Mỗi thao tác có một `operationId` (như `list-campaigns`), một tag và ba phần mở rộng: `x-access` (ai được gọi:
+  `workspace`, `key`, `user`, `instance_admin` hoặc `public`), `x-permission` (khóa quyền cần có) và, trên những thao
+  tác chỉ dành cho tích hợp, `x-integration`.
+- Tài liệu không có mục `servers`: hãy cung cấp URL công khai của hệ thống làm base URL cho client của bạn.
+- Hệ thống phục vụ tài liệu nhưng không có trang tham chiếu. Hãy dùng [tài liệu API](/api/) tại đây.
+
+## Sinh client
+
+Mọi trình sinh mã OpenAPI đều đọc được tài liệu 3.1. Hãy dùng các biến thể 3.0 với những trình sinh mã chỉ đọc được
+OpenAPI 3.0. Ứng dụng web ReputeCast tự tạo kiểu TypeScript của mình bằng
+[openapi-typescript](https://openapi-ts.dev/cli) (kiểm tra tháng 10/2026), công cụ này đọc tài liệu từ một URL:
+
+```sh title="Terminal"
+npx openapi-typescript https://reputecast.example.com/api/openapi.json -o reputecast.d.ts
+```
+
+Phần lớn trình sinh mã đặt tên phương thức theo `operationId`, nên `list-campaigns` sẽ thành phương thức
+`listCampaigns` hoặc tương tự.
+
+## Gọi API từ máy chủ của bạn
+
+Khóa API là bí mật, vì vậy hãy gọi API từ backend, một tác vụ định kỳ hoặc một công cụ quy trình, không bao giờ gọi từ
+trang web. Các đường dẫn `/api/` không gửi header CORS, và máy chủ từ chối các yêu cầu thay đổi dữ liệu đến từ trình
+duyệt trên trang khác. Để thu thập lượt đăng ký trên website, hãy nhúng một [biểu mẫu đăng ký](/vi/forms/signup-forms/):
+endpoint của biểu mẫu nhận yêu cầu từ những trang bạn cho phép.
+
+## Bạn có thể xây dựng gì
+
+<CardGrid>
+  <LinkCard
+    title="Gửi email giao dịch bằng API"
+    description="Đặt lại mật khẩu, biên lai và cảnh báo từ sản phẩm của bạn, kèm khóa idempotency."
+    href="/vi/developers/transactional-api/"
+  />
+  <LinkCard
+    title="Nhận webhook"
+    description="Sự kiện có chữ ký cho liên hệ, chiến dịch, việc gửi email và nhiều thứ khác."
+    href="/vi/developers/webhooks/"
+  />
+  <LinkCard
+    title="Kết nối tác tử AI bằng MCP"
+    description="Máy chủ MCP tại /mcp với token tác tử và quyền riêng."
+    href="/vi/developers/mcp/"
+  />
+  <LinkCard
+    title="Xây dựng một tích hợp"
+    description="Khóa tích hợp, REST hook và các hành động giữ nguyên sự đồng ý."
+    href="/vi/developers/integration-api/"
+  />
+  <LinkCard
+    title="Ghi nhận sự kiện và chuyển đổi"
+    description="Khởi chạy tự động hóa từ sản phẩm của bạn và phân bổ doanh thu cho chiến dịch."
+    href="/vi/developers/events-and-conversions/"
+  />
+  <LinkCard
+    title="Adapter nhà cung cấp"
+    description="Kết nối một dịch vụ email chưa có adapter tích hợp sẵn."
+    href="/vi/adapters/overview/"
+  />
+</CardGrid>
+
+Nếu bạn muốn kết nối một công cụ mà không cần viết mã, Zapier, Make, n8n và WordPress đã có sẵn
+[tích hợp](/vi/integrations/overview/).
+
+## Mặc định và giới hạn
+
+<LimitsTable area="api" />
+
+Tốc độ yêu cầu có trang riêng: [giới hạn tốc độ](/vi/developers/api-rate-limits/). Cách từng thao tác danh sách chia
+kết quả thành trang nằm trong [phân trang](/vi/developers/api-pagination/).
+
+## Khi nào nên thay đổi
+
+Các giới hạn này là cố định. Hãy duyệt qua danh sách dài bằng tham số phân trang của từng thao tác, dùng thao tác theo
+lô cho công việc khối lượng lớn, và gửi tệp qua các thao tác tải lên thay vì trong body JSON. Người vận hành máy chủ có
+thể thay đổi số yêu cầu mỗi phút mà một khóa được thực hiện bằng `http.rate_limit_api` (xem [tham chiếu cấu
+hình](/vi/reference/configuration/)).
+
+## Liên quan
+
+- [Thực hiện lệnh gọi API đầu tiên](/vi/developers/api-quickstart/)
+- [Xác thực và khóa API](/vi/developers/api-authentication/)
+- [Lỗi API](/vi/developers/api-errors/)
+- [Quyền và vai trò](/vi/reference/permissions/)
+- [Tài liệu API](/api/)

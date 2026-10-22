@@ -1,0 +1,184 @@
+---
+title: Bảo mật và gia cố hệ thống
+description: Cách ReputeCast đảm bảo bảo mật email tự host, từ mã hóa thông tin xác thực và xoay vòng khóa đến bảo vệ đăng nhập, chặn mạng nội bộ và header bảo mật.
+type: explanation
+audience: [operator]
+primaryKeyword: bảo mật email tự host
+sources:
+  - README.md
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/linktoken/linktoken.go
+  - internal/netguard/netguard.go
+  - internal/server/middleware.go
+  - internal/server/ratelimit.go
+  - internal/authn/password.go
+  - internal/authn/breached.go
+  - internal/accounts/service.go
+  - migrations/00002_workspaces.sql
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Bảo mật email tự host nghĩa là bạn tự nắm giữ chìa khóa: ReputeCast lưu mọi thông tin xác thực ở dạng mã hóa bằng một
+khóa chỉ máy chủ của bạn có, kiểm tra mọi thao tác theo cùng một mô hình phân quyền, và từ chối các yêu cầu gửi vào mạng
+nội bộ của bạn trừ khi bạn cho phép. Trang này giải thích từng lớp bảo vệ, các thiết lập thay đổi chúng, và một việc
+bạn phải tự lên kế hoạch: giữ và xoay vòng khóa bí mật.
+
+## Cách ReputeCast bảo vệ dữ liệu của bạn
+
+1. **Thông tin xác thực được mã hóa khi lưu trữ.** Thông tin xác thực của nhà cung cấp gửi thư, SMS, thanh toán và AI,
+   client secret của OIDC và của đăng nhập bằng tài khoản mạng xã hội, token HostRepute, khóa bí mật ký webhook, thông
+   tin xác thực của hộp thư mẫu và seed của ứng dụng xác thực (TOTP) đều được niêm phong bằng AES-256-GCM. Mỗi giá trị
+   gắn với hàng và trường của nó, nên không thể chép sang một bản ghi khác. Các giá trị này ở chế độ chỉ ghi: API và ứng
+   dụng không bao giờ trả chúng về.
+2. **Mật khẩu và token được băm.** Mật khẩu dùng argon2id. Phiên và khóa API là các token ngẫu nhiên 256 bit, và cơ sở
+   dữ liệu chỉ lưu giá trị băm SHA-256 của chúng; một khóa chỉ hiển thị một lần, lúc được tạo.
+3. **Đăng nhập khó bị tấn công.** Màn hình đăng nhập hỏi email trước và chỉ trả về thông báo lỗi chung, nên không ai
+   biết được địa chỉ nào có tài khoản. Nhập sai mật khẩu nhiều lần sẽ khóa email đó một thời gian (mặc định 10 lần thử
+   sẽ khóa 15 phút), và `/api/v1/auth/*` chấp nhận 30 yêu cầu mỗi phút cho mỗi địa chỉ IP. Theo mặc định, xác thực hai
+   lớp bằng ứng dụng xác thực, khóa truy cập và [mã khôi phục](/vi/reference/glossary/#recovery-code) dùng một lần là
+   bắt buộc với mọi người giữ [quyền nhạy cảm](/vi/reference/glossary/#sensitive-permission).
+4. **Cookie phiên chỉ nằm trong trình duyệt.** Cookie phiên có `HttpOnly` và `SameSite=Lax`, và có thêm `Secure` khi
+   `http.public_url` bắt đầu bằng `https://` (hoặc, ngoài môi trường phát triển, khi `auth.cookie_secure` là `true`, giá
+   trị mặc định).
+5. **Mọi thao tác đều qua cùng một bước kiểm tra quyền.** Người dùng, khóa API và tác tử MCP đều đi qua cùng một bước
+   kiểm tra; khóa và tác tử không bao giờ có nhiều quyền hơn người đã tạo ra chúng. Xem
+   [vai trò và quyền](/vi/team/roles-and-permissions/).
+6. **Không thể sửa nhật ký kiểm tra.** Mọi thay đổi và mọi lần thử bị từ chối đều được ghi lại cùng tác nhân, địa chỉ
+   IP, user agent và request ID. Một trigger của cơ sở dữ liệu từ chối mọi cập nhật lên các mục nhật ký; chỉ tác vụ dọn
+   dẹp theo thời hạn lưu giữ mới xóa các mục cũ.
+7. **Yêu cầu gửi ra ngoài không thể chạm tới mạng nội bộ của bạn.** Các địa chỉ người dùng nhập vào ứng dụng (URL nhà
+   cung cấp, endpoint webhook, trình nhập dữ liệu, nguồn cấp, máy chủ mô hình AI, hộp thư mẫu và các loại khác) được
+   kiểm tra trước khi ReputeCast kết nối, rồi được kiểm tra lại lúc kết nối, sau khi phân giải DNS. ReputeCast không đi
+   theo chuyển hướng.
+8. **Trình duyệt nhận header nghiêm ngặt.** Mọi phản hồi đều mang Content Security Policy, `X-Frame-Options: DENY`,
+   `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+   `Cross-Origin-Opener-Policy: same-origin` và một `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
+   được thêm khi `http.public_url` là `https://`. Các yêu cầu cross-site từ trình duyệt làm thay đổi dữ liệu đều bị từ
+   chối, trừ webhook của nhà cung cấp (`POST /hooks/…`) và lượt gửi biểu mẫu công khai (`POST /p/…`), vốn được xác minh
+   theo cách khác. Các route `/api` không gửi header CORS.
+9. **Phân khúc SQL chỉ đọc được.** SQL do người dùng viết chạy trong một transaction chỉ đọc có statement timeout,
+   dưới một role chỉ đọc được liên hệ của một không gian làm việc. Xem [PostgreSQL](/vi/self-hosting/postgres/#phân-khúc-sql).
+
+Content Security Policy của ứng dụng:
+
+```txt title="Content-Security-Policy"
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; object-src 'none'
+```
+
+## Khóa bí mật
+
+Một khóa 32 byte bảo vệ mọi giá trị được niêm phong. ReputeCast đọc khóa từ `secrets.key` (`REPUTECAST_SECRETS__KEY`,
+base64) hoặc, khi giá trị này trống, từ tệp tại `secrets.key_file`. Nếu tệp chưa tồn tại, ReputeCast tạo tệp với một
+khóa mới, chỉ chủ sở hữu đọc được (quyền `0600`), và ghi log
+`generated a new secret key; back it up together with the database`.
+
+Cùng khóa đó cũng ký các liên kết trong email của bạn: hủy đăng ký, trung tâm tùy chọn, xem trực tuyến, xác nhận, theo
+dõi lượt mở và lượt nhấp. Hãy sao lưu khóa cùng cơ sở dữ liệu ([sao lưu và khôi phục](/vi/self-hosting/backups/)), và
+để khóa bên ngoài các tệp dump.
+
+### Xoay vòng khóa
+
+Hãy xoay vòng khóa khi khóa có thể đã bị lộ. ReputeCast không mã hóa lại các giá trị đã lưu: giá trị niêm phong bằng
+khóa cũ vẫn mở được chừng nào khóa cũ còn nằm trong `secrets.previous_keys`, và một giá trị chỉ chuyển sang khóa mới khi
+có người lưu lại nó.
+
+<Aside type="caution" title="Xoay vòng khóa làm hỏng liên kết trong các email đã gửi">
+  Liên kết trong email chỉ được ký bằng khóa hiện tại; `secrets.previous_keys` không áp dụng cho chúng. Sau khi xoay
+  vòng, liên kết hủy đăng ký, liên kết tùy chọn và liên kết theo dõi trong mọi email gửi trước đó đều ngừng hoạt động.
+  Chỉ xoay vòng khi bắt buộc, và hãy chuẩn bị cho việc nhận khiếu nại về liên kết hủy đăng ký trong các email cũ.
+</Aside>
+
+<Steps>
+
+1. In ra một khóa mới:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets generate-key
+   ```
+
+2. Tìm khóa hiện tại: giá trị của `REPUTECAST_SECRETS__KEY`, hoặc nội dung của tệp khóa
+   (`/var/lib/reputecast/secret.key` trong Docker).
+
+3. Đặt khóa mới vào `REPUTECAST_SECRETS__KEY` và khóa cũ vào `REPUTECAST_SECRETS__PREVIOUS_KEYS` (phân tách bằng dấu
+   phẩy khi có nhiều khóa). Với Docker Compose, hãy truyền cả hai biến vào container ứng dụng, ví dụ trong một tệp
+   `docker-compose.override.yml` đặt cạnh `docker-compose.yml`, với các giá trị nằm trong `.env`:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     app:
+       environment:
+         REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY}
+         REPUTECAST_SECRETS__PREVIOUS_KEYS: ${REPUTECAST_SECRETS__PREVIOUS_KEYS}
+   ```
+
+   Khi đã đặt `REPUTECAST_SECRETS__KEY`, tệp khóa không còn được đọc nữa.
+
+4. Khởi động lại ReputeCast (`docker compose up -d`) và đăng nhập bằng ứng dụng xác thực để kiểm tra rằng các giá trị cũ
+   vẫn mở được.
+
+5. Giữ mọi khóa cũ chừng nào còn có thể tồn tại giá trị được niêm phong bằng chúng. Không có chỗ nào liệt kê những giá
+   trị vẫn dùng khóa cũ, nên trên thực tế hãy giữ khóa cũ cho đến khi mọi thông tin xác thực, client secret và ứng dụng
+   xác thực đều đã được lưu lại.
+
+</Steps>
+
+<Aside type="caution">
+  `REPUTECAST_SECRETS__PREVIOUS_KEYS` để trống sẽ làm quá trình khởi động dừng với
+  `Error: previous secret key: key must be 32 bytes, got 0`. Khi không có khóa cũ nào, hãy xóa biến này cùng dòng của nó
+  trong `docker-compose.override.yml` thay vì để trống.
+</Aside>
+
+## Mạng nội bộ
+
+Theo mặc định, yêu cầu gửi ra các địa chỉ nhập vào ứng dụng bị từ chối khi chúng phân giải ra một địa chỉ riêng hoặc
+loopback (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7` và vài dải
+dự trữ khác), hoặc khi host là `localhost`, `*.localhost` hay `*.internal`. Thông báo lỗi có dạng
+`address not allowed: 10.0.0.5 is a private or loopback address`.
+
+Hai thiết lập cho phép các địa chỉ này, dành cho những dịch vụ chạy trong mạng của bạn:
+
+| Thiết lập                          | Cho phép địa chỉ riêng với                                                                                                                      |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `providers.allow_private_networks` | URL của nhà cung cấp (máy chủ Postal, adapter HTTP chung), địa chỉ adapter cộng đồng (`http://` không mã hóa chỉ được phép ở đây), kiểm tra SMTP, IMAP và POP3, trình nhập dữ liệu, nguồn cấp, biểu mẫu, máy chủ mô hình AI, kiểm tra vị trí thư và các tích hợp khác. |
+| `webhooks.allow_private_networks`  | Webhook gửi đi, hook tích hợp (n8n, Zapier, Make) và luồng nhật ký kiểm tra (audit stream).                                                     |
+
+Địa chỉ link-local và địa chỉ metadata của cloud (`169.254.0.0/16`, `fe80::/10`, `100.100.100.200`, `fd00:ec2::254`),
+multicast và `0.0.0.0/8` vẫn bị từ chối dù bật thiết lập nào.
+
+## Mặc định và giới hạn
+
+<LimitsTable area="rate-limits" />
+
+Chính sách đăng nhập (độ dài mật khẩu, việc dùng lại mật khẩu cũ, kiểm tra mật khẩu bị lộ, bắt buộc xác thực hai lớp,
+phiên và khóa đăng nhập) nằm ở <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; xem
+[quản trị hệ thống](/vi/self-hosting/instance-admin/).
+
+## Khi nào nên thay đổi mặc định
+
+- **Bật kiểm tra mật khẩu bị lộ** trong <UiPath path="admin.authentication" />, trừ khi máy chủ không kết nối internet.
+  Tính năng này mặc định tắt. Khi bật, ReputeCast gửi 5 ký tự đầu của giá trị băm SHA-1 của mật khẩu mới đến
+  `api.pwnedpasswords.com` (k-anonymity); nếu dịch vụ đó không trả lời, mật khẩu vẫn được chấp nhận.
+- **Đặt `http.trusted_proxies`** thành địa chỉ của reverse proxy. Nếu không, ReputeCast bỏ qua `X-Forwarded-For`, và
+  mọi client phía sau proxy dùng chung một địa chỉ IP trong giới hạn tốc độ và nhật ký kiểm tra.
+- **Dùng URL công khai `https://`** trong môi trường production, để cookie có `Secure` và HSTS được gửi. Xem
+  [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+- **Không công khai `/metrics`**: endpoint này không yêu cầu xác thực. Xem
+  [health check, metrics và log](/vi/self-hosting/monitoring/).
+- **Chỉ cho phép mạng nội bộ** với những dịch vụ thật sự cần, và chỉ bật thiết lập bao gồm những dịch vụ đó.
+
+## Báo cáo lỗ hổng bảo mật
+
+Hãy gửi email đến security@hostrepute.com thay vì mở issue công khai trên GitHub.
+
+## Liên quan
+
+- [Sao lưu và khôi phục](/vi/self-hosting/backups/): khóa và cơ sở dữ liệu phải luôn đi cùng nhau.
+- [Tham chiếu cấu hình](/vi/reference/configuration/): `secrets.*`, `http.*`, `auth.*` và các thiết lập mạng nội bộ.
+- [Nhật ký kiểm tra](/vi/team/audit-log/): những gì được ghi lại và được giữ trong bao lâu.

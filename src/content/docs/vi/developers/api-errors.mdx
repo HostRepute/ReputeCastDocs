@@ -1,0 +1,137 @@
+---
+title: Lỗi API
+description: Lỗi API RFC 9457 trong ReputeCast. Các trường problem+json, ví dụ lỗi thiếu quyền, yêu cầu không hợp lệ, vượt giới hạn tốc độ và mọi mã lỗi theo nhóm.
+type: reference
+audience: [developer]
+primaryKeyword: lỗi API RFC 9457
+sources:
+  - internal/api/errors.go
+  - internal/api/auth.go
+  - internal/api/integrations.go
+  - internal/api/lang.go
+  - internal/authz/authz.go
+  - internal/server/ratelimit.go
+  - internal/app/app.go
+sidebar:
+  order: 4
+---
+
+import ErrorCodesTable from '~/components/ErrorCodesTable.astro'
+
+Mọi lệnh gọi thất bại đến REST API của ReputeCast đều trả về một problem document theo RFC 9457: các lỗi API RFC 9457
+bên dưới dùng chung một cấu trúc JSON, được trả về dưới dạng `application/problem+json`, kèm một `code` cố định để
+chương trình của bạn rẽ nhánh. Định dạng này được định nghĩa trong [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)
+(kiểm tra tháng 10/2026).
+
+## Các trường của problem document
+
+| Trường       | Kiểu     | Ý nghĩa                                                                                                                                                                                          |
+| ------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `status`     | integer  | Mã trạng thái HTTP, giống với mã của phản hồi.                                                                                                                                                  |
+| `title`      | string   | Văn bản trạng thái HTTP, chẳng hạn `Forbidden`.                                                                                                                                                  |
+| `detail`     | string   | Một câu giúp người đọc biết cần làm gì. Câu này có thể thay đổi giữa các phiên bản và có thể bằng tiếng Việt, vì vậy hãy hiển thị nó, đừng phân tích nó.                                       |
+| `code`       | string   | Mã cố định để máy đọc, chẳng hạn `permission_denied`. Xem [mã lỗi](#mã-lỗi).                                                                                                                   |
+| `permission` | string   | Khóa [quyền](/vi/reference/glossary/#permission) còn thiếu, có trên `permission_denied` và trên `escalation_denied` khi thiếu đúng một quyền.                                                  |
+| `helpers`    | string[] | Tối đa hai thành viên đang có quyền còn thiếu, để người dùng biết nên hỏi ai.                                                                                                                  |
+| `errors`     | object[] | Với yêu cầu không hợp lệ: mỗi vấn đề một mục, gồm `message`, `location` (chẳng hạn `body.email` hoặc `query.pageSize`) và `value`.                                                             |
+| `meta`       | object   | Thông tin thêm cho một số mã, ví dụ `lockedUntil` và `failures` trên `locked`, `attemptsLeft` trên các lỗi đăng nhập, `retryAfter` trên giới hạn tốc độ của cửa hàng, `rules` trên `approval_required`. |
+
+`type` và `instance` thuộc mô hình RFC 9457 nhưng ReputeCast không dùng. Khi không có `type`, loại lỗi là
+`about:blank`, nghĩa là trạng thái HTTP đã nói lên tất cả. Một vài lỗi do framework tự tạo ra, chẳng hạn lỗi máy chủ,
+không có `code`: với những lỗi đó, hãy dùng `status`.
+
+Đường dẫn không tồn tại dưới `/api/` trả về `404` với mã `not_found` và detail "No such API endpoint."
+
+## Ví dụ body
+
+### Thiếu quyền
+
+Khóa hoặc thành viên không có quyền mà một thao tác cần sẽ nhận `403`. Quyền đó và tối đa hai thành viên đang có
+quyền nằm trong body:
+
+```json title="403 Forbidden"
+{
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "Sending needs the campaigns:send permission. Ask Marcus Chen or Linh Nguyen.",
+  "code": "permission_denied",
+  "permission": "campaigns:send",
+  "helpers": ["Marcus Chen", "Linh Nguyen"]
+}
+```
+
+Hãy tạo một khóa có quyền đó, hoặc hỏi một trong những người trong `helpers`. Một khóa không bao giờ có nhiều quyền
+hơn thành viên đã tạo ra nó (xem [xác thực và khóa API](/vi/developers/api-authentication/)).
+
+### Yêu cầu không hợp lệ
+
+Một tham số hoặc trường trong body vi phạm schema sẽ nhận `422`, với mỗi vấn đề một mục trong `errors`. Yêu cầu sai
+định dạng, chẳng hạn JSON không phân tích được, nhận `400` với cùng mã.
+
+```json title="422 Unprocessable Entity"
+{
+  "title": "Unprocessable Entity",
+  "status": 422,
+  "detail": "validation failed",
+  "errors": [{ "message": "expected number <= 100", "location": "query.pageSize", "value": 500 }],
+  "code": "validation_failed"
+}
+```
+
+Với những kiểm tra do ReputeCast tự thực hiện, câu thông báo nằm trong `detail` và trường bị lỗi nằm trong `errors`,
+ví dụ `"detail": "Use a work email."` với `"location": "body.email"`.
+
+### Vượt giới hạn tốc độ
+
+Khi vượt tốc độ yêu cầu cho phép của mỗi khóa, API trả về `429` kèm header `Retry-After`:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Con số "1,000 items" trong thông báo này đúng với thao tác thêm vào danh sách chặn gửi; thao tác gửi giao dịch theo lô
+nhận tối đa 100 thư. Hãy chờ số giây ghi trong `Retry-After` rồi gửi lại. [Giới hạn tốc độ
+API](/vi/developers/api-rate-limits/) liệt kê mọi giới hạn.
+
+## Ngôn ngữ của `detail`
+
+Các lỗi về quyền truy cập (thiếu quyền, đăng nhập) được viết bằng ngôn ngữ mà header `Accept-Language` yêu cầu, nếu
+ReputeCast có ngôn ngữ đó (`en` hoặc `vi`). Khóa API nhận tiếng Anh trừ khi bạn gửi header này. Với
+`Accept-Language: vi`, detail của lỗi thiếu quyền sẽ như sau:
+
+```json title="403 Forbidden, Accept-Language: vi"
+{
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "Để quản lý khóa API, bạn cần quyền apikeys:manage. Hãy hỏi Marcus Chen hoặc Linh Nguyen.",
+  "code": "permission_denied",
+  "permission": "apikeys:manage",
+  "helpers": ["Marcus Chen", "Linh Nguyen"]
+}
+```
+
+`code`, `permission` và các trường khác không bao giờ thay đổi theo ngôn ngữ.
+
+## Xử lý lỗi
+
+- Rẽ nhánh theo `status` và `code`. Coi `detail` là văn bản dành cho người đọc.
+- `401`: khóa bị thiếu, không tồn tại, đã bị thu hồi hoặc đã hết hạn. Hãy sửa khóa; thử lại không giúp được gì.
+- `403`: thiếu một quyền (`permission_denied`), thao tác cần một người đã đăng nhập (`humans_only`), hoặc một khóa tích
+  hợp đã gọi một thao tác mà tích hợp của nó không dùng (`integration_operation_denied`).
+- `404`, `409`, `410`, `422`: hãy sửa yêu cầu. Các mã `409` như `version_conflict` và `idempotency_key_reused` cho
+  biết điều gì đã thay đổi.
+- `429`: chờ theo `Retry-After`. Với lượt gửi giao dịch, hãy thử lại với cùng `Idempotency-Key` để mỗi thư chỉ được
+  gửi một lần (xem [gửi email giao dịch bằng API](/vi/developers/transactional-api/)).
+- `502` và `503`: một dịch vụ bên ngoài hoặc một phần của máy chủ không phản hồi. Hãy thử lại với độ trễ tăng dần.
+
+## Mã lỗi
+
+Các mã được nhóm theo khu vực. Ở một số thao tác, một mã có thể đi kèm trạng thái HTTP khác; bảng ghi trạng thái
+thường gặp.
+
+<ErrorCodesTable headingLevel={3} />

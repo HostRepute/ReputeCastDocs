@@ -1,0 +1,154 @@
+---
+title: Sự kiện gửi thư và đồng bộ danh sách chặn gửi
+description: Cách ReputeCast nhận webhook bounce email từ từng nhà cung cấp gửi thư, chuẩn hóa sự kiện, giữ mã gốc và đồng bộ một danh sách chặn gửi dùng chung.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: webhook bounce email
+sources:
+  - internal/ingest
+  - internal/suppressions/sync.go
+  - internal/providers/provider.go
+  - internal/providers/manage/health.go
+  - internal/app/wire_providers.go
+  - web/src/features/providers/EventsPage.tsx
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  order: 17
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Mỗi nhà cung cấp gửi thư báo lại chuyện gì đã xảy ra với thư của bạn theo định dạng riêng: Amazon SES qua thông báo SNS,
+Postmark và Mailgun qua webhook, máy chủ SMTP qua thư trả lại trong một hộp thư. ReputeCast chuyển các sự kiện webhook
+bounce email, gửi thành công và khiếu nại này thành một mô hình
+[sự kiện chuẩn hóa](/vi/reference/glossary/#normalized-event) duy nhất, giữ mã gốc của nhà cung cấp bên cạnh, và chia sẻ
+mọi thư trả lại và khiếu nại qua một [danh sách chặn gửi](/vi/reference/glossary/#suppression-list) dùng chung.
+
+## Sự kiện về đến như thế nào
+
+1. **Nhà cung cấp gọi ReputeCast.** Mỗi nhà cung cấp đã kết nối có địa chỉ webhook riêng,
+   `https://<public URL>/hooks/<adapter>/<token>`. Trình hướng dẫn kết nối đăng ký địa chỉ này ở nhà cung cấp giúp bạn,
+   hoặc hiển thị nó để bạn tự dán vào. Hãy đọc [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
+2. **ReputeCast kiểm tra chữ ký.** Mỗi adapter xác minh yêu cầu theo đúng cách nhà cung cấp của nó ký (chữ ký SNS với
+   Amazon SES, HMAC với Mailgun, chữ ký ECDSA với SendGrid, khóa bí mật dùng chung với các nhà cung cấp không ký). Yêu cầu
+   không hợp lệ nhận phản hồi `401` và không bao giờ được xử lý; 2 KB đầu tiên của nó được giữ lại để chẩn đoán.
+3. **ReputeCast lưu payload gốc và trả lời ngay.** Payload đã xác minh được lưu nguyên trạng và nhà cung cấp nhận `200`
+   ngay lập tức, nên việc xử lý chậm không bao giờ khiến nhà cung cấp gửi lại hay bỏ cuộc. Nếu không lưu được, ReputeCast
+   trả lời `429` kèm `Retry-After: 30` thay vì `5xx`, vì một số nhà cung cấp bỏ sự kiện sau khi gặp lỗi máy chủ.
+4. **Một tác vụ nền chuẩn hóa payload.** Payload trở thành một hoặc nhiều sự kiện chuẩn hóa, được ghép với thư mà
+   ReputeCast đã gửi. Sự kiện bị gửi lại được nhận ra và chỉ tính một lần.
+5. **Sự kiện có hiệu lực.** Nó cập nhật trạng thái của thư, các bộ đếm của chiến dịch theo nhà cung cấp hộp thư và nhà
+   cung cấp gửi thư, và số liệu hằng ngày của nhà cung cấp. Trả thư vĩnh viễn, khiếu nại và hủy đăng ký do nhà cung cấp
+   báo về sẽ đưa địa chỉ vào danh sách chặn gửi dùng chung, và liên hệ được đánh dấu là bị trả thư hoặc đã khiếu nại.
+
+Các nhà cung cấp không có webhook đi cùng con đường đó từ bước 4: ReputeCast đọc thư trả lại từ
+[hộp thư nhận thư trả lại](/vi/reference/glossary/#bounce-mailbox) của máy chủ SMTP mỗi phút, và hỏi định kỳ API sự kiện
+của Mailgun hoặc SparkPost mỗi phút khi bạn chọn hỏi định kỳ trong trình hướng dẫn kết nối.
+
+## Sự kiện chuẩn hóa
+
+<TableScroll label="Các loại sự kiện chuẩn hóa">
+
+| Sự kiện       | Ý nghĩa                                                                         | Chặn gửi địa chỉ |
+| ------------- | ------------------------------------------------------------------------------- | ---------------- |
+| `delivered`   | Máy chủ thư nhận đã chấp nhận thư.                                              | Không            |
+| `deferred`    | Việc chuyển phát bị hoãn do lỗi tạm thời; nhà cung cấp sẽ thử lại.              | Không            |
+| `hard_bounce` | Chuyển phát thất bại vĩnh viễn, ví dụ vì hộp thư không tồn tại.                 | Có               |
+| `soft_bounce` | Chuyển phát thất bại vì một lý do có thể chỉ là tạm thời, như hộp thư bị đầy.   | Không            |
+| `complaint`   | Người nhận đánh dấu thư là spam (một báo cáo từ vòng phản hồi).                 | Có               |
+| `rejected`    | Nhà cung cấp từ chối gửi thư ngay từ đầu.                                       | Không            |
+| `open`        | Một lượt mở do nhà cung cấp theo dõi.                                           | Không            |
+| `click`       | Một lượt nhấp do nhà cung cấp theo dõi.                                         | Không            |
+| `unsubscribe` | Một lượt hủy đăng ký mà nhà cung cấp nhận được.                                 | Có               |
+
+</TableScroll>
+
+Mỗi sự kiện giữ loại sự kiện gốc của nhà cung cấp (như `Bounce · Permanent · General` hay `HardFail`), mã gốc (như
+`550 5.1.1`) và nội dung chẩn đoán. Thư trả lại còn được gán một
+[loại thư trả lại](/vi/reference/glossary/#bounce-class): `mailbox_unknown`, `mailbox_full`, `domain_invalid`,
+`policy_block`, `spam_block`, `reputation`, `temporary` hoặc `other`. Nhóm này cho bạn biết vì sao thư thất bại, bất kể
+từng nhà cung cấp diễn đạt thế nào; hãy đọc
+[Thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/) và
+[Mã lỗi SMTP](/vi/smtp-errors/).
+
+ReputeCast tự theo dõi lượt mở và lượt nhấp. Sự kiện `open` và `click` của nhà cung cấp chỉ được tính khi bạn chọn giữ
+theo dõi của nhà cung cấp đó (xem
+[Kiểm tra theo dõi phía nhà cung cấp](#kiểm-tra-theo-dõi-phía-nhà-cung-cấp)).
+
+## Nhật ký sự kiện
+
+<UiPath path="nav.providers > providers.tabEvents" /> bắt đầu bằng <UiPath path="providers.events.logTitle" />: mọi sự
+kiện gốc từ nhà cung cấp đặt cạnh dạng chuẩn hóa của nó, mã gốc và nội dung chẩn đoán, người nhận (đã được che bớt) và
+chiến dịch, quy trình tự động hay thư hệ thống mà sự kiện thuộc về. Lọc theo nhà cung cấp gửi thư hoặc loại sự kiện, hoặc
+tìm theo người nhận hay mã thư.
+
+<Screenshot
+  id="providers-events"
+  alt="Nhật ký sự kiện: các sự kiện gốc từ Postmark, Amazon SES và Postal đặt cạnh loại đã chuẩn hóa (gửi thành công, trả thư vĩnh viễn, hoãn nhận, khiếu nại, trả thư tạm thời, bị từ chối), mỗi sự kiện kèm mã SMTP gốc và nội dung chẩn đoán."
+/>
+
+<UiPath path="providers.events.exportCsv" /> tải xuống các sự kiện đã lọc. Người nhận vẫn được che bớt trừ khi bạn có quyền
+`subscribers:export`, và mọi lần xuất đều được ghi vào [nhật ký kiểm tra](/vi/team/audit-log/).
+
+## Đồng bộ danh sách chặn gửi
+
+Một thư trả lại hay khiếu nại ở một nhà cung cấp sẽ dừng việc gửi đến địa chỉ đó trên mọi nhà cung cấp. Thẻ
+<UiPath path="providers.events.syncTitle" /> cho biết từng nhà cung cấp tham gia như thế nào:
+
+- **Hai chiều**: ReputeCast kéo các địa chỉ bị chặn của chính nhà cung cấp về danh sách dùng chung và đẩy các địa chỉ chặn
+  gửi mới của danh sách dùng chung ra danh sách chặn của nhà cung cấp.
+- **Chỉ kéo về**: nhà cung cấp liệt kê được các địa chỉ bị chặn nhưng API của nó không nhận địa chỉ mới (Brevo).
+  ReputeCast kéo các địa chỉ đó về.
+- **Chỉ cục bộ** (hiển thị là Áp dụng cục bộ): nhà cung cấp không có API danh sách chặn (Postal, SMTP, Azure Communication
+  Services, adapter HTTP chung). ReputeCast kiểm tra danh sách dùng chung trước mỗi lần gửi.
+
+Việc đồng bộ chạy mỗi 15 phút cho mọi nhà cung cấp, và chạy sớm ngay sau khi một sự kiện thêm địa chỉ chặn gửi mới. Để
+chạy ngay, chọn <UiPath path="providers.events.syncAll" /> (cần quyền `providers:manage`). Thẻ cho biết mỗi nhà cung cấp
+đã kéo về và đẩy đi những gì, lần đồng bộ gần nhất và lỗi nếu có. Hãy đọc [Danh sách chặn gửi](/vi/audience/suppressions/)
+để thêm, tải lên hoặc gỡ địa chỉ thủ công.
+
+## Kiểm tra theo dõi phía nhà cung cấp
+
+Một số nhà cung cấp tự thêm pixel theo dõi lượt mở hoặc viết lại liên kết để theo dõi lượt nhấp. Khi có thêm tính năng
+theo dõi của ReputeCast, lượt mở bị đếm hai lần và liên kết bị viết lại hai lần. Mỗi ngày một lần, ReputeCast đọc cài đặt
+theo dõi của từng nhà cung cấp, và thẻ <UiPath path="providers.events.trackingTitle" /> liệt kê những gì nó tìm thấy. Với
+một nhà cung cấp có theo dõi, bạn có thể:
+
+- tắt tính năng theo dõi của nhà cung cấp qua API của nó (ở những nơi API cho phép),
+- giữ theo dõi của nhà cung cấp và bỏ qua theo dõi của ReputeCast, hoặc
+- quay lại dùng theo dõi của ReputeCast.
+
+Brevo tự thêm theo dõi riêng theo mặc định; hãy đọc [Gửi bằng Brevo](/vi/providers/brevo/).
+
+## Mặc định và giới hạn
+
+<LimitsTable area="providers" />
+
+## Khi nào nên thay đổi
+
+- **Sự kiện ngừng về**: ReputeCast đánh dấu một nhà cung cấp là Suy giảm khi webhook của nó im lặng trong lúc nó vẫn nhận
+  thư. Hãy đọc [Tình trạng và sự cố của nhà cung cấp](/vi/providers/health-and-outages/).
+- **Bạn đã xoay vòng khóa bí mật webhook**: những nhà cung cấp có webhook do bạn thiết lập thủ công cần khóa bí mật mới,
+  nếu không sự kiện của chúng sẽ bị từ chối. Hãy đọc
+  [Cài đặt gửi mặc định của không gian làm việc](/vi/providers/workspace-defaults/).
+- **Bạn chuyển từ nền tảng khác sang**: hãy kéo về danh sách chặn của nhà cung cấp cũ trước lần gửi đầu tiên. Hãy đọc
+  [Chuyển sang ReputeCast mà không mất sự đồng ý](/vi/migrate/overview/).
+
+<Aside type="note">
+Payload gốc từ nhà cung cấp được giữ 90 ngày, và nhật ký sự kiện hiển thị sự kiện của 90 ngày gần nhất.
+</Aside>
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Danh sách chặn gửi" href="/vi/audience/suppressions/" />
+  <LinkCard title="Thư trả lại, khiếu nại và giới hạn của nhà cung cấp" href="/vi/deliverability/bounces-and-complaints/" />
+  <LinkCard title="Đọc báo cáo chiến dịch" href="/vi/campaigns/reports/" />
+  <LinkCard title="Nhận webhook" href="/vi/developers/webhooks/" />
+</CardGrid>

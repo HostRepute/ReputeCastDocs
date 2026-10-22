@@ -1,0 +1,235 @@
+---
+title: Viết adapter cộng đồng
+description: Dùng SDK TypeScript và mẫu có sẵn để tự viết adapter email cho bất kỳ nhà cung cấp gửi thư nào, chạy bộ kiểm thử hợp đồng, rồi cài đặt và kiểm tra adapter.
+type: tutorial
+audience: [developer, operator]
+uiPath: 'nav.providers > providers.tabAdapters > providers.adapters.communityTitle'
+primaryKeyword: tự viết adapter email
+sources:
+  - sdk/adapter-template
+  - sdk/adapter-sdk
+  - internal/cli/adapter.go
+  - internal/providers/remote
+  - internal/providers/manage/adapters.go
+  - docs/adapters.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps, FileTree, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Trong hướng dẫn từng bước này, bạn dùng mẫu của ReputeCast để tự viết adapter email cho một [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) chưa có adapter có sẵn, chạy bộ kiểm thử hợp đồng với adapter đó, rồi cài nó lên một hệ thống thử nghiệm và kiểm tra rằng ReputeCast gọi được nó. Quá trình mất khoảng 30 phút.
+
+[Adapter cộng đồng](/vi/reference/glossary/#community-adapter) là một tiến trình nhỏ nói [giao thức adapter](/vi/adapters/protocol/): ReputeCast gửi cho nó các yêu cầu JSON có ký (gửi những thư này, xác minh webhook này), và nó gọi API của nhà cung cấp. Mẫu là một adapter chạy được cho Example ESP, một nhà cung cấp hư cấu có API điển hình, viết bằng SDK TypeScript `@reputecast/adapter-sdk`.
+
+## Trước khi bắt đầu
+
+- Node.js 24.11 trở lên, pnpm và Git.
+- Một hệ thống ReputeCast thử nghiệm trên cùng máy, nơi bạn chạy được CLI `reputecast`. Adapter đã cài áp dụng cho mọi không gian làm việc trên hệ thống, nên đừng thử trên hệ thống đang chạy thật (production).
+- `providers.allow_private_networks: true` trên hệ thống đó, cho cả máy chủ và CLI (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Adapter lắng nghe trên `127.0.0.1`, và ReputeCast từ chối địa chỉ loopback nếu không bật thiết lập này.
+
+## Xây dựng và cài adapter
+
+<Steps>
+
+1. Sao chép mẫu ra khỏi kho mã ReputeCast:
+
+   ```sh title="Terminal"
+   git clone https://github.com/hostrepute/reputecast.git
+   cp -r reputecast/sdk/adapter-template my-esp-adapter
+   cd my-esp-adapter
+   ```
+
+   <FileTree>
+   - my-esp-adapter/
+     - src/
+       - adapter.ts adapter: `defineAdapter({ id, capabilities, terms, send, … })`
+       - main.ts khởi động máy chủ giao thức
+     - test/
+       - adapter.test.ts kiểm thử đơn vị
+       - contract.test.ts
+       - fake-api.ts bản giả lập API của Example ESP
+       - fixtures/
+         - webhooks.json các webhook đã ghi lại và các sự kiện chúng phải tạo ra
+     - manifest.json những gì ReputeCast đọc khi cài đặt
+     - reputecast.contract.ts thiết lập của bộ kiểm thử hợp đồng
+     - .env.example
+     - Dockerfile
+     - package.json
+   </FileTree>
+
+2. Cài các dependency:
+
+   ```sh title="Terminal"
+   pnpm install
+   ```
+
+   Lệnh này cài `@reputecast/adapter-sdk` (Node 24, TypeScript 6, không có dependency khi chạy) từ npm.
+
+   <Aside type="note">
+     Nếu pnpm báo `@reputecast/adapter-sdk` không có trong npm registry, hãy làm việc ngay trong kho mã: chạy `pnpm install` trong `reputecast/sdk/`, rồi dùng `reputecast/sdk/adapter-template`. Bên trong kho mã, mẫu được liên kết với bản SDK của pnpm workspace, bản mà lệnh cài đặt này build.
+   </Aside>
+
+3. Chạy kiểm thử:
+
+   ```sh title="Terminal"
+   pnpm test
+   ```
+
+   `pnpm test` chạy kiểm thử đơn vị bằng Vitest, rồi chạy bộ kiểm thử hợp đồng (`reputecast-adapter test`). Bộ kiểm thử hợp đồng khởi động adapter, gọi adapter qua giao thức với API giả lập trong `test/fake-api.ts` và chạy đúng các kịch bản mà bộ kiểm thử Go của ReputeCast chạy với adapter có sẵn:
+
+   ```txt title="Kết quả"
+   Contract suite for example-esp (adapter protocol 1)
+   ✓ Registration (40 ms)
+   ✓ Health (90 ms)
+   ✓ Authentication (56 ms)
+   ✓ Send (29 ms)
+   ✓ SendRejected (17 ms)
+   ✓ SendOutage (17 ms)
+   ✓ SendAuth (33 ms)
+   ✓ SendIdempotent (36 ms)
+   ✓ Verify (81 ms)
+   ✓ Quota (8 ms)
+   ✓ SuppressionsPull (26 ms)
+   ✓ Webhook/Delivered (54 ms)
+   ✓ Webhook/HardBounce (63 ms)
+   ✓ Webhook/SoftBounce (42 ms)
+   ✓ Webhook/Batch (24 ms)
+
+   15 passed, 0 failed, 0 skipped
+   ```
+
+   Bộ kiểm thử đối chiếu manifest với mã, kiểm tra health và xác thực có ký, một lần gửi, một lần từ chối vĩnh viễn (bản giả lập từ chối `rejected@contract.test`), một sự cố ngừng hoạt động, thông tin xác thực bị từ chối, một lần thử lại idempotent, và từng webhook đã ghi lại: hợp lệ, đã được xác minh trước và bị sửa đổi.
+
+4. Đọc cách adapter được khai báo. `src/adapter.ts` ánh xạ API của Example ESP:
+
+   ```ts title="src/adapter.ts (excerpt)"
+   export default defineAdapter<ExampleEvent>({
+     id: 'example-esp',
+     capabilities: { webhooks: true, batch: 100, suppressionSync: 'pull', quotaDiscovery: true },
+     terms: { bulkMarketing: 'allowed' },
+     http: {
+       name: 'Example ESP',
+       baseUrl: () => process.env['EXAMPLE_ESP_API_URL'] ?? API_URL,
+       headers: (ctx) => ({ authorization: `Bearer ${String(ctx.credentials['api_key'] ?? '')}` }),
+     },
+
+     async send(msg, ctx) {
+       const r = await ctx.http.post<{ id: string }>('/v1/messages', toPayload(msg))
+       return { providerMessageId: r.data.id }
+     },
+
+     verifyWebhook(req, ctx) {
+       /* checks X-Example-Signature with verifyTimestampedHmac */
+     },
+
+     normalizeEvent(raw) {
+       /* maps one Example ESP event to a ReputeCast event */
+     },
+   })
+   ```
+
+   Mỗi khả năng đã khai báo cần hook tương ứng (`webhooks` cần `verifyWebhook` và `normalizeEvent`, `quotaDiscovery` cần `discoverQuota`, đồng bộ `pull` cần `syncSuppressions`), và `defineAdapter` dừng tiến trình ngay khi khởi động nếu thiếu một hook. `manifest.json` phải khai báo cùng id, khả năng và điều khoản; máy chủ từ chối khởi động khi chúng khác nhau. `ctx.http` chỉ kết nối tới các host trong `permissions.network` của manifest, và ánh xạ phản hồi của nhà cung cấp thành lỗi giao thức: 401 và 403 thành `provider_auth`, 429 thành `provider_throttled`, 5xx và hết thời gian chờ thành `provider_unavailable`, còn mọi 4xx khác là lời từ chối riêng cho thư đó.
+
+5. Trên máy chạy ReputeCast, cài adapter từ manifest của nó và cung cấp địa chỉ mà tiến trình sẽ lắng nghe:
+
+   ```sh title="Terminal"
+   reputecast adapter install ./manifest.json --url http://127.0.0.1:4600
+   ```
+
+   ```txt title="Kết quả"
+   Installed Example ESP 0.1.0 as community:example-esp.
+
+   Signing secret (shown once):
+
+     rcas_…
+
+   Set it on the adapter process as REPUTECAST_ADAPTER_SECRET.
+   Then check it: reputecast adapter check example-esp
+   ```
+
+   Hãy sao chép khóa bí mật để ký ngay bây giờ: ReputeCast lưu nó ở dạng niêm phong và không bao giờ hiển thị lại. Nếu làm mất, bạn chạy `reputecast adapter secret example-esp` để cấp một khóa mới.
+
+   <Aside type="note">
+     Khi ReputeCast chạy trong Docker Compose, CLI chạy bên trong container app (`docker compose exec app /usr/local/bin/reputecast …`), nơi `./manifest.json` của bạn và `127.0.0.1` không tồn tại. Hãy chạy adapter dưới dạng một container trong cùng mạng (bước 9) và cài nó từ URL `https://` của manifest với `--url http://example-esp:4600`.
+   </Aside>
+
+6. Cấp khóa bí mật cho adapter và khởi động nó:
+
+   ```sh title="Terminal"
+   cp .env.example .env
+   ```
+
+   Đặt `REPUTECAST_ADAPTER_SECRET` trong `.env` bằng khóa bí mật từ bước 5 (`PORT=4600` và `HOST=127.0.0.1` đã có sẵn), rồi khởi động tiến trình:
+
+   ```sh title="Terminal"
+   pnpm dev
+   ```
+
+   ```txt title="Kết quả"
+   {"time":"2026-10-22T12:20:56.017Z","level":"info","msg":"adapter listening","adapter":"example-esp","url":"http://127.0.0.1:4600","protocol":1}
+   ```
+
+   `pnpm dev` khởi động lại tiến trình khi mã thay đổi. Nếu không có khóa bí mật, tiến trình không khởi động mà yêu cầu bạn đặt `REPUTECAST_ADAPTER_SECRET`. `GET /healthz` trả lời `{"ok":true}` cho health check của container, còn mọi yêu cầu khác phải được ReputeCast ký:
+
+   ```sh title="Terminal"
+   curl -s -X POST http://127.0.0.1:4600/v1/health -d '{}'
+   ```
+
+   ```json title="Kết quả"
+   {"protocol":1,"idempotencyKey":"","error":{"code":"unauthenticated","message":"Refused: the request is not signed, or its timestamp is more than 5 minutes off."}}
+   ```
+
+7. Kiểm tra rằng ReputeCast kết nối được tới adapter bằng khóa bí mật của nó:
+
+   ```sh title="Terminal"
+   reputecast adapter check example-esp
+   ```
+
+   ```txt title="Kết quả"
+   community:example-esp: Answered as example-esp 0.1.0, protocol 1.
+   ```
+
+   `reputecast adapter check` gọi thao tác `health` có ký và ghi lại kết quả. `reputecast adapter list` hiển thị từng adapter đã cài cùng địa chỉ, thời điểm cấp khóa bí mật, lần kiểm tra gần nhất và số nhà cung cấp đang dùng adapter đó. Trong vòng 15 giây, mọi tiến trình ReputeCast nhận adapter mới, và Example ESP xuất hiện trong <UiPath path="providers.adapters.communityTitle" /> trên <UiPath path="nav.providers > providers.tabAdapters" /> và trong <UiPath path="providers.overview.addProvider" /> ở mọi không gian làm việc.
+
+8. Ánh xạ nhà cung cấp của bạn. Dừng `pnpm dev`, rồi:
+   - Đổi `id` trong `src/adapter.ts` và `manifest.json`, cùng `name`, `maintainer` và các liên kết. Id (2 đến 40 ký tự: `a-z`, `0-9` và `-`, bắt đầu bằng một chữ cái) trở thành `community:<id>` và xuất hiện trong URL webhook, nên hãy giữ id ổn định qua các phiên bản.
+   - Viết lại `send` (hoặc `sendBatch` cho API theo lô), `verifyWebhook` và `normalizeEvent` cho API của nhà cung cấp, với các hàm hỗ trợ `verifyHmac`, `verifyTimestampedHmac`, `verifyBasicAuth` và `classifyBounce`. Gửi mọi header trong `msg.headers` và trả `msg.id` lại trong sự kiện.
+   - Trong `manifest.json`, khai báo khả năng và điều khoản, `pricing` của nhà cung cấp (bắt buộc), biểu mẫu kết nối trong `config` (đánh dấu khóa và token là `"secret": true`) và các host của nhà cung cấp trong `permissions.network`. [Tài liệu tham chiếu giao thức](/vi/adapters/protocol/) liệt kê những gì ReputeCast gọi ứng với từng khả năng.
+   - Ghi lại vài webhook thật, đã xóa dữ liệu cá nhân, vào `test/fixtures/webhooks.json` cùng các sự kiện chúng phải tạo ra, và chỉnh `test/fake-api.ts` cho phù hợp.
+
+   Chạy `pnpm test` và `pnpm typecheck` đến khi cả hai đều đạt. Sau đó cài lại manifest bằng `reputecast adapter install ./manifest.json --url http://127.0.0.1:4600`. Id mới là một lần cài mới: lệnh in ra khóa bí mật mới cho `.env`, và `reputecast adapter remove example-esp` gỡ adapter của mẫu. Với cùng id, lệnh cập nhật manifest đã cài và giữ nguyên khóa bí mật. Khởi động lại `pnpm dev`.
+
+9. Đóng gói thành container:
+
+   ```sh title="Terminal"
+   pnpm build && pnpm start
+   docker build -t example-esp-adapter .
+   docker run -d --name example-esp -p 127.0.0.1:4600:4600 \
+     -e REPUTECAST_ADAPTER_SECRET=rcas_… example-esp-adapter
+   ```
+
+   `pnpm start` chạy bản build với permission model của Node. Image của mẫu chạy dưới người dùng `node` không phải root, chỉ đọc các tệp của chính nó, không khởi động được tiến trình con hay worker, và trả lời `HEALTHCHECK` trên `/healthz`. Image cài đặt bằng `pnpm install --frozen-lockfile`, nên hãy commit `pnpm-lock.yaml` được tạo ở bước 2. Nếu nền tảng của bạn cho phép, hãy giới hạn lưu lượng mạng đi ra của container chỉ tới API của nhà cung cấp.
+
+   Công bố image và `manifest.json` tại một URL `https://`. Người vận hành cài adapter bằng `reputecast adapter install <manifest URL> --url <where it runs>`, hoặc bằng <UiPath path="providers.adapters.installFromRegistry" /> trên tab Adapter; tab này không hiển thị khóa bí mật, nên họ cấp khóa bằng `reputecast adapter secret <id>` và đặt địa chỉ bằng `reputecast adapter set-url <id> <url>`.
+
+</Steps>
+
+<Aside type="tip">
+  Để xoay vòng khóa bí mật để ký mà không gián đoạn, hãy chạy `reputecast adapter secret <id>` và đặt cả hai khóa trên tiến trình, khóa mới trước: `REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old`. Khóa trước đó vẫn dùng được trong ReputeCast thêm 24 giờ.
+</Aside>
+
+## Bạn đã làm được gì
+
+Bạn có một tiến trình adapter vượt qua đúng các kịch bản hợp đồng như adapter có sẵn của ReputeCast, được cài trên hệ thống của bạn cho mọi không gian làm việc, và được ký theo cả hai chiều bằng khóa bí mật riêng. Khi adapter đã làm việc với nhà cung cấp thật của bạn, mọi quản trị viên không gian làm việc đều kết nối được nó từ <UiPath path="providers.overview.addProvider" /> như một adapter có sẵn: thông tin xác thực họ nhập được niêm phong trong ReputeCast và gửi kèm mỗi lệnh gọi, còn adapter không bao giờ lưu chúng.
+
+`reputecast adapter remove <id>` gỡ cài đặt adapter; ReputeCast từ chối gỡ khi còn nhà cung cấp đã kết nối đang dùng nó. [Tham chiếu CLI](/vi/reference/cli/#adapter) liệt kê mọi lệnh `adapter`.
+
+## Bước tiếp theo
+
+<CardGrid>
+  <LinkCard title="Giao thức adapter v1" description="Mọi header, thao tác, kiểu dữ liệu và mã lỗi mà adapter của bạn phải trả lời." href="/vi/adapters/protocol/" />
+  <LinkCard title="Kết nối nhà cung cấp gửi thư" description="Trình hướng dẫn mà quản trị viên không gian làm việc dùng để kết nối một nhà cung cấp qua adapter của bạn." href="/vi/providers/connect/" />
+  <LinkCard title="Tham chiếu adapter HTTP chung" description="Ánh xạ một API HTTP đơn giản bằng một ánh xạ JSON thay vì chạy một tiến trình." href="/vi/adapters/generic-http/" />
+</CardGrid>

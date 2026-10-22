@@ -1,0 +1,143 @@
+---
+title: Gửi thư bằng Postmark
+description: 'Gửi newsletter bằng Postmark qua ReputeCast: kết nối server token; luồng Broadcast, webhook, bản ghi DNS và đồng bộ danh sách chặn gửi được thiết lập sẵn.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: gửi newsletter bằng Postmark
+sources:
+  - internal/providers/postmark
+  - internal/connect
+  - internal/providers/manage/actions.go
+  - internal/domains/attach.go
+  - web/src/features/connect
+  - web/src/features/providers/bulk.messages.ts
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Postmark chỉ cho phép thư hàng loạt trên một Broadcast message stream, nên luồng Broadcast là trọng tâm khi bạn gửi
+newsletter bằng Postmark: bạn kết nối Postmark bằng một server token, còn ReputeCast tạo luồng Broadcast, đăng ký
+webhook trên từng luồng, lấy các bản ghi DNS của tên miền và giữ danh sách chặn gửi luôn đồng bộ.
+
+<ProviderMatrix family="email" id="postmark" />
+
+## Trước khi bắt đầu
+
+- **Một Postmark server và Server API token của nó** (Postmark › Servers › máy chủ của bạn › API Tokens). Khi tài
+  khoản Postmark của bạn còn chờ duyệt, mọi người nhận phải cùng tên miền với địa chỉ From
+  ([Postmark API overview, error 412](https://postmarkapp.com/developer/api/overview), kiểm tra tháng 10/2026), nên
+  hãy gửi thư thử tới một địa chỉ thuộc tên miền của bạn cho đến khi Postmark duyệt tài khoản.
+- **Không bắt buộc: một Account API token.** Có token này, ReputeCast tự thêm tên miền gửi của bạn vào Postmark và
+  hiển thị các bản ghi DKIM và Return-Path. Không có nó, bạn tự thêm tên miền trong Postmark.
+- **Quyền.** Kết nối cần `providers:manage`; thêm tên miền gửi mới cần `domains:manage`.
+- **Một địa chỉ HTTPS công khai.** Postmark gửi sự kiện tới `<public URL>/hooks/postmark/<token>`. Postmark không có
+  API sự kiện để ReputeCast hỏi định kỳ thay thế, nên địa chỉ này phải truy cập được từ internet.
+
+Postmark tách Transactional message stream (thư một-một do hành động của người dùng kích hoạt) khỏi Broadcast stream
+(newsletter và thông báo)
+([Postmark: How to create and send through Message Streams](https://postmarkapp.com/support/article/how-to-create-and-send-through-message-streams),
+kiểm tra tháng 10/2026). ReputeCast gửi thư của luồng Hệ thống, Tự động hóa và Giao dịch trên luồng transactional của
+máy chủ là `outbound`, còn thư Gửi hàng loạt chỉ đi qua một luồng Broadcast.
+
+## Kết nối Postmark
+
+<Steps>
+
+1. Mở <UiPath path="nav.providers" />, chọn <UiPath path="providers.overview.addProvider" /> rồi chọn Postmark trong
+   danh mục. [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/) hướng dẫn các bước chung của mọi nhà cung cấp.
+
+   <Screenshot
+     id="providers-catalog"
+     alt="Danh mục nhà cung cấp: thẻ Postmark cho biết chỉ gửi hàng loạt trên luồng Broadcast và liệt kê webhook, tên miền qua API, đồng bộ danh sách chặn gửi và lô 500 thư."
+   />
+
+2. Dán <UiPath path="providers.fields.postmark.serverToken" /> và giữ
+   <UiPath path="providers.fields.postmark.messageStream" /> là `outbound`. Trong phần thiết lập thêm của Postmark, bạn
+   có thể thêm <UiPath path="providers.fields.postmark.accountToken" /> và
+   <UiPath path="providers.fields.monthlyLimit" /> (dùng cho thanh hạn mức). Để trống
+   <UiPath path="providers.fields.postmark.broadcastStream" />: ReputeCast tạo luồng này ở bước 8.
+
+3. Chọn <UiPath path="connect.connection.connect" />. ReputeCast kiểm tra token bằng các lệnh gọi chỉ đọc (`GET /server`
+   và thống kê thư gửi đi của tháng này) rồi lưu token ở dạng mã hóa.
+
+4. Trong <UiPath path="connect.connection.webhooksTitle" />, ReputeCast kiểm tra URL công khai của chính nó trước, rồi
+   đăng ký một webhook trên message stream với HTTP basic auth (user `reputecast`, một khóa bí mật do ReputeCast tạo).
+   Webhook báo các sự kiện Delivery, Bounce, SpamComplaint và SubscriptionChange; Open và Click vẫn tắt vì ReputeCast
+   tự theo dõi lượt mở và lượt nhấp.
+
+5. Chọn <UiPath path="connect.connection.continueDomain" /> và nhập tên miền gửi. Với Account API token, ReputeCast
+   thêm tên miền vào Postmark với Return-Path `pm-bounces.<your domain>` và liệt kê bản ghi TXT DKIM cùng CNAME
+   Return-Path (trỏ tới `pm.mtasv.net`), kèm bản ghi DMARC nếu tên miền chưa có.
+
+6. Trong <UiPath path="connect.stepTest" />, gửi thư thử. Thư đi qua luồng `outbound`; dòng thời gian chờ webhook
+   Delivery của Postmark.
+
+7. Trong <UiPath path="connect.stepStreams" /> và <UiPath path="connect.stepContacts" />, chọn các luồng Postmark đảm
+   nhận và chọn có kéo các địa chỉ chặn gửi hiện có từ Postmark về hay không. Luồng Gửi hàng loạt chưa có ở bước này:
+   điều khoản của Postmark chỉ cho phép thư hàng loạt trên luồng Broadcast.
+
+8. Để gửi newsletter qua Postmark, mở <UiPath path="nav.providers > providers.tabRouting" /> và đặt Postmark làm tuyến
+   (hoặc dự phòng) cho <UiPath path="providers.streamBroadcast" />. Khi bạn lưu, ReputeCast đề nghị tạo luồng: chọn
+   <UiPath path="providers.bulk.actionCreate" />. ReputeCast tạo một luồng Broadcast tên "ReputeCast Broadcasts" trong
+   Postmark server của bạn (stream ID `broadcast`, hoặc `reputecast-broadcasts` nếu ID đó đã được dùng), đăng ký
+   webhook trên luồng này, và dùng nó cho tuyến.
+
+</Steps>
+
+<Aside type="caution">
+  Nhập một stream ID có sẵn vào ô Broadcast stream không mở khóa luồng Gửi hàng loạt; ReputeCast dùng ID đó để gửi
+  nhưng vẫn coi Postmark là nhà cung cấp chỉ dành cho thư giao dịch. Hãy tạo luồng từ phần Định tuyến như ở bước 8.
+</Aside>
+
+## Kiểm tra kết quả
+
+- Thẻ Postmark trên <UiPath path="nav.providers > providers.tabProviders" /> hiển thị
+  <UiPath path="providers.statusHealthy" /> và lượng thư của tháng này.
+- Trong Postmark, mỗi luồng ReputeCast dùng có một webhook trỏ tới `/hooks/postmark/…` với basic auth, và máy chủ của
+  bạn liệt kê luồng "ReputeCast Broadcasts" sau khi bạn đã tạo.
+- Sự kiện gửi thư từ cả hai luồng xuất hiện trong <UiPath path="nav.providers > providers.tabEvents" />.
+
+ReputeCast gửi tối đa 500 thư mỗi lệnh gọi tới batch endpoint của Postmark, với `TrackOpens` tắt và `TrackLinks` đặt
+là `None` trên từng thư. Nếu thiết lập theo dõi riêng của máy chủ đang bật,
+<UiPath path="providers.events.trackingTitle" /> trên tab Sự kiện và đồng bộ sẽ báo điều đó và có thể tắt qua API;
+trước khi tắt, [Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) cảnh báo về việc bị theo dõi hai lần. Danh
+sách chặn gửi được đồng bộ theo từng luồng mỗi 15 phút: ReputeCast đẩy danh sách dùng chung lên cả hai luồng và, nếu
+bạn đã chọn tùy chọn kéo về, nhập các thư trả lại, khiếu nại spam và lượt hủy đăng ký của Postmark.
+
+## Khắc phục sự cố
+
+- **"Postmark rejected this key"** kèm `ErrorCode 10`. Token không phải Server API token, hoặc thuộc một máy chủ khác.
+  Hãy sao chép token từ máy chủ bạn dùng để gửi, không phải Account token.
+- **Thẻ webhook báo không truy cập được endpoint.** Postmark không hỗ trợ hỏi định kỳ, nên hãy sửa URL công khai
+  (hoặc dùng tunnel khi thử nghiệm), rồi chọn <UiPath path="connect.connection.retest" />. Xem
+  [Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+- **Thư thử nằm trong hàng đợi và được thử lại** khi tài khoản Postmark còn chờ duyệt. Postmark từ chối người nhận
+  ngoài tên miền From (lỗi 412) và ReputeCast thử lại như một lỗi tạm thời. Hãy gửi thư thử tới một địa chỉ thuộc tên
+  miền của bạn, hoặc chờ Postmark duyệt.
+- **Luồng Gửi hàng loạt không dùng được Postmark** ở bước chọn luồng hoặc trong phần Định tuyến. Hãy tạo luồng
+  Broadcast như ở bước 8.
+- **Bước tên miền không hiển thị bản ghi DKIM hay Return-Path.** Bạn đã kết nối mà không có Account API token. Hãy
+  thêm tên miền trong Postmark và công bố bản ghi DKIM mà Postmark hiển thị, hoặc thêm token trong
+  <UiPath path="providers.overview.settings > providers.overview.credentials" /> trên thẻ nhà cung cấp.
+- **"Postmark didn't create the stream"** vì cả hai stream ID đều đã được dùng. Hãy tạo một luồng Broadcast trong
+  Postmark, rồi nhập ID của nó.
+- **Danh mục hiển thị huy hiệu "Sandbox token".** ReputeCast không có chế độ thử cho Postmark: thư thử trong lúc
+  thiết lập là một thư thật.
+- **Bạn đã đổi URL công khai hoặc ngắt kết nối Postmark.** URL công khai mới thêm một webhook cho địa chỉ mới; hãy xóa
+  webhook cũ trong Postmark. Ngắt kết nối sẽ xóa các webhook của ReputeCast, nhưng luồng Broadcast, tên miền và các
+  địa chỉ chặn gửi đã đẩy lên vẫn còn trong Postmark.
+
+## Liên quan
+
+- [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/)
+- [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/)
+- [Sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)
+- [Cấu hình SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/)
+- [Chọn nhà cung cấp gửi thư](/vi/providers/choose/)

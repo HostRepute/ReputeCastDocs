@@ -1,0 +1,160 @@
+---
+title: Gửi thư qua SMTP relay
+description: Bật SMTP relay cho ứng dụng chỉ hỗ trợ SMTP, mở cổng 587 và 465, rồi gửi email giao dịch qua SMTP relay bằng thông tin xác thực chỉ dùng để gửi.
+type: how-to
+audience: [operator, admin, developer]
+permissions: ['apikeys:manage']
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance > transactional.relayAdmin.title'
+primaryKeyword: email giao dịch qua SMTP relay
+sources:
+  - internal/smtprelay
+  - internal/app/wire_smtprelay.go
+  - internal/apikeys/transactional.go
+  - web/src/features/transactional/RelayAdminCard.tsx
+  - web/src/features/transactional/setup.messages.ts
+  - deploy/docker-compose.yml
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+SMTP relay giúp những ứng dụng không gọi được HTTP API vẫn gửi email giao dịch qua SMTP relay của ReputeCast: ứng
+dụng kết nối tới cổng 587 (STARTTLS) hoặc 465 (TLS), xác thực bằng một thông tin xác thực chỉ dùng để gửi, và thư đi
+qua tuyến Giao dịch, danh sách chặn gửi và [nhật ký thư](/vi/transactional/message-log/) của không gian làm việc.
+Quản trị viên hệ thống bật relay một lần cho mỗi hệ thống; sau đó mỗi không gian làm việc tự tạo thông tin xác thực
+của mình.
+
+## Trước khi bắt đầu
+
+- Bạn là quản trị viên hệ thống, và bạn có thể thay đổi tường lửa của máy chủ cùng tệp Docker Compose.
+- Một tên máy chủ cho relay, như `smtp.example.com`, có bản ghi `A`/`AAAA` trỏ về máy chủ. ReputeCast gợi ý host của
+  URL công khai của hệ thống.
+- Trong không gian làm việc: `apikeys:manage` để tạo thông tin xác thực SMTP, và một người gửi Giao dịch đã xác minh.
+  Địa chỉ `From` của mọi thư phải là một người gửi Giao dịch đã xác minh
+  (xem [thêm tên miền gửi thư và người gửi](/vi/providers/senders-and-domains/)).
+- Các tiến trình có vai trò `web` chạy các listener của relay. Nếu bạn tách vai trò, xem
+  [mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/).
+
+## Mở cổng
+
+ReputeCast lắng nghe trên các cổng relay bên trong container, nhưng Docker Compose chỉ mở những cổng bạn liệt kê.
+Tệp `deploy/docker-compose.yml` mặc định chỉ mở cổng 8080, nên bạn cần tự thêm hai cổng relay vào service `app`:
+
+```yaml title="docker-compose.yml"
+services:
+  app:
+    ports:
+      - "${REPUTECAST_PORT:-8080}:8080"
+      - "587:587" # SMTP relay, STARTTLS
+      - "465:465" # SMTP relay, implicit TLS
+```
+
+Áp dụng thay đổi bằng `docker compose up -d`, và mở cả hai cổng trên tường lửa của máy chủ. SMTP không phải HTTP, nên
+các cổng relay đi thẳng đến ứng dụng, không bao giờ qua reverse proxy của bạn. Nếu bạn đổi cổng trong cài đặt relay,
+hãy mở các cổng đó thay thế.
+
+## Bật relay
+
+<Steps>
+
+1. Mở <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> từ menu tài khoản và tìm phần
+   <UiPath path="transactional.relayAdmin.title" />.
+
+2. Đặt **Hostname** (tên máy chủ), **STARTTLS port** (587) và **TLS port** (465). Hai cổng phải khác nhau.
+
+3. Chọn **Certificate** (chứng chỉ):
+   - **Let's Encrypt**: ReputeCast tự lấy và gia hạn chứng chỉ. Let's Encrypt xác thực tên máy chủ qua HTTP, nên
+     `http://<hostname>/.well-known/acme-challenge/` phải đến được một tiến trình web của ReputeCast, ví dụ thông qua
+     [reverse proxy](/vi/self-hosting/reverse-proxy/) của bạn. Mọi node web dùng chung chứng chỉ này.
+   - **Certificate and key files**: tải lên **Certificate chain (PEM)** và **Private key (PEM)**. Khóa riêng ở chế độ
+     chỉ ghi: nó được niêm phong và không bao giờ hiển thị lại.
+
+4. Chọn <UiPath path="transactional.relayAdmin.turnOn" />, rồi <UiPath path="transactional.relayAdmin.runChecks" />.
+   ReputeCast kiểm tra tên máy chủ có phân giải được không, cả hai cổng có truy cập được từ internet không, và chứng
+   chỉ có hợp lệ không. Các kiểm tra này cũng chạy mỗi 10 phút; quản trị viên hệ thống được thông báo khi một cổng
+   ngừng phản hồi.
+
+</Steps>
+
+## Tạo thông tin xác thực SMTP
+
+<Steps>
+
+1. Trong không gian làm việc, mở <UiPath path="nav.transactional > transactional.common.tabSetup" /> rồi chọn
+   <UiPath path="transactional.setup.createCredential" />.
+
+2. Đặt tên theo ứng dụng, chọn chế độ **Live** (chính thức) hoặc **Test** (thử nghiệm), và nếu muốn, giới hạn những
+   mẫu và danh mục mà thông tin xác thực được phép gửi, cũng như đặt thời điểm hết hạn. Chế độ thử nghiệm chỉ gửi tới
+   thành viên của không gian làm việc và các địa chỉ thử mà bạn cho phép.
+
+3. Sao chép mật khẩu ngay: nó chỉ hiển thị một lần. **Username** (tên người dùng) là ID khóa của thông tin xác thực;
+   **password** (mật khẩu) là khóa bí mật của nó, bắt đầu bằng `rc_smtp_`. Thông tin xác thực này chỉ có
+   `transactional:send`.
+
+</Steps>
+
+<Screenshot
+  id="transactional-setup"
+  alt="Trang Setup của Giao dịch: thẻ HTTP API, các khóa có thể gửi thư, trong đó có một thông tin xác thực SMTP cho dịch vụ thanh toán, và thẻ SMTP relay đang ở trạng thái On."
+/>
+
+## Cấu hình ứng dụng
+
+| Cài đặt | Giá trị |
+| --- | --- |
+| Host | Tên máy chủ của relay, ví dụ `smtp.example.com` |
+| Port | `587` với STARTTLS, hoặc `465` với TLS |
+| Auth | `PLAIN` hoặc `LOGIN` |
+| Username | ID khóa của thông tin xác thực |
+| Password | Khóa bí mật của thông tin xác thực (`rc_smtp_…`) |
+| From | Một địa chỉ thuộc người gửi Giao dịch đã xác minh |
+
+Hai header không bắt buộc dùng để gắn nhãn thư trong ReputeCast; relay đọc chúng và không chuyển tiếp chúng đi:
+
+```text title="Header không bắt buộc"
+X-ReputeCast-Tags: invoice, eu
+X-ReputeCast-Category: Billing
+```
+
+`X-ReputeCast-Tags` gồm các thẻ cách nhau bằng dấu phẩy. `X-ReputeCast-Category` nhận tên hoặc ID của một danh mục;
+nếu không có header này, thông tin xác thực chỉ được phép dùng một danh mục sẽ dùng danh mục đó. Người nhận đã tắt một
+danh mục Tùy chọn sẽ không nhận thư của danh mục đó.
+
+## Giới hạn
+
+<LimitsTable area="smtp-relay" />
+
+## Kiểm tra kết quả
+
+Gửi một thư từ ứng dụng của bạn, rồi mở <UiPath path="nav.transactional > transactional.common.tabMessages" />. Thư
+hiển thị **Raw (SMTP)** thay cho tên mẫu, kèm dòng thời gian gửi.
+
+## Khắc phục sự cố
+
+- **Kiểm tra báo một cổng không truy cập được** → cổng chưa được mở trong Compose, hoặc tường lửa phía trước máy chủ
+  đang chặn nó.
+- **Kiểm tra báo tên máy chủ không phân giải được** → thêm bản ghi `A`/`AAAA`, chờ DNS cập nhật, rồi chạy lại kiểm
+  tra.
+- **Let's Encrypt thất bại** → cổng 80 của tên máy chủ không đến được tiến trình web của ReputeCast. Hãy định tuyến
+  `/.well-known/acme-challenge/` tới tiến trình đó, hoặc tải lên tệp chứng chỉ.
+- **Xác thực thất bại** → dùng ID khóa làm tên người dùng, không phải tên của thông tin xác thực, và kiểm tra thông tin
+  xác thực chưa bị thu hồi hoặc hết hạn.
+- **Thư bị từ chối với lỗi kích thước** → relay nhận tối đa 40 MiB, nhưng các nhà cung cấp gửi thư trên tuyến có thể
+  nhận ít hơn; phản hồi sẽ nói rõ điều này.
+- **Ứng dụng bị từ chối kết nối** → relay đang tắt. HTTP API vẫn hoạt động trong mọi trường hợp.
+
+<Aside type="note">
+Relay chỉ dành cho thư giao dịch từ chính các ứng dụng của bạn. Để gửi chiến dịch hoặc tự động hóa, hãy dùng ứng
+dụng ReputeCast; để gửi từ mã nguồn với mẫu, hãy dùng HTTP API (xem
+[gửi email giao dịch bằng API](/vi/developers/transactional-api/)).
+</Aside>
+
+## Liên quan
+
+- [Email giao dịch trong ReputeCast](/vi/transactional/overview/)
+- [Cài đặt bằng Docker Compose](/vi/self-hosting/docker/)
+- [Xác thực và khóa API](/vi/developers/api-authentication/)

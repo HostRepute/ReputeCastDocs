@@ -1,0 +1,109 @@
+---
+title: Giới hạn tốc độ API
+description: Rate limit API trong ReputeCast. Số yêu cầu mỗi phút cho mỗi khóa, giới hạn đăng nhập và MCP, tốc độ gửi giao dịch, các header X-RateLimit và cách xử lý 429.
+type: reference
+audience: [developer, operator]
+primaryKeyword: rate limit API
+sources:
+  - internal/server/ratelimit.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/send.go
+  - internal/revenue/conversions.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 6
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Đây là các rate limit API (giới hạn tốc độ) của một hệ thống ReputeCast: mỗi bên gọi được thực hiện bao nhiêu yêu
+cầu, máy chủ đếm chúng thế nào, và máy chủ trả về gì khi một bên gọi vượt giới hạn.
+
+## Giới hạn
+
+<LimitsTable area="rate-limits" />
+
+- Lệnh gọi bằng khóa API được đếm theo từng khóa, bất kể đến từ địa chỉ nào. Lệnh gọi không có bearer token (phiên
+  trình duyệt) được đếm theo địa chỉ IP của client.
+- Lệnh gọi gửi giao dịch đơn lẻ và theo lô không tính vào giới hạn yêu cầu của mỗi khóa; thay vào đó, mỗi khóa có tốc
+  độ gửi thư riêng (xem [gửi email giao dịch bằng API](/vi/developers/transactional-api/)).
+- Trang công khai, liên kết theo dõi và webhook của nhà cung cấp (`/p/`, `/t/`, `/hooks/`) nằm ngoài các giới hạn này.
+  Biểu mẫu đăng ký có giới hạn riêng (xem [biểu mẫu đăng ký](/vi/forms/signup-forms/)).
+- Mỗi tiến trình máy chủ đếm riêng. Khi có nhiều node web phía sau một bộ cân bằng tải, một bên gọi có thể chạm giới
+  hạn trên từng node.
+
+## Header
+
+<TableScroll label="Header giới hạn tốc độ">
+
+| Header                  | Được gửi kèm                                                             | Giá trị                                                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-RateLimit-Limit`     | Mọi phản hồi `/api/` trừ gửi giao dịch đơn lẻ và theo lô                 | Số yêu cầu được phép mỗi phút cho bên gọi này.                                                                                                        |
+| `X-RateLimit-Remaining` | Như trên                                                                 | Số yêu cầu còn lại trong khung thời gian hiện tại.                                                                                                    |
+| `X-RateLimit-Reset`     | Như trên                                                                 | Thời điểm khung thời gian hiện tại kết thúc, tính bằng giây Unix.                                                                                     |
+| `Retry-After`           | Phản hồi `429`                                                           | Số giây cần chờ. `60` với giới hạn theo khóa, giới hạn đăng nhập và giới hạn MCP; với gửi giao dịch và chuyển đổi, là thời gian cho đến khi khóa có chỗ trở lại (tối thiểu 1). |
+
+</TableScroll>
+
+```http title="Header phản hồi"
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Ratelimit-Limit: 600
+X-Ratelimit-Remaining: 590
+X-Ratelimit-Reset: 1792671646
+```
+
+Tên header HTTP không phân biệt chữ hoa chữ thường; hãy đọc chúng mà không phụ thuộc vào kiểu chữ.
+
+## Phản hồi khi chạm giới hạn
+
+Khi vượt giới hạn yêu cầu của mỗi khóa:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Con số "1,000 items" trong thông báo này đúng với thao tác thêm vào danh sách chặn gửi; thao tác gửi giao dịch theo lô
+nhận tối đa 100 thư.
+
+Khi vượt tốc độ gửi thư của một khóa chỉ gửi (ở đây là 50 thư mỗi giây), kèm `Retry-After: 1`:
+
+```json title="429 Too Many Requests"
+{
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This key sends at most 50 messages per second. Wait 1 second (Retry-After) and send again with the same idempotency key.",
+  "code": "rate_limited"
+}
+```
+
+Khi vượt giới hạn đăng nhập, detail là "Too many sign-in attempts from your network. Wait a minute and try again."
+Máy chủ MCP báo giới hạn của nó bằng văn bản thuần kèm `Retry-After: 60`: "Rate limit reached: 120 calls per minute
+per agent. Calls resume within a minute." (với giới hạn riêng của tác tử thay cho 120). Xem [lỗi API](/vi/developers/api-errors/)
+để biết định dạng problem document.
+
+## Giữ dưới giới hạn
+
+- Đọc `X-RateLimit-Remaining` và giảm tốc trước khi giá trị này về 0.
+- Khi nhận `429`, hãy chờ số giây trong `Retry-After` rồi thử lại. Thử lại sớm hơn chỉ nhận thêm một `429`.
+- Dùng thao tác theo lô và kích thước trang lớn nhất bạn cần (xem [phân trang](/vi/developers/api-pagination/)).
+- [Nhận webhook](/vi/developers/webhooks/) thay vì hỏi định kỳ để biết thay đổi.
+- Thử lại lượt gửi giao dịch với cùng `Idempotency-Key`, để mỗi thư chỉ được gửi một lần.
+- Cấp cho mỗi tác vụ một khóa riêng, để một tác vụ bận rộn không dùng hết giới hạn của tác vụ khác.
+
+## Thay đổi giới hạn
+
+Người vận hành máy chủ đặt giới hạn yêu cầu trong cấu hình: `http.rate_limit_api` cho lệnh gọi API và
+`http.rate_limit_auth` cho đăng nhập (xem [tham chiếu cấu hình](/vi/reference/configuration/)). Đặt
+`http.rate_limit_api` thành 0 sẽ tắt cả hai. Khi ReputeCast chạy sau một reverse proxy, hãy đặt `http.trusted_proxies`
+để các bên gọi không có khóa được đếm theo địa chỉ của chính họ, không phải địa chỉ của proxy (xem [reverse proxy và
+TLS](/vi/self-hosting/reverse-proxy/)). Tốc độ gửi thư của khóa chỉ gửi được đặt khi tạo khóa, còn giới hạn lệnh gọi
+của tác tử MCP được đặt trong phần cài đặt MCP của không gian làm việc.

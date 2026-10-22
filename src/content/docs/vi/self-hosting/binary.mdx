@@ -1,0 +1,160 @@
+---
+title: Cài đặt bằng tệp nhị phân
+description: 'Cài đặt ReputeCast trên Linux bằng tệp nhị phân, không cần Docker: kiểm tra bản tải về, chuẩn bị PostgreSQL, viết tệp biến môi trường và chạy bằng systemd.'
+type: how-to
+audience: [operator]
+primaryKeyword: cài đặt ReputeCast trên Linux
+sources:
+  - .goreleaser.yaml
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/config/config.go
+  - README.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này cho biết cách cài đặt ReputeCast trên Linux dưới dạng một tệp nhị phân duy nhất do systemd chạy, bên cạnh
+một máy chủ PostgreSQL. Tệp nhị phân chứa ứng dụng web và mọi migration cơ sở dữ liệu; bạn không cần cài thêm gì khác.
+
+## Trước khi bắt đầu
+
+- Một máy chủ Linux `amd64` hoặc `arm64` có systemd, và PostgreSQL 16, 17 hoặc 18 (xem
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/)).
+- Quyền `sudo` và một reverse proxy cho TLS trên cùng máy chủ ([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+- Tệp nhị phân cũng chạy được trên macOS và Windows, nhưng hướng dẫn này dùng systemd.
+
+## Cài đặt ReputeCast
+
+<Steps>
+
+1. Tải tệp nén cho nền tảng của bạn (`linux_amd64` hoặc `linux_arm64`) và `checksums.txt` từ
+   [trang phát hành](https://github.com/hostrepute/reputecast/releases), kiểm tra tệp rồi cài tệp nhị phân:
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   tar -xzf reputecast_*_linux_amd64.tar.gz reputecast
+   sudo install -m 0755 reputecast /usr/local/bin/reputecast
+   reputecast version
+   ```
+
+2. Tạo cơ sở dữ liệu, người dùng của nó và role cho phân khúc SQL
+   ([PostgreSQL](/vi/self-hosting/postgres/#tạo-cơ-sở-dữ-liệu)):
+
+   ```sh
+   sudo -u postgres psql -c "CREATE ROLE reputecast LOGIN PASSWORD 'change-me'" \
+     -c "CREATE DATABASE reputecast OWNER reputecast" \
+     -c "CREATE ROLE reputecast_segments NOLOGIN" \
+     -c "GRANT reputecast_segments TO reputecast"
+   ```
+
+3. Tạo một tài khoản hệ thống Linux cho dịch vụ. systemd tạo thư mục dữ liệu của nó, `/var/lib/reputecast`, ở bước 6:
+
+   ```sh
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin reputecast
+   ```
+
+4. Tạo thư mục `/etc/reputecast` (`sudo mkdir -p /etc/reputecast`) và ghi cấu hình vào đó dưới dạng tệp biến môi
+   trường, chỉ root và dịch vụ đọc được:
+
+   ```sh title="/etc/reputecast/env"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:change-me@localhost:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_HTTP__ADDR=127.0.0.1:8080
+   REPUTECAST_HTTP__TRUSTED_PROXIES=127.0.0.1
+   REPUTECAST_SECRETS__KEY_FILE=/var/lib/reputecast/secret.key
+   REPUTECAST_LOG__FORMAT=json
+   ```
+
+   ```sh
+   sudo chown root:reputecast /etc/reputecast/env && sudo chmod 0640 /etc/reputecast/env
+   ```
+
+   Nếu không có `REPUTECAST_SECRETS__KEY_FILE`, tệp khóa sẽ là `data/secret.key` trong thư mục làm việc. Mọi khóa cấu
+   hình được mô tả trong [cấu hình ReputeCast](/vi/self-hosting/configuration/).
+
+5. Áp dụng migration và tạo Chủ sở hữu đầu tiên:
+
+   ```sh
+   sudo sh -c 'set -a && . /etc/reputecast/env && reputecast install --email you@company.com --name "Your Name"'
+   ```
+
+   ```txt title="Đầu ra"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    HAwc-PKEn-jSXh-EE9w   (temporary: you'll replace it at first sign-in)
+   ```
+
+   `install` chỉ ghi vào cơ sở dữ liệu. Lệnh dừng với ``ReputeCast is already installed: users exist`` khi cơ sở dữ liệu
+   đã có người dùng.
+
+6. Tạo dịch vụ:
+
+   ```ini title="/etc/systemd/system/reputecast.service"
+   [Unit]
+   Description=ReputeCast
+   After=network-online.target postgresql.service
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=reputecast
+   Group=reputecast
+   EnvironmentFile=/etc/reputecast/env
+   ExecStart=/usr/local/bin/reputecast serve
+   Restart=on-failure
+   StateDirectory=reputecast
+   WorkingDirectory=/var/lib/reputecast
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   `StateDirectory=reputecast` khiến systemd tạo `/var/lib/reputecast` thuộc sở hữu của người dùng dịch vụ. Ở lần khởi
+   động đầu tiên, ReputeCast ghi khóa bí mật vào đó và lưu tệp tải lên trong `/var/lib/reputecast/files`.
+
+7. Khởi động dịch vụ:
+
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now reputecast
+   ```
+
+8. Trỏ [reverse proxy](/vi/self-hosting/reverse-proxy/) đến `127.0.0.1:8080`, mở URL công khai và hoàn tất
+   [lần đăng nhập đầu tiên](/vi/self-hosting/first-run/).
+
+</Steps>
+
+<Aside type="caution">
+  Hãy sao lưu `/var/lib/reputecast/secret.key` cùng với cơ sở dữ liệu. Thiếu tệp này, thông tin xác thực của nhà cung
+  cấp và các bí mật khác lưu trong cơ sở dữ liệu không thể giải mã ([sao lưu và khôi phục](/vi/self-hosting/backups/)).
+</Aside>
+
+## Kiểm tra kết quả
+
+- `systemctl status reputecast` hiện `active (running)`.
+- `journalctl -u reputecast` có một dòng `http listening` kèm địa chỉ, URL công khai và các vai trò.
+- `curl http://127.0.0.1:8080/readyz` trả về `ready`.
+- `sudo sh -c 'set -a && . /etc/reputecast/env && reputecast migrate status'` không liệt kê migration nào là `pending`.
+
+## Khắc phục sự cố
+
+- **`Error: http.public_url must be an absolute URL, got "…"`**: hãy viết địa chỉ kèm scheme,
+  `https://news.example.com`.
+- **Log cảnh báo `database has pending migrations`**: `serve` không chạy migration trừ khi bạn truyền `--auto-migrate`.
+  Hãy chạy `reputecast migrate up` với cùng môi trường, hoặc thêm `--auto-migrate` vào `ExecStart`.
+- **`connect to postgres: …`**: hãy kiểm tra URL, mật khẩu và `pg_hba.conf` bằng `psql` với cùng URL.
+- **Lỗi permission denied khi đọc khóa bí mật**: `/var/lib/reputecast` phải thuộc về người dùng dịch vụ; hãy giữ
+  `StateDirectory=reputecast` trong unit.
+- **Mất mật khẩu tạm thời**: `reputecast user reset-password --email you@company.com` in ra một liên kết dùng một lần
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)).
+
+## Liên quan
+
+- [Cài đặt bằng Docker Compose](/vi/self-hosting/docker/)
+- [Nâng cấp ReputeCast](/vi/self-hosting/upgrades/)
+- [Tham chiếu CLI](/vi/reference/cli/)

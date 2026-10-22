@@ -8,6 +8,12 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['github'], ['list']] : 'list',
   use: { baseURL: 'http://localhost:4321', trace: 'retain-on-failure' },
-  webServer: { command: 'pnpm preview --port 4321', port: 4321, reuseExistingServer: false, timeout: 60_000 },
+  // --ignore-lock keeps `astro preview` in the foreground (Astro backgrounds it when an AI agent runs it).
+  webServer: {
+    command: 'pnpm preview --port 4321 --ignore-lock',
+    port: 4321,
+    reuseExistingServer: false,
+    timeout: 60_000,
+  },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
 })

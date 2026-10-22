@@ -1,0 +1,275 @@
+---
+title: Kết nối tác tử AI qua MCP
+description: "Kết nối Claude Code, Cursor hoặc VS Code tới MCP server cho email marketing mà nhóm bạn kiểm soát: token và quyền riêng cho từng tác tử, nhật ký, đề xuất gửi."
+type: how-to
+audience: [developer, admin]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: MCP server cho email marketing
+sources:
+  - internal/mcpserver/mcpserver.go
+  - internal/mcpserver/server.go
+  - internal/mcpserver/tools.go
+  - internal/mcpserver/transactional.go
+  - internal/mcpserver/resources.go
+  - internal/app/wire_mcpserver.go
+  - internal/authz/permissions.go
+  - web/src/features/keys/McpPage.tsx
+  - web/src/features/keys/CreateKeyDialog.tsx
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast có sẵn một máy chủ [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), để trợ lý AI có thể
+đọc báo cáo, kiểm tra Độ sẵn sàng gửi, soạn nháp chiến dịch hoặc tạm dừng một lượt gửi trong không gian làm việc của
+bạn: một MCP server cho email marketing mà nhóm của bạn kiểm soát được. Mỗi
+[tác tử MCP](/vi/reference/glossary/#mcp-agent) có token và quyền riêng, không bao giờ nhiều hơn người đã tạo ra nó,
+và mọi thao tác có thể gửi thư đều được chuyển tới một người dưới dạng đề xuất thay vì tự chạy.
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `mcp:manage` trong không gian làm việc (một [quyền nhạy cảm](/vi/reference/glossary/#sensitive-permission)).
+  Bạn chỉ có thể cấp cho tác tử những quyền mà chính bạn đang có.
+- Hệ thống của bạn cần một URL công khai mà MCP client truy cập được qua HTTPS. Endpoint là `<public URL>/mcp`, do vai
+  trò web phục vụ.
+- Nếu ReputeCast chạy sau reverse proxy, `/mcp` phải truyền phản hồi theo luồng (streaming) mà không đệm. Xem
+  [Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+
+## Tạo tác tử
+
+<Steps>
+
+1. Mở <UiPath path="nav.settings > settings.keys" />. Thẻ MCP ở trên cùng hiển thị endpoint, ví dụ
+   `https://reputecast.example.com/mcp`.
+
+2. Chọn <UiPath path="keys.addAgent" />. Đặt cho tác tử một cái tên cho biết ai dùng nó, chẳng hạn "Claude: analytics".
+
+3. Chọn quyền cho tác tử. Hãy bắt đầu với quyền đọc, chẳng hạn `reports:view` và `deliverability:view`, rồi bổ sung
+   sau. Quyền bạn không có sẽ bị khóa. Tác tử không bao giờ được giữ `subscribers:verify`, `placement:run`,
+   `placement:manage`, `integrations:manage`, `ai:use` hay các quyền agency.
+
+4. Nếu muốn, hãy giới hạn tác tử trong một số danh sách và đặt thời hạn, rồi tạo tác tử.
+
+5. Sao chép token, `rc_agent_…`. Token chỉ hiển thị một lần; ReputeCast chỉ giữ mã băm SHA-256 của nó.
+
+</Steps>
+
+<Screenshot
+  id="settings-mcp"
+  alt="Cài đặt, Khóa và MCP: thẻ MCP với endpoint và đoạn cấu hình client, cùng ma trận tác tử. Một tác tử được đọc báo cáo và liên hệ; một tác tử vận hành đọc tình trạng nhà cung cấp và được tạm dừng lượt gửi nhưng không bao giờ được bắt đầu gửi."
+/>
+
+Ma trận tác tử cho biết mỗi tác tử làm được gì, suy ra từ quyền của nó:
+
+<TableScroll label="Khả năng của tác tử">
+
+| Cột                       | Cho phép khi tác tử có                                             | Ghi chú                                                                  |
+| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Read reports and contacts | `reports:view` hoặc `subscribers:view`                             | Hiển thị "Allow · provider health" hoặc "Allow · deliverability" khi quyền đọc hẹp hơn. |
+| Draft campaigns           | `campaigns:edit`                                                   | Chỉ tạo bản nháp; không gửi gì.                                          |
+| Edit audience             | `subscribers:edit`, `segments:edit` hoặc `lists:manage`            |                                                                          |
+| Schedule or send          | `campaigns:send` hiển thị "Approve"; chỉ có `campaigns:pause` thì hiển thị "Pause only · never start" | Lên lịch luôn cần một người. Xem [Đề xuất](#đề-xuất-cho-mọi-thao-tác-gửi-thư). |
+| Change routing            | `providers:manage`                                                 |                                                                          |
+
+</TableScroll>
+
+## Kết nối MCP client
+
+Máy chủ dùng transport **Streamable HTTP** của MCP. Mọi yêu cầu đều mang token của tác tử dưới dạng bearer token:
+
+```http title="Header của yêu cầu"
+Authorization: Bearer rc_agent_…
+```
+
+Tại đây ReputeCast chỉ chấp nhận token tác tử: khóa API (`rc_live_…`) hoặc cookie phiên đăng nhập đều bị từ chối. Hãy
+chọn client của bạn bên dưới. Các ví dụ đọc token từ biến môi trường `REPUTECAST_AGENT_TOKEN`; hãy thay
+`reputecast.example.com` bằng URL công khai của bạn.
+
+<Tabs syncKey="mcp-client">
+<TabItem label="Claude Code">
+
+```sh title="Terminal"
+claude mcp add --transport http reputecast https://reputecast.example.com/mcp \
+  --header "Authorization: Bearer $REPUTECAST_AGENT_TOKEN"
+```
+
+Để chia sẻ máy chủ với cả dự án, hãy thêm nó vào `.mcp.json` ở thư mục gốc của dự án. Claude Code cần
+`"type": "http"` cho máy chủ có `url`; mục không có `type` sẽ bị hiểu là lệnh cục bộ và bị bỏ qua:
+
+```json title=".mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Chạy `claude mcp get reputecast` để kiểm tra kết nối. Nguồn:
+[tài liệu MCP của Claude Code](https://code.claude.com/docs/en/mcp), kiểm tra tháng 10/2026.
+
+</TabItem>
+<TabItem label="Cursor">
+
+Thêm máy chủ vào `~/.cursor/mcp.json` (cho mọi dự án) hoặc `.cursor/mcp.json` (cho một dự án):
+
+```json title="~/.cursor/mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Cursor điền `${env:NAME}` từ môi trường của bạn. Nguồn:
+[tài liệu MCP của Cursor](https://cursor.com/docs/context/mcp), kiểm tra tháng 10/2026.
+
+</TabItem>
+<TabItem label="VS Code">
+
+Thêm máy chủ vào `.vscode/mcp.json` trong workspace VS Code của bạn. VS Code hỏi token một lần và lưu trữ nó an toàn:
+
+```json title=".vscode/mcp.json"
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "reputecast-agent-token",
+      "description": "ReputeCast agent token (rc_agent_…)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${input:reputecast-agent-token}" }
+    }
+  }
+}
+```
+
+Nguồn: [tài liệu tham chiếu cấu hình MCP của VS Code](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration),
+kiểm tra tháng 10/2026.
+
+</TabItem>
+<TabItem label="Client khác">
+
+Mọi client kết nối tới MCP server từ xa bằng URL và cho phép bạn đặt header yêu cầu đều dùng được. Hầu hết dùng cấu
+trúc dưới đây; hãy xem tài liệu của client để biết tên tệp và liệu nó có cần thêm `"type": "http"` không:
+
+```json title="mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer rc_agent_…" }
+    }
+  }
+}
+```
+
+Client chỉ khởi chạy được máy chủ cục bộ (stdio) cần một cầu nối cục bộ tới máy chủ HTTP từ xa; ReputeCast không cung
+cấp cầu nối này.
+
+</TabItem>
+</Tabs>
+
+<Aside type="danger" title="Bảo vệ token như mật khẩu">
+Bất kỳ ai có token đều có thể hành động với tư cách tác tử. Đừng để token trong kho mã dùng chung: hãy dùng biến môi
+trường hoặc lời nhắc nhập khóa bí mật của client, như ở trên. Nếu token bị lộ, hãy thu hồi tác tử trong
+<UiPath path="nav.settings > settings.keys" />.
+</Aside>
+
+## Tác tử làm được gì
+
+Máy chủ cung cấp 53 công cụ (tool), 3 tài nguyên (resource) và 2 prompt. Mỗi công cụ kiểm tra một quyền, giống hệt
+khóa API, và bạn có thể chỉ định chiến dịch bằng tên hoặc ID. Danh sách đầy đủ, kèm quyền và tác động của từng công cụ,
+nằm trong [Công cụ, tài nguyên và prompt MCP](/vi/reference/mcp-tools/).
+
+- **Đọc**: danh sách và báo cáo chiến dịch, Độ sẵn sàng gửi, số liệu gửi trực tiếp, tình trạng nhà cung cấp, định
+  tuyến, khả năng vào hộp thư, kiểm tra vị trí thư, tự động hóa, bản tin tổng hợp, bình chọn, tăng trưởng, doanh thu
+  và nội dung website.
+- **Thay đổi**: tạo bản nháp chiến dịch, SMS, thông báo đẩy, WhatsApp và bài viết website; cập nhật nội dung chiến
+  dịch; tạo phân khúc; thêm địa chỉ vào danh sách chặn gửi; thay đổi tỷ trọng định tuyến; tạm dừng và tiếp tục lượt
+  gửi.
+- **Gửi thử**: `send_test_email` chỉ gửi bản thử của chiến dịch tới thành viên của không gian làm việc, qua luồng Hệ
+  thống.
+- **Email giao dịch**: chỉ đọc. Tác tử liệt kê và kết xuất mẫu, tìm kiếm trong nhật ký thư, nhưng không bao giờ gửi
+  thư giao dịch.
+- **Tài nguyên**: MJML của một chiến dịch, một báo cáo dạng CSV và 100 mục mới nhất của nhật ký kiểm tra.
+
+Quyền của tác tử được kiểm tra lại ở mọi lệnh gọi, đối chiếu với vai trò hiện tại của người tạo. Khi người tạo mất một
+quyền, tác tử cũng mất quyền đó; khi người tạo rời không gian làm việc hoặc bị vô hiệu hóa, tác tử không làm được gì
+nữa.
+
+## Đề xuất cho mọi thao tác gửi thư
+
+Tác tử không bắt đầu lượt gửi.
+
+- `schedule_campaign` không bao giờ lên lịch. Công cụ này ghi lại một đề xuất cho thành viên đầu tiên có quyền
+  `campaigns:send`; người này nhận thông báo ("Claude: analytics asked to schedule Weekly Digest #142") kèm liên kết
+  tới chiến dịch. Người đó lên lịch chiến dịch trong ReputeCast, nơi Độ sẵn sàng gửi và phê duyệt được áp dụng như
+  bình thường.
+- Lệnh gọi mà tác tử không có quyền sẽ bị từ chối. Tác tử nhận lỗi nêu tên quyền còn thiếu, việc từ chối được ghi vào
+  nhật ký kiểm tra, và một đề xuất được gửi tới thành viên đầu tiên có quyền đó.
+- Thông báo nêu rõ thời điểm đề xuất hết hạn: mặc định 2 giờ, có thể đặt từ 1 đến 168 giờ trong
+  <UiPath path="keys.changeLimits" />. ReputeCast không bao giờ tự thực hiện đề xuất, nên thời hạn chỉ cho người nhận
+  biết yêu cầu còn hiệu lực trong bao lâu; khi hết hạn, không có gì xảy ra.
+- `pause_campaign` cần `campaigns:pause` và tạm dừng ngay. `resume_campaign` cần `campaigns:send` và tiếp tục gửi
+  ngay: chỉ cấp `campaigns:send` cho tác tử nếu nó được phép khởi động lại một lượt gửi đã tạm dừng.
+
+## Nhật ký kiểm tra và giới hạn
+
+Mọi lệnh gọi công cụ đều được ghi vào nhật ký kiểm tra với tác tử là người thực hiện, tên công cụ và kết quả, kể cả
+lệnh gọi bị từ chối. <UiPath path="keys.recentAgentActions" /> trên cùng trang hiển thị các lệnh gọi gần nhất; mở
+[nhật ký kiểm tra](/vi/team/audit-log/) để xem phần còn lại.
+
+<UiPath path="keys.changeLimits" /> đặt số lệnh gọi mỗi phút cho mỗi tác tử và thời hạn đề xuất của không gian làm
+việc, đồng thời cho phép tắt MCP server. Khi máy chủ tắt, mọi token tác tử đều bị từ chối. Tác tử vượt giới hạn nhận
+`429` kèm `Retry-After: 60`.
+
+<LimitsTable area="mcp" />
+
+## Kiểm tra kết quả
+
+- Hãy yêu cầu trợ lý liệt kê các công cụ của máy chủ `reputecast`, hoặc gọi `list_campaigns`. Kết quả phải là danh
+  sách chiến dịch của bạn.
+- Trong <UiPath path="nav.settings > settings.keys" />, lệnh gọi gần nhất của tác tử xuất hiện trong ma trận tác tử và
+  trong <UiPath path="keys.recentAgentActions" />.
+
+## Khắc phục sự cố
+
+- **401 "use an MCP agent token (rc_agent_…)"**: client gửi khóa API hoặc không gửi header. Hãy tạo tác tử và dùng
+  token của nó.
+- **401 "this agent was revoked" hoặc "… expired"**: tạo tác tử mới hoặc xoay vòng token của nó trong
+  <UiPath path="nav.settings > settings.keys" />.
+- **401 "the MCP server is off"**: bật máy chủ trong <UiPath path="keys.changeLimits" />.
+- **Client kết nối được nhưng mọi công cụ đều bị từ chối**: tác tử thiếu quyền, hoặc người tạo không còn quyền đó.
+  Thông báo lỗi nêu tên quyền.
+- **Claude Code bỏ qua máy chủ**: mục trong `.mcp.json` có `url` nhưng không có `"type": "http"`.
+- **Lệnh gọi bị treo hoặc hết thời gian chờ khi đi qua proxy**: proxy đang đệm phản hồi của `/mcp`. Hãy tắt đệm cho
+  đường dẫn đó.
+- **Lỗi 429**: tác tử gọi nhiều hơn mức không gian làm việc cho phép mỗi phút. Hãy nâng giới hạn hoặc giảm tốc độ của
+  tác tử.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Công cụ, tài nguyên và prompt MCP" href="/vi/reference/mcp-tools/" description="Mọi công cụ kèm quyền và tác động của nó." />
+  <LinkCard title="Vai trò và quyền" href="/vi/team/roles-and-permissions/" description="Mô hình quyền mà tác tử dùng chung với thành viên và khóa API." />
+  <LinkCard title="Xác thực và khóa API" href="/vi/developers/api-authentication/" description="Khóa cho script và dịch vụ gọi REST API." />
+  <LinkCard title="Dùng trợ lý AI với mô hình của riêng bạn" href="/vi/integrations/ai-assistant/" description="Trợ lý có sẵn trong trình soạn thảo, dành cho người dùng." />
+</CardGrid>

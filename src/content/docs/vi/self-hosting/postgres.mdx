@@ -1,0 +1,175 @@
+---
+title: PostgreSQL
+description: 'Cấu hình PostgreSQL cho ReputeCast: phiên bản hỗ trợ, người dùng và role cho phân khúc SQL, cơ sở dữ liệu được quản lý, URL kết nối, pool và migration.'
+type: how-to
+audience: [operator]
+primaryKeyword: cấu hình PostgreSQL cho ReputeCast
+sources:
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - internal/segments/sqlmode.go
+  - internal/db/db.go
+  - internal/cli/migrate.go
+  - internal/config/config.go
+  - .github/workflows/ci.yml
+sidebar:
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Trang này hướng dẫn cấu hình PostgreSQL cho ReputeCast: cơ sở dữ liệu, người dùng, kết nối và migration lược đồ.
+ReputeCast lưu mọi thứ trong PostgreSQL, kể cả hàng đợi tác vụ, và không cần extension nào.
+
+## Trước khi bắt đầu
+
+- PostgreSQL 16, 17 hoặc 18, tự quản lý hoặc do một nhà cung cấp đám mây vận hành.
+- Một tài khoản quản trị trên máy chủ đó (ví dụ `postgres`) để tạo cơ sở dữ liệu và các role.
+- [Stack Docker Compose](/vi/self-hosting/docker/) đã chạy sẵn PostgreSQL 18 với superuser `reputecast`, tự tạo mọi thứ
+  dưới đây; trang này dành cho mọi cơ sở dữ liệu khác.
+
+## Tạo cơ sở dữ liệu
+
+<Steps>
+
+1. Với tài khoản quản trị, tạo người dùng của ứng dụng, cơ sở dữ liệu của người dùng đó và role mà phân khúc SQL chạy
+   dưới quyền:
+
+   ```sql title="setup.sql"
+   CREATE ROLE reputecast LOGIN PASSWORD 'change-me';
+   CREATE DATABASE reputecast OWNER reputecast;
+   CREATE ROLE reputecast_segments NOLOGIN;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+   Hãy tạo `reputecast_segments` ngay bây giờ, trước migration đầu tiên: xem [phân khúc SQL](#phân-khúc-sql).
+
+2. Trỏ ReputeCast đến cơ sở dữ liệu bằng `database.url` (`REPUTECAST_DATABASE__URL`, hoặc `DATABASE_URL`):
+
+   ```txt
+   postgres://reputecast:change-me@db.internal:5432/reputecast?sslmode=require
+   ```
+
+   - Dùng `sslmode=require` (hoặc `verify-full` với CA của nhà cung cấp) khi cơ sở dữ liệu nằm trên máy khác; chỉ dùng
+     `sslmode=disable` trên cùng máy chủ hoặc trong một network Docker riêng.
+   - Mã hóa phần trăm (percent-encode) các ký tự như `@`, `:` và `/` trong mật khẩu, hoặc chọn mật khẩu không chứa
+     chúng.
+
+3. Chạy migration và tạo Chủ sở hữu đầu tiên bằng `reputecast install` (Docker image làm cả hai việc này khi khởi
+   động).
+
+</Steps>
+
+## PostgreSQL được quản lý
+
+Cơ sở dữ liệu trên đám mây thường cấp cho bạn một tài khoản quản trị không phải superuser. ReputeCast vẫn hoạt động với
+tài khoản đó:
+
+- Các migration không tạo extension nào và chỉ cần quyền sở hữu cơ sở dữ liệu.
+- Tạo `reputecast_segments` cần đặc quyền `CREATEROLE`. Nếu người dùng của ứng dụng không có đặc quyền này, hãy tạo
+  role bằng tài khoản quản trị trước lần khởi động đầu tiên (bước 1 ở trên); nếu không, ReputeCast vẫn cài đặt bình
+  thường nhưng phân khúc SQL sẽ bị tắt.
+
+## Chọn kích thước pool kết nối
+
+Mỗi tiến trình ReputeCast mở pool riêng với tối đa `database.max_conns` kết nối (mặc định 20). Các lệnh dòng lệnh mở
+thêm vài kết nối trong lúc chạy (`migrate` và `install` 4, `user` 2). Hãy giữ tổng số dưới `max_connections` của
+PostgreSQL (mặc định 100), chừa chỗ cho các công cụ của riêng bạn:
+
+| Tiến trình                                       | Số kết nối tối đa |
+| ------------------------------------------------ | ----------------- |
+| Một `serve` (mọi vai trò), pool mặc định         | 20                |
+| Ba `serve --role=web,ingest` và một worker       | 4 × 20 = 80       |
+
+Hãy giảm `database.max_conns` cho mỗi tiến trình, hoặc tăng `max_connections`, khi bạn
+[thêm tiến trình](/vi/self-hosting/scaling/).
+
+## Phân khúc SQL
+
+[Phân khúc SQL](/vi/audience/segments/) chạy câu `SELECT` của thành viên dưới role `reputecast_segments`, một role tự nó
+không đọc được gì, bên trong một transaction chỉ đọc có statement timeout. Khi thiếu role này, trình tạo phân khúc báo
+rằng phân khúc SQL đang bị tắt trên cơ sở dữ liệu này.
+
+Các migration thiết lập phân khúc SQL khi role tồn tại và người dùng của ứng dụng là thành viên của role đó. Hãy tạo
+role bằng các lệnh mà ReputeCast in ra, thay `<app user>` bằng người dùng trong `database.url`:
+
+```sql title="Với tài khoản quản trị"
+CREATE ROLE reputecast_segments NOLOGIN;
+GRANT reputecast_segments TO <app user>;
+```
+
+- **Trước lần khởi động đầu tiên** (khuyên dùng): chạy các lệnh này, rồi cài đặt ReputeCast. Không cần làm gì thêm.
+- **Trên cơ sở dữ liệu đã chạy migration**, chỉ chạy `reputecast migrate up` thì chưa đủ: migration tạo segment runner
+  (`00151_segment_runner.sql`) đã được ghi nhận là đã chạy. Sau hai lệnh trên, hãy chạy câu lệnh của migration đó một
+  lần với người dùng của ứng dụng, rồi khởi động lại mọi tiến trình ReputeCast (mỗi tiến trình chỉ kiểm tra runner một
+  lần, khi lần đầu cần đến nó):
+
+  ```sql title="Với người dùng của ứng dụng (psql -U reputecast -d reputecast)"
+  DO $$
+  BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'reputecast_segments') THEN
+          RAISE NOTICE 'reputecast_segments role missing: SQL segments stay disabled';
+          RETURN;
+      END IF;
+      IF NOT pg_has_role(current_user, 'reputecast_segments', 'MEMBER') THEN
+          RAISE NOTICE '% is not a member of reputecast_segments: SQL segments stay disabled', current_user;
+          RETURN;
+      END IF;
+      BEGIN
+          CREATE SCHEMA IF NOT EXISTS reputecast_sql;
+          EXECUTE $create$
+              CREATE OR REPLACE FUNCTION reputecast_sql.segment_ids(query text) RETURNS SETOF uuid
+                  LANGUAGE plpgsql SECURITY DEFINER
+                  SET search_path = pg_temp, pg_catalog
+              AS $fn$
+              BEGIN
+                  RETURN QUERY EXECUTE 'SELECT s.id::uuid FROM (' || query || ') s';
+              END
+              $fn$
+          $create$;
+          GRANT USAGE, CREATE ON SCHEMA reputecast_sql TO reputecast_segments;
+          ALTER FUNCTION reputecast_sql.segment_ids(text) OWNER TO reputecast_segments;
+          REVOKE CREATE ON SCHEMA reputecast_sql FROM reputecast_segments;
+          REVOKE ALL ON FUNCTION reputecast_sql.segment_ids(text) FROM PUBLIC;
+          EXECUTE format('GRANT EXECUTE ON FUNCTION reputecast_sql.segment_ids(text) TO %I', current_user);
+      EXCEPTION WHEN insufficient_privilege THEN
+          RAISE NOTICE 'could not set up reputecast_sql.segment_ids: SQL segments stay disabled';
+      END;
+  END;
+  $$;
+  ```
+
+Kiểm tra kết quả: `SELECT to_regprocedure('reputecast_sql.segment_ids(text)') IS NOT NULL;` trả về `t` khi phân khúc
+SQL dùng được. Role này dùng chung cho mọi cơ sở dữ liệu trên máy chủ, và `pg_dump` không bao gồm role: hãy tạo role
+trên máy chủ mới trước khi [khôi phục bản sao lưu](/vi/self-hosting/backups/).
+
+## Migration
+
+Tệp nhị phân mang theo mọi migration lược đồ: của chính ReputeCast, rồi đến của hàng đợi tác vụ.
+
+- `reputecast migrate up` áp dụng các migration đang chờ và in `Database is up to date.`; `reputecast install` và
+  `serve --auto-migrate` (mặc định của Docker image) cũng làm như vậy khi khởi động.
+- `reputecast migrate status` liệt kê từng migration cùng ngày áp dụng hoặc `pending`.
+- `reputecast migrate down` chỉ hoàn tác migration ReputeCast mới nhất. Muốn lùi xa hơn, hãy khôi phục một bản sao lưu.
+- Một tiến trình khởi động không có `--auto-migrate` trên cơ sở dữ liệu còn migration đang chờ sẽ ghi log
+  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate`` và vẫn tiếp tục chạy.
+
+## Kiểm tra kết quả
+
+- `/readyz` trả về `ready`; nó trả về `503 database unavailable` khi một lần ping cơ sở dữ liệu mất hơn 2 giây.
+- `reputecast migrate status` không có dòng `pending` nào.
+- Trong <UiPath path="nav.audience > audience.tabSegments" />, một phân khúc ở chế độ SQL đếm được liên hệ.
+
+## Khắc phục sự cố
+
+- **`connect to postgres: …` khi khởi động**: sai host, mật khẩu hoặc `sslmode`; hãy thử cùng URL bằng `psql`.
+- **`FATAL: sorry, too many clients already`**: tổng các pool vượt quá `max_connections`; hãy giảm `database.max_conns`.
+- **Phân khúc SQL vẫn tắt sau khi bạn đã tạo role**: cơ sở dữ liệu đã chạy migration từ trước; hãy chạy câu lệnh trong
+  [phân khúc SQL](#phân-khúc-sql) rồi khởi động lại ReputeCast.
+
+## Liên quan
+
+- [Sao lưu và khôi phục](/vi/self-hosting/backups/)
+- [Tham chiếu cấu hình](/vi/reference/configuration/#database): `database.url` và `database.max_conns`.
+- [Nâng cấp ReputeCast](/vi/self-hosting/upgrades/): migration khi nâng cấp.

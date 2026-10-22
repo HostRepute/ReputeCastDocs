@@ -1,0 +1,214 @@
+---
+title: Đăng nhập một lần (SSO) với OIDC
+description: 'Cấu hình SSO OIDC cho ReputeCast với Google Workspace, Microsoft Entra ID, Okta, Keycloak hoặc Authentik: tự tạo tài khoản, vai trò theo nhóm và bắt buộc SSO.'
+type: how-to
+audience: [operator, admin]
+primaryKeyword: cấu hình SSO OIDC
+uiPath: 'shell.userMenuInstanceAdmin > admin.sso'
+sources:
+  - internal/sso
+  - internal/accounts/signin.go
+  - internal/instance/policy.go
+  - migrations/00750_instance_admin_sso.sql
+  - web/src/features/admin/sso
+  - web/src/features/admin/auth/AuthenticationPage.tsx
+  - web/src/features/auth/signin.messages.ts
+sidebar:
+  order: 14
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Cấu hình SSO OIDC cho phép mọi người đăng nhập vào ReputeCast bằng nhà cung cấp danh tính (IdP) của tổ chức bạn, tự
+tạo tài khoản ở lần đăng nhập đầu tiên, và nhận vai trò trong không gian làm việc từ các nhóm trên IdP. ReputeCast dùng
+OpenID Connect; ReputeCast không hỗ trợ SAML hay SCIM.
+
+## Trước khi bắt đầu
+
+- Bạn là [quản trị viên hệ thống](/vi/reference/glossary/#instance-admin). SSO được thiết lập một lần cho toàn hệ thống.
+- URL công khai đã cố định và dùng `https://`
+  (<UiPath path="shell.userMenuInstanceAdmin > admin.instance > admin.publicUrl" />). Redirect URI bạn đăng ký ở IdP
+  được tạo từ URL này; nếu sau này URL thay đổi, hãy cập nhật cả đăng ký ở IdP.
+- Bạn có thể tạo một ứng dụng (client) trong IdP, và biết mọi người trong tổ chức dùng những tên miền email nào.
+- <UiPath path="admin.methodSso" /> đang bật trong <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />
+  (mặc định là bật).
+
+## Thiết lập một nhà cung cấp
+
+<Screenshot
+  id="sso-setup"
+  alt="Thiết lập Microsoft Entra ID: hàng chọn preset, rồi thẻ Connection với redirect URI để sao chép, issuer URL sau khi kiểm tra discovery thành công, client ID, client secret chỉ ghi đã lưu và các scope."
+/>
+
+<Steps>
+
+1. Mở <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> và chọn <UiPath path="admin.addSsoProvider" />.
+   Trong <UiPath path="sso.cardPreset" />, chọn IdP của bạn: Google Workspace, Microsoft Entra ID, Okta, Keycloak,
+   Authentik hoặc Generic OIDC. ReputeCast lưu bản nháp ngay; chưa có gì hoạt động cho đến khi bạn bật nhà cung cấp.
+
+2. Trong <UiPath path="sso.cardConnection" />, sao chép <UiPath path="sso.redirectUri" />. URI có dạng
+   `<public URL>/auth/oidc/<slug>/callback`, trong đó slug lấy từ preset: `google`, `entra`, `okta`, `keycloak`,
+   `authentik` hoặc `oidc` (nhà cung cấp thứ hai dùng cùng preset có thêm `-2`).
+
+3. Đăng ký ReputeCast ở IdP như một ứng dụng web dùng authorization code flow, với redirect URI từ bước 2. Ghi lại
+   issuer URL, client ID và client secret.
+
+   <Tabs syncKey="idp">
+   <TabItem label="Google Workspace">
+
+   - Tạo một OAuth client ID loại **Web application** trong Google Cloud console (APIs & Services › Credentials) và
+     thêm redirect URI làm authorized redirect URI
+     ([tài liệu OpenID Connect của Google](https://developers.google.com/identity/openid-connect/openid-connect),
+     kiểm tra tháng 10/2026).
+   - Issuer URL: luôn là `https://accounts.google.com` (preset tự điền).
+   - Nhóm: Google không gửi claim groups qua OIDC, nên không dùng được ánh xạ nhóm. Hãy cấp vai trò mặc định cho tài
+     khoản mới qua tính năng tự tạo tài khoản (bước 7), hoặc gán vai trò trong
+     [cài đặt nhóm](/vi/team/members/) của từng không gian làm việc.
+   - Xác thực hai lớp: ReputeCast coi lượt đăng nhập Google là đã qua xác thực hai lớp (khi Workspace bắt buộc Xác minh
+     2 bước).
+
+   </TabItem>
+   <TabItem label="Microsoft Entra ID">
+
+   - Tạo một app registration (nền tảng Web) trong Microsoft Entra admin center, thêm redirect URI và tạo client secret
+     ([Microsoft identity platform và OpenID Connect](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc),
+     kiểm tra tháng 10/2026). Client secret của Entra có hạn dùng: hãy nhập ngày hết hạn vào ReputeCast để ứng dụng cho
+     bạn biết khi nào cần thay secret.
+   - Issuer URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`, với tenant ID của bạn (một GUID) hoặc tên miền
+     đã xác minh. Tenant ID nằm ở Entra ID › Overview.
+   - Nhóm: mở **Token configuration** của app registration, chọn **Add groups claim** và đưa các security group vào ID
+     token. Entra gửi **object ID** của nhóm chứ không gửi tên: hãy dán ID vào một ánh xạ và đặt nhãn cho nó. Người
+     thuộc hơn 200 nhóm sẽ nhận một liên kết overage thay cho claim; khi đó hãy dùng app role.
+   - Xác thực hai lớp được tính khi claim `amr` của ID token cho biết đã dùng MFA (ví dụ do Conditional Access bắt
+     buộc).
+
+   </TabItem>
+   <TabItem label="Okta">
+
+   - Tạo một OIDC web application integration với redirect URI làm sign-in redirect URI
+     ([Okta: customize tokens with a groups claim](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/),
+     kiểm tra tháng 10/2026).
+   - Issuer URL: tên miền Okta của bạn hoặc một authorization server, ví dụ `https://acme.okta.com/oauth2/default`.
+     Bạn tìm thấy nó trong Security › API › Authorization Servers.
+   - Nhóm: thêm một groups claim vào authorization server (bộ lọc: matches regex `.*`). Preset Okta đã yêu cầu sẵn
+     scope `groups`.
+   - Xác thực hai lớp được tính khi claim `amr` của ID token cho biết đã dùng MFA (do sign-on policy bắt buộc).
+
+   </TabItem>
+   <TabItem label="Keycloak">
+
+   - Trong realm của bạn, tạo một client OpenID Connect với client authentication bật và redirect URI làm valid
+     redirect URI ([Keycloak server administration guide](https://www.keycloak.org/docs/latest/server_admin/#_oidc),
+     kiểm tra tháng 10/2026).
+   - Issuer URL: kết thúc bằng realm, ví dụ `https://sso.acme.io/realms/acme`.
+   - Nhóm: trong Clients › client của bạn › Client scopes › dedicated scope, thêm một mapper **Group Membership** với
+     token claim name là `groups` và tắt full group path.
+   - Xác thực hai lớp được tính khi claim `amr` của ID token cho biết đã dùng MFA (browser flow của realm yêu cầu OTP).
+
+   </TabItem>
+   <TabItem label="Authentik">
+
+   - Tạo một OAuth2/OpenID provider (confidential client) với redirect URI, và một application dùng provider đó
+     ([Authentik OAuth2 provider](https://docs.goauthentik.io/docs/add-secure-apps/providers/oauth2/), kiểm tra
+     tháng 10/2026).
+   - Issuer URL: kết thúc bằng slug của application và một dấu gạch chéo, ví dụ
+     `https://auth.acme.io/application/o/reputecast/`.
+   - Nhóm: Authentik gửi nhóm trong claim `groups` của scope `profile`. Hãy giữ profile mapping mặc định trong scope
+     mappings của provider.
+   - Xác thực hai lớp được tính khi claim `amr` của ID token cho biết đã dùng MFA (một MFA stage trong authentication
+     flow).
+
+   </TabItem>
+   </Tabs>
+
+4. Quay lại <UiPath path="sso.cardConnection" />, nhập <UiPath path="sso.issuerUrl" /> và chọn
+   <UiPath path="sso.testDiscovery" />. ReputeCast lấy `<issuer>/.well-known/openid-configuration` và các khóa ký của
+   nó; issuer phải dùng `https://` và khớp chính xác với tài liệu đó. Sau đó nhập client ID và client secret. Secret
+   được mã hóa và không bao giờ hiển thị lại; bạn chỉ có thể thay nó.
+
+5. Scope: `openid`, `profile` và `email` luôn được yêu cầu. Chỉ thêm scope khác nếu IdP của bạn cần chúng để gửi nhóm.
+
+6. Trong <UiPath path="sso.cardClaims" />, kiểm tra những claim nào điền thông tin tài khoản: `email`, `email_verified`,
+   `name` và, với preset có nhóm, `groups`. Giá trị mặc định phù hợp với từng preset; chỉ đổi tên claim nếu IdP của bạn
+   dùng tên khác. Email mà IdP đánh dấu là chưa xác minh sẽ bị từ chối. Thiếu `email_verified` chỉ được coi là đã xác
+   minh với các tên miền được phép ở bước 7.
+
+7. Trong <UiPath path="sso.cardAccess" />, quyết định ai được vào và với vai trò nào:
+
+   - Với <UiPath path="sso.allowedDomains" /> (tối đa 50), lượt đăng nhập từ các tên miền khác bị từ chối và được ghi
+     log. Trang đăng nhập chỉ hiển thị "Continue with …" của nhà cung cấp này cho những người có email thuộc một trong
+     các tên miền đó. Nếu không có tên miền nào, mọi tên miền đều đăng nhập được, nhưng nút này không xuất hiện trên
+     trang đăng nhập.
+   - Công tắc <UiPath path="sso.jit" /> tạo tài khoản ở lần đăng nhập đầu tiên, trong một không gian làm việc mặc định
+     với vai trò mặc định (Người xem, trừ khi bạn chọn vai trò khác; không bao giờ là Chủ sở hữu). Tắt công tắc nghĩa
+     là chỉ những người đã có tài khoản mới đăng nhập được. Thiết lập <UiPath path="admin.domainAllowlist" /> cấp hệ
+     thống trong tab Xác thực giới hạn những tên miền nào được tự động tạo tài khoản.
+   - Trong <UiPath path="sso.groupMapping" />, chọn <UiPath path="sso.addMapping" /> cho mỗi nhóm trên IdP (tối đa 200
+     ánh xạ). Ánh xạ được áp dụng lại ở mỗi lần đăng nhập và ghi đè vai trò đặt thủ công. Khi một người rời khỏi nhóm
+     đã ánh xạ, lần đăng nhập tiếp theo sẽ gỡ họ khỏi không gian làm việc đó và thu hồi các khóa API và tác tử họ đã tạo
+     ở đó; riêng trong không gian làm việc mặc định của tính năng tự tạo tài khoản, họ quay về vai trò mặc định. Ánh xạ
+     không bao giờ biến ai thành Chủ sở hữu và không bao giờ thay đổi một Chủ sở hữu. Bạn chỉ có thể ánh xạ một vai trò
+     mà chính bạn có đủ quyền của nó trong không gian làm việc đó.
+   - Công tắc bắt buộc tắt các phương thức đăng nhập khác với các tên miền được phép: xem
+     [bắt buộc SSO cho tên miền của bạn](#bắt-buộc-sso-cho-tên-miền-của-bạn).
+
+8. Trong <UiPath path="sso.cardTest" />, chọn <UiPath path="sso.runTestSignIn" />. Một cửa sổ bật lên mở IdP của bạn;
+   sau khi bạn đăng nhập, ReputeCast hiển thị các claim nhận được và những gì một lượt đăng nhập thật sẽ làm (tài khoản
+   mới hay đã có, không gian làm việc, vai trò, xác thực hai lớp). Bước này không đăng nhập cho ai và không thay đổi gì.
+
+9. Chọn **Enable** (hoặc <UiPath path="sso.saveDraft" /> để hoàn tất sau). Để bật được, cần một lần kiểm tra discovery
+   thành công, client ID và client secret đã lưu.
+
+</Steps>
+
+## Bắt buộc SSO cho tên miền của bạn
+
+Chế độ bắt buộc tắt đăng nhập bằng mật khẩu, khóa truy cập và tài khoản mạng xã hội cho mọi tài khoản thuộc các tên
+miền được phép của nhà cung cấp, nên người ở các tên miền đó chỉ đăng nhập được qua IdP. Bật chế độ này trong
+<UiPath path="sso.cardAccess" />; hộp thoại liệt kê ai đang đăng nhập bằng cách nào hiện nay và sau khi bật, rồi bạn
+xác nhận bằng <UiPath path="sso.turnOnEnforcement" />.
+
+- **Chủ sở hữu khẩn cấp (break-glass)** vẫn giữ đăng nhập bằng mật khẩu và xác thực hai lớp, để bạn vào được khi IdP
+  ngừng hoạt động. Khi bạn bật chế độ bắt buộc, mọi Chủ sở hữu ở các tên miền đó được đánh dấu là tài khoản khẩn cấp;
+  Chủ sở hữu đầu tiên do `reputecast install` tạo cũng vậy. Các lượt đăng nhập bằng mật khẩu của họ được ghi log là
+  break-glass.
+- Nếu không còn Chủ sở hữu nào ở tên miền đó giữ mật khẩu, hộp thoại sẽ cảnh báo bạn: nếu IdP gặp sự cố, không ai ở tên
+  miền đó đăng nhập được. Hãy giữ một quản trị viên hệ thống ở tên miền khác, hoặc xem
+  [khôi phục quyền truy cập từ dòng lệnh](/vi/self-hosting/account-recovery/).
+- Mỗi tên miền chỉ có thể được bắt buộc bởi một nhà cung cấp đang bật. Tắt nhà cung cấp sẽ chấm dứt chế độ bắt buộc của
+  nó.
+
+## Kiểm tra kết quả
+
+- Trong một cửa sổ trình duyệt ẩn danh, mở trang đăng nhập và nhập một email thuộc tên miền được phép: "Continue with
+  …" đưa bạn đến IdP rồi quay lại, ở trạng thái đã đăng nhập.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> hiển thị người đó với phương thức đăng nhập SSO, và
+  "Via IdP" ở cột 2FA khi IdP đã xác nhận xác thực hai lớp.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> ghi lại lượt đăng nhập, cùng mọi tài khoản hoặc vai trò
+  mà lượt đăng nhập đó tạo ra.
+
+## Khắc phục sự cố
+
+- **Discovery thất bại**: issuer URL sai hoặc máy chủ không kết nối được tới nó. Hãy sao chép chính xác như IdP hiển
+  thị, kể cả dấu gạch chéo cuối với Authentik, và dùng issuer theo tenant với Entra ID. Một nhà cung cấp đã bật vẫn dùng
+  issuer đã lưu cho đến khi một lần kiểm tra mới thành công.
+- **IdP báo redirect URI không khớp**: URL công khai đã thay đổi, hoặc URI bị dán sai. Hãy sao chép lại
+  <UiPath path="sso.redirectUri" /> và cập nhật IdP.
+- **"No account for …"**: tính năng tự tạo tài khoản đang tắt và người đó chưa có tài khoản, hoặc tên miền của họ không
+  được phép ở đây hay trong danh sách cho phép của hệ thống. Hãy mời họ, hoặc bật <UiPath path="sso.jit" />.
+- **Bước kiểm tra báo "Groups claim missing"**: IdP không gửi nhóm nào, nên ánh xạ không được áp dụng; vai trò hiện có
+  giữ nguyên và tài khoản mới nhận vai trò mặc định. Hãy làm theo bước về nhóm cho IdP của bạn ở trên, rồi chạy lại bước
+  kiểm tra.
+- **"The client secret can't be decrypted with this server's key"**: khóa bí mật của máy chủ đã thay đổi kể từ khi
+  secret được lưu. Hãy thay client secret. Xem [bảo mật và gia cố hệ thống](/vi/self-hosting/security/#khóa-bí-mật).
+- **Lượt đăng nhập mất quá nhiều thời gian**: một lượt đăng nhập phải quay về từ IdP trong vòng 10 phút. Hãy bắt đầu
+  lại.
+
+## Liên quan
+
+- [Đăng nhập bằng Google, Microsoft và GitHub](/vi/self-hosting/social-sign-in/): đăng nhập cho người được mời mà không
+  cần IdP.
+- [Quản trị hệ thống](/vi/self-hosting/instance-admin/): chính sách đăng nhập và việc bắt buộc xác thực hai lớp.
+- [Vai trò và quyền](/vi/team/roles-and-permissions/): mỗi vai trò mà một ánh xạ cấp được làm những gì.

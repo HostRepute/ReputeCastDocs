@@ -1,0 +1,381 @@
+---
+title: Nhận webhook
+description: Nhận sự kiện ReputeCast có chữ ký tại endpoint của bạn, kèm mã xác minh chữ ký webhook cho Node.js, Python, Go và PHP, cơ chế thử lại và gửi lại.
+type: how-to
+audience: [developer]
+permissions: ['webhooks:manage']
+uiPath: 'nav.settings > settings.webhooks'
+primaryKeyword: xác minh chữ ký webhook
+sources:
+  - internal/webhooks/webhooks.go
+  - internal/webhooks/jobs.go
+  - internal/webhooks/api.go
+  - internal/store/queries/webhooks.sql
+  - internal/netguard/netguard.go
+  - web/src/features/webhooks
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast gửi [sự kiện chuẩn hóa](/vi/reference/glossary/#normalized-event) (thư gửi thành công, thư trả lại, khiếu
+nại, lượt đăng ký, lượt gửi và nhiều loại khác) tới các endpoint bạn đăng ký, và ký mọi yêu cầu. Trang này hướng dẫn
+thiết lập một endpoint và cách xác minh chữ ký webhook bằng Node.js, Python, Go và PHP, để mã của bạn chỉ xử lý những
+yêu cầu thực sự đến từ hệ thống ReputeCast của bạn.
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `webhooks:manage` trong không gian làm việc.
+- Endpoint của bạn cần một URL mà máy chủ ReputeCast truy cập được, chẳng hạn
+  `https://api.example.com/webhooks/reputecast`. Địa chỉ trên mạng riêng và mạng nội bộ (`10.0.0.0/8`, `localhost`,
+  `*.internal` và tương tự) bị từ chối, trừ khi quản trị viên hệ thống bật `webhooks.allow_private_networks`
+  ([tham chiếu cấu hình](/vi/reference/configuration/)). URL chứa thông tin đăng nhập (`https://user:pass@…`) cũng bị
+  từ chối; khóa bí mật ký webhook thay cho chúng.
+- Webhook thuộc về một không gian làm việc. Hãy thêm endpoint trong từng không gian làm việc mà bạn muốn nhận sự kiện.
+
+## Thêm endpoint
+
+<Steps>
+
+1. Mở <UiPath path="nav.settings > settings.webhooks" /> và chọn <UiPath path="webhooks.addEndpoint" />.
+
+2. Nhập URL của endpoint, tên và mô tả (không bắt buộc), rồi chọn các sự kiện. Khi đánh dấu cả một nhóm, endpoint
+   đăng ký ký tự đại diện của nhóm đó, chẳng hạn `email.*`; những sự kiện được thêm vào nhóm sau này cũng được bao
+   gồm.
+
+3. Chọn <UiPath path="webhooks.addEndpoint" />. ReputeCast hiển thị khóa bí mật ký webhook, `whsec_…`, đúng một lần.
+   Hãy sao chép nó vào cấu hình của bộ nhận, ví dụ dưới dạng `REPUTECAST_WEBHOOK_SECRET`. ReputeCast lưu khóa ở dạng
+   mã hóa và không bao giờ hiển thị lại.
+
+4. Triển khai một bộ nhận có xác minh chữ ký ([Xác minh chữ ký](#xác-minh-chữ-ký)) và trả lời `2xx`.
+
+5. Mở lại endpoint và chọn <UiPath path="webhooks.sendTestEvent" />. ReputeCast gửi ngay một sự kiện `webhook.test`
+   và hiển thị phản hồi.
+
+</Steps>
+
+<Screenshot
+  id="settings-webhooks"
+  alt="Cài đặt, thẻ Webhook: bốn endpoint webhook gửi đi cùng các sự kiện, tỷ lệ thành công trong 24 giờ và trạng thái của chúng. Một endpoint kho dữ liệu đăng ký email.* đang lỗi với HTTP 502, và một endpoint n8n được đánh dấu Managed by n8n. Bên dưới là thẻ Verify a signature."
+/>
+
+Bạn cũng có thể quản lý các endpoint này qua API: `create-webhook`, `update-webhook`, `pause-webhook`,
+`test-webhook` và các thao tác khác trong [nhóm Webhooks](/api/operations/tags/webhooks/) của tài liệu API.
+
+## Sự kiện và ký tự đại diện
+
+Một endpoint đăng ký từ 1 đến 40 mục. Mỗi mục là một tên sự kiện (`email.bounced`), một ký tự đại diện cho cả nhóm
+(`email.*`) hoặc `*` cho mọi sự kiện. Danh mục đầy đủ, với ý nghĩa của từng sự kiện và mẫu `data` của nó, nằm trong
+[Sự kiện webhook](/vi/reference/webhook-events/).
+
+`webhook.test` không có trong danh mục: chỉ nút gửi thử và thao tác `test-webhook` mới gửi sự kiện này.
+
+## Một lần gửi trông như thế nào
+
+Mỗi lần gửi là một yêu cầu HTTP `POST` với phần thân JSON dạng envelope:
+
+```json title="Phần thân yêu cầu"
+{
+  "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44",
+  "type": "contact.subscribed",
+  "created_at": "2026-10-22T09:41:07Z",
+  "workspace": "acme-newsletter",
+  "data": { "…": "the event's own fields" }
+}
+```
+
+- `id` định danh sự kiện. Giá trị này giữ nguyên ở mọi lần thử lại và với mọi endpoint nhận sự kiện, nên hãy dùng nó
+  để bỏ qua bản trùng lặp.
+- `type` là tên sự kiện, `created_at` là thời điểm sự kiện xảy ra (UTC) và `workspace` là slug của không gian làm
+  việc.
+- `data` tùy thuộc vào từng sự kiện; xem [Sự kiện webhook](/vi/reference/webhook-events/).
+
+Mọi lần gửi đều kèm các header sau:
+
+| Header                   | Giá trị                                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `Content-Type`           | `application/json`                                                                                          |
+| `User-Agent`             | `ReputeCast-Webhooks/<version>`                                                                             |
+| `X-ReputeCast-Signature` | HMAC-SHA256 của `<timestamp>.<raw body>`, mã hóa hex chữ thường. Không có tiền tố `sha256=` hay tiền tố nào khác. |
+| `X-ReputeCast-Timestamp` | Thời điểm ký lần thử này, tính bằng giây Unix.                                                              |
+| `X-ReputeCast-Event`     | Tên sự kiện, giống `type`.                                                                                  |
+| `X-ReputeCast-Delivery`  | ID của lần gửi: một ID cho mỗi cặp sự kiện và endpoint, giữ nguyên ở mọi lần thử lại.                      |
+
+## Xác minh chữ ký
+
+Để kiểm tra một lần gửi:
+
+1. Đọc phần thân thô của yêu cầu dưới dạng byte, trước khi phân tích JSON. JSON đã được tuần tự hóa lại sẽ không khớp.
+2. Lấy header `X-ReputeCast-Timestamp` và từ chối yêu cầu khi giá trị này lệch quá 5 phút so với đồng hồ của bạn. Cách
+   này ngăn một yêu cầu cũ bị bắt được rồi phát lại. ReputeCast không thực thi bước này; bộ nhận của bạn làm việc đó.
+3. Tính HMAC-SHA256 trên dấu thời gian, một dấu chấm và phần thân thô: `<timestamp>.<raw body>`.
+4. Dùng **toàn bộ chuỗi khóa bí mật làm khóa**, gồm cả tiền tố `whsec_`, dưới dạng byte UTF-8. Đừng bỏ tiền tố và đừng
+   giải mã base64 phần còn lại.
+5. Mã hóa kết quả sang hex chữ thường và so sánh với `X-ReputeCast-Signature` theo thời gian hằng định (constant time).
+   Trả lời `401` nếu không khớp.
+
+Mỗi ví dụ dưới đây là một bộ nhận hoàn chỉnh trên cổng 3000 tại `/webhooks/reputecast`, đọc khóa bí mật từ
+`REPUTECAST_WEBHOOK_SECRET`:
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```js title="server.mjs"
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createServer } from 'node:http'
+
+// The HMAC key is the whole secret, whsec_ prefix included.
+const secret = process.env.REPUTECAST_WEBHOOK_SECRET
+
+function verify(rawBody, timestamp, signature) {
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp))
+  if (!signature || !(age <= 300)) return false // reject timestamps more than 5 minutes off
+  const expected = createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex')
+  const a = Buffer.from(expected)
+  const b = Buffer.from(signature)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+createServer((req, res) => {
+  if (req.method !== 'POST' || req.url !== '/webhooks/reputecast') return res.writeHead(404).end()
+  const chunks = []
+  req.on('data', (chunk) => chunks.push(chunk))
+  req.on('end', () => {
+    const rawBody = Buffer.concat(chunks) // the exact bytes ReputeCast signed
+    if (!verify(rawBody, req.headers['x-reputecast-timestamp'], req.headers['x-reputecast-signature'])) {
+      return res.writeHead(401).end()
+    }
+    const event = JSON.parse(rawBody.toString('utf8'))
+    console.log(event.type, event.id)
+    res.writeHead(204).end()
+  })
+}).listen(3000)
+```
+
+Chạy trên Node.js 18 trở lên, không cần cài gói nào: `node server.mjs`.
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="app.py"
+import hashlib
+import hmac
+import os
+import time
+
+from flask import Flask, abort, request
+
+app = Flask(__name__)
+# The HMAC key is the whole secret, whsec_ prefix included.
+SECRET = os.environ["REPUTECAST_WEBHOOK_SECRET"].encode()
+
+
+def verify(raw_body: bytes, timestamp: str | None, signature: str | None) -> bool:
+    if not timestamp or not timestamp.isdigit() or not signature:
+        return False
+    if abs(time.time() - int(timestamp)) > 300:  # reject timestamps more than 5 minutes off
+        return False
+    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected.encode(), signature.encode())
+
+
+@app.post("/webhooks/reputecast")
+def reputecast_webhook():
+    raw_body = request.get_data()  # the exact bytes ReputeCast signed
+    timestamp = request.headers.get("X-ReputeCast-Timestamp")
+    signature = request.headers.get("X-ReputeCast-Signature")
+    if not verify(raw_body, timestamp, signature):
+        abort(401)
+    event = request.get_json()
+    print(event["type"], event["id"])
+    return "", 204
+```
+
+Cần Python 3.10 trở lên và Flask 3 (`pip install flask`); chạy bằng `flask --app app run --port 3000`.
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="main.go"
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+// The HMAC key is the whole secret, whsec_ prefix included.
+var secret = []byte(os.Getenv("REPUTECAST_WEBHOOK_SECRET"))
+
+func verify(body []byte, timestamp, signature string) bool {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	// Reject timestamps more than 5 minutes off.
+	if age := time.Since(time.Unix(ts, 0)); age > 5*time.Minute || age < -5*time.Minute {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+func main() {
+	http.HandleFunc("POST /webhooks/reputecast", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20)) // the exact bytes ReputeCast signed
+		if err != nil {
+			http.Error(w, "can't read body", http.StatusBadRequest)
+			return
+		}
+		if !verify(body, r.Header.Get("X-ReputeCast-Timestamp"), r.Header.Get("X-ReputeCast-Signature")) {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+		var event struct {
+			ID   string          `json:"id"`
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &event); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		log.Println(event.Type, event.ID)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+Cần Go 1.22 trở lên (mẫu phương thức trong `http.HandleFunc`): `go run .`.
+
+</TabItem>
+<TabItem label="PHP">
+
+```php title="webhook.php"
+<?php
+// The HMAC key is the whole secret, whsec_ prefix included.
+$secret = getenv('REPUTECAST_WEBHOOK_SECRET');
+$rawBody = file_get_contents('php://input'); // the exact bytes ReputeCast signed
+$timestamp = $_SERVER['HTTP_X_REPUTECAST_TIMESTAMP'] ?? '';
+$signature = $_SERVER['HTTP_X_REPUTECAST_SIGNATURE'] ?? '';
+
+$expected = hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
+// Reject timestamps more than 5 minutes off, then compare in constant time.
+if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !hash_equals($expected, $signature)) {
+    http_response_code(401);
+    exit;
+}
+
+$event = json_decode($rawBody, true, flags: JSON_THROW_ON_ERROR);
+error_log($event['type'] . ' ' . $event['id']);
+http_response_code(204);
+```
+
+Chạy bằng máy chủ web của bạn, hoặc thử với `php -S 127.0.0.1:3000 webhook.php`. Cần PHP 8.0 trở lên.
+
+</TabItem>
+</Tabs>
+
+<Aside type="danger" title="Giữ khóa bí mật trên máy chủ">
+Bất kỳ ai có khóa bí mật đều có thể ký những yêu cầu mà bộ nhận của bạn chấp nhận. Hãy giữ nó trong kho bí mật của
+máy chủ, không bao giờ đặt trong mã chạy trên trình duyệt hay ứng dụng di động. Nếu khóa bị lộ, hãy xoay vòng nó
+([Xoay vòng khóa bí mật ký](#xoay-vòng-khóa-bí-mật-ký)).
+</Aside>
+
+## Kiểm tra kết quả
+
+- Trong ReputeCast, <UiPath path="webhooks.sendTestEvent" /> cho biết sự kiện thử đã được gửi tới chưa và bộ nhận của
+  bạn đã trả lời gì. <UiPath path="webhooks.deliveryLog" /> trên cùng trang liệt kê mọi lần gửi kèm mã phản hồi.
+- Để thử bộ nhận mà không cần ReputeCast, hãy tự ký một yêu cầu bằng OpenSSL. Lệnh này tính ra đúng chữ ký đó:
+
+  ```sh title="Terminal"
+  ts=$(date +%s)
+  body='{"id":"0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44","type":"webhook.test","created_at":"2026-10-22T09:41:07Z","workspace":"acme-newsletter","data":{}}'
+  sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$REPUTECAST_WEBHOOK_SECRET" | sed 's/^.* //')
+  curl -i -X POST http://localhost:3000/webhooks/reputecast \
+    -H 'Content-Type: application/json' \
+    -H "X-ReputeCast-Timestamp: $ts" \
+    -H "X-ReputeCast-Signature: $sig" \
+    --data "$body"
+  ```
+
+  Bộ nhận của bạn trả lời `204`. Nếu đổi một ký tự trong `body` sau khi ký, nó trả lời `401`.
+
+## Trả lời nhanh; ReputeCast lo phần thử lại
+
+- Mọi phản hồi `2xx` đều được tính là đã gửi thành công. Hãy trả lời trong vòng 10 giây và làm phần việc chậm sau khi
+  trả lời (ví dụ: đưa sự kiện vào hàng đợi của riêng bạn). Chuyển hướng (redirect) không được theo.
+- Mọi phản hồi khác, hết thời gian chờ hoặc lỗi kết nối đều là một lần thử thất bại. ReputeCast thử mỗi lần gửi tối đa
+  **8 lần**, chờ 1, 2, 4, 8, 30, 90 và 225 phút giữa các lần thử: tổng cộng khoảng 6 giờ.
+- Sau lần thất bại thứ 8, lần gửi chuyển vào hàng đợi dead-letter và nằm ở đó 7 ngày kể từ lần thử cuối. Để gửi lại,
+  chọn <UiPath path="webhooks.replay" /> trong <UiPath path="webhooks.deliveryLog" />: thao tác này bắt đầu một vòng 8
+  lần thử mới.
+- Để bỏ qua thời gian chờ, chọn <UiPath path="webhooks.retryNow" /> trên một lần gửi đang thử lại, hoặc
+  <UiPath path="webhooks.retryAllFailed" /> để xếp hàng lại mọi lần gửi thất bại (`retry-failed-webhooks` trong API).
+- Lần thử lại và lần gửi lại mang cùng `id` và `X-ReputeCast-Delivery`, với dấu thời gian và chữ ký mới. Hãy làm cho
+  trình xử lý của bạn có tính idempotent: bỏ qua `id` mà bạn đã xử lý.
+- Khi một endpoint đang lỗi, ReputeCast chỉ thử lần gửi chờ lâu nhất của nó, theo lịch ở trên. Các lần gửi khác chờ và
+  được gửi đi theo thứ tự ngay khi endpoint trả lời `2xx` trở lại. Không phần nào khác của ReputeCast phải chờ
+  endpoint: việc gửi thư, nhập dữ liệu và tự động hóa vẫn tiếp tục.
+
+## Tạm dừng endpoint
+
+<UiPath path="webhooks.pauseEndpoint" /> giữ lại các sự kiện mới của endpoint thay vì gửi đi, ví dụ trong lúc bảo trì.
+<UiPath path="webhooks.resumeEndpoint" /> gửi toàn bộ sự kiện đã giữ, theo đúng thứ tự.
+
+## Xoay vòng khóa bí mật ký
+
+<UiPath path="webhooks.rotateSecret" /> tạo khóa bí mật mới, hiển thị nó một lần và dùng nó để ký mọi lần gửi kể từ
+thời điểm đó. Khóa cũ ngừng hoạt động ngay; không có khoảng thời gian chồng lấn. Những lần gửi thất bại trong lúc bạn
+cập nhật bộ nhận sẽ được thử lại theo lịch ở trên (1, 2, 4 phút, v.v.), vì vậy hãy cập nhật bộ nhận ngay sau khi xoay
+vòng. Chỉ người dùng mới xoay vòng được khóa bí mật; khóa API thì không.
+
+## Endpoint do tích hợp quản lý
+
+Zapier, Make và n8n tự tạo endpoint khi một quy trình (workflow) bắt đầu bằng trình kích hoạt ReputeCast.
+<UiPath path="nav.settings > settings.webhooks" /> đánh dấu các endpoint này là do ứng dụng đó quản lý và chỉ cho xem;
+khóa API không thấy chúng. Khi một endpoint như vậy trả lời `410 Gone`, ReputeCast xóa nó. Xem
+[Xây dựng tích hợp](/vi/developers/integration-api/).
+
+## Giới hạn
+
+<LimitsTable area="webhooks" />
+
+## Khắc phục sự cố
+
+- **Mọi lần gửi đều bị bộ nhận trả lời 401**: bạn đang băm JSON đã phân tích thay vì phần thân thô, dùng khóa bí mật
+  mà bỏ tiền tố `whsec_`, hoặc so sánh với chuỗi hex chữ hoa. Hãy thử bằng lệnh OpenSSL ở trên.
+- **Chỉ một số lần gửi bị 401**: đồng hồ máy chủ của bạn bị lệch. Hãy đồng bộ bằng NTP; phép kiểm tra 5 phút so sánh
+  với đồng hồ này.
+- **Lỗi "… is a local hostname" hoặc địa chỉ bị chặn khi lưu**: URL trỏ tới mạng riêng. Hãy dùng địa chỉ công khai,
+  hoặc nhờ quản trị viên hệ thống đặt `webhooks.allow_private_networks`.
+- **Lần gửi bị hết thời gian chờ**: trình xử lý của bạn mất hơn 10 giây. Hãy trả lời trước, rồi mới xử lý.
+- **Sự kiện thử hoạt động nhưng sự kiện thật không bao giờ đến**: kiểm tra xem endpoint đã đăng ký những sự kiện đó
+  chưa, và endpoint có đang bị tạm dừng không.
+- **Sự kiện đến hai lần**: một lần thử lại đã diễn ra sau một phản hồi đến quá muộn hoặc không phải `2xx`. Hãy bỏ qua
+  `id` mà bạn đã xử lý.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Sự kiện webhook" href="/vi/reference/webhook-events/" description="Mọi loại sự kiện, theo nhóm, kèm payload mẫu." />
+  <LinkCard title="Xây dựng tích hợp" href="/vi/developers/integration-api/" description="REST hook cho các công cụ tự động hóa quy trình, dùng cùng cơ chế chữ ký." />
+  <LinkCard title="Gửi email giao dịch bằng API" href="/vi/developers/transactional-api/" description="Các sự kiện message.* báo về từng thư bạn gửi." />
+  <LinkCard title="Sự kiện gửi thư và đồng bộ danh sách chặn gửi" href="/vi/providers/events-and-sync/" description="Cách nhà cung cấp gửi thư báo kết quả về cho ReputeCast." />
+</CardGrid>
