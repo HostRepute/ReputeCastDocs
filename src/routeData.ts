@@ -1,4 +1,5 @@
-// SEO additions to every Starlight page: font preloads, Open Graph image, JSON-LD and noindex rules.
+// SEO additions to every Starlight page: font preloads, Open Graph image, JSON-LD, API page titles, TOC entries for
+// reference components and noindex for untranslated fallbacks.
 import { defineRouteMiddleware } from '@astrojs/starlight/route-data'
 import sans400 from '@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-400-normal.woff2?url'
 import sans600 from '@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-normal.woff2?url'
@@ -130,7 +131,9 @@ export const onRequest = defineRouteMiddleware(async (context, next) => {
     })
   }
 
-  if (route.isFallback || process.env.DOCS_PREVIEW === '1') {
+  // Untranslated fallback pages must not compete with the English original. Preview deployments are kept out of
+  // indexes by the X-Robots-Tag header (src/integrations/preview-noindex.ts), so the HTML stays production-identical.
+  if (route.isFallback) {
     head.push({ tag: 'meta', attrs: { name: 'robots', content: 'noindex, follow' } })
   }
 })

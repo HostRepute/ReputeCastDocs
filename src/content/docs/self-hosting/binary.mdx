@@ -1,0 +1,160 @@
+---
+title: Install the binary
+description: Install ReputeCast Linux binary releases without Docker — verify the download, prepare PostgreSQL, write an environment file and run it with systemd.
+type: how-to
+audience: [operator]
+primaryKeyword: install ReputeCast Linux
+sources:
+  - .goreleaser.yaml
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/config/config.go
+  - README.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+This guide shows how to install ReputeCast on Linux as a single binary run by systemd, next to a PostgreSQL server.
+The binary contains the web app and every database migration; nothing else needs to be installed.
+
+## Before you begin
+
+- A Linux server on `amd64` or `arm64` with systemd, and PostgreSQL 16, 17 or 18 (see
+  [system requirements](/self-hosting/requirements/)).
+- `sudo` access and a reverse proxy for TLS on the same server ([reverse proxy and TLS](/self-hosting/reverse-proxy/)).
+- The binary also runs on macOS and Windows, but this guide uses systemd.
+
+## Install ReputeCast
+
+<Steps>
+
+1. Download the archive for your platform (`linux_amd64` or `linux_arm64`) and `checksums.txt` from the
+   [releases page](https://github.com/hostrepute/reputecast/releases), check it and install the binary:
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   tar -xzf reputecast_*_linux_amd64.tar.gz reputecast
+   sudo install -m 0755 reputecast /usr/local/bin/reputecast
+   reputecast version
+   ```
+
+2. Create the database, its user and the SQL segments role
+   ([PostgreSQL](/self-hosting/postgres/#create-the-database)):
+
+   ```sh
+   sudo -u postgres psql -c "CREATE ROLE reputecast LOGIN PASSWORD 'change-me'" \
+     -c "CREATE DATABASE reputecast OWNER reputecast" \
+     -c "CREATE ROLE reputecast_segments NOLOGIN" \
+     -c "GRANT reputecast_segments TO reputecast"
+   ```
+
+3. Create a system user. systemd creates its data folder, `/var/lib/reputecast`, in step 6:
+
+   ```sh
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin reputecast
+   ```
+
+4. Create the folder `/etc/reputecast` (`sudo mkdir -p /etc/reputecast`) and write the configuration there as an
+   environment file, readable only by root and the service:
+
+   ```sh title="/etc/reputecast/env"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:change-me@localhost:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_HTTP__ADDR=127.0.0.1:8080
+   REPUTECAST_HTTP__TRUSTED_PROXIES=127.0.0.1
+   REPUTECAST_SECRETS__KEY_FILE=/var/lib/reputecast/secret.key
+   REPUTECAST_LOG__FORMAT=json
+   ```
+
+   ```sh
+   sudo chown root:reputecast /etc/reputecast/env && sudo chmod 0640 /etc/reputecast/env
+   ```
+
+   Without `REPUTECAST_SECRETS__KEY_FILE`, the key file would be `data/secret.key` under the working directory. Every
+   key is described in [configure ReputeCast](/self-hosting/configuration/).
+
+5. Apply the migrations and create the first Owner:
+
+   ```sh
+   sudo sh -c 'set -a && . /etc/reputecast/env && reputecast install --email you@company.com --name "Your Name"'
+   ```
+
+   ```txt title="Output"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    HAwc-PKEn-jSXh-EE9w   (temporary: you'll replace it at first sign-in)
+   ```
+
+   `install` only writes to the database. It stops with ``ReputeCast is already installed: users exist`` when the
+   database has users.
+
+6. Create the service:
+
+   ```ini title="/etc/systemd/system/reputecast.service"
+   [Unit]
+   Description=ReputeCast
+   After=network-online.target postgresql.service
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=reputecast
+   Group=reputecast
+   EnvironmentFile=/etc/reputecast/env
+   ExecStart=/usr/local/bin/reputecast serve
+   Restart=on-failure
+   StateDirectory=reputecast
+   WorkingDirectory=/var/lib/reputecast
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   `StateDirectory=reputecast` makes systemd create `/var/lib/reputecast` owned by the service user. On its first
+   start, ReputeCast writes its secret key there and keeps uploaded files in `/var/lib/reputecast/files`.
+
+7. Start it:
+
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now reputecast
+   ```
+
+8. Point your [reverse proxy](/self-hosting/reverse-proxy/) at `127.0.0.1:8080`, open the public URL and complete the
+   [first sign-in](/self-hosting/first-run/).
+
+</Steps>
+
+<Aside type="caution">
+  Back up `/var/lib/reputecast/secret.key` with the database. Without it, the provider credentials and other secrets
+  stored in the database can't be decrypted ([back up and restore](/self-hosting/backups/)).
+</Aside>
+
+## Check that it worked
+
+- `systemctl status reputecast` shows `active (running)`.
+- `journalctl -u reputecast` shows an `http listening` line with the address, public URL and roles.
+- `curl http://127.0.0.1:8080/readyz` answers `ready`.
+- `sudo sh -c 'set -a && . /etc/reputecast/env && reputecast migrate status'` lists no `pending` migration.
+
+## Troubleshooting
+
+- **`Error: http.public_url must be an absolute URL, got "…"`**: write the address with its scheme,
+  `https://news.example.com`.
+- **The log warns `database has pending migrations`**: `serve` doesn't migrate unless you pass `--auto-migrate`. Run
+  `reputecast migrate up` with the same environment, or add `--auto-migrate` to `ExecStart`.
+- **`connect to postgres: …`**: check the URL, the password and `pg_hba.conf` with `psql` and the same URL.
+- **Permission denied on the secret key**: `/var/lib/reputecast` must belong to the service user; keep
+  `StateDirectory=reputecast` in the unit.
+- **The temporary password is lost**: `reputecast user reset-password --email you@company.com` prints a one-time link
+  ([recover access](/self-hosting/account-recovery/)).
+
+## Related
+
+- [Install with Docker Compose](/self-hosting/docker/)
+- [Upgrade ReputeCast](/self-hosting/upgrades/)
+- [CLI reference](/reference/cli/)

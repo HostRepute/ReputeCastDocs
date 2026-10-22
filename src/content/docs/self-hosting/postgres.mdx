@@ -1,0 +1,170 @@
+---
+title: PostgreSQL
+description: PostgreSQL setup for ReputeCast — supported versions, users and the SQL segments role, managed databases, connection URLs, pool sizing and migrations.
+type: how-to
+audience: [operator]
+primaryKeyword: PostgreSQL setup for ReputeCast
+sources:
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - internal/segments/sqlmode.go
+  - internal/db/db.go
+  - internal/cli/migrate.go
+  - internal/config/config.go
+  - .github/workflows/ci.yml
+sidebar:
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+This page covers the PostgreSQL setup for ReputeCast: the database, its users, the connection and the schema
+migrations. ReputeCast keeps everything in PostgreSQL, including its job queue, and needs no extensions.
+
+## Before you begin
+
+- PostgreSQL 16, 17 or 18, self-managed or from a cloud provider.
+- An administrator account on it (for example `postgres`) to create the database and roles.
+- The [Docker Compose stack](/self-hosting/docker/) already runs PostgreSQL 18 as a superuser `reputecast`, which
+  creates everything below by itself; this page is for any other database.
+
+## Create the database
+
+<Steps>
+
+1. As an administrator, create the app user, its database and the role SQL segments run as:
+
+   ```sql title="setup.sql"
+   CREATE ROLE reputecast LOGIN PASSWORD 'change-me';
+   CREATE DATABASE reputecast OWNER reputecast;
+   CREATE ROLE reputecast_segments NOLOGIN;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+   Create `reputecast_segments` now, before the first migration: see [SQL segments](#sql-segments).
+
+2. Point ReputeCast at the database with `database.url` (`REPUTECAST_DATABASE__URL`, or `DATABASE_URL`):
+
+   ```txt
+   postgres://reputecast:change-me@db.internal:5432/reputecast?sslmode=require
+   ```
+
+   - Use `sslmode=require` (or `verify-full` with the provider's CA) when the database is on another machine;
+     `sslmode=disable` only on the same host or a private Docker network.
+   - Percent-encode characters such as `@`, `:` and `/` in the password, or pick a password without them.
+
+3. Run the migrations and create the first Owner with `reputecast install` (the Docker image does both at start).
+
+</Steps>
+
+## Managed PostgreSQL
+
+Cloud databases usually give you an administrator that is not a superuser. ReputeCast works with that:
+
+- The migrations create no extensions and need only ownership of the database.
+- Creating `reputecast_segments` needs the `CREATEROLE` privilege. If the app's user doesn't have it, create the
+  role with the administrator before the first start (step 1 above); otherwise ReputeCast installs fine, but SQL
+  segments stay off.
+
+## Size the connection pool
+
+Each ReputeCast process opens its own pool of up to `database.max_conns` connections (default 20). Command-line
+commands open a few more while they run (`migrate` and `install` 4, `user` 2). Keep the total below PostgreSQL's
+`max_connections` (100 by default), with room for your own tools:
+
+| Processes                                      | Connections at most |
+| ---------------------------------------------- | ------------------- |
+| One `serve` (all roles), default pool          | 20                  |
+| Three `serve --role=web,ingest` and one worker | 4 × 20 = 80         |
+
+Lower `database.max_conns` per process, or raise `max_connections`, when you [add processes](/self-hosting/scaling/).
+
+## SQL segments
+
+[SQL segments](/audience/segments/) run a member's `SELECT` as `reputecast_segments`, a role that can read nothing on
+its own, inside a read-only transaction with a statement timeout. When the role is missing, the segment builder says
+SQL segments are turned off on this database.
+
+The migrations set SQL segments up when the role exists and the app's user is a member of it. Create it with the
+commands ReputeCast prints, replacing `<app user>` with the user in `database.url`:
+
+```sql title="As an administrator"
+CREATE ROLE reputecast_segments NOLOGIN;
+GRANT reputecast_segments TO <app user>;
+```
+
+- **Before the first start** (recommended): run them, then install ReputeCast. Nothing else is needed.
+- **On a database that is already migrated**, `reputecast migrate up` alone doesn't finish the job: the migration that
+  creates the segment runner (`00151_segment_runner.sql`) has already been recorded. After the two commands, run that
+  migration's statement once as the app user, then restart every ReputeCast process (each checks for the runner once,
+  when it first needs it):
+
+  ```sql title="As the app user (psql -U reputecast -d reputecast)"
+  DO $$
+  BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'reputecast_segments') THEN
+          RAISE NOTICE 'reputecast_segments role missing: SQL segments stay disabled';
+          RETURN;
+      END IF;
+      IF NOT pg_has_role(current_user, 'reputecast_segments', 'MEMBER') THEN
+          RAISE NOTICE '% is not a member of reputecast_segments: SQL segments stay disabled', current_user;
+          RETURN;
+      END IF;
+      BEGIN
+          CREATE SCHEMA IF NOT EXISTS reputecast_sql;
+          EXECUTE $create$
+              CREATE OR REPLACE FUNCTION reputecast_sql.segment_ids(query text) RETURNS SETOF uuid
+                  LANGUAGE plpgsql SECURITY DEFINER
+                  SET search_path = pg_temp, pg_catalog
+              AS $fn$
+              BEGIN
+                  RETURN QUERY EXECUTE 'SELECT s.id::uuid FROM (' || query || ') s';
+              END
+              $fn$
+          $create$;
+          GRANT USAGE, CREATE ON SCHEMA reputecast_sql TO reputecast_segments;
+          ALTER FUNCTION reputecast_sql.segment_ids(text) OWNER TO reputecast_segments;
+          REVOKE CREATE ON SCHEMA reputecast_sql FROM reputecast_segments;
+          REVOKE ALL ON FUNCTION reputecast_sql.segment_ids(text) FROM PUBLIC;
+          EXECUTE format('GRANT EXECUTE ON FUNCTION reputecast_sql.segment_ids(text) TO %I', current_user);
+      EXCEPTION WHEN insufficient_privilege THEN
+          RAISE NOTICE 'could not set up reputecast_sql.segment_ids: SQL segments stay disabled';
+      END;
+  END;
+  $$;
+  ```
+
+Check the result: `SELECT to_regprocedure('reputecast_sql.segment_ids(text)') IS NOT NULL;` returns `t` when SQL
+segments are available. The role is shared by every database on the server, and `pg_dump` doesn't include roles:
+create it on a new server before you [restore a backup](/self-hosting/backups/).
+
+## Migrations
+
+The binary carries every schema migration: ReputeCast's own, then those of its job queue.
+
+- `reputecast migrate up` applies what is pending and prints `Database is up to date.`; `reputecast install` and
+  `serve --auto-migrate` (the Docker image's default) do the same at start.
+- `reputecast migrate status` lists each migration with its applied date or `pending`.
+- `reputecast migrate down` rolls back only the latest ReputeCast migration. Restore a backup to go further back.
+- A process started without `--auto-migrate` on a database with pending migrations logs
+  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate`` and keeps running.
+
+## Check that it worked
+
+- `/readyz` answers `ready`; it answers `503 database unavailable` when a database ping takes longer than 2 seconds.
+- `reputecast migrate status` shows no `pending` line.
+- In <UiPath path="nav.audience > audience.tabSegments" />, a segment in SQL mode counts contacts.
+
+## Troubleshooting
+
+- **`connect to postgres: …` at start**: wrong host, password or `sslmode`; test the same URL with `psql`.
+- **`FATAL: sorry, too many clients already`**: the pools exceed `max_connections`; lower `database.max_conns`.
+- **SQL segments stay off after you created the role**: the database was migrated before; run the statement in
+  [SQL segments](#sql-segments) and restart ReputeCast.
+
+## Related
+
+- [Back up and restore](/self-hosting/backups/)
+- [Configuration reference](/reference/configuration/#database): `database.url` and `database.max_conns`.
+- [Upgrade ReputeCast](/self-hosting/upgrades/): migrations during upgrades.

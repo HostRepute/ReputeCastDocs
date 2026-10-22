@@ -1,0 +1,156 @@
+---
+title: How ReputeCast works
+description: The newsletter sending architecture behind ReputeCast, from workspaces and streams to routes, failover, delivery events and one shared suppression list.
+type: explanation
+audience: [publisher, admin, operator]
+primaryKeyword: newsletter sending architecture
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - README.md
+  - internal/providers/provider.go
+  - internal/routing/routing.go
+  - internal/ingest
+  - internal/suppressions
+  - internal/readiness
+  - internal/sending/engine
+  - internal/authz
+sidebar:
+  order: 4
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+
+This page explains the newsletter sending architecture behind ReputeCast: who works where, what kinds of mail exist, how
+each email finds its sending provider, and how delivery results come back and protect your next send. The terms used here
+appear throughout the app and the rest of these docs.
+
+## Instances, workspaces and members
+
+- An [instance](/reference/glossary/#instance) is one ReputeCast installation: the server, its PostgreSQL database and
+  every workspace on it. [Instance admins](/reference/glossary/#instance-admin) manage users, sign-in methods, single
+  sign-on and updates for the whole instance.
+- A [workspace](/reference/glossary/#workspace) is a separate space with its own lists, campaigns, automations, sending
+  providers and team. An instance can have any number of workspaces, for example one per publication, brand or client.
+- A [member](/reference/glossary/#member) is a person in a workspace, with exactly one [role](/reference/glossary/#role)
+  there. The built-in roles are Owner, Admin, Editor and Viewer; you can add custom roles with your own set of
+  permissions. API keys and AI agents get permissions the same way and can never hold more than the person who created
+  them. Read [Roles and permissions](/team/roles-and-permissions/).
+
+## Sending providers and mailbox providers
+
+ReputeCast always says which of the two it means:
+
+- A [sending provider](/reference/glossary/#sending-provider) delivers your mail: Amazon SES, Postmark, Mailgun, a Postal
+  server, any SMTP server and the others in [Choose a sending provider](/providers/choose/).
+- A [mailbox provider](/reference/glossary/#mailbox-provider) is where your reader opens the mail: Gmail, Outlook, Yahoo,
+  iCloud and others.
+
+Reports and the live monitor show results per mailbox provider and per sending provider side by side, because a problem
+can sit on either side.
+
+## Four streams
+
+A [stream](/reference/glossary/#stream) is a kind of mail. Each stream has its own route and failover policy, so a bad
+campaign never blocks a password reset.
+
+| Stream        | What it carries                                                                                       |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| Broadcasts    | Campaigns.                                                                                            |
+| Automations   | Emails sent by automation flows.                                                                      |
+| System        | Double opt-in confirmations, preference-center links, team invitations and password resets.          |
+| Transactional | Product email your own application sends through the transactional API or the SMTP relay.             |
+
+Invitations, password resets and email notifications work only once a sending provider carries the System stream.
+Transactional mail goes first when it shares a sending provider with Broadcasts. Read
+[Transactional email in ReputeCast](/transactional/overview/).
+
+## Routes, weighted splits and failover
+
+A [route](/reference/glossary/#route) decides which sending provider delivers an email. Each stream has a default rule,
+and you can add rules for particular lists, sender domains or the recipient's mailbox provider. A rule can send all its
+mail through one provider or share it as a [weighted split](/reference/glossary/#weighted-split), such as 90/10 while
+you move to a new provider or warm up a new IP address.
+
+When a provider fails, the stream's [failover](/reference/glossary/#failover) policy decides what happens:
+
+- **Automatic**: mail moves to the fallback provider. This is the default for Automations, System and Transactional.
+- **Pause and ask**: the remaining recipients wait until a person decides. This is the default for Broadcasts, because
+  moving a large send to a cold provider in the middle of it can hurt your reputation.
+- **Automatic, warmed-up only**: mail moves only to a fallback that is not warming up; otherwise ReputeCast pauses and
+  asks.
+
+Read [Route mail across providers](/providers/routing/).
+
+## One event model and one suppression list
+
+Every sending provider reports deliveries, bounces and complaints in its own format. ReputeCast receives these reports
+on its public URL (`/hooks/<adapter>/<token>`), checks the signature, stores the raw payload and answers at once; a
+background job then translates each report into a [normalized event](/reference/glossary/#normalized-event):
+delivered, deferred, hard bounce, soft bounce, complaint, rejected, open, click or unsubscribe. The provider's original
+code stays with the event. SMTP servers have no webhooks, so ReputeCast reads their bounces from a bounce mailbox
+instead.
+
+Hard bounces, complaints and unsubscribes go on one [suppression list](/reference/glossary/#suppression-list) shared by
+every sending provider: a bounce at one provider stops mail to that address everywhere. Each entry applies to all mail or
+to marketing mail only. Read [Delivery events and suppression sync](/providers/events-and-sync/) and
+[The suppression list](/audience/suppressions/).
+
+## Consent
+
+ReputeCast records [consent](/reference/glossary/#consent) per list, with its evidence: how and when the contact
+subscribed and the exact text they agreed to. Signup forms can use [double opt-in](/reference/glossary/#double-opt-in),
+and imports keep the consent status from the platform you leave: unsubscribed, bounced and complained contacts become
+suppressions and are never subscribed again. Read [Lists, consent and double opt-in](/audience/lists-and-consent/).
+
+## Guarded sending from start to finish
+
+<SendFlowDiagram />
+
+Send Readiness checks a campaign before it starts, routing hands each recipient to a sending provider, delivery events
+come back through webhooks, and thresholds decide whether the send keeps going or pauses.
+
+1. **Send Readiness.** [Send Readiness](/reference/glossary/#send-readiness) checks reputation, authentication, content,
+   languages, accessibility, conditional content, links, compliance, audience quality and routing, and gives a verdict:
+   Ready, Ready with warnings or Blocked. It runs again 15 minutes before a scheduled send and when the send starts; a
+   Block stops the send.
+2. **Routing.** The send builds its recipient list in pages and routes each recipient. Batches go to each provider
+   within its rate limit and each mailbox provider's throttle. Every message is claimed before it goes out, so nothing is
+   sent twice.
+3. **Delivery events.** Providers report deliveries, bounces and complaints, and ReputeCast normalizes them.
+4. **Thresholds.** During the send, ReputeCast checks bounce, complaint and deferral rates every 2 seconds. A rate over
+   its threshold, with enough evidence, [auto-pauses](/reference/glossary/#auto-pause) only the mailbox provider or
+   sending provider it concerns, or the whole campaign if you chose that scope.
+5. **Decision.** The live monitor explains what tripped. A person with permission resumes, resumes with changes or
+   cancels the send.
+
+## Defaults and limits
+
+These are the auto-pause defaults of [guarded sending](/reference/glossary/#guarded-sending):
+
+<LimitsTable area="auto-pause" />
+
+Every other default is in [Limits and defaults](/reference/limits-and-defaults/).
+
+## When to change them
+
+- **Lower the thresholds** for a list you have not mailed in a while, or for a new sending domain, so a bad segment pauses
+  sooner.
+- **Raise them slightly** only when a known cause inflates a rate, such as a list you know contains old addresses that
+  you are cleaning up on purpose.
+- **Pause the whole campaign** instead of one route when any problem should stop everything, for example an
+  announcement that must reach everyone or no one.
+
+Change the workspace defaults in Settings › Providers and a single campaign's values in Review & send; read
+[Workspace sending defaults](/providers/workspace-defaults/) and
+[Monitor a send and auto-pause](/campaigns/live-monitor/).
+
+## Related
+
+<CardGrid>
+  <LinkCard title="What is ReputeCast" href="/getting-started/introduction/" />
+  <LinkCard title="Send Readiness: check before you send" href="/campaigns/send-readiness/" />
+  <LinkCard title="Route mail across providers" href="/providers/routing/" />
+  <LinkCard title="Glossary" href="/reference/glossary/" />
+</CardGrid>

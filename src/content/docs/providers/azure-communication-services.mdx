@@ -1,0 +1,147 @@
+---
+title: Send with Azure Communication Services
+description: Send Azure Communication Services email from ReputeCast, with delivery reports from an Event Grid subscription and a connection string or Entra ID app.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Azure Communication Services email
+sources:
+  - internal/providers/azureacs
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/ingest/handler.go
+  - web/src/features/connect
+sidebar:
+  order: 11
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast sends Azure Communication Services email through your Email Communication resource and reads delivery
+reports from an Azure Event Grid subscription. ReputeCast can't create anything in Azure for you: you set up the
+email domain and the Event Grid subscription in the Azure portal, and ReputeCast gives you the webhook URL and checks
+that each delivery is authentic.
+
+<ProviderMatrix family="email" id="azureacs" />
+
+<Aside type="caution" title="Azure Communication Services Email is retiring">
+  Microsoft retires Azure Communication Services as a standalone offering on September 30, 2028, and ACS Email is on
+  the list of retired services. From October 23, 2026, Microsoft limits onboarding for customers who don't already
+  have a Communication Services resource
+  ([Microsoft Learn: Retirement and breaking changes guide](https://learn.microsoft.com/en-us/azure/communication-services/acs-retirement-and-breaking-changes-guide),
+  checked October 2026). Plan a second sending provider before you depend on Azure.
+</Aside>
+
+## Before you begin
+
+- **A Communication Services resource with a verified custom email domain** connected to it, and the sender usernames
+  you send from
+  ([Microsoft Learn: Add custom verified email domains](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/add-custom-verified-domains),
+  checked October 2026). The From display name comes from the sender username in Azure, not from ReputeCast.
+- **Credentials.** Either the resource's connection string (Azure portal › your Communication Services resource ›
+  Keys), or a Microsoft Entra ID app registration with a client secret and the Communication and Email Service Owner
+  role on the resource.
+- **Permissions.** Connecting needs `providers:manage`; adding a new sending domain needs `domains:manage`.
+- **A public HTTPS address.** Event Grid delivers to `<public URL>/hooks/azureacs/<token>`. Azure can't be polled
+  for past events, so the address must be reachable from the internet.
+
+## Connect Azure Communication Services
+
+<Steps>
+
+1. Open <UiPath path="nav.providers" />, choose <UiPath path="providers.overview.addProvider" /> and pick Azure
+   Communication Services in the catalog. [Connect a sending provider](/providers/connect/) explains the steps every
+   provider shares.
+
+2. Enter one set of credentials:
+   - the <UiPath path="providers.fields.azureacs.connectionString" /> (`endpoint=https://…/;accesskey=…`), or
+   - under the extra Azure settings, the <UiPath path="providers.fields.azureacs.endpoint" />
+     (`https://<resource>.communication.azure.com`), <UiPath path="providers.fields.azureacs.tenantId" />,
+     <UiPath path="providers.fields.azureacs.clientId" /> and <UiPath path="providers.fields.azureacs.clientSecret" />.
+     When both are filled in, Entra ID is used.
+
+   Also enter the limits Azure gives your domain: <UiPath path="providers.fields.azureacs.perMinute" /> becomes
+   ReputeCast's send rate for Azure (the form suggests 30 for a new custom domain until Azure raises it), and
+   <UiPath path="providers.fields.azureacs.perHour" /> is shown on the card.
+
+3. Choose <UiPath path="connect.connection.connect" />. ReputeCast makes one read-only call to your resource and
+   stores the credentials encrypted. The card shows "Communication Services · reachable" and your limits.
+
+4. In <UiPath path="connect.connection.webhooksTitle" />, ReputeCast tests its own public URL, then shows the webhook
+   URL to add in Azure. Choose <UiPath path="connect.connection.copyUrl" />.
+
+5. Decide how Event Grid proves each delivery comes from your subscription:
+   - **A shared secret.** Choose <UiPath path="connect.connection.createSecret" /> and copy the secret; it's shown
+     only once, and a new one replaces the old. Event Grid will send it as a custom delivery header
+     `X-ReputeCast-Secret` (or as `Authorization: Bearer <secret>`).
+   - **Microsoft Entra ID.** Enter the <UiPath path="providers.fields.azureacs.eventGridAudience" /> (the application
+     ID or its `api://` URI) and, when that app lives in another tenant, the
+     <UiPath path="providers.fields.azureacs.eventGridTenant" />. ReputeCast then accepts only Entra tokens issued to
+     that application with the `AzureEventGridSecureWebhookSubscriber` role.
+
+6. In the Azure portal, open your Communication Services resource › Events › Add Event Subscription and create a
+   subscription with:
+   - event type **Email Delivery Report Received** (`Microsoft.Communication.EmailDeliveryReportReceived`);
+   - event schema **Event Grid Schema**;
+   - endpoint type **Web Hook**, with the URL you copied;
+   - for a shared secret, a delivery property (custom header) `X-ReputeCast-Secret` set to the secret, with
+     "Is secret?" checked; for Entra ID, Microsoft Entra authentication with the application from step 5.
+
+   ReputeCast answers Event Grid's validation handshake on its own, so the subscription is created at once. See
+   [Microsoft Learn: Handle email events](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/handle-email-events),
+   [Set custom headers on delivered events](https://learn.microsoft.com/en-us/azure/event-grid/delivery-properties)
+   and [Deliver events to Microsoft Entra protected endpoints](https://learn.microsoft.com/en-us/azure/event-grid/secure-webhook-delivery)
+   (checked October 2026).
+
+7. Choose <UiPath path="connect.connection.continueDomain" />. Azure's DKIM and verification records come from the
+   Azure portal, so the domain step only checks what ReputeCast can (DMARC is suggested if the domain has none).
+
+8. In <UiPath path="connect.stepTest" />, send a test. The wizard lets you continue before Event Grid is set up, so
+   this step is the proof: the timeline waits for the first delivery report from Azure.
+
+9. Finish <UiPath path="connect.stepStreams" /> and <UiPath path="connect.stepContacts" />. There is nothing to pull:
+   ReputeCast doesn't read or write Azure's suppression list.
+
+</Steps>
+
+## Check that it worked
+
+- The test send's timeline shows the delivery report from Azure.
+- The Azure card on <UiPath path="nav.providers > providers.tabProviders" /> shows
+  <UiPath path="providers.statusHealthy" />.
+- In the Azure portal, the event subscription's metrics show delivered events and no delivery failures.
+
+ReputeCast sends one API call per message with Azure's engagement tracking turned off; it tracks opens and clicks
+itself. Delivery reports map to ReputeCast events: Delivered to a delivery, Bounced to a hard bounce (a soft bounce
+when the receiver blocked the sender), Suppressed to a rejection, FilteredSpam, Quarantined and Failed to soft
+bounces. Azure reports no complaints or unsubscribes, so those come only from ReputeCast's own unsubscribe links. The
+shared [suppression list](/reference/glossary/#suppression-list) is enforced before every send.
+
+## Troubleshooting
+
+- **"These settings can't be used: … the connection string needs endpoint= and accesskey=".** Copy the whole
+  connection string from the resource's Keys page.
+- **"Azure Communication Services rejected this key".** The access key was regenerated, or the Entra app's client
+  secret or IDs are wrong. For Entra ID, also check that the app has the Communication and Email Service Owner role.
+- **The test waits forever for the first event.** Check the subscription in Azure: event type, Event Grid schema,
+  the exact webhook URL, and the `X-ReputeCast-Secret` header (or Entra authentication). Deliveries without valid
+  authentication get `401` from ReputeCast.
+- **Deliveries started failing after you created a new secret.** Each new secret replaces the old one at once. Paste
+  the new secret into the subscription's delivery header.
+- **Mail arrives with the wrong From name.** Azure uses the display name of the sender username configured in Azure.
+  Change it there.
+- **Transactional messages with Cc, Bcc or attachments fail.** The Azure adapter can't send copies or attachments;
+  route those templates through another provider.
+- **You changed the public URL or disconnected Azure.** ReputeCast changes nothing in Azure. Update or delete the
+  event subscription yourself.
+
+## Related
+
+- [Connect a sending provider](/providers/connect/)
+- [Route mail across providers](/providers/routing/)
+- [Delivery events and suppression sync](/providers/events-and-sync/)
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Choose a sending provider](/providers/choose/)

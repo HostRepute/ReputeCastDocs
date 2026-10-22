@@ -1,0 +1,176 @@
+---
+title: Run ReputeCast from source
+description: The ReputeCast development setup from source with Go, Node.js and Docker, the demo data, simulated live sends, tests, linters, builds and project conventions.
+type: how-to
+audience: [developer]
+primaryKeyword: ReputeCast development setup
+sources:
+  - Makefile
+  - README.md
+  - docs/dev/CONVENTIONS.md
+  - docker-compose.yml
+  - .env.example
+  - .air.toml
+  - go.mod
+  - web/package.json
+  - internal/cli/demo.go
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+
+This guide is the ReputeCast development setup: it runs the app from its source code with live reload, loads the
+demo workspace and shows the commands that test and build it. Use it to fix a bug, build a feature or try an
+[adapter](/adapters/overview/) against a real server. To run ReputeCast for your own mail, install a release instead
+([Install with Docker Compose](/self-hosting/docker/)).
+
+## Before you begin
+
+- **Go 1.27.** `go.mod` asks for Go 1.27.2; a recent Go downloads that toolchain by itself.
+- **Node.js 24** (LTS) with **pnpm 12** for the web app. The web app's `package.json` pins pnpm 12.11.0.
+- **Docker** with Compose, for PostgreSQL 18 and [Mailpit](https://mailpit.axllent.org/) (a local mail catcher).
+- **golangci-lint v2**, only to run the Go linters (`make lint`).
+- Free ports 5432 (PostgreSQL), 1025 and 8025 (Mailpit), 8080 (API) and 5173 (web app).
+
+## Run it locally
+
+<Steps>
+
+1. Get the source and install the Go modules and web dependencies:
+
+   ```sh title="Terminal"
+   git clone https://github.com/hostrepute/reputecast.git
+   cd reputecast
+   make deps
+   ```
+
+2. Start everything:
+
+   ```sh title="Terminal"
+   make dev
+   ```
+
+   This starts PostgreSQL and Mailpit with Docker Compose, then the API with live reload on
+   http://localhost:8080 and the web app (Vite) on http://localhost:5173. The API applies database migrations when it
+   starts. Stop both with <kbd>Ctrl</kbd> <kbd>C</kbd>.
+
+3. In a second terminal, load the demo data, the Acme workspaces:
+
+   ```sh title="Terminal"
+   make seed
+   ```
+
+4. Open http://localhost:5173 and sign in with a demo account. Every email the app sends lands in Mailpit at
+   http://localhost:8025.
+
+</Steps>
+
+| Account         | Password          | Role                  | Notes                                                                   |
+| --------------- | ----------------- | --------------------- | ----------------------------------------------------------------------- |
+| `linh@acme.io`  | `reputecast-demo` | Owner, instance admin | Authenticator secret `JBSWY3DPEHPK3PXP`, recovery code `b4xk-9q2m-7hdn` |
+| `aisha@acme.io` | `reputecast-demo` | Viewer                | Password only (two-factor grace period)                                 |
+
+<Aside type="tip" title="Other ports">
+If a port is taken, copy `.env.example` to `.env` and change `PG_PORT`, `MAILPIT_SMTP_PORT` or `MAILPIT_UI_PORT`.
+Docker Compose and the Makefile both read it.
+</Aside>
+
+## Watch a live send
+
+The demo's sending providers are simulated: nothing they send leaves your machine. `reputecast demo send` starts a
+campaign's send through them, and the running server keeps sending in real time, with deliveries, bounces,
+complaints, opens and clicks, so the [live monitor](/campaigns/live-monitor/) has something to show:
+
+```sh title="Terminal"
+export REPUTECAST_ENV=development   # the command refuses to run otherwise
+go run ./cmd/reputecast demo send "Weekly Digest #142" --elapsed 20m
+go run ./cmd/reputecast demo send "Weekly Digest #142" --scenario outlook-complaints --elapsed 20m --reset
+go run ./cmd/reputecast demo send "Weekly Digest #142" --scenario postal-outage --elapsed 17m --reset
+```
+
+- `--elapsed` starts the send that long ago and fast-forwards it, so the monitor opens mid-send.
+- `--scenario outlook-complaints` makes lapsed Outlook readers complain until the Outlook share is auto-paused;
+  `--scenario postal-outage` makes Postal refuse connections 14 minutes in, so its share is held.
+- `--reset` clears an earlier send of the campaign first, including what it changed elsewhere (provider statistics,
+  suppressions from its bounces). It runs only in a workspace whose providers are all demo providers.
+
+The flags are listed in the [CLI reference](/reference/cli/).
+
+## Test, lint and build
+
+<TableScroll label="Development tasks">
+
+| Task                                                                      | Command                                          |
+| ------------------------------------------------------------------------- | ------------------------------------------------ |
+| All tests: Go unit and integration tests on real PostgreSQL, web unit tests | `make test`                                    |
+| Linters: golangci-lint, ESLint and TypeScript                             | `make lint`                                      |
+| Regenerate sqlc code, the OpenAPI document and the web API types          | `make generate`                                  |
+| Production build: one binary with the web app embedded, in `bin/reputecast` | `make build`                                   |
+| Docker image                                                              | `make docker`                                    |
+| Browser tests (Playwright) against the running dev stack                  | `make e2e`                                       |
+| The reputecast.com landing site: build, or live reload on :5288           | `make site`, `make site-dev`                     |
+| Adapter SDK and template: build and test, then run through the Go runtime | `make sdk`                                       |
+| Accessibility sweep of the app's screens (axe-core, WCAG 2.0–2.2 A and AA) | `cd web && pnpm a11y`                           |
+| Every task with a one-line description                                    | `make help`                                      |
+
+</TableScroll>
+
+Integration tests start PostgreSQL 18 with Testcontainers, or reuse the Compose database when it runs; `make test`
+picks automatically. CI runs the Go suite on Go 1.27 against PostgreSQL 16, 17 and 18. When several test runs share
+one database server, `go test -p 4 ./...` keeps the connection count within PostgreSQL's limits.
+
+After you change an API operation, regenerate the OpenAPI document and the web types, and commit both:
+
+```sh title="Terminal"
+go run ./cmd/reputecast openapi > web/openapi.json
+cd web && pnpm api:types
+```
+
+## Conventions
+
+Read [`docs/dev/CONVENTIONS.md`](https://github.com/hostrepute/reputecast/blob/main/docs/dev/CONVENTIONS.md) before
+your first change. It explains how a screen is built end to end. In short:
+
+- Each domain is a Go package under `internal/` with a `Service` and a `Register` function for its API operations.
+  Every operation declares who may call it and which permission it needs, and every change writes an
+  [audit log](/team/audit-log/) entry in the same transaction.
+- Errors are RFC 9457 problem documents with a sentence that says what to do
+  ([Errors](/developers/api-errors/)). Secrets are write-only.
+- SQL lives in `internal/store/queries/` and goes through sqlc; migrations are goose files in `migrations/`, with a
+  `Down` for each, and must run on PostgreSQL 16 to 18.
+- The web app calls the API only through the client generated from `web/openapi.json`.
+- Screens follow the design boards in `design/boards/` at 1440, 834 and 390 px.
+- Interface text goes into message files so it can be translated
+  ([Translate ReputeCast](/developers/translating/)).
+
+## Open a pull request
+
+- Keep `make test`, `make lint` and `make build` passing, and add tests with your change.
+- Write commit messages as [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
+  `type(scope): description`, for example `fix(campaigns): count only blocking issues for a blocked draft`. The
+  first line is at most 100 characters, imperative and lower case after the colon, with no full stop.
+- Never add paywalls or license checks: every feature in the repository is free.
+
+## Check that it worked
+
+- `make dev` prints `API  http://localhost:8080   Web  http://localhost:5173   Mail http://localhost:8025`.
+- `curl http://localhost:8080/readyz` answers `200`.
+- You can sign in as `linh@acme.io` and see the Acme Newsletter workspace.
+
+## Troubleshooting
+
+- **`make dev` fails on a port**: another PostgreSQL or Mailpit is running. Stop it, or set other ports in `.env`.
+- **"too many clients" in tests**: run `go test -p 4 ./...`.
+- **`make lint` says golangci-lint is missing**: install golangci-lint v2.
+- **`demo send` refuses to run**: set `REPUTECAST_ENV=development` in that terminal.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Translate ReputeCast" href="/developers/translating/" description="Where the interface text lives and how to check it." />
+  <LinkCard title="Write a community adapter" href="/adapters/community/" description="Add a sending provider without changing ReputeCast." />
+  <LinkCard title="Configure ReputeCast" href="/self-hosting/configuration/" description="Every setting the server reads." />
+  <LinkCard title="Build on ReputeCast" href="/developers/overview/" description="The API, webhooks and MCP." />
+</CardGrid>

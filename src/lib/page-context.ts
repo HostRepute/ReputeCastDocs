@@ -10,10 +10,10 @@ const english: Translate = (key, vars) =>
     String(vars?.[name] ?? ''),
   )
 
-export function pageContext(locals: App.Locals): { lang: string; t: Translate } {
+export function pageContext(locals: App.Locals): { lang: string; t: Translate; inStarlight: boolean } {
   try {
-    return { lang: locals.starlightRoute.lang, t: locals.t as unknown as Translate }
+    return { lang: locals.starlightRoute.lang, t: locals.t as unknown as Translate, inStarlight: true }
   } catch {
-    return { lang: 'en', t: english }
+    return { lang: 'en', t: english, inStarlight: false }
   }
 }

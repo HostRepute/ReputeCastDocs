@@ -1,0 +1,131 @@
+---
+title: Monitor a send and auto-pause
+description: 'How ReputeCast guards a running send: the auto-pause email campaign bounce rate and complaint limits, outage holds, and your choices after a pause.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:pause', 'campaigns:send']
+uiPath: 'nav.campaigns > campaigns.liveMonitor'
+primaryKeyword: auto-pause email campaign bounce rate
+sources:
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/actions.go
+  - internal/sending/engine/analysis.go
+  - internal/sending/engine/live.go
+  - internal/sending/engine/api.go
+  - internal/providers/manage/health.go
+  - web/src/features/live
+sidebar:
+  order: 14
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Once a campaign starts, the <UiPath path="live.title" /> shows it as it happens, and [guarded sending](/reference/glossary/#guarded-sending) watches its rates. When the bounce rate or the complaint rate of an email campaign crosses its threshold, ReputeCast auto-pauses only the part of the send that caused it, for example the Outlook recipients, and the rest keeps going. When a sending provider stops answering, its share is held or moved. In both cases a person decides what happens next.
+
+<Screenshot
+  id="live-monitor"
+  alt="The live monitor 20 minutes into Weekly Digest #142: 64% sent, 118 bounces (0.60%) and 8 complaints (0.04%), every mailbox provider OK, and every threshold bar under its limit."
+/>
+
+The page shows progress and the expected finish time, five tiles (delivered, bounced, complained, opened with human and machine opens split out, clicked), a table <UiPath path="live.perMailbox" /> and one <UiPath path="live.perProvider" />, the <UiPath path="live.thresholds" /> with a bar per rate, and the <UiPath path="live.liveEvents" /> feed. The numbers come from your sending providers' delivery webhooks (see [delivery events and suppression sync](/providers/events-and-sync/)) and update about once a second over a server-sent event stream.
+
+## How auto-pause decides
+
+1. **Rates are counted per message.** The bounce rate is hard plus soft bounces per message sent. The complaint rate is complaints per message delivered. The deferral rate is deferred messages per message sent.
+2. **Every 2 seconds** ReputeCast checks them in this order: for each mailbox provider (Gmail, Outlook, Yahoo, iCloud, other) the complaint rate, the bounce rate and the deferral rate; for each sending provider the bounce rate; then the bounce and complaint rates of the whole campaign. The first rate that trips wins.
+3. **A rate trips only on enough evidence.** A mailbox provider or a sending provider needs 500 messages before its rates count; the whole campaign needs 1,000. There must be at least 5 bounces, complaints or deferrals, the rate must be over its limit, and ReputeCast must be about 90% confident the true rate is over the limit, so one unlucky complaint early in a send doesn't stop it.
+4. **The scope decides what pauses.** With the default scope, only the affected mailbox provider's recipients (or the affected sending provider's share) are held, and everything else keeps sending. With the campaign scope, the whole campaign pauses.
+5. **Thresholds are frozen when the send starts.** They come from the workspace defaults, changed for this campaign in Review & send if you did.
+
+The deferral threshold (5.0% per mailbox provider) is fixed and has no field in the app.
+
+## What happens on a pause
+
+- The held recipients wait in the queue. Nothing is dropped.
+- Everyone in the workspace with `campaigns:send` gets an urgent notification in the app and by email, for example "Outlook complaint rate reached 0.18% (limit 0.10%). 2,522 held, everything else still sending."
+- The `campaign.paused` [webhook](/reference/webhook-events/) fires with `paused_by: auto_pause`, the metric, its value and limit, the scope and the number held.
+- The live monitor opens a decision panel: <UiPath path="live.whatTripped" />, the likely causes, a recommendation and <UiPath path="live.chooseTitle" />.
+
+<Screenshot
+  id="live-monitor-paused"
+  alt="Weekly Digest #142 auto-paused for Outlook: the complaint rate reached 0.32% (limit 0.10%) after 5 complaints in 1,564 delivered. ReputeCast held 4,642 Outlook recipients while Gmail, Yahoo, iCloud and Other continue."
+/>
+
+### Decisions after a threshold pause
+
+- **Resume as is** sends to everyone still held. The threshold stays armed and pauses again at the next complaint (or bounce) of that kind.
+- **Resume with changes** is offered for a mailbox provider pause when ReputeCast finds a cause. It can exclude the group that produced most of the complaints (for example never-engaged imports, or at-risk and sunset contacts), halve that mailbox provider's sending rate for the rest of the send, and, when a matching re-permission or re-engagement automation is live, add the excluded contacts to it. The option lists exactly what it will do before you choose it. For a sending provider pause, it resumes without changes.
+- **Cancel the share** skips the held recipients; the rest of the campaign finishes normally.
+- **Cancel the whole campaign** with <UiPath path="live.cancelWhole" /> stops everything that hasn't been sent.
+
+With the campaign scope, the choices are Resume as is and cancel the campaign.
+
+## Sending provider outages
+
+The <UiPath path="live.model.thresholdErrors" /> bar shows the highest share of failed calls, over the last 3 minutes, among the sending providers on the route (it counts every call to that provider, not only this send's). It is there to watch; it never pauses a send, even when it turns red. A provider's share is taken off the send when:
+
+- its calls for this send have all failed for 3 minutes, with at least 5 failed calls (rate-limit answers don't count, and one success resets the clock),
+- the provider health check marks the provider down, or
+- the provider rejects the credentials, at once.
+
+What happens then depends on the Broadcast stream's [failover policy](/providers/routing/). With an automatic policy, ReputeCast moves the remaining share to a provider that is available, allows bulk mail and isn't warming up (the stream's fallback first, then the largest share of the split), and records the move. With "pause and ask", with rejected credentials, or when no provider qualifies, the share is held and everyone with `campaigns:send` is asked to decide.
+
+<Screenshot
+  id="live-monitor-outage"
+  alt="Postal returned connection errors for 3 minutes, so its share is on hold with 739 recipients remaining while Amazon SES keeps sending. Moving the share to SES costs $0.07 extra, adds 53 seconds and has low reputation risk."
+/>
+
+### Decisions after an outage hold
+
+- **Retry** keeps the recipients on the same provider and tries again. If it is still failing after 15 more minutes, you are asked again.
+- **Move the remaining share** sends the held recipients through another provider. The panel shows the extra cost, the extra time at that provider's rate, its quota after the move and the reputation risk ("Low · SES is warm"). Messages already sent keep their tracking.
+- **Cancel the share** skips the held recipients. They are marked "not sent" in the report and can be sent later.
+
+A message that fails temporarily is retried up to 10 times, after 5, 10, 20 and 40 seconds and then every 60 seconds. Each attempt carries an idempotency key, so no message is sent twice.
+
+## Pausing and resuming by hand
+
+<TableScroll label="Live monitor actions and the permission each needs">
+
+| Action                                              | Needs             | Notes                                                                                   |
+| --------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                        | `campaigns:pause` | Shown while the campaign is sending. Everything stops until someone resumes it.         |
+| <UiPath path="live.resumeSending" />                | `campaigns:send`  | Also every resume, move and retry decision.                                             |
+| <UiPath path="live.cancelSend" />                   | `campaigns:send`  | The dialog offers <UiPath path="live.pauseInstead" /> if you hold `campaigns:pause`.    |
+| Watching the monitor                                | `campaigns:view`  |                                                                                         |
+
+</TableScroll>
+
+Pausing is deliberately the cheaper permission: someone who notices a problem can stop a send, and someone who may send decides how it continues. Owner, Admin and Editor hold both; Viewer holds neither. See [roles and permissions](/team/roles-and-permissions/).
+
+## On a phone
+
+<Screenshot
+  id="live-monitor-mobile"
+  alt="The live monitor on a phone: its own header with the status Live · events 1 s ago, 64% sent with the ETA and rate, five tiles in two columns with human opens shown first, and the threshold bars."
+/>
+
+Below 768 px the live view gets its own layout: a short header with the connection status ("Live · events 1 s ago"), the tiles in two columns, compact threshold and provider rows, and Pause (or Resume) and Cancel at the bottom. Decision panels use the desktop layout.
+
+If the event stream drops, the monitor reconnects by itself (up to 10 attempts) and offers <UiPath path="live.reconnectNow" />. A monitor that never updates behind a reverse proxy usually means the proxy buffers the stream; see [reverse proxy and TLS](/self-hosting/reverse-proxy/).
+
+## Defaults and limits
+
+<LimitsTable area="auto-pause" />
+
+## When to change them
+
+- **Workspace defaults** in [workspace sending defaults](/providers/workspace-defaults/) (<UiPath path="nav.settings > settings.providers" />) set the bounce and complaint thresholds and the <UiPath path="senders.providers.pauseScope" /> for every new send.
+- **One campaign** can use different thresholds or the campaign scope in <UiPath path="composer.reviewSend" />, until it starts. Lower them for a list you haven't mailed in a long time or a new provider; choose the campaign scope when a partial send would confuse readers, for example a time-limited offer.
+- Raising a threshold above what your sending provider tolerates trades a paused send for a suspended account. Compare with the provider's own limits in [bounces, complaints and provider limits](/deliverability/bounces-and-complaints/).
+
+## Related
+
+- [Schedule and send a campaign](/campaigns/schedule-and-send/) is where per-campaign thresholds are set.
+- [Provider health and outages](/providers/health-and-outages/) covers held Broadcast shares from the Sending providers screen.
+- [Read campaign reports](/campaigns/reports/) shows the final numbers per mailbox and sending provider.
+- [Limits and defaults](/reference/limits-and-defaults/) lists every fixed number.

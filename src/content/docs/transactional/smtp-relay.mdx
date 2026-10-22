@@ -1,0 +1,157 @@
+---
+title: Send through the SMTP relay
+description: Turn on the SMTP relay for apps that only speak SMTP, publish ports 587 and 465 and send SMTP relay transactional email with send-only credentials.
+type: how-to
+audience: [operator, admin, developer]
+permissions: ['apikeys:manage']
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance > transactional.relayAdmin.title'
+primaryKeyword: SMTP relay transactional email
+sources:
+  - internal/smtprelay
+  - internal/app/wire_smtprelay.go
+  - internal/apikeys/transactional.go
+  - web/src/features/transactional/RelayAdminCard.tsx
+  - web/src/features/transactional/setup.messages.ts
+  - deploy/docker-compose.yml
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+The SMTP relay lets apps that can't call an HTTP API send SMTP relay transactional email through ReputeCast: they
+connect on port 587 (STARTTLS) or 465 (TLS), authenticate with a send-only credential, and the message goes through
+the workspace's Transactional route, suppressions and [message log](/transactional/message-log/). An instance admin
+turns it on once per instance; each workspace then creates its own credentials.
+
+## Before you begin
+
+- You are an instance admin, and you can change the server's firewall and Docker Compose file.
+- A hostname for the relay, such as `smtp.example.com`, with an `A`/`AAAA` record pointing to the server. The
+  instance's public URL host is suggested.
+- In the workspace: `apikeys:manage` to create SMTP credentials, and a verified Transactional sender. The `From`
+  address of every message must be a verified Transactional sender
+  (see [add sending domains and senders](/providers/senders-and-domains/)).
+- Processes with the `web` role run the relay listeners. If you split roles, see
+  [scale with web, ingest and worker roles](/self-hosting/scaling/).
+
+## Publish the ports
+
+ReputeCast listens on the relay ports inside the container, but Docker Compose only publishes what you list. The
+default `deploy/docker-compose.yml` publishes port 8080 only, so add the two relay ports to the `app` service
+yourself:
+
+```yaml title="docker-compose.yml"
+services:
+  app:
+    ports:
+      - "${REPUTECAST_PORT:-8080}:8080"
+      - "587:587" # SMTP relay, STARTTLS
+      - "465:465" # SMTP relay, implicit TLS
+```
+
+Apply it with `docker compose up -d`, and open both ports in the server's firewall. SMTP is not HTTP, so the
+relay ports go straight to the app, never through your reverse proxy. If you change the ports in the relay
+settings, publish those instead.
+
+## Turn on the relay
+
+<Steps>
+
+1. Open <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> from the account menu and find the
+   <UiPath path="transactional.relayAdmin.title" /> section.
+
+2. Set the **Hostname**, the **STARTTLS port** (587) and the **TLS port** (465). The two ports must differ.
+
+3. Choose the **Certificate**:
+   - **Let's Encrypt**: ReputeCast gets and renews the certificate itself. Let's Encrypt validates the hostname over
+     HTTP, so `http://<hostname>/.well-known/acme-challenge/` must reach a ReputeCast web process, for example
+     through your [reverse proxy](/self-hosting/reverse-proxy/). Every web node shares the certificate.
+   - **Certificate and key files**: upload a **Certificate chain (PEM)** and a **Private key (PEM)**. The key is
+     write-only: it is sealed and never shown again.
+
+4. Choose <UiPath path="transactional.relayAdmin.turnOn" />, then <UiPath path="transactional.relayAdmin.runChecks" />.
+   ReputeCast checks that the hostname resolves, that both ports are reachable from the internet, and that the
+   certificate is valid. Checks also run every 10 minutes; instance admins are told when a port stops answering.
+
+</Steps>
+
+## Create an SMTP credential
+
+<Steps>
+
+1. In the workspace, open <UiPath path="nav.transactional > transactional.common.tabSetup" /> and choose
+   <UiPath path="transactional.setup.createCredential" />.
+
+2. Name it after the app, choose **Live** or **Test** mode, and optionally limit the templates and categories it can
+   send and when it expires. Test mode delivers only to workspace members and the test addresses you allow.
+
+3. Copy the password now: it is shown once. The **username** is the credential's key ID; the **password** is its
+   secret, which starts with `rc_smtp_`. The credential holds `transactional:send` only.
+
+</Steps>
+
+<Screenshot
+  id="transactional-setup"
+  alt="Transactional Setup: the HTTP API card, the keys that can send including an SMTP credential for the billing service, and the SMTP relay card showing On."
+/>
+
+## Configure your app
+
+| Setting  | Value                                                    |
+| -------- | -------------------------------------------------------- |
+| Host     | The relay hostname, such as `smtp.example.com`           |
+| Port     | `587` with STARTTLS, or `465` with TLS                   |
+| Auth     | `PLAIN` or `LOGIN`                                       |
+| Username | The credential's key ID                                  |
+| Password | The credential's secret (`rc_smtp_…`)                    |
+| From     | An address on a verified Transactional sender            |
+
+Two optional headers tag the message in ReputeCast; the relay reads them and they are not passed on:
+
+```text title="Optional headers"
+X-ReputeCast-Tags: invoice, eu
+X-ReputeCast-Category: Billing
+```
+
+`X-ReputeCast-Tags` is comma-separated. `X-ReputeCast-Category` takes a category's name or ID; without it, a
+credential limited to one category uses that one. A recipient who turned an Optional category off doesn't get its
+mail.
+
+## Limits
+
+<LimitsTable area="smtp-relay" />
+
+## Check that it worked
+
+Send a message from your app, then open <UiPath path="nav.transactional > transactional.common.tabMessages" />. The
+message shows **Raw (SMTP)** in place of a template, with its delivery timeline.
+
+## Troubleshooting
+
+- **The check says a port isn't reachable** → the port is not published in Compose, or a firewall in front of the
+  server blocks it.
+- **The check says the hostname doesn't resolve** → add the `A`/`AAAA` record, wait for DNS, then run the checks
+  again.
+- **Let's Encrypt fails** → port 80 for the hostname doesn't reach a ReputeCast web process. Route
+  `/.well-known/acme-challenge/` to it, or upload certificate files.
+- **Authentication fails** → use the key ID as the username, not the credential's name, and check that the
+  credential isn't revoked or expired.
+- **The message is refused with a size error** → the relay accepts up to 40 MiB, but the route's sending providers
+  may accept less; the reply says so.
+- **Apps get a refused connection** → the relay is off. The HTTP API keeps working either way.
+
+<Aside type="note">
+The relay is only for transactional mail from your own apps. To send campaigns or automations, use the app; to send
+from code with templates, use the HTTP API (see
+[send transactional email with the API](/developers/transactional-api/)).
+</Aside>
+
+## Related
+
+- [Transactional email in ReputeCast](/transactional/overview/)
+- [Install with Docker Compose](/self-hosting/docker/)
+- [Authentication and API keys](/developers/api-authentication/)

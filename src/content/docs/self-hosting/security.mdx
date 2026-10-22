@@ -1,0 +1,178 @@
+---
+title: Security and hardening
+description: How ReputeCast handles self-hosted email security, from encrypted credentials and key rotation to sign-in protection, network guards and headers.
+type: explanation
+audience: [operator]
+primaryKeyword: self-hosted email security
+sources:
+  - README.md
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/linktoken/linktoken.go
+  - internal/netguard/netguard.go
+  - internal/server/middleware.go
+  - internal/server/ratelimit.go
+  - internal/authn/password.go
+  - internal/authn/breached.go
+  - internal/accounts/service.go
+  - migrations/00002_workspaces.sql
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Self-hosted email security means you hold the keys: ReputeCast stores every credential encrypted with a key that only
+your server has, checks every action against the same permission model, and refuses outbound requests to your private
+network unless you allow them. This page explains each protection, the settings that change it, and the one task you
+must plan yourself: keeping and rotating the secret key.
+
+## How ReputeCast protects your data
+
+1. **Credentials are encrypted at rest.** Sending provider, SMS, payment and AI credentials, OIDC and social sign-in
+   client secrets, HostRepute tokens, webhook signing secrets, seed-mailbox credentials and authenticator (TOTP) seeds
+   are sealed with AES-256-GCM. Each value is bound to its row and field, so it can't be copied onto another record.
+   They are write-only: the API and the app never return them.
+2. **Passwords and tokens are hashed.** Passwords use argon2id. Sessions and API keys are random 256-bit tokens, and the
+   database stores only their SHA-256 hashes; a key is shown once, when it is created.
+3. **Sign-in is hard to attack.** Sign-in asks for the email first and answers with generic errors, so nobody learns
+   which addresses have accounts. Failed passwords lock the email for a while (10 attempts lock it for 15 minutes by
+   default), and `/api/v1/auth/*` accepts 30 requests a minute per IP address. Two-factor authentication with an
+   authenticator app, passkeys and one-time [recovery codes](/reference/glossary/#recovery-code) is required by default
+   for everyone who holds a [sensitive permission](/reference/glossary/#sensitive-permission).
+4. **Session cookies stay in the browser.** The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` when
+   `http.public_url` starts with `https://` (or, outside development, while `auth.cookie_secure` is `true`, the default).
+5. **Every action passes one permission check.** People, API keys and MCP agents go through the same check; keys and
+   agents never hold more than the person who created them. See [roles and permissions](/team/roles-and-permissions/).
+6. **The audit log can't be edited.** Every change and every denied attempt is recorded with actor, IP address, user
+   agent and request ID. A database trigger rejects updates to audit entries; only the retention cleanup removes old
+   ones.
+7. **Outbound requests can't reach your network.** Addresses people type into the app (provider URLs, webhook
+   endpoints, importers, feeds, AI model servers, seed mailboxes and others) are checked before ReputeCast connects, and
+   again at connect time, after DNS. Redirects are not followed.
+8. **Browsers get strict headers.** Every response carries a Content Security Policy, `X-Frame-Options: DENY`,
+   `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+   `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
+   is added when `http.public_url` is `https://`. Cross-site browser requests that change something are rejected,
+   except provider webhooks (`POST /hooks/…`) and public form posts (`POST /p/…`), which are verified in other ways.
+   The `/api` routes send no CORS headers.
+9. **SQL segments can only read.** User-written SQL runs in a read-only transaction with a statement timeout, as a role
+   that can read only one workspace's contacts. See [PostgreSQL](/self-hosting/postgres/#sql-segments).
+
+The Content Security Policy of the app:
+
+```txt title="Content-Security-Policy"
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; object-src 'none'
+```
+
+## The secret key
+
+One 32-byte key protects every sealed value. ReputeCast reads it from `secrets.key` (`REPUTECAST_SECRETS__KEY`, base64)
+or, when that is empty, from the file at `secrets.key_file`. If the file doesn't exist, ReputeCast creates it with a new
+key, readable only by its owner (mode `0600`), and logs
+`generated a new secret key; back it up together with the database`.
+
+The same key also signs the links in your emails: unsubscribe, preference center, view online, confirmation, and open
+and click tracking. Back it up with the database ([back up and restore](/self-hosting/backups/)), and keep it out of
+the dump files.
+
+### Rotate the key
+
+Rotate the key when it may have leaked. ReputeCast does not re-encrypt stored values: values sealed with the old key
+keep opening as long as the old key is in `secrets.previous_keys`, and a value moves to the new key only when someone
+saves it again.
+
+<Aside type="caution" title="Rotating breaks links in emails already sent">
+  Email links are signed with the current key only; `secrets.previous_keys` doesn't apply to them. After a rotation,
+  unsubscribe, preference and tracking links in every email sent before it stop working. Rotate only when you must,
+  and expect complaints about unsubscribe links in older emails.
+</Aside>
+
+<Steps>
+
+1. Print a new key:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets generate-key
+   ```
+
+2. Find the current key: the value of `REPUTECAST_SECRETS__KEY`, or the contents of the key file
+   (`/var/lib/reputecast/secret.key` in Docker).
+
+3. Set the new key as `REPUTECAST_SECRETS__KEY` and the old one as `REPUTECAST_SECRETS__PREVIOUS_KEYS` (comma-separated
+   when there are several). With Docker Compose, pass both into the app container, for example in a
+   `docker-compose.override.yml` next to `docker-compose.yml`, with the values in `.env`:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     app:
+       environment:
+         REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY}
+         REPUTECAST_SECRETS__PREVIOUS_KEYS: ${REPUTECAST_SECRETS__PREVIOUS_KEYS}
+   ```
+
+   Once `REPUTECAST_SECRETS__KEY` is set, the key file is no longer read.
+
+4. Restart ReputeCast (`docker compose up -d`) and sign in with your authenticator app to check that old values still
+   open.
+
+5. Keep every previous key for as long as values sealed with it may exist. Nothing lists which values still use an old
+   key, so in practice keep it until every credential, client secret and authenticator has been saved again.
+
+</Steps>
+
+<Aside type="caution">
+  An empty `REPUTECAST_SECRETS__PREVIOUS_KEYS` stops the start with
+  `Error: previous secret key: key must be 32 bytes, got 0`. When you have no previous key, remove the variable and its
+  line in `docker-compose.override.yml` instead of leaving it empty.
+</Aside>
+
+## Private networks
+
+By default, outbound requests to addresses typed into the app are refused when they resolve to a private or loopback
+address (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7` and a few
+reserved ranges), or when the host is `localhost`, `*.localhost` or `*.internal`. The error reads
+`address not allowed: 10.0.0.5 is a private or loopback address`.
+
+Two settings allow them, for services that run on your own network:
+
+| Setting                            | Allows private addresses for                                                                                                                    |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `providers.allow_private_networks` | Provider URLs (a Postal server, the generic HTTP adapter), community adapter addresses (plain `http://` only there), SMTP, IMAP and POP3 tests, importers, feeds, forms, AI model servers, placement tests and other integrations. |
+| `webhooks.allow_private_networks`  | Outgoing webhooks, integration hooks (n8n, Zapier, Make) and the audit stream.                                                                  |
+
+Link-local and cloud metadata addresses (`169.254.0.0/16`, `fe80::/10`, `100.100.100.200`, `fd00:ec2::254`),
+multicast and `0.0.0.0/8` stay refused with either setting.
+
+## Defaults and limits
+
+<LimitsTable area="rate-limits" />
+
+The sign-in policy (password length, re-use, the breached-password check, two-factor enforcement, sessions and lockout)
+lives in <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; see
+[instance admin](/self-hosting/instance-admin/).
+
+## When to change the defaults
+
+- **Turn on the breached-password check** in <UiPath path="admin.authentication" /> unless the server is offline. It
+  is off by default. When on, ReputeCast sends the first 5 characters of a new password's SHA-1 hash to
+  `api.pwnedpasswords.com` (k-anonymity); if that service doesn't answer, the password is accepted.
+- **Set `http.trusted_proxies`** to your reverse proxy's address. Without it, ReputeCast ignores `X-Forwarded-For`,
+  and every client behind the proxy shares one IP address in rate limits and the audit log.
+- **Use an `https://` public URL** in production, so cookies are `Secure` and HSTS is sent. See
+  [reverse proxy and TLS](/self-hosting/reverse-proxy/).
+- **Keep `/metrics` private**: it needs no authentication. See [health checks, metrics and logs](/self-hosting/monitoring/).
+- **Allow private networks** only for the services that need it, and only the setting that covers them.
+
+## Report a vulnerability
+
+Email security@hostrepute.com instead of opening a public GitHub issue.
+
+## Related
+
+- [Back up and restore](/self-hosting/backups/): the key and the database belong together.
+- [Configuration reference](/reference/configuration/): `secrets.*`, `http.*`, `auth.*` and the private-network settings.
+- [Audit log](/team/audit-log/): what is recorded and how long it is kept.

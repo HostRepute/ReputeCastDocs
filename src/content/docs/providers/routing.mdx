@@ -1,0 +1,145 @@
+---
+title: Route mail across providers
+description: Route each stream through the right sending provider, split traffic by weight and set up email failover multiple providers can share, then test an address.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabRouting'
+primaryKeyword: email failover multiple providers
+sources:
+  - internal/routing
+  - internal/sending/engine/audience.go
+  - internal/providers/manage/health.go
+  - internal/connect/streams.go
+  - web/src/features/providers/RoutingPage.tsx
+  - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing.messages.ts
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Routing decides which [sending provider](/reference/glossary/#sending-provider) delivers each email: per stream, by list,
+sender domain or the recipient's mailbox provider, with weighted splits and a fallback. This page sets up routes and
+email failover multiple providers can take part in, then checks the result with the
+[route tester](/reference/glossary/#route-tester) before you save.
+
+## Before you begin
+
+- Connect at least one provider; failover and splits need two. Read [Connect a sending provider](/providers/connect/).
+- You need `providers:manage` to change routing. With `providers:view` you can open the page and use the route tester.
+
+## How a route decides
+
+Each email belongs to one of four [streams](/reference/glossary/#stream): Broadcasts (campaigns), Automations, System
+(double opt-in confirmations, preference links, team invites) and Transactional (mail from your product). For every
+recipient, ReputeCast:
+
+1. Takes the stream's rules.
+2. Checks the stream's conditions in order. The first one that matches decides the provider.
+3. If no condition matches, uses the stream's default route: the primary provider, or a
+   [weighted split](/reference/glossary/#weighted-split). A split puts each address in one of 100 buckets from a hash of
+   the address, so the same recipient always lands on the same provider.
+4. Checks the shared suppression list. A suppressed address gets nothing, whichever provider it was routed to.
+5. If the chosen provider can't take mail, applies the stream's failover policy.
+
+The mailbox provider (Gmail, Outlook, Yahoo, iCloud or Other) comes from the contact's mail server records when the
+contact exists, and from the address's domain otherwise.
+
+## Set up the routes
+
+<Steps>
+
+1. Open <UiPath path="nav.providers > providers.tabRouting" />. There is one card per stream.
+
+   <Screenshot
+     id="providers-routing"
+     alt="Routing and failover for Broadcasts: Amazon SES as primary with a 90/10 weighted split to Postal, two conditions, the failover policy set to pause and ask, and the route tester answering Amazon SES for an Outlook address."
+   />
+
+2. For each stream, pick the <UiPath path="providers.routing.primary" /> and, if you have a second provider, the
+   <UiPath path="providers.routing.fallback" />. The fallback takes over when the primary is down; it can't also be part
+   of the split.
+
+3. Adjust a <UiPath path="providers.routing.weightedSplit" /> if the stream has one. Splits are created when you connect a
+   provider and give it the Weighted split role on the Streams step (Broadcasts only). Here you change each provider's
+   share; the primary gets the rest. Set a share to 0 to take the provider out of the split. While a provider in the
+   split [warms up](/providers/warm-up/), the warm-up planner raises its share on schedule and the card says when.
+
+4. Add conditions where one kind of mail should always use one provider: <UiPath path="providers.routing.addCondition" />.
+   Broadcasts and Automations can match on the list, the sender domain or the recipient's mailbox provider;
+   Transactional matches on the transactional category or the mailbox provider. System mail has no conditions. Each
+   condition sends to exactly one provider, and what you type under <UiPath path="providers.routing.why" /> is shown next
+   to it, for example "Outlook and iCloud are strict with new IPs".
+
+5. Choose the Broadcasts <UiPath path="providers.routing.failoverPolicy" />:
+   - **Pause and ask** (the default): if the primary fails during a send, the remaining recipients are held and you are
+     notified. Moving a bulk send to a cold provider can hurt its reputation.
+   - <UiPath path="providers.routing.warmOnly" />: moves the send to the fallback automatically once the fallback has
+     finished its warm-up; until then, it behaves like pause and ask.
+   - <UiPath path="providers.routing.automatic" />.
+
+   Automations, System and Transactional mail fail over to their fallback automatically, because it must keep going
+   out. Without a fallback, it waits until the provider recovers.
+
+6. For Transactional mail, <UiPath path="providers.routing.firstInLine" /> makes transactional messages go first on a
+   provider that also sends a campaign, within the provider's rate.
+
+7. Try a few addresses in the <UiPath path="providers.routing.testerTitle" />: pick the stream, a list, a sender domain
+   (or a transactional template) and type a recipient. It answers with the provider, the mailbox provider, the DKIM
+   selector, the cost of one message, each step of the decision and what happens if the provider fails. It tests your
+   unsaved changes.
+
+8. Choose <UiPath path="providers.routing.saveRouting" />. New sends use the routing right away; sends already in
+   progress keep their route.
+
+</Steps>
+
+On a phone, the stream cards stack and the route tester follows them:
+
+<Screenshot
+  id="providers-routing-mobile"
+  alt="The routing page on a phone: the Broadcasts card with its primary, fallback, weighted split and the first condition, above the bottom tab bar."
+/>
+
+<Aside type="caution">
+Before it saves, ReputeCast checks that every Broadcasts provider's terms allow bulk marketing. If one doesn't, it offers
+a fix (create a Postmark Broadcast stream, use another provider or save without a fallback). Keeping it anyway is
+recorded in the audit log, and [Send Readiness](/campaigns/send-readiness/) blocks every broadcast until the route
+changes. Read [Choose a sending provider](/providers/choose/#bulk-marketing-terms).
+</Aside>
+
+## Check that it worked
+
+- The page header shows when routing was saved and by whom.
+- <UiPath path="nav.providers > providers.tabProviders" /> shows the routing per stream as a bar with each provider's
+  share, the fallback and the failover policy.
+- The route tester gives the provider you expect for an address on each list and mailbox provider that has a condition.
+- During a send, the [live monitor](/campaigns/live-monitor/) shows each provider's share of the campaign.
+
+## Troubleshooting
+
+- **"The Broadcasts split adds up to 95%; it must add up to 100%"**: change a share so the total is 100.
+- **"A provider appears twice in the split"** or **"The fallback is already part of the split"**: pick another provider,
+  or none, as the fallback.
+- **"Broadcasts has no primary provider"**: every stream except Transactional needs a primary. Transactional can stay
+  without a route while your product sends no mail.
+- **A warning that the fallback is warming up**: moving a broadcast to a provider that is still warming up can hurt its
+  reputation. With the warmed-up-only policy, Broadcasts don't fail over to it until its warm-up ends; with Automatic,
+  they do. The warning doesn't stop the save.
+- **The route tester says the email would wait**: the provider is down or its webhooks are silent, so its share waits
+  for it or for the fallback. Read [Provider health and outages](/providers/health-and-outages/).
+- **The tester says the address is suppressed**: nothing is sent to it on any provider. Read
+  [The suppression list](/audience/suppressions/).
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Provider health and outages" href="/providers/health-and-outages/" />
+  <LinkCard title="Warm up a new provider or IP" href="/providers/warm-up/" />
+  <LinkCard title="Monitor a send and auto-pause" href="/campaigns/live-monitor/" />
+  <LinkCard title="How ReputeCast works" href="/getting-started/concepts/" />
+</CardGrid>

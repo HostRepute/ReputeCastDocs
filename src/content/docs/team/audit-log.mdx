@@ -1,0 +1,120 @@
+---
+title: Audit log
+description: What the ReputeCast audit log records for every action, who can see it, its filters, CSV and JSON export, the signed audit stream and retention rules.
+type: reference
+audience: [admin, operator]
+permissions: ['audit:view']
+uiPath: 'nav.settings > settings.audit'
+primaryKeyword: audit log
+sources:
+  - internal/audit/audit.go
+  - internal/auditlog
+  - internal/maintenance/maintenance.go
+  - migrations/00002_workspaces.sql
+  - web/src/features/audit
+  - web/src/features/admin/audit
+sidebar:
+  order: 7
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+The [audit log](/reference/glossary/#audit-log) records who did what, to what, from where, and whether it was
+allowed, for each workspace in <UiPath path="nav.settings > settings.audit" /> and for the instance in
+<UiPath path="shell.userMenuInstanceAdmin > admin.audit" />.
+
+<Screenshot
+  id="settings-audit"
+  alt="The workspace audit log: search and filters for actor type, action, result and date range above a list of entries with time, actor, event, target, source and result."
+/>
+
+## Access
+
+| Log       | Who can read it                                    | Who can change retention and streaming                     |
+| --------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| Workspace | Members, API keys and MCP agents with `audit:view` (Owner, Admin, Editor, Viewer; not the client roles) | Signed-in members with `workspace:manage`                  |
+| Instance  | Instance admins, signed in                         | Instance admins                                            |
+
+The instance log shows every workspace's entries plus instance-level ones: sign-ins, single sign-on, policies, users
+and agency mode. Instance admins can switch between the two with <UiPath path="audit.instanceView" />.
+
+## What an entry records
+
+<TableScroll label="Audit entry fields">
+
+| Field              | Content                                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Time               | When it happened (UTC in exports).                                                                          |
+| Actor              | Type (member, API key, MCP agent, or automatic for the system), ID and name.                                |
+| Action             | A dotted name such as `role.updated`, `member.removed` or `audit.exported`.                                 |
+| Target             | Type, ID and name of what changed.                                                                           |
+| Result             | `allowed`, `denied` or `error`, with the reason (for example the missing permission).                       |
+| Before and after   | The changed values; the detail panel shows them as a diff.                                                  |
+| Source             | Client IP address (as resolved through your trusted proxies), user agent and request ID.                    |
+| Metadata           | Extra context, such as an export's entry count.                                                             |
+
+</TableScroll>
+
+## Notes on recording
+
+- An action and its entry are saved in the same database transaction.
+- Entries are immutable: a database trigger refuses updates and deletes, except the retention cleanup. The app has no
+  way to edit or delete them.
+- Entries outlive the workspace, user or key they name.
+- Denied changes are always recorded. Denied reads are recorded only when they need a sensitive permission, such as an
+  export. Most plain reads are not recorded.
+- Secrets (API keys, webhook and provider secrets) never appear in entries.
+- Exports are themselves recorded as `audit.exported`.
+
+## Filters
+
+| Filter       | Values                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------- |
+| Search       | Target or actor name (contains), target ID or request ID (exact). The instance log also matches the sign-in reference ID shown on error pages. |
+| Actor type   | Members, API keys, MCP agents, System                                                                   |
+| Action       | 22 categories, from Sending and Team & access to Agency                                                  |
+| Result       | Allowed, Denied, Error (instance log: Allowed, Denied)                                                   |
+| Date range   | Last 24 hours, 7 days (default), 30 days, 90 days, all retained, or custom dates in the workspace timezone |
+| Workspace    | Instance log only: all workspaces, one workspace or instance-only entries                                |
+
+## Export
+
+<UiPath path="audit.exportCsv" /> and <UiPath path="audit.exportJson" /> download the entries that match the current
+filters, with no row limit, as `audit-<workspace>-<date>.csv` or `.json` (instance: `audit-instance-<date>`). The CSV
+columns are `occurred_at, actor_type, actor_name, actor_id, action, target_type, target_id, target_name, result,
+reason, summary, ip, user_agent, request_id, before, after`; the instance export adds `workspace`. The API equivalent
+is `GET /api/v1/workspaces/<workspace>/audit/export?format=csv|json` with the same filters (see the
+[API reference](/api/)).
+
+## Audit stream
+
+The workspace's <UiPath path="audit.streamDialog" /> dialog, with <UiPath path="audit.streamToggle" />, sends new
+entries to an HTTPS endpoint, such as a SIEM or a warehouse. Instance admins set up a separate stream for
+instance-level entries with <UiPath path="audit.streamInstance" />.
+
+- Every 30 seconds, ReputeCast posts up to 500 new entries per workspace, oldest first, as
+  `{"workspace": "<id>", "sent_at": "…", "events": [ … ]}`.
+- Each request is signed like [workspace webhooks](/developers/webhooks/): headers `X-ReputeCast-Timestamp`,
+  `X-ReputeCast-Event: audit.batch` and `X-ReputeCast-Signature`, the HMAC-SHA256 of `<timestamp>.<raw body>` with the
+  `whsec_…` secret shown once after saving.
+- A batch counts as delivered on any 2xx answer. Until then, the same batch is retried every 30 seconds, in order, and
+  nothing is dropped.
+- Turning the stream on or changing its URL starts from that moment; older entries are not sent.
+- Private and loopback addresses are refused unless the operator sets `webhooks.allow_private_networks`.
+
+## Retention
+
+Set <UiPath path="audit.keepEntriesFor" /> in the workspace dialog, or <UiPath path="audit.changeRetention" /> for the
+instance log. Cleanup runs every hour.
+
+<LimitsTable area="audit-log" />
+
+## Related
+
+- [Roles and permissions](/team/roles-and-permissions/)
+- [Security and hardening](/self-hosting/security/)
+- [Receive webhooks](/developers/webhooks/)
+- [Instance admin](/self-hosting/instance-admin/)

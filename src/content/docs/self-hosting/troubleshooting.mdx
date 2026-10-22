@@ -1,0 +1,190 @@
+---
+title: Troubleshooting
+description: ReputeCast troubleshooting for operators, with each symptom, its cause and the fix, from a missing first password to silent webhooks and stalled live monitors.
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast troubleshooting
+sources:
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/app/app.go
+  - internal/accounts/service.go
+  - internal/accounts/reset.go
+  - internal/config/config.go
+  - internal/segments/sqlmode.go
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/netguard/netguard.go
+  - internal/connect/connection.go
+  - internal/sending/engine/api.go
+  - internal/linktoken/linktoken.go
+  - deploy/docker-compose.yml
+sidebar:
+  order: 17
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+This ReputeCast troubleshooting page lists what goes wrong most often on a self-hosted instance, why, and how to fix
+it. Each entry starts with what you see.
+
+## Before you begin
+
+<Steps>
+
+1. Read the app's logs. With Docker Compose: `docker compose logs app --since 1h`. With the binary under systemd:
+   `journalctl -u reputecast --since "1 hour ago"`.
+
+2. Check the process and the database: `curl -s http://localhost:8080/readyz` answers `ready` when ReputeCast can reach
+   PostgreSQL ([health checks, metrics and logs](/self-hosting/monitoring/)).
+
+3. Check the schema: `docker compose exec app /usr/local/bin/reputecast migrate status` (or `reputecast migrate status`)
+   lists any migration as `pending`.
+
+4. For more detail, restart with `REPUTECAST_LOG__LEVEL=debug`, and set it back afterwards.
+
+</Steps>
+
+## Install and start
+
+### The temporary password isn't in the logs
+
+The first Owner and its temporary password are created only on the first start against an empty database. Run:
+
+```sh
+docker compose logs app | grep -A4 "ReputeCast is installed"
+```
+
+- **Nothing found, and the database volume existed before:** users already exist, so nothing was created. Use the
+  account you made then, or set a new password for it from the server (below).
+- **Nothing found, and the container was recreated:** `docker compose logs` shows only the current container's logs.
+  Set a new password from the server.
+- **You don't know the Owner's email:** without `REPUTECAST_ADMIN_EMAIL`, the shipped compose file uses
+  `admin@example.com`.
+
+To set a password from the server:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email admin@example.com --password 'a long passphrase here'
+```
+
+See [recover access from the command line](/self-hosting/account-recovery/).
+
+### The app container keeps restarting
+
+Read the last lines of `docker compose logs app`. The start stops with `Error: …`:
+
+- `Error: previous secret key: key must be 32 bytes, got 0`: `REPUTECAST_SECRETS__PREVIOUS_KEYS` is set but empty.
+  Remove the variable.
+- `Error: secret key: key must be 32 bytes, got …` or `key must be base64-encoded`: the key in `REPUTECAST_SECRETS__KEY`
+  or the key file is not a base64 32-byte key. Use the value `reputecast secrets generate-key` printed, unchanged.
+- `Error: owner email: … (pass --email or set REPUTECAST_ADMIN_EMAIL)`: the database is empty and the first Owner's
+  email is missing or not a valid address.
+- `Error: migrate: …`: a migration failed. Restore the backup taken before the upgrade and report the error with the
+  version ([upgrade ReputeCast](/self-hosting/upgrades/)).
+
+### The logs warn about pending migrations
+
+The binary is newer than the database schema and the process was started without `--auto-migrate`. Run
+`reputecast migrate up` once with the server's environment, then restart every process. The Docker image migrates at
+start by itself.
+
+### `/readyz` answers `503 database unavailable`
+
+ReputeCast can't reach PostgreSQL within 2 seconds. Check that the database runs, that `REPUTECAST_DATABASE__URL` points
+at it, and that `database.max_conns` per process times the number of processes stays under PostgreSQL's
+`max_connections` ([PostgreSQL](/self-hosting/postgres/)).
+
+## Sign-in
+
+### Signing in over `http://` sends you back to the sign-in page
+
+Outside development, the session cookie is marked `Secure`, and browsers don't keep `Secure` cookies set by a plain
+`http://` site, except on `localhost`
+([MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie), checked October
+2026). Put ReputeCast behind TLS and set `http.public_url` to the `https://` address
+([reverse proxy and TLS](/self-hosting/reverse-proxy/)). For a short test on a private network only, you can set
+`REPUTECAST_AUTH__COOKIE_SECURE=false`.
+
+### "Sign-in is locked after too many attempts"
+
+Too many wrong passwords for that email. Lift the lock in
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, set a new password through a reset link, or wait for the
+lock to end (15 minutes by default). `reputecast user unlock` doesn't lift this lock in the current version. See
+[clear a sign-in lockout](/self-hosting/account-recovery/#clear-a-sign-in-lockout).
+
+### Authenticator codes fail with `secrets: cannot decrypt value`
+
+The secret key doesn't match the database, usually after a restore without the key or after the key file was lost.
+Put the original key back. If it is gone, see [back up and restore](/self-hosting/backups/): people sign in with a
+recovery code or passkey, and an admin resets their authenticator.
+
+### Password reset emails never arrive
+
+Reset emails go out on the System stream. Until a sending provider serves it, the app shows the command to run instead:
+`reputecast user reset-password --email <address>` prints the link on the server.
+
+## Sending providers and webhooks
+
+### Provider webhooks never arrive
+
+Delivery events stay empty, and a sending provider shows "Degraded · webhooks silent" in
+<UiPath path="nav.providers" />. Providers post events to `<public URL>/hooks/…`, so:
+
+- The public URL must be reachable from the internet. Run <UiPath path="admin.publicUrlCheck" /> in
+  <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />: the reachability line must pass. A URL like
+  `http://localhost:8080` can't receive webhooks.
+- Your reverse proxy must forward `/hooks/` paths unchanged to ReputeCast.
+- If you split roles, at least one process must run the `ingest` role behind that address
+  ([scale with web, ingest and worker roles](/self-hosting/scaling/)).
+
+After a public URL change, the providers that support it get the new webhook address automatically; the page lists
+the others, where you paste it yourself. See [provider health and outages](/providers/health-and-outages/).
+
+### Requests to private addresses are refused
+
+ReputeCast refuses outbound requests to private and loopback addresses, for example
+`address not allowed: 10.0.0.5 is a private or loopback address`. For a Postal server, an SMTP server or another
+service on your own network, set `providers.allow_private_networks: true`; for webhook endpoints, n8n and the audit
+stream, set `webhooks.allow_private_networks: true`. Link-local and cloud metadata addresses stay blocked. See
+[security and hardening](/self-hosting/security/#private-networks).
+
+## Live monitor never updates
+
+The live monitor of a running send stays at its first numbers until you reload. It reads a server-sent event stream at
+`/api/v1/workspaces/<workspace>/campaigns/<campaign>/live/stream`, which sends a heartbeat every 15 seconds. A proxy
+that buffers responses holds the events back. Turn buffering off for that path, as shown in
+[reverse proxy and TLS](/self-hosting/reverse-proxy/).
+
+## SQL segments are turned off
+
+Building a SQL segment answers `SQL segments are turned off on this database.` The PostgreSQL role
+`reputecast_segments` is missing, or the app's database user isn't a member of it, typically on managed PostgreSQL
+where the user can't create roles. Follow [the SQL segments steps](/self-hosting/postgres/#sql-segments): on a database
+that was migrated before the role existed, `reputecast migrate up` alone doesn't turn them on.
+
+## Blocklist checks fail
+
+Blocklist results for Spamhaus or URIBL report an error such as `Spamhaus answered 127.255.255.254 (use your own
+resolver, not a public one)` or `the list refused queries from this resolver`. These lists refuse queries that come
+through public resolvers (1.1.1.1, 8.8.8.8). Point `dns.servers` at your own recursive resolver, for example
+`REPUTECAST_DNS__SERVERS=10.0.0.53`. See [check and fix blocklist listings](/deliverability/blocklists/).
+
+## Links in sent emails stop working
+
+Unsubscribe, preference and tracking links in emails sent earlier lead to an error. The links are signed with a key
+derived from the secret key, so they break when the key changes (a rotation, or a restore without the original key).
+New emails work. Restore the original key if you still have it ([security and hardening](/self-hosting/security/#the-secret-key)).
+
+<Aside type="tip">
+  Still stuck? Search or open an issue at [github.com/hostrepute/reputecast](https://github.com/hostrepute/reputecast/issues)
+  with the version (`reputecast version`) and the log lines around the problem. Report security problems to
+  security@hostrepute.com instead.
+</Aside>
+
+## Related
+
+- [Health checks, metrics and logs](/self-hosting/monitoring/)
+- [Recover access from the command line](/self-hosting/account-recovery/)
+- [Configuration reference](/reference/configuration/)

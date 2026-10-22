@@ -1,0 +1,449 @@
+---
+title: Send transactional email with the API
+description: Use the transactional email API to send one message or a batch of up to 100, with idempotency keys, scheduling, attachments, test-mode keys and errors.
+type: how-to
+audience: [developer]
+permissions: ['transactional:send']
+uiPath: 'nav.transactional > transactional.common.tabSetup'
+primaryKeyword: transactional email API
+sources:
+  - internal/transactional/send.go
+  - internal/transactional/sendapi.go
+  - internal/transactional/transactional.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/events.go
+  - internal/transactional/preview.go
+  - internal/apikeys/transactional.go
+  - internal/authn/tokens.go
+  - internal/server/ratelimit.go
+  - web/src/features/transactional
+  - src/data/api-samples/send-transactional-message.yaml
+  - src/data/api-samples/send-transactional-batch.yaml
+sidebar:
+  order: 7
+---
+
+import { Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+The transactional email API sends password resets, receipts and other one-to-one messages from a published
+[transactional template](/reference/glossary/#transactional-template): one message per call, or a batch of up to 100.
+Each call answers at once with a message ID, and the message goes out on the
+[Transactional stream](/reference/glossary/#stream) through its own route and failover.
+
+## Before you begin
+
+- A published transactional template. Its **template ID** (for example `password-reset`) is what the API takes. See
+  [Create and publish transactional templates](/transactional/templates/).
+- A verified sender on a domain used for Transactional mail. See
+  [Add sending domains and senders](/providers/senders-and-domains/).
+- A route for the Transactional stream to a connected sending provider. See
+  [Route mail across providers](/providers/routing/).
+- A key that holds `transactional:send`. The best fit is a
+  [send-only key](/reference/glossary/#send-only-key), created in
+  <UiPath path="nav.transactional > transactional.common.tabSetup" /> with
+  <UiPath path="transactional.setup.createKey" />. It holds `transactional:send` and nothing else, can be limited to
+  some templates or categories, and has its own send rate. Any other API key with `transactional:send` works too
+  ([Authentication and API keys](/developers/api-authentication/)).
+
+If you have none of this yet, the [first-send guide](/transactional/first-send/) walks you through all four in the app.
+
+<Screenshot
+  id="transactional-setup"
+  alt="Transactional Setup lists the HTTP API's paths, the authentication, idempotency, size, rate and scheduling rules, and the three keys that can send: a live send-only key, a test-mode key and an SMTP credential."
+/>
+
+## Send one message
+
+<Steps>
+
+1. Copy your public URL, your workspace slug and the key. The examples read the key from the `REPUTECAST_API_KEY`
+   environment variable; replace `reputecast.example.com` and `your-workspace` with your own values.
+
+2. Send `POST /api/v1/workspaces/<workspace>/transactional/messages` with the template ID, the recipient and the
+   template's variables in `data`. Send an `Idempotency-Key` header so a retry never sends twice.
+
+   <Tabs syncKey="lang">
+   <TabItem label="cURL">
+
+   ```sh title="send.sh"
+   # REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   # Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   curl --request POST \
+     --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages \
+     --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+     --header 'Content-Type: application/json' \
+     --header 'Idempotency-Key: password-reset-8f14e45f' \
+     --data '{
+       "template": "password-reset",
+       "to": { "email": "sam.rivera@outlook.com", "name": "Sam Rivera" },
+       "data": {
+         "first_name": "Sam",
+         "reset_url": "https://app.example.com/reset/8f14e45f",
+         "expires_in": "30 minutes"
+       },
+       "tags": ["password-reset"]
+     }'
+   ```
+
+   </TabItem>
+   <TabItem label="Node.js">
+
+   ```js title="send.mjs"
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   const response = await fetch(
+     'https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages',
+     {
+       method: 'POST',
+       headers: {
+         Authorization: `Bearer ${process.env.REPUTECAST_API_KEY}`,
+         'Content-Type': 'application/json',
+         // A retry with the same key within 24 hours never sends twice.
+         'Idempotency-Key': 'password-reset-8f14e45f',
+       },
+       body: JSON.stringify({
+         template: 'password-reset',
+         to: { email: 'sam.rivera@outlook.com', name: 'Sam Rivera' },
+         data: {
+           first_name: 'Sam',
+           reset_url: 'https://app.example.com/reset/8f14e45f',
+           expires_in: '30 minutes',
+         },
+         tags: ['password-reset'],
+       }),
+     },
+   )
+   const result = await response.json()
+   if (!response.ok) throw new Error(`${response.status} ${result.code}: ${result.detail}`)
+   console.log(result.id, result.status) // status: queued
+   ```
+
+   </TabItem>
+   <TabItem label="Python">
+
+   ```python title="send.py"
+   # REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   # Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   import os
+
+   import requests
+
+   response = requests.post(
+       "https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages",
+       headers={
+           "Authorization": f"Bearer {os.environ['REPUTECAST_API_KEY']}",
+           # A retry with the same key within 24 hours never sends twice.
+           "Idempotency-Key": "password-reset-8f14e45f",
+       },
+       json={
+           "template": "password-reset",
+           "to": {"email": "sam.rivera@outlook.com", "name": "Sam Rivera"},
+           "data": {
+               "first_name": "Sam",
+               "reset_url": "https://app.example.com/reset/8f14e45f",
+               "expires_in": "30 minutes",
+           },
+           "tags": ["password-reset"],
+       },
+       timeout=10,
+   )
+   result = response.json()
+   if not response.ok:
+       raise RuntimeError(f"{response.status_code} {result.get('code')}: {result.get('detail')}")
+   print(result["id"], result["status"])  # status: queued
+   ```
+
+   </TabItem>
+   <TabItem label="Go">
+
+   ```go title="main.go"
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   package main
+
+   import (
+   	"bytes"
+   	"encoding/json"
+   	"fmt"
+   	"log"
+   	"net/http"
+   	"os"
+   )
+
+   func main() {
+   	body, err := json.Marshal(map[string]any{
+   		"template": "password-reset",
+   		"to":       map[string]string{"email": "sam.rivera@outlook.com", "name": "Sam Rivera"},
+   		"data": map[string]string{
+   			"first_name": "Sam",
+   			"reset_url":  "https://app.example.com/reset/8f14e45f",
+   			"expires_in": "30 minutes",
+   		},
+   		"tags": []string{"password-reset"},
+   	})
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	req, err := http.NewRequest(http.MethodPost,
+   		"https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages", bytes.NewReader(body))
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	req.Header.Set("Authorization", "Bearer "+os.Getenv("REPUTECAST_API_KEY"))
+   	req.Header.Set("Content-Type", "application/json")
+   	// A retry with the same key within 24 hours never sends twice.
+   	req.Header.Set("Idempotency-Key", "password-reset-8f14e45f")
+
+   	resp, err := http.DefaultClient.Do(req)
+   	if err != nil {
+   		log.Fatal(err)
+   	}
+   	defer resp.Body.Close()
+
+   	var result struct {
+   		ID     string `json:"id"`
+   		Status string `json:"status"`
+   		Code   string `json:"code"`
+   		Detail string `json:"detail"`
+   	}
+   	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+   		log.Fatal(err)
+   	}
+   	if resp.StatusCode >= 300 {
+   		log.Fatalf("%d %s: %s", resp.StatusCode, result.Code, result.Detail)
+   	}
+   	fmt.Println(result.ID, result.Status) // status: queued
+   }
+   ```
+
+   </TabItem>
+   <TabItem label="PHP">
+
+   ```php title="send.php"
+   <?php
+   // REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+   // Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+   $payload = [
+       'template' => 'password-reset',
+       'to' => ['email' => 'sam.rivera@outlook.com', 'name' => 'Sam Rivera'],
+       'data' => [
+           'first_name' => 'Sam',
+           'reset_url' => 'https://app.example.com/reset/8f14e45f',
+           'expires_in' => '30 minutes',
+       ],
+       'tags' => ['password-reset'],
+   ];
+
+   $ch = curl_init('https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages');
+   curl_setopt_array($ch, [
+       CURLOPT_POST => true,
+       CURLOPT_RETURNTRANSFER => true,
+       CURLOPT_HTTPHEADER => [
+           'Authorization: Bearer ' . getenv('REPUTECAST_API_KEY'),
+           'Content-Type: application/json',
+           // A retry with the same key within 24 hours never sends twice.
+           'Idempotency-Key: password-reset-8f14e45f',
+       ],
+       CURLOPT_POSTFIELDS => json_encode($payload, JSON_THROW_ON_ERROR),
+   ]);
+   $body = curl_exec($ch);
+   if ($body === false) {
+       throw new RuntimeException(curl_error($ch));
+   }
+   $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+   $result = json_decode($body, true, flags: JSON_THROW_ON_ERROR);
+   if ($status >= 300) {
+       throw new RuntimeException("{$status} {$result['code']}: {$result['detail']}");
+   }
+   echo $result['id'], ' ', $result['status'], PHP_EOL; // status: queued
+   ```
+
+   </TabItem>
+   </Tabs>
+
+3. Read the answer. ReputeCast answers `202 Accepted` once the message is checked, rendered and queued:
+
+   ```json title="202 Accepted"
+   { "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44", "status": "queued" }
+   ```
+
+   `status` is `queued`, `scheduled` (with `send_at`) or `not_delivered` (a test-mode key's message to an address it
+   may not deliver to). Keep the `id`: the message log, the API and every `message.*` webhook event use it.
+
+</Steps>
+
+The Node.js example needs Node.js 18 or later (built-in `fetch`), and the Python example needs the `requests`
+package. The [operation reference](/api/operations/send-transactional-message/) lists every field and answer.
+
+## Request body
+
+<TableScroll label="Fields of a transactional send">
+
+| Field                       | Required | What it does                                                                                                                                            |
+| --------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `template`                  | Yes      | The template ID, up to 64 characters. ReputeCast sends the template's live (published) version.                                                         |
+| `to`                        | Yes      | `{ "email": "…", "name": "…" }`. `name` is optional.                                                                                                    |
+| `data`                      | No       | The template's variables. A call without a variable the template marks required gets `422 missing_variables`.                                           |
+| `from`                      | No       | A verified Transactional sender, as `address` or `Name <address>`. Without it: the template's sender, then the workspace default, then the first verified Transactional sender. |
+| `reply_to`                  | No       | An address. Without it, the template's or the sender's reply-to applies.                                                                               |
+| `subject`, `preheader`      | No       | Replace the template's subject or preheader for this message. Both accept Liquid.                                                                      |
+| `language`                  | No       | The language version to send, such as `es` or `pt-BR`. Without it, the linked contact's language, then the workspace's fallback.                         |
+| `cc`, `bcc`                 | No       | Up to 20 addresses each, in the same shape as `to`.                                                                                                     |
+| `attachments`               | No       | Up to 20 files: `filename`, `content` (standard base64), optional `content_type` (guessed from the file name) and `content_id` for inline images (`cid:`). |
+| `tags`                      | No       | Up to 10 strings. They come back with every webhook event of the message.                                                                               |
+| `metadata`                  | No       | Up to 20 string pairs (keys up to 100 characters, values up to 500). They come back with every webhook event.                                           |
+| `send_at`                   | No       | An RFC 3339 time up to 72 hours ahead. See [Schedule a message](#schedule-a-message).                                                                  |
+
+</TableScroll>
+
+Unknown fields are refused with `422 validation_failed`. A recipient who matches a contact shows the message in that
+contact's activity; the API never creates contacts.
+
+## Send a batch
+
+`POST …/transactional/messages/batch` takes `{ "messages": [ … ] }` with 1 to 100 messages, each in the same shape
+as a single send. More than 100 is refused; split larger sends into several calls.
+
+```sh title="send-batch.sh"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send. Up to 100 messages per call.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/messages/batch \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: welcome-2026-10-22-0900' \
+  --data '{
+    "messages": [
+      {
+        "template": "welcome",
+        "to": { "email": "priya.shah@gmail.com", "name": "Priya Shah" },
+        "data": { "first_name": "Priya", "dashboard_url": "https://app.example.com/" }
+      },
+      {
+        "template": "welcome",
+        "to": { "email": "sam.rivera@outlook.com" },
+        "data": { "dashboard_url": "https://app.example.com/" }
+      }
+    ]
+  }'
+```
+
+The batch answers `200 OK` with one result per message, in the order sent, and the totals:
+
+```json title="200 OK"
+{
+  "accepted": 1,
+  "failed": 1,
+  "results": [
+    { "index": 0, "id": "0192f1c4-8a10-7d3e-b4f2-6c1d9e0a7b55", "status": "queued" },
+    {
+      "index": 1,
+      "status": "error",
+      "error": {
+        "status": 422,
+        "title": "Missing variables",
+        "code": "missing_variables",
+        "detail": "welcome v3 needs first_name. Add it to data and call again.",
+        "missing": ["first_name"]
+      }
+    }
+  ]
+}
+```
+
+One message's problem never stops the others. The
+[batch operation reference](/api/operations/send-transactional-batch/) has the same example in Node.js, Python, Go
+and PHP.
+
+## Retry safely with Idempotency-Key
+
+Send an `Idempotency-Key` header (up to 255 characters) with every send, for example your own event or order ID.
+
+- A retry with the same key and the same body within 24 hours gets the first answer again and sends nothing.
+- The same key with a different body within 24 hours gets `409 idempotency_key_reused`. Use a new key for a new
+  message.
+- After 24 hours the key is forgotten and can be used again.
+- A batch's key covers the whole batch; each message in it is recorded under `<key>#<index>`.
+
+Retry on network errors, `429` and `503` with the same key. Don't retry `422` answers without changing the request.
+
+## Schedule a message
+
+Set `send_at` to send later, up to 72 hours ahead. A later time gets `422 validation_failed` ("send_at can be at most
+72 hours ahead"); schedule later sends in your own app. A time in the past, or less than a second ahead, sends now.
+The answer has `"status": "scheduled"` and the `send_at` it will use.
+
+## Test without emailing customers
+
+A send-only key in test mode starts with `rc_test_`. It renders and logs every message, but delivers only to the
+workspace's members and the key's allowed test addresses (patterns such as `qa+*@example.com`). Any other recipient
+gets `"status": "not_delivered"` and `"test": true`, and nothing is sent. Use it in staging and CI.
+
+To check the subject, HTML and text without sending or logging anything, call
+`POST …/transactional/templates/<template>/render` with the same `to`, `data` and `language`
+([render operation](/api/operations/render-transactional-template/)).
+
+## Errors
+
+Errors are [RFC 9457 problem documents](/developers/api-errors/) whose `detail` says what to fix. The codes a send
+can get:
+
+- `422 template_not_found`, `422 template_not_published`: check the template ID, or publish the template.
+- `422 missing_variables`: add the variables listed in `missing` to `data`.
+- `422 invalid_recipient`: validate addresses in your app before calling.
+- `422 recipient_suppressed`: the address bounced, complained or is a spam trap, or the recipient turned off this
+  message's Optional category. The message is still in the log, with a `message.rejected` event. Unsubscribes from
+  newsletters don't stop transactional mail.
+- `422 sender_not_verified`: `from` isn't a verified Transactional sender, or none exists yet.
+- `422 attachments_too_large`: the message is larger than the route's sending provider accepts; the detail names the
+  limit.
+- `422 template_does_not_render`: the live version fails with this data; the detail says why.
+- `403 template_not_allowed`: the key is limited to other templates or categories.
+- `409 idempotency_key_reused`: see [Retry safely with Idempotency-Key](#retry-safely-with-idempotency-key).
+- `429 rate_limited`: the key's send rate is used up. Wait for `Retry-After` seconds and send again with the same
+  idempotency key.
+- `503 no_healthy_route`: every sending provider in the route is down. Retry with the same idempotency key.
+
+## Rate limits
+
+Each key has its own send rate: 50 messages per second unless the key sets another rate (1–10,000). A batch counts
+as its number of messages. People who send from the app share 50 per second each. These endpoints don't count toward
+the general API limit of 600 requests per minute ([Rate limits](/developers/api-rate-limits/)).
+
+Each server process keeps its own counters, so several web nodes behind a load balancer together allow up to their
+number times the rate.
+
+## Check that it worked
+
+- Open <UiPath path="nav.transactional > transactional.common.tabMessages" /> and find the message by recipient, or
+  call `GET …/transactional/messages/<id>` for its timeline. See [Message log and alerts](/transactional/message-log/).
+- Subscribe an endpoint to `message.delivered`, `message.bounced` and `message.failed` to hear about each message as
+  it happens ([Receive webhooks](/developers/webhooks/)). Their `data` carries `message_id`, `template`, `to`,
+  `status`, `provider`, your `tags` and `metadata`.
+
+## Troubleshooting
+
+- **`401 unauthenticated`**: send the key as `Authorization: Bearer <key>`; check that it isn't revoked or expired.
+- **`403 permission_denied`**: the key lacks `transactional:send`, or its creator no longer holds it.
+- **`422 sender_not_verified` on every call**: add a sender on a Transactional domain in
+  <UiPath path="nav.settings > settings.senders" /> and verify its DNS records.
+- **`status: not_delivered`**: you are using a test-mode (`rc_test_`) key; send with a live key, or add the address to
+  the key's test addresses.
+- **Duplicate messages after timeouts**: send an `Idempotency-Key`, and reuse the same one on every retry.
+
+## Limits
+
+<LimitsTable area="transactional" />
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Transactional email in ReputeCast" href="/transactional/overview/" description="Streams, categories, suppressions and retention." />
+  <LinkCard title="Send your first transactional email" href="/transactional/first-send/" description="The five-step guide in the app." />
+  <LinkCard title="Send through the SMTP relay" href="/transactional/smtp-relay/" description="For apps that only speak SMTP." />
+  <LinkCard title="Webhook events" href="/reference/webhook-events/" description="Every message.* event and its payload." />
+</CardGrid>

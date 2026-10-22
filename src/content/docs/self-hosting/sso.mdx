@@ -1,0 +1,202 @@
+---
+title: Single sign-on with OIDC
+description: OIDC SSO setup for ReputeCast with Google Workspace, Microsoft Entra ID, Okta, Keycloak or Authentik, with automatic accounts, group roles and enforcement.
+type: how-to
+audience: [operator, admin]
+primaryKeyword: OIDC SSO setup
+uiPath: 'shell.userMenuInstanceAdmin > admin.sso'
+sources:
+  - internal/sso
+  - internal/accounts/signin.go
+  - internal/instance/policy.go
+  - migrations/00750_instance_admin_sso.sql
+  - web/src/features/admin/sso
+  - web/src/features/admin/auth/AuthenticationPage.tsx
+  - web/src/features/auth/signin.messages.ts
+sidebar:
+  order: 14
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+This OIDC SSO setup lets people sign in to ReputeCast with your organization's identity provider (IdP), create their
+accounts on first sign-in, and get workspace roles from their IdP groups. ReputeCast speaks OpenID Connect; it does not
+support SAML or SCIM.
+
+## Before you begin
+
+- You are an [instance admin](/reference/glossary/#instance-admin). SSO is set up once for the whole instance.
+- The public URL is final and uses `https://`
+  (<UiPath path="shell.userMenuInstanceAdmin > admin.instance > admin.publicUrl" />). The redirect URI you register at
+  the IdP is built from it; if the URL changes later, update the registration at the IdP too.
+- You can create an application (client) in your IdP, and you know which email domains your people use.
+- <UiPath path="admin.methodSso" /> is on in <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />
+  (it is on by default).
+
+## Set up a provider
+
+<Screenshot
+  id="sso-setup"
+  alt="Setting up Microsoft Entra ID: the preset row, then the Connection card with the redirect URI to copy, the issuer URL after a successful discovery test, the client ID, the saved write-only client secret and the scopes."
+/>
+
+<Steps>
+
+1. Open <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> and choose <UiPath path="admin.addSsoProvider" />.
+   In <UiPath path="sso.cardPreset" />, pick your IdP: Google Workspace, Microsoft Entra ID, Okta, Keycloak, Authentik or
+   Generic OIDC. ReputeCast saves a draft at once; nothing is live until you enable it.
+
+2. In <UiPath path="sso.cardConnection" />, copy the <UiPath path="sso.redirectUri" />. It has the form
+   `<public URL>/auth/oidc/<slug>/callback`, where the slug comes from the preset: `google`, `entra`, `okta`,
+   `keycloak`, `authentik` or `oidc` (a second provider with the same preset gets `-2`).
+
+3. Register ReputeCast at your IdP as a web application that uses the authorization code flow, with the redirect URI
+   from step 2. Note the issuer URL, the client ID and the client secret.
+
+   <Tabs syncKey="idp">
+   <TabItem label="Google Workspace">
+
+   - Create an OAuth client ID of type **Web application** in the Google Cloud console (APIs & Services ›
+     Credentials) and add the redirect URI as an authorized redirect URI
+     ([Google OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect),
+     checked October 2026).
+   - Issuer URL: always `https://accounts.google.com` (the preset fills it in).
+   - Groups: Google doesn't send a groups claim over OIDC, so group mapping is not available. Give new accounts a
+     default role through automatic accounts (step 7), or assign roles in each workspace's
+     [team settings](/team/members/).
+   - Two-factor: ReputeCast trusts Google's sign-in as two-factor (2-Step Verification enforced in Workspace).
+
+   </TabItem>
+   <TabItem label="Microsoft Entra ID">
+
+   - Create an app registration (Web platform) in the Microsoft Entra admin center, add the redirect URI, and create a
+     client secret ([Microsoft identity platform and OpenID Connect](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc),
+     checked October 2026). Entra client secrets expire: enter the expiry date in ReputeCast so it shows when to
+     replace the secret.
+   - Issuer URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`, with your tenant ID (a GUID) or verified
+     domain. Find the tenant ID under Entra ID › Overview.
+   - Groups: open the app registration's **Token configuration**, choose **Add groups claim** and include security
+     groups in the ID token. Entra sends group **object IDs**, not names: paste the ID into a mapping and give it a
+     label. Someone in more than 200 groups gets an overage link instead of the claim; use app roles then.
+   - Two-factor counts when the ID token's `amr` claim says MFA (for example, enforced by Conditional Access).
+
+   </TabItem>
+   <TabItem label="Okta">
+
+   - Create an OIDC web application integration with the redirect URI as its sign-in redirect URI
+     ([Okta: customize tokens with a groups claim](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/),
+     checked October 2026).
+   - Issuer URL: your Okta domain or an authorization server, such as `https://acme.okta.com/oauth2/default`. Find it
+     under Security › API › Authorization Servers.
+   - Groups: add a groups claim to the authorization server (filter: matches regex `.*`). The Okta preset already
+     requests the `groups` scope.
+   - Two-factor counts when the ID token's `amr` claim says MFA (enforced by a sign-on policy).
+
+   </TabItem>
+   <TabItem label="Keycloak">
+
+   - In your realm, create an OpenID Connect client with client authentication on and the redirect URI as a valid
+     redirect URI ([Keycloak server administration guide](https://www.keycloak.org/docs/latest/server_admin/#_oidc),
+     checked October 2026).
+   - Issuer URL: ends with the realm, for example `https://sso.acme.io/realms/acme`.
+   - Groups: in Clients › your client › Client scopes › the dedicated scope, add a **Group Membership** mapper with the
+     token claim name `groups` and full group path off.
+   - Two-factor counts when the ID token's `amr` claim says MFA (OTP required by the realm's browser flow).
+
+   </TabItem>
+   <TabItem label="Authentik">
+
+   - Create an OAuth2/OpenID provider (confidential client) with the redirect URI, and an application that uses it
+     ([Authentik OAuth2 provider](https://docs.goauthentik.io/docs/add-secure-apps/providers/oauth2/), checked
+     October 2026).
+   - Issuer URL: ends with the application slug and a slash, for example
+     `https://auth.acme.io/application/o/reputecast/`.
+   - Groups: Authentik sends them in the `groups` claim of the `profile` scope. Keep the default profile mapping in the
+     provider's scope mappings.
+   - Two-factor counts when the ID token's `amr` claim says MFA (an MFA stage in the authentication flow).
+
+   </TabItem>
+   </Tabs>
+
+4. Back in <UiPath path="sso.cardConnection" />, enter the <UiPath path="sso.issuerUrl" /> and choose
+   <UiPath path="sso.testDiscovery" />. ReputeCast fetches `<issuer>/.well-known/openid-configuration` and its signing
+   keys; the issuer must use `https://` and match the document exactly. Then enter the client ID and the client
+   secret. The secret is encrypted and never shown again; you can only replace it.
+
+5. Scopes: `openid`, `profile` and `email` are always requested. Add others only if your IdP needs them for groups.
+
+6. In <UiPath path="sso.cardClaims" />, check which claims fill the account: `email`, `email_verified`, `name` and,
+   where the preset has groups, `groups`. The defaults fit each preset; change a name only if your IdP uses another
+   one. An email that the IdP marks as not verified is rejected. A missing `email_verified` counts as verified only for
+   the allowed domains of step 7.
+
+7. In <UiPath path="sso.cardAccess" />, decide who gets in and with which role:
+
+   - Under <UiPath path="sso.allowedDomains" /> (up to 50), sign-ins from other domains are rejected and logged. The
+     sign-in page shows "Continue with …" for this provider only to people whose email is at one of these domains.
+     With no domain, any domain can sign in, but the button doesn't appear on the sign-in page.
+   - The switch <UiPath path="sso.jit" /> creates an account at the first sign-in, in a default workspace with a
+     default role (Viewer unless you pick another; never Owner). Off means only people who already have an account
+     can sign in. The instance-wide <UiPath path="admin.domainAllowlist" /> in Authentication limits which domains may
+     get automatic accounts.
+   - Under <UiPath path="sso.groupMapping" />, choose <UiPath path="sso.addMapping" /> for each IdP group (up to 200
+     mappings). Mappings are applied again at every sign-in and override roles set by hand. When someone leaves a
+     mapped group, the next sign-in removes them from that workspace and revokes the API keys and agents they created
+     there; in the default workspace of automatic accounts they fall back to the default role instead. A mapping never
+     makes anyone an Owner and never changes an Owner. You can only map a role whose permissions you hold yourself in
+     that workspace.
+   - The enforcement switch turns off other sign-in methods for the allowed domains: see
+     [enforce SSO for your domains](#enforce-sso-for-your-domains).
+
+8. In <UiPath path="sso.cardTest" />, choose <UiPath path="sso.runTestSignIn" />. A popup opens your IdP; after you
+   sign in, ReputeCast shows the claims it received and what a real sign-in would do (new or existing account,
+   workspaces, roles, two-factor). It signs nobody in and changes nothing.
+
+9. Choose **Enable** (or <UiPath path="sso.saveDraft" /> to finish later). Enabling needs a successful discovery test,
+   the client ID and a saved client secret.
+
+</Steps>
+
+## Enforce SSO for your domains
+
+Enforcement turns off password, passkey and social sign-in for every account at the provider's allowed domains, so
+people at those domains can only sign in through the IdP. Turn it on in <UiPath path="sso.cardAccess" />; the dialog
+lists who signs in how today and after, then confirm with <UiPath path="sso.turnOnEnforcement" />.
+
+- **Break-glass Owners** keep password and two-factor sign-in, so you can get in when the IdP is down. When you turn
+  enforcement on, every Owner at those domains is marked break-glass; the first Owner created by `reputecast install`
+  is one too. Their password sign-ins are logged as break-glass.
+- If no Owner at the domain keeps a password, the dialog warns you: should the IdP fail, nobody at that domain can
+  sign in. Keep an instance admin at another domain, or see [recover access from the command line](/self-hosting/account-recovery/).
+- A domain can be enforced by only one enabled provider. Disabling the provider ends its enforcement.
+
+## Check that it worked
+
+- In a private browser window, open the sign-in page and enter an email at an allowed domain: "Continue with …" takes
+  you to the IdP and back, signed in.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> shows the person with their SSO sign-in method, and
+  "Via IdP" in the 2FA column when the IdP vouched for two-factor.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> records the sign-in, and any account or role it created.
+
+## Troubleshooting
+
+- **Discovery failed**: the issuer URL is wrong or unreachable from the server. Copy it exactly as your IdP shows it,
+  including a trailing slash for Authentik, and use the tenant-specific issuer for Entra ID. A provider that is already
+  enabled keeps using its saved issuer until a new test passes.
+- **The IdP says the redirect URI doesn't match**: the public URL changed, or the URI was pasted with a typo. Copy the
+  <UiPath path="sso.redirectUri" /> again and update the IdP.
+- **"No account for …"**: automatic accounts are off and the person has no account, or their domain isn't allowed
+  here or in the instance allowlist. Invite them, or turn on <UiPath path="sso.jit" />.
+- **The test says "Groups claim missing"**: the IdP sent no groups, so mappings don't apply; existing roles stay and
+  new accounts get the default role. Follow the groups step for your IdP above, then run the test again.
+- **"The client secret can't be decrypted with this server's key"**: the server's secret key changed since the secret
+  was saved. Replace the client secret. See [security and hardening](/self-hosting/security/#the-secret-key).
+- **The sign-in took too long**: a sign-in must come back from the IdP within 10 minutes. Start again.
+
+## Related
+
+- [Google, Microsoft and GitHub sign-in](/self-hosting/social-sign-in/): sign-in for invited people without an IdP.
+- [Instance admin](/self-hosting/instance-admin/): the sign-in policy and two-factor enforcement.
+- [Roles and permissions](/team/roles-and-permissions/): what each role a mapping grants can do.

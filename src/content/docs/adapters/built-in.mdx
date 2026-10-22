@@ -1,0 +1,206 @@
+---
+title: Contribute a built-in adapter
+description: How to contribute email adapter Go code to ReputeCast, from the provider contract and descriptor to webhook rules, the contract suite and registration.
+type: how-to
+audience: [developer]
+primaryKeyword: contribute email adapter Go
+sources:
+  - docs/adapters.md
+  - internal/providers/provider.go
+  - internal/providers/optional.go
+  - internal/providers/extras.go
+  - internal/providers/contracttest
+  - internal/providers/apiclient
+  - internal/providers/webhookauth
+  - internal/providers/bounce
+  - internal/providers/resend
+  - internal/app/wire_adapters.go
+  - internal/providers/manage/adapters.go
+  - internal/connect/catalog.go
+  - internal/connect/copy.go
+  - Makefile
+sidebar:
+  order: 5
+---
+
+import { Steps, FileTree } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+This guide shows how to contribute email adapter Go code to ReputeCast: a built-in adapter for a [sending provider](/reference/glossary/#sending-provider), compiled into the binary, tested against the shared contract suite and released with every version. If you only need your own instance to reach a provider, a [generic HTTP mapping](/adapters/generic-http/) or a [community adapter](/adapters/community/) is quicker; [provider adapters](/adapters/overview/) compares the three.
+
+## Before you begin
+
+- A checkout of the ReputeCast repository and Go 1.27 (the toolchain downloads automatically). [Run ReputeCast from source](/developers/contributing/) sets up `make dev`.
+- [golangci-lint](https://golangci-lint.run/welcome/install/) v2, for `make lint`.
+- The provider's API documentation, its current acceptable-use policy, and sample webhook payloads from its documentation.
+- `docs/dev/CONVENTIONS.md` in the repository, which every change follows.
+
+## Write the adapter
+
+<Steps>
+
+1. Read the contract in `internal/providers/provider.go`. It is read-only for adapter authors. Every adapter implements `providers.Provider`:
+
+   | Method                                        | Does                                                                                                     |
+   | --------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+   | `Adapter() string`                            | The registry key, like `"mailgun"`.                                                                      |
+   | `Capabilities() Capabilities`                 | The badges: bulk policy, webhooks, domain API, suppression sync, batch size, dedicated IPs, sandbox, quota and rate discovery, pricing, tracking. |
+   | `Send(ctx, msgs) ([]SendResult, error)`       | Sends at most `BatchSize` messages and returns one result per message, in input order.                  |
+   | `ParseWebhook(ctx, r, body) ([]Event, error)` | Verifies the request and maps its payload to normalized events.                                          |
+
+   Then implement every optional interface the provider's API really supports. Core code type-asserts before using them, and the screens explain the missing ones:
+
+   <TableScroll label="Optional adapter interfaces">
+
+   | Interface                                                | Used for                                                                                                                   |
+   | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+   | `Verifier`, `QuotaReporter`                              | The connect step and the health job (every 5 minutes, every minute while the provider is down). `Quota` wins when both exist. |
+   | `ReputationReporter`                                     | The provider's own bounce and complaint rates, which its review thresholds apply to.                                       |
+   | `DomainManager`                                          | DNS records with live status for the domain step and Deliverability.                                                       |
+   | `WebhookRegistrar`, `WebhookUnregistrar`                 | Registering ReputeCast's webhook, and removing it when the provider is removed.                                            |
+   | `WebhookInspector`, `WebhookTester`                      | The "webhooks silent" diagnosis and "Send test event".                                                                     |
+   | `WebhookVerifier`, `WebhookHandshaker`                   | Verifying before ingest stores a request; answering handshakes (SNS subscriptions, Event Grid validation) without storing them. |
+   | `WebhookSecrets`                                         | Naming headers that carry a shared webhook secret as it is, so ingest leaves them out of the stored raw event.             |
+   | `SuppressionSyncer`                                      | Two-way sync with the shared suppression list. Return `providers.ErrNotSupported` from `AddSuppressions` for pull only.    |
+   | `TrackingManager`                                        | Reading and turning off provider-side tracking, so opens and clicks aren't counted twice.                                  |
+   | `EventBackfiller`                                        | Fetching message status when webhooks went silent.                                                                         |
+   | `StatusPage`, `StatusReporter`                           | The status button and incident text during an outage.                                                                      |
+   | `BroadcastStreamCreator`                                 | Providers whose terms want a separate stream for bulk mail (Postmark).                                                     |
+   | `ExtrasSender`                                           | Sending copies and attachments; a message with extras only goes to a provider that has it.                                 |
+
+   </TableScroll>
+
+2. Create the package. `internal/providers/resend` is a compact example to follow:
+
+   <FileTree>
+   - internal/providers/example/
+     - example.go package comment with the provider's terms, Descriptor, settings, credentials, New, Send
+     - webhook.go VerifyWebhook, ParseWebhook, normalization
+     - account.go Verify or Quota, domains, webhook registration, suppressions, tracking, backfill
+     - example_test.go fake API, contracttest.Run, adapter-specific tests
+     - testdata/ recorded webhook payloads
+   </FileTree>
+
+3. Write the descriptor and register it from `init`:
+
+   ```go title="internal/providers/example/example.go"
+   func init() { providers.Register(Descriptor()) }
+
+   func Descriptor() providers.Descriptor {
+   	return providers.Descriptor{
+   		Adapter: "example",
+   		Name:    "Example ESP",
+   		Kind:    "api", // api, smtp, self_hosted
+   		Capabilities: providers.Capabilities{
+   			Bulk:            providers.BulkAllowed, // cite the AUP in the package comment
+   			Webhooks:        "Registered",
+   			DomainAPI:       "full",
+   			SuppressionSync: true,
+   			BatchSize:       1,
+   			Sandbox:         "mode",
+   			QuotaDiscovery:  true,
+   			Pricing:         "plan, from $10 per month",
+   		},
+   		Version:    version.Version,
+   		Maintainer: "HostRepute",
+   		Terms: []providers.Terms{{Bulk: providers.BulkAllowed, Note: "Opted-in lists only.",
+   			Streams: []providers.Stream{providers.StreamBroadcast, providers.StreamAutomation, providers.StreamSystem}}},
+   		Events: "Webhooks", DomainSetup: "API", SuppressionMode: "Two-way",
+   		Fields: []providers.Field{
+   			{Key: "api_key", Label: "API key", Secret: true, Required: true, Help: "Example ESP › Settings › API keys."},
+   			{Key: "region", Label: "Region", Options: []string{"us", "eu"}},
+   		},
+   		New: New,
+   	}
+   }
+   ```
+
+   The badges must be true for the provider today:
+   - **Bulk:** `BulkAllowed`, `BulkBroadcastStreams` (only on a dedicated stream), `BulkForbidden` or `BulkYourPolicy` (self-hosted). Quote the provider's acceptable-use policy in the package comment with its URL and the date you checked it, and put the conditions that matter in `Terms.Note`: the routing screen shows it.
+   - **Sandbox:** `detection`, `test token`, `mode` or `test addresses`; empty when there is none.
+   - **Quota and rate discovery:** set them only when an API call reports them.
+   - **Pricing and dedicated IPs:** short summaries; prefer a plan name to a price that will go stale.
+   - **Tracking:** set `RewritesLinks` or `AddsOpenPixel` when the provider tracks by default and the adapter can't turn it off per message.
+   - `Events`, `DomainSetup` and `SuppressionMode` are the words the Adapters tab shows, like "SNS webhooks", "API" and "Two-way".
+
+4. Handle settings and credentials. `providers.Config.Settings` holds the non-secret fields; `Config.Credentials` holds the decrypted secrets as a flat JSON object keyed by the `Secret` fields' keys. Credentials are write-only: sealed at rest, never returned by the API, replaced one key at a time. Mark every field whose key looks secret (`password`, `token`, `secret`, or ending in `api_key`) as `Secret`, or the contract suite fails.
+
+   `New` must not do network I/O and must not fail because an optional value is missing; report missing credentials from the first call. The factory builds an adapter per request, so keep anything worth reusing in a package-level cache keyed by the account. Keep signing material read from the provider's API in a `webhookauth.Material`, which reads it again when a signature fails (at most once a minute) and every hour.
+
+5. Implement `Send`:
+   - Return a per-message `SendError` for a refusal that concerns one message (an invalid address, an unverified sender). Return an error for an account or service failure, wrapping `providers.ErrUnauthorized` (rejected credentials) or `providers.ErrUnavailable` (outage). `apiclient` does this mapping: `Do` for JSON calls, `Exec` for form or multipart bodies, signed requests and response headers. 401 and 403 become rejected credentials, 429 throttling, 408 and 5xx outages; `apiclient.MessageError` turns the other 4xx answers into a permanent `SendError`.
+   - For one call per message, use `apiclient.Fanout`: it keeps results in order, starts no new call after an account-level failure, and gives unsent messages a temporary error so the engine retries them.
+   - Echo the ReputeCast message id in whatever the provider returns on events (custom args, tags, metadata), and send the `X-ReputeCast-Message` header.
+   - Where the provider supports idempotency, derive the key from the message id, so a retry after a timeout never sends twice.
+   - Turn the provider's open and click tracking off on every message: ReputeCast tracks itself.
+   - Never mark an accepted message as failed. If the provider accepts it but returns no id, use the ReputeCast id as the provider id.
+
+6. Verify and normalize webhooks:
+   - `VerifyWebhook` must return an error wrapping `providers.ErrBadSignature` for every failure, including "couldn't fetch the key". Ingest stores a request with any other error as verified.
+   - `ParseWebhook` verifies unless `providers.SignatureVerified(ctx)` is set. The normalization job sets it when it re-parses a stored payload, which no longer has the original URL or the `Authorization` header.
+   - Use the scheme the provider signs with; `internal/providers/webhookauth` has Standard Webhooks, HMAC helpers and constant-time comparisons. Where the provider doesn't sign, register the webhook with basic auth or a bearer token carrying `Config.WebhookSecret`, which travels in `Authorization` and is never stored.
+   - Bound the signed timestamp: five minutes with `webhookauth.Fresh`, or a window that spans the provider's retries with `webhookauth.Within`.
+   - Map every delivery-relevant event to `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` or `unsubscribe`. Keep the provider's type in `OriginalType`, its code in `OriginalCode` (split it with `bounce.Split`), the rest in `Diagnostic`, and set `BounceClass` with `bounce.Classify`. Lowercase the recipient, keep the raw JSON in `Raw`, and return no event for things that aren't outcomes (sent, processed, auto-replies, test pings).
+   - Don't suppress on a guess: a permanent failure caused by the sender (a spam or reputation block, retries running out) is a soft bounce. Only an address problem is a hard bounce, because hard bounces and complaints go on the shared [suppression list](/audience/suppressions/).
+
+7. Test against the contract suite. Every adapter passes `internal/providers/contracttest`, which checks registration, capabilities, a send, a permanent rejection, an outage and rejected credentials against your fake API, and every recorded webhook: verified, normalized, re-parsed with a verified context, and refused once tampered with.
+
+   ```go title="internal/providers/example/example_test.go"
+   func TestContract(t *testing.T) {
+   	contracttest.Run(t, contracttest.Suite{
+   		Adapter: example.Adapter,
+   		API:     fakeAPI, // reads env.Mode(): "", contracttest.ModeOutage, contracttest.ModeAuth
+   		New:     newProvider,
+   		Delivered: func(t *testing.T, env *contracttest.Env, msgs []providers.Message, res []providers.SendResult) {
+   			// check env.Requests(): headers, the echoed message id, tracking off
+   		},
+   		Webhooks: []contracttest.Webhook{{
+   			Name:    "HardBounce",
+   			Request: signed("testdata/bounce.json"), // signed at test time with a test key
+   			Want:    []providers.Event{{Type: providers.EventHardBounce, Recipient: "john@example.com", OriginalCode: "550 5.1.1", BounceClass: "mailbox_unknown"}},
+   		}},
+   		// Tamper defaults to flipping a body byte; override it when the
+   		// signature doesn't cover the body or auth is a header.
+   	})
+   }
+   ```
+
+   Tests use no network: run a fake of the provider's API, record webhook payloads from the provider's documentation as fixtures, and sign them in the test with a test key. Where the provider publishes a signature test vector, test against it. Test the optional interfaces, the error mapping and every quirk you code around (ids above 2^53, a field that is a string or an array, a 400 that carries per-message results).
+
+8. Register the adapter in the build:
+   - Add a blank import of the package to `internal/app/wire_adapters.go`. Registering the same key twice panics at startup.
+   - Add the key to `adapterOrder` in `internal/providers/manage/adapters.go` (the Adapters tab order) and to `catalogOrder` in `internal/connect/catalog.go` (the setup catalog order).
+   - Optionally, give the connect wizard its wording in `copyTable` in `internal/connect/copy.go`; without an entry, the wizard uses the descriptor's name and fields.
+   - Built-in adapters carry the ReputeCast version (`version.Version`) and the maintainer "HostRepute".
+
+</Steps>
+
+## Check that it worked
+
+1. Run the adapter's tests and the linter:
+
+   ```sh title="Terminal"
+   go test ./internal/providers/example/
+   golangci-lint run ./internal/providers/...
+   ```
+
+   `make test` runs every Go and web test, against the development Postgres when it is running; `make lint` runs every linter.
+
+2. Start the app with `make dev`, sign in, and open <UiPath path="nav.providers > providers.tabAdapters" />. The adapter is listed under built-in adapters with the version `dev` and the maintainer HostRepute, and <UiPath path="nav.providers > providers.overview.addProvider" /> offers it in the catalog.
+
+## Troubleshooting
+
+- **The server panics with `providers: duplicate adapter <key>`:** another adapter already registers that key. Choose a unique `Adapter` key.
+- **The contract suite fails a connection field:** its key looks like a secret (`password`, `token`, `secret`, `…api_key`). Set `Secret: true`.
+- **A tampered webhook passes, or a refused one is stored as verified:** `VerifyWebhook` returned an error that doesn't wrap `providers.ErrBadSignature`.
+- **Stored webhooks fail when they are normalized:** `ParseWebhook` verifies again although `providers.SignatureVerified(ctx)` is set; the stored request has no `Authorization` header.
+- **Events don't match their messages:** the provider doesn't echo the ReputeCast message id. Pass it in the provider's metadata, tags or custom args, and send the `X-ReputeCast-Message` header.
+- **Opens or clicks are counted twice:** the provider still tracks. Turn its tracking off on every message, or implement `TrackingManager` to turn it off for the account.
+
+## Related
+
+- [Provider adapters](/adapters/overview/) explains the three kinds of adapters and how to choose one.
+- [Delivery events and suppression sync](/providers/events-and-sync/) describes the normalized events your adapter produces.
+- [Write a community adapter](/adapters/community/) builds an adapter that runs in its own process instead.
+- [Run ReputeCast from source](/developers/contributing/) covers `make deps`, `make dev`, `make test` and `make lint`.

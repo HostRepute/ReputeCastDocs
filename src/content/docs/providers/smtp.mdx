@@ -1,0 +1,133 @@
+---
+title: Send through any SMTP server
+description: 'Send newsletter via SMTP server or relay in ReputeCast: connect host, TLS and login, plus an IMAP or POP3 bounce mailbox for bounces.'
+type: how-to
+audience: [admin, operator]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: send newsletter via SMTP server
+sources:
+  - internal/providers/smtp
+  - internal/providers/bounce
+  - internal/providers/mimemsg
+  - internal/ingest/jobs.go
+  - internal/connect/connection.go
+  - web/src/features/connect/ConnectionSMTP.tsx
+  - web/src/features/connect/connection.messages.ts
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+You can send a newsletter via an SMTP server with ReputeCast: your own mail server, a relay, or a provider's SMTP
+endpoint. SMTP has no event webhooks, so you also connect a [bounce mailbox](/reference/glossary/#bounce-mailbox):
+ReputeCast reads the delivery failures and spam reports that land there and turns them into the same bounce and
+complaint events other providers send by webhook.
+
+<ProviderMatrix family="email" id="smtp" />
+
+## Before you begin
+
+- **The server's details:** host name, port, encryption and, if it requires one, a login. ReputeCast logs in with
+  `AUTH PLAIN` or `AUTH LOGIN`; servers that offer only other methods (such as CRAM-MD5 or XOAUTH2) can't be used.
+  TLS needs version 1.2 or later and a certificate valid for the host name.
+- **DKIM signing on the server or relay.** ReputeCast hands each message over unsigned, so the server must sign it
+  with your domain's DKIM key.
+- **A dedicated bounce mailbox** reachable over IMAP or POP3, whose address will be the return-path (envelope sender)
+  of every message. Don't read it in a mail client: ReputeCast only fetches unread messages.
+- **For a server on your own network** (loopback or private addresses), an instance admin turns on
+  `providers.allow_private_networks` (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Cloud metadata addresses
+  are always refused.
+- **Permissions.** Connecting needs `providers:manage`; adding a new sending domain needs `domains:manage`.
+
+## Connect an SMTP server
+
+<Steps>
+
+1. Open <UiPath path="nav.providers" />, choose <UiPath path="providers.overview.addProvider" /> and pick the SMTP
+   card in the catalog. [Connect a sending provider](/providers/connect/) explains the steps every provider shares.
+
+2. In <UiPath path="connect.connection.smtp.serverTitle" />, fill in:
+   - <UiPath path="connect.connection.smtp.host" />, for example `smtp.example.com`;
+   - <UiPath path="connect.connection.smtp.port" /> and <UiPath path="connect.connection.smtp.encryption" />:
+     STARTTLS on 587 (the default), implicit TLS on 465, or no TLS (only on a private network);
+   - <UiPath path="connect.connection.smtp.username" /> and <UiPath path="connect.connection.smtp.password" />, if the
+     server requires a login;
+   - <UiPath path="connect.connection.smtp.maxRate" /> and <UiPath path="connect.connection.smtp.dailyCap" />. SMTP
+     servers don't publish their limits, so ReputeCast throttles to the rate you enter (10 messages per second when
+     you leave it empty) and backs off when the server answers with a 4xx code.
+
+3. Choose <UiPath path="connect.connection.smtp.testConnection" />. ReputeCast connects, says EHLO with your public
+   URL's host name, starts TLS and logs in, then disconnects; nothing is sent. The result shows what worked, for
+   example "STARTTLS, TLS 1.3 · AUTH PLAIN accepted", with the server's replies.
+
+4. In <UiPath path="connect.connection.smtp.mailboxTitle" />, fill in the
+   <UiPath path="connect.connection.smtp.returnPath" />, the <UiPath path="connect.connection.smtp.protocol" /> (IMAP
+   is recommended), the <UiPath path="connect.connection.smtp.mailServer" />, port, login and, for IMAP, the
+   <UiPath path="connect.connection.smtp.folder" /> (`INBOX` by default). Choose
+   <UiPath path="connect.connection.smtp.testMailbox" />. ReputeCast reads the mailbox without changing it and says
+   how many messages it found and how many look like delivery reports.
+
+5. Choose <UiPath path="connect.connection.continueDomain" />; it unlocks once both tests pass. Enter your sending
+   domain. ReputeCast can't add records on the server, so it lists what to publish: an SPF record with
+   `a:<your SMTP host>`, merged with your existing SPF record, and DMARC if the domain has none. Publish the DKIM record
+   your server or relay gives you.
+
+6. In <UiPath path="connect.stepTest" />, send a test. Delivery is confirmed by the server's `250` reply; a bounce
+   for an address that doesn't exist arrives later through the bounce mailbox.
+
+7. Finish <UiPath path="connect.stepStreams" /> and <UiPath path="connect.stepContacts" />. There is nothing to pull
+   from an SMTP server: the suppression list stays in ReputeCast.
+
+</Steps>
+
+## Check that it worked
+
+- The SMTP card on <UiPath path="nav.providers > providers.tabProviders" /> shows
+  <UiPath path="providers.statusHealthy" />. ReputeCast repeats the connect-and-login check about every 5 minutes.
+- A bounce to an address that doesn't exist shows up under <UiPath path="nav.providers > providers.tabEvents" />
+  within a few minutes, with the original status code.
+
+ReputeCast sends up to 25 messages over one SMTP connection, with `Message-ID`, `List-Unsubscribe`,
+`List-Unsubscribe-Post` and `Feedback-ID` headers, and the bounce mailbox address as the envelope sender. SMTP servers
+report no deliveries: ReputeCast knows that the server accepted a message (its `250` reply) and learns about failures
+from the bounce mailbox. There, it reads standard delivery
+status notifications (RFC 3464), spam reports in ARF format (RFC 5965) and the common non-standard bounce formats;
+out-of-office replies and other mail are ignored. A permanent failure is a hard bounce and suppresses the address
+across the workspace; temporary ones are soft bounces. Unclear codes count as temporary, so nothing is suppressed on
+a guess.
+
+<Aside type="note">
+  ReputeCast checks the bounce mailbox every minute and reads up to 200 unread messages each time. It marks IMAP
+  messages as read and deletes POP3 messages after reading them. The form's <UiPath path="connect.connection.smtp.pollEvery" />
+  and <UiPath path="connect.connection.smtp.afterProcessing" /> choices are saved but don't change this yet.
+</Aside>
+
+## Troubleshooting
+
+- **"ECONNREFUSED · nothing listens on that port"**, **"ENOTFOUND · the host name doesn't resolve"** or
+  **"ETIMEDOUT · no answer within 15 s"**. Check the host and port, and whether a firewall blocks outgoing SMTP from
+  the ReputeCast host.
+- **"… doesn't offer STARTTLS on port …".** Use implicit TLS on 465, or turn encryption off only on a private network.
+- **"… doesn't offer a login method ReputeCast supports".** The server offers neither `PLAIN` nor `LOGIN`. Turn one on
+  for the account, or use another relay.
+- **The test connection fails with `535`.** The server rejected the user name or password.
+- **"ReputeCast won't connect to that address".** The host is on a private or loopback address. Turn on
+  `providers.allow_private_networks`, or use the server's public name.
+- **"The mailbox rejected the user name or password."** Check the bounce mailbox login; some hosts need an app
+  password for IMAP or POP3.
+- **Bounces never show up.** Check that the return-path address is the bounce mailbox, that nobody reads the mailbox in
+  a mail client (read messages are skipped), and that the folder is right.
+- **Gmail or Yahoo report DKIM as missing.** ReputeCast doesn't sign SMTP mail. Turn on DKIM signing on the server or
+  relay and publish its key.
+
+## Related
+
+- [Connect a sending provider](/providers/connect/)
+- [Delivery events and suppression sync](/providers/events-and-sync/)
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Send with your own Postal server](/providers/postal/)
+- [Bounces, complaints and provider limits](/deliverability/bounces-and-complaints/)

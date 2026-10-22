@@ -1,0 +1,215 @@
+---
+title: Send with Amazon SES
+description: Send your Amazon SES newsletter through ReputeCast. Connect with a CloudFormation role or IAM keys; SNS topics and configuration sets are created for you.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Amazon SES newsletter
+sources:
+  - internal/providers/ses
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/providers/manage
+  - web/src/features/connect
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+To send an Amazon SES newsletter from ReputeCast, you connect your own AWS account in the connect wizard. ReputeCast
+creates the Amazon SNS topic and one configuration set per [stream](/reference/glossary/#stream) that carry bounces,
+complaints and deliveries back to it, detects the SES sandbox in every region, and reads your sending quota and rate.
+
+<ProviderMatrix family="email" id="ses" />
+
+## Before you begin
+
+- **An AWS account with Amazon SES.** New SES accounts start in the sandbox in each AWS Region: you can send only to
+  verified addresses and domains, at most 200 messages per 24 hours and 1 message per second
+  ([Amazon SES: Request production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html),
+  checked October 2026). You can connect a sandboxed region and request
+  [production access](/reference/glossary/#production-access) from the wizard.
+- **Permissions.** Connecting needs `providers:manage`. Adding a new sending domain in the wizard also needs
+  `domains:manage`.
+- **A public HTTPS address.** SNS delivers events to `<public URL>/hooks/ses/<token>`, so ReputeCast's public URL must
+  be reachable from the internet. On a laptop, use a tunnel while testing (see
+  [Reverse proxy and TLS](/self-hosting/reverse-proxy/)).
+- **A way to grant access.** Pick one:
+  - **CloudFormation stack (recommended).** The stack creates an IAM role named `ReputeCastSES` that ReputeCast
+    assumes with an external ID. No long-lived keys are stored. The ReputeCast server itself needs an AWS identity to
+    assume the role with (an instance role, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in its environment).
+  - **IAM access keys.** An access key ID and secret access key of an IAM user that has the policy below. Use a
+    long-term key (it starts with `AKIA`); the form has no field for a session token.
+
+This is the least-privilege policy the stack attaches to the role, and the one an IAM user needs:
+
+```json title="ReputeCast SES policy"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ses:SendEmail",
+        "ses:SendRawEmail",
+        "ses:GetAccount",
+        "ses:GetSendQuota",
+        "ses:*ConfigurationSet*",
+        "ses:*EmailIdentity*",
+        "ses:*SuppressedDestination*",
+        "ses:PutAccountDetails"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["sns:CreateTopic", "sns:Subscribe", "sns:SetTopicAttributes", "sns:GetSubscriptionAttributes"],
+      "Resource": "arn:aws:sns:*:*:reputecast-*"
+    }
+  ]
+}
+```
+
+## Connect Amazon SES
+
+<Steps>
+
+1. Open <UiPath path="nav.providers" />, choose <UiPath path="providers.overview.addProvider" /> and pick Amazon SES in
+   the catalog. The wizard has six steps; [Connect a sending provider](/providers/connect/) describes the ones every
+   provider shares.
+
+2. Under <UiPath path="connect.connection.ses.grantTitle" />, choose how ReputeCast gets into your AWS account.
+   - <UiPath path="connect.connection.ses.stackTitle" />: choose
+     <UiPath path="connect.connection.ses.launchStack" />. The AWS CloudFormation console opens a quick-create stack
+     named `ReputeCastSES` with the external ID filled in. Create the stack, then copy its `RoleArn` output (it looks
+     like `arn:aws:iam::123456789012:role/ReputeCastSES`) into
+     <UiPath path="connect.connection.ses.roleArnLabel" />.
+   - <UiPath path="connect.connection.ses.keysTitle" />: paste the
+     <UiPath path="connect.connection.ses.keyIdLabel" /> and the
+     <UiPath path="connect.connection.ses.secretLabel" />.
+
+   <UiPath path="connect.connection.ses.policyToggle" /> shows the policy above. Choose
+   <UiPath path="connect.connection.ses.checkAccess" />: ReputeCast checks the access with read-only calls
+   (`GetAccount`) before it stores anything, encrypted.
+
+   <Screenshot
+     id="connect-ses-connection"
+     alt="The Amazon SES connection step: CloudFormation stack chosen, the role assumed, region us-east-1 with production access, and the provisioning rows marked Done."
+   />
+
+3. In <UiPath path="connect.connection.ses.regionTitle" />, pick the
+   <UiPath path="connect.connection.ses.regionLabel" />. ReputeCast reads your account in
+   each region, so every option says whether that region has production access and its daily quota, or is in the
+   sandbox. Pick the region where you already have production access, or the one closest to your recipients.
+
+4. Wait for the provisioning list to finish. ReputeCast creates, with retries:
+   - the SNS topic `reputecast-events`, subscribed to your webhook URL, and confirms the subscription when SNS sends
+     its handshake;
+   - the configuration sets `rc-broadcasts`, `rc-automations`, `rc-system` and `rc-transactional`, each with an event
+     destination that publishes sends, deliveries, bounces, complaints, rejects, delays and subscription events to
+     the topic. Open and click events stay off: ReputeCast tracks those itself.
+
+   If another connection on this instance already uses the same AWS account and region, the names get your
+   workspace's slug as a suffix. A failed row shows AWS's error code and the action that was refused; fix the policy
+   (<UiPath path="connect.connection.ses.fixPolicy" /> opens the role or the IAM users page in AWS), then retry.
+
+5. If the region is in the sandbox, a sandbox badge appears with a form that files the production-access request
+   with AWS for you: <UiPath path="connect.connection.ses.website" />,
+   <UiPath path="connect.connection.ses.mailType" />, <UiPath path="connect.connection.ses.useCase" />,
+   <UiPath path="connect.connection.ses.dailyVolume" /> and <UiPath path="connect.connection.ses.contactLanguage" />.
+   The use case text is prefilled from your lists and says that bounces and complaints are processed through SNS and
+   suppressed across all sending providers. [Move Amazon SES out of the sandbox](/deliverability/amazon-ses-production-access/)
+   explains what AWS looks for. You can keep going while you wait.
+
+6. Choose <UiPath path="connect.connection.continueDomain" /> and enter your sending domain. ReputeCast creates the
+   SES identity with 2048-bit DKIM keys, sets its MAIL FROM domain to `bounce.<your domain>`, and lists the exact
+   records to publish. Records turn <UiPath path="connect.domain.statusVerified" /> as DNS propagates.
+
+   <Screenshot
+     id="connect-domain"
+     alt="Seven DNS records for news.acme.io, all verified: three DKIM CNAMEs, the MAIL FROM MX and SPF records, SPF for the sending domain and DMARC."
+   >
+     1. The first of three DKIM CNAME records that point to `dkim.amazonses.com`.
+     2. The MAIL FROM MX record on `bounce.<your domain>`, so bounces and SPF align with your domain.
+     3. SPF for the sending domain, merged with the record you already have.
+     4. The DMARC record, suggested when the domain has none.
+     5. The verification status and the time of the last check.
+   </Screenshot>
+
+7. In <UiPath path="connect.stepTest" />, send a test. The delivery timeline shows the message accepted by SES (with
+   its MessageId and configuration set), then the Send and Delivery events that come back through SNS.
+
+8. In <UiPath path="connect.stepStreams" />, choose the streams SES carries. Each stream uses its own configuration
+   set, so a Broadcast problem never touches password resets.
+
+9. In <UiPath path="connect.stepContacts" />, keep the option to pull existing suppressions from SES ticked (it is
+   recommended and ticked by default) to import the addresses on your SES account-level suppression list. With it
+   ticked, the [suppression sync](/reference/glossary/#suppression-sync) is two-way; unticked, ReputeCast only pushes
+   its list to SES.
+
+</Steps>
+
+<Aside type="note">
+  The Launch stack link opens the template set in `connect.ses_template_url`. AWS reads quick-create templates from
+  Amazon S3, so if you publish your own copy, point this setting at it (see the
+  [configuration reference](/reference/configuration/)). IAM access keys work without the template.
+</Aside>
+
+## Check that it worked
+
+- On <UiPath path="nav.providers > providers.tabProviders" />, the Amazon SES card shows
+  <UiPath path="providers.statusHealthy" /> (or <UiPath path="providers.statusSandbox" />), your account status,
+  the 24-hour quota and the send rate ReputeCast read from SES.
+
+  <Screenshot
+    id="providers-list"
+    alt="Sending providers lists Amazon SES as Healthy with its quota, rate, account status, and bounce and complaint rates against the SES review limits."
+  />
+
+- In the AWS console, in the region you picked: the SNS topic `reputecast-events` has a confirmed HTTPS subscription,
+  the four `rc-` configuration sets each have an event destination called `reputecast`, and your domain identity is
+  verified.
+- New deliveries and bounces appear under <UiPath path="nav.providers > providers.tabEvents" />.
+
+ReputeCast sends each message with SES `SendEmail` and the stream's configuration set. A batch is up to 50 messages,
+sent as parallel calls, at the maximum send rate SES reports for your account. When a campaign is larger than the
+24-hour quota left, [Send Readiness](/reference/glossary/#send-readiness) warns you: sending pauses at the quota and
+resumes as it frees up. The card shows your bounce and complaint rates against limits of 5% and 0.1%, next to the
+levels at which SES reviews and pauses an account;
+[Bounces, complaints and provider limits](/deliverability/bounces-and-complaints/) explains them.
+
+## Troubleshooting
+
+- **"AWS didn't let ReputeCast assume this role."** Check that the stack finished, that you pasted its `RoleArn`
+  output, and that the external ID in the stack wasn't changed. The same message appears when the role is missing a
+  permission or AWS didn't answer, so check the role's policy too.
+- **"ReputeCast couldn't assume the role: this server has no AWS credentials of its own."** The server has no AWS
+  identity to assume the role with. Run ReputeCast with an instance role or `AWS_*` environment variables, or use
+  IAM access keys instead.
+- **"Amazon SES rejected this key"** with a code such as `UnrecognizedClientException`. The key ID or secret is wrong
+  or the key was deleted. Create a new access key for the IAM user and paste both values again.
+- **A provisioning row fails with `AccessDenied`** and an action such as `ses:CreateConfigurationSet`. The role's or
+  user's policy doesn't allow that action (or was edited after the stack ran). Restore the policy above, then retry.
+- **"No confirmation after 5 minutes"** on the SNS subscription row. SNS couldn't reach your webhook URL. Make sure
+  the public URL is reachable from the internet over HTTPS and that your proxy passes `/hooks/` to ReputeCast, then
+  retry.
+- **The test fails with `MessageRejected`** because an address isn't verified. The region is in the sandbox: verify
+  the recipient in SES, send to an address you verified, or request production access.
+- **You changed the public URL.** ReputeCast doesn't update SNS for you. Subscribe the `reputecast-events` topic to
+  the new webhook URL in AWS.
+- **You disconnected SES.** ReputeCast deletes its stored credentials but removes nothing in AWS. Delete the SNS
+  topic and subscription, the `rc-` configuration sets, the identity and the stack or IAM user yourself if you no
+  longer need them.
+
+## Related
+
+- [Connect a sending provider](/providers/connect/)
+- [Move Amazon SES out of the sandbox](/deliverability/amazon-ses-production-access/)
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Route mail across providers](/providers/routing/)
+- [Delivery events and suppression sync](/providers/events-and-sync/)

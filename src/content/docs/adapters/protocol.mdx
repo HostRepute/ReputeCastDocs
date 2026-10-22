@@ -1,0 +1,340 @@
+---
+title: Adapter protocol v1
+description: Wire reference for adapter protocol version 1, with signed JSON requests and answers, operations, data types, error codes, timeouts and the circuit breaker.
+type: reference
+audience: [developer, operator]
+primaryKeyword: adapter protocol
+sources:
+  - docs/adapters.md
+  - internal/providers/remote/protocol.go
+  - internal/providers/remote/sign.go
+  - internal/providers/remote/client.go
+  - internal/providers/remote/breaker.go
+  - internal/providers/remote/provider.go
+  - internal/providers/remote/manifest.go
+  - internal/providers/remote/runtime.go
+  - internal/ingest/handler.go
+  - sdk/adapter-sdk/src
+sidebar:
+  order: 4
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Adapter protocol version 1 is how ReputeCast calls a [community adapter](/reference/glossary/#community-adapter) that runs in its own process: signed JSON over HTTP, one operation per request. The TypeScript SDK (`@reputecast/adapter-sdk`) implements every rule on this page; read it when you write an adapter in another language or debug one. To build an adapter with the SDK, follow [write a community adapter](/adapters/community/).
+
+## Transport
+
+- ReputeCast sends `POST <adapter URL>/v1/<operation>` with a JSON body (`Content-Type: application/json`, UTF-8) and expects a JSON answer with `Content-Type: application/json`.
+- HTTP/1.1 and HTTP/2 both work. Redirects are never followed.
+- ReputeCast calls an adapter concurrently (up to 64 calls at a time per installed adapter), so the adapter must handle concurrent requests.
+- The adapter URL is set by an operator (`reputecast adapter install --url` or `reputecast adapter set-url`). Plain `http://` is accepted only for loopback and private addresses, and those need `providers.allow_private_networks`. Link-local and cloud metadata addresses are always refused.
+
+## Request headers
+
+| Header                   | Value                                                                                                                        |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `X-ReputeCast-Protocol`  | `1`                                                                                                                          |
+| `X-ReputeCast-Timestamp` | Unix time in seconds.                                                                                                        |
+| `X-ReputeCast-Signature` | `v1=<hex>`. In the 24 hours after a secret rotation, two comma-separated entries, the new secret first.                     |
+| `X-ReputeCast-Operation` | The body's `operation`, for logs.                                                                                            |
+| `Idempotency-Key`        | The body's `idempotencyKey`.                                                                                                 |
+| `User-Agent`             | `ReputeCast/<version> (adapter-protocol 1)`                                                                                  |
+
+## Signatures
+
+Each `v1` entry is the lowercase hex HMAC-SHA256 of `<timestamp>.<raw body>`, keyed with the installation's signing secret: the whole `rcas_…` string as bytes. ReputeCast creates the secret when the adapter is installed (`rcas_` and 32 random bytes), seals it at rest and prints it once.
+
+The adapter must:
+
+1. Refuse a request without a matching `v1` entry, or whose timestamp is more than 300 seconds from its clock, with HTTP 401 and the error code `unauthenticated`. That answer may be unsigned.
+2. Check that the body's `operation` matches the URL path and that `adapter` is its own id, else answer `400 invalid_request`.
+3. Sign every answer the same way, with its current secret: `X-ReputeCast-Timestamp` and `X-ReputeCast-Signature: v1=<hex HMAC-SHA256 of "<timestamp>.<body>">`, and echo the request's `idempotencyKey` in the body.
+
+ReputeCast refuses answers that are unsigned, signed with another secret, more than five minutes off, of another content type, or for another request. Because the operation, the idempotency key, the connection and the input are all in the body, the signature covers them.
+
+```ts title="signing.ts"
+import { createHmac, timingSafeEqual } from 'node:crypto'
+
+const MAX_SKEW_SECONDS = 300
+
+/** Lowercase hex HMAC-SHA256 of "<timestamp>.<body>" with the whole rcas_… secret. */
+export function sign(secret: string, timestamp: number, body: Buffer | string): string {
+  return createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex')
+}
+
+/** True when one v1 entry of X-ReputeCast-Signature matches one of the secrets. */
+export function verify(
+  secrets: string[],
+  timestamp: string | undefined,
+  header: string | undefined,
+  rawBody: Buffer,
+  now = Date.now(),
+): boolean {
+  const ts = Number(timestamp)
+  if (!header || !/^\d+$/.test(timestamp ?? '') || Math.abs(now / 1000 - ts) > MAX_SKEW_SECONDS) return false
+  const got = header
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => p.startsWith('v1='))
+    .map((p) => Buffer.from(p.slice(3)))
+  return secrets.some((s) => {
+    const want = Buffer.from(sign(s, ts, rawBody))
+    return got.some((g) => g.length === want.length && timingSafeEqual(g, want))
+  })
+}
+```
+
+During a rotation, keep both secrets (`REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old` with the SDK) and sign answers with the new one.
+
+## Request body
+
+```json title="POST /v1/send"
+{
+  "protocol": 1,
+  "operation": "send",
+  "adapter": "example-esp",
+  "idempotencyKey": "send-8c3f0a6e2b9d4c71a5e0f3b6d2c1a9e8",
+  "deadline": "2026-10-13T09:00:30.000Z",
+  "connection": {
+    "providerId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+    "workspaceId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e00",
+    "settings": { "region": "eu" },
+    "credentials": { "api_key": "…", "webhook_signing_key": "…" },
+    "webhookSecret": "…"
+  },
+  "input": { "messages": [] }
+}
+```
+
+| Field            | Rules                                                                                                                                                                                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deadline`       | When ReputeCast stops waiting (the operation's timeout). Stop provider calls by then.                                                                                                                                              |
+| `connection`     | The connected provider the call is for; absent for `health`. `settings` holds the non-secret connection values, `credentials` the secret ones. Only the keys the manifest's `config` declares are sent.                          |
+| `webhookSecret`  | The provider's webhook secret generated by ReputeCast. Sent only to adapters that declare `webhooks`, and only when the connection has one.                                                                                       |
+| Unknown fields   | Ignore them, in requests and answers: new optional fields don't change the protocol version.                                                                                                                                       |
+
+## Response body
+
+```json title="Answers"
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "result": { "results": [] } }
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "error": { "code": "provider_unavailable", "message": "Example ESP answered 503.", "status": 503, "providerCode": "service_unavailable", "retryAfter": 30 } }
+```
+
+A `result` comes with HTTP 200, an `error` with the status in the table below. `message` is a sentence for the event log (never include credentials; texts over 2,000 characters are cut). `status` and `providerCode` are what the provider answered, and `retryAfter` is in seconds.
+
+<TableScroll label="Error codes of the adapter protocol">
+
+| `error.code`           | HTTP | Meaning                                              | What ReputeCast does                                                         |
+| ---------------------- | ---- | ---------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `invalid_request`      | 400  | ReputeCast sent something the adapter can't read.    | Fails the call and counts an adapter failure.                                |
+| `unauthenticated`      | 401  | The signature or the timestamp was rejected.         | Adapter unavailable: issue a new secret or fix the clocks.                   |
+| `too_large`            | 413  | The body is over the adapter's limit.                | Fails the call and counts an adapter failure.                                |
+| `bad_signature`        | 422  | The provider's webhook signature is invalid.         | Refuses the webhook (answers the provider 401).                              |
+| `provider_throttled`   | 429  | The provider is rate limiting.                       | Temporary: retried later.                                                    |
+| `provider_auth`        | 502  | The provider rejected the credentials.               | The provider shows as down with failed authentication and asks for new credentials. |
+| `provider_error`       | 502  | The provider refused the request for good.           | Permanent error, with the provider's code.                                   |
+| `provider_unavailable` | 503  | The provider is down or timing out.                  | Provider outage: failover follows each stream's policy.                      |
+| `not_supported`        | 501  | The adapter doesn't implement the operation.         | Treated as "not supported by this provider".                                 |
+| `internal`             | 500  | The adapter failed.                                  | Adapter unavailable, retried.                                                |
+
+</TableScroll>
+
+## Idempotency
+
+Every request has an `idempotencyKey` of 1 to 128 characters from `A-Z a-z 0-9 . _ : -`. For `send`, the key is derived from the message ids, so a retry of the same batch carries the same key. Other operations get a new key per call, kept when ReputeCast retries a request on a broken connection.
+
+An adapter must return the same result for a key it has already answered successfully (for at least 15 minutes) and must not run one key twice at the same time. That is what keeps a retried batch from being sent twice. Errors are not remembered: a retry after an error runs again.
+
+## Operations
+
+ReputeCast calls only the operations the installed manifest's capabilities declare. `health`, `verify` and `send` are always available.
+
+<TableScroll label="Operations of the adapter protocol">
+
+| Operation           | Needs                                      | Input                                              | Result                                                    | Largest answer |
+| ------------------- | ------------------------------------------ | -------------------------------------------------- | --------------------------------------------------------- | -------------- |
+| `health`            | —                                          | `{}`                                               | `{ adapter, version, protocol, sdk?, capabilities? }`     | 64 KiB         |
+| `verify`            | —                                          | `{}`                                               | a [Quota](#quota-object), every field optional            | 64 KiB         |
+| `send`              | —                                          | `{ messages: [Message] }`                          | `{ results: [SendResult] }`                               | 4 MiB          |
+| `webhooks/verify`   | `webhooks`                                 | `{ request: WebhookRequest }`                      | `{}` or `{ handshake: { body } }`                         | 64 KiB         |
+| `webhooks/parse`    | `webhooks`                                 | `{ request: WebhookRequest, verified }`            | `{ events: [Event] }`                                     | 16 MiB         |
+| `webhooks/register` | `registerWebhooks`                         | `{ url }`                                          | `{}`                                                      | 64 KiB         |
+| `domains/add`       | `domainSetup`                              | `{ domain }`                                       | `{ records: [DNSRecord] }`                                | 1 MiB          |
+| `domains/status`    | `domainSetup`                              | `{ domain }`                                       | `{ records: [DNSRecord] }`                                | 1 MiB          |
+| `quota`             | `quotaDiscovery`                           | `{}`                                               | a [Quota](#quota-object) with `kind`, `max`, `used`       | 64 KiB         |
+| `suppressions/list` | `suppressionSync` `pull` or `two-way`      | `{ since, cursor }` (either may be `null`)         | `{ suppressions: [Suppression], nextCursor }`             | 8 MiB          |
+| `suppressions/add`  | `suppressionSync` `push` or `two-way`      | `{ emails: [string] }`                             | `{}`                                                      | 64 KiB         |
+
+</TableScroll>
+
+Each operation's timeout is in [limits](#limits). Every operation except `health` carries `connection`.
+
+### `health`
+
+Called by `reputecast adapter check` and the instance admin API's check. It goes through even while the circuit breaker is open, and a success closes it. ReputeCast checks that `adapter` is the installed id and `protocol` is `1`, and reports when the running `version` differs from the installed manifest.
+
+### `verify`
+
+Checks the connection's credentials with the provider: in the connect wizard, when credentials are replaced, and from the health job when the adapter has no `quotaDiscovery`. An adapter that can't check credentials without sending returns `{}`.
+
+### `send`
+
+Sends 1 to `batch` messages. The result holds exactly one SendResult per message, in the same order, each echoing its `messageId`. A recipient the provider refuses is a per-message error, and the call as a whole succeeds. Fail the whole call (`provider_auth`, `provider_unavailable`, `provider_throttled`) only when no message of the batch was accepted; otherwise report the rest as temporary per-message errors, so a retry never sends a message twice.
+
+### `webhooks/verify`
+
+ReputeCast received a provider webhook at `/hooks/community:<id>/<token>` and asks whether it is authentic before storing it and answering the provider. Keep it fast: the provider is waiting.
+
+- `{}`: authentic. ReputeCast stores it and answers the provider 200.
+- `{ "handshake": { "body": "<text>" } }`: a subscription handshake the adapter completed (like an SNS `SubscriptionConfirmation`). ReputeCast answers the provider 200 with `body` (at most 16 KiB) and stores nothing.
+- Error `bad_signature`: ReputeCast answers the provider 401 and keeps the first 2 KiB for diagnosis.
+
+When the adapter can't be reached, ReputeCast answers the provider 429 with `Retry-After: 30`, so the provider retries. An unverified request is never stored as verified.
+
+### `webhooks/parse`
+
+Turns a stored webhook into normalized events, in the background job that follows `webhooks/verify`. With `"verified": true`, don't verify again: the stored request has lost the headers ReputeCast never stores (`Authorization`, `Cookie`), and time-window checks would fail. With `false`, verify first and answer `bad_signature` when it fails. Return `[]` for payloads with nothing to record. If the adapter can't be reached, the job retries later; no event is lost.
+
+### `webhooks/register`
+
+Registers ReputeCast's webhook URL at the provider (for example `https://reputecast.acme.io/hooks/community:example-esp/<token>`). Use `connection.webhookSecret` as the provider-side secret when the provider lets you choose one. Register delivery, bounce, complaint and unsubscribe events; ReputeCast tracks opens and clicks itself.
+
+### `domains/add` and `domains/status`
+
+Sets up a sending domain at the provider and reads its DNS records with their status.
+
+### `quota`
+
+The account's allowance and usage. The health job calls it every five minutes, and every minute while the provider is down.
+
+### `suppressions/list` and `suppressions/add`
+
+`suppressions/list` pulls the provider's suppressions into the shared [suppression list](/audience/suppressions/): at most 1,000 per page, and ReputeCast follows `nextCursor` for up to 100 pages per sync. `suppressions/add` pushes addresses from the shared list, at most 500 per call.
+
+## Data types
+
+### `Message` object
+
+```json title="Message"
+{
+  "id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+  "stream": "broadcast",
+  "from": { "name": "Acme Newsletter", "address": "news@news.acme.io" },
+  "replyTo": { "name": "", "address": "help@acme.io" },
+  "to": { "name": "Linh Nguyen", "address": "linh@example.com" },
+  "subject": "October product notes",
+  "html": "<p>…</p>",
+  "text": "…",
+  "headers": {
+    "List-Unsubscribe": "<https://news.acme.io/p/acme/unsubscribe/…>",
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    "X-ReputeCast-Message": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40"
+  },
+  "tags": { "campaign": "0199…" }
+}
+```
+
+`stream` is `broadcast`, `automation` or `system`. `replyTo`, `html`, `text` and `tags` may be absent. The message is already rendered and personalized: send it as it is with every header (mailbox providers require the [one-click unsubscribe](/deliverability/one-click-unsubscribe/) headers), and pass `id` or the `X-ReputeCast-Message` header back on events so they match the message. Turn off the provider's open and click tracking.
+
+### `SendResult` object
+
+```json title="SendResult"
+{ "messageId": "0199…40", "providerMessageId": "msg_7fa3" }
+{ "messageId": "0199…41", "error": { "code": "recipient_suppressed", "message": "The recipient is on Example ESP's suppression list.", "temporary": false, "throttled": false } }
+```
+
+`providerMessageId` is required on success. `temporary` (or `throttled`) errors are retried; permanent ones are not.
+
+### `WebhookRequest` object
+
+```json title="WebhookRequest"
+{
+  "method": "POST",
+  "url": "https://reputecast.acme.io/hooks/community:example-esp/9f2c…",
+  "headers": { "content-type": ["application/json"], "x-example-signature": ["t=1760346062,v1=5b1d…"] },
+  "body": "<base64 of the raw body>"
+}
+```
+
+Header names are lowercase. Hop-by-hop headers and `Cookie` are left out.
+
+### `Event` object
+
+```json title="Event"
+{
+  "type": "hard_bounce",
+  "recipient": "john@example.com",
+  "providerMessageId": "msg_7fa3",
+  "messageId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e41",
+  "occurredAt": "2026-10-12T13:41:02Z",
+  "originalType": "bounced · hard",
+  "originalCode": "550 5.1.1",
+  "diagnostic": "The email account that you tried to reach does not exist.",
+  "bounceClass": "mailbox_unknown",
+  "raw": { "event": "bounced" }
+}
+```
+
+| Field                            | Rules                                                                                                                                                       |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`                           | `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` or `unsubscribe`.                                         |
+| `recipient`                      | Required. Lowercased by ReputeCast.                                                                                                                         |
+| `providerMessageId`, `messageId` | The provider's id, and ReputeCast's id when the provider echoes it (a UUID). Events match messages by either.                                              |
+| `occurredAt`                     | Required, RFC 3339.                                                                                                                                         |
+| `originalType`, `originalCode`, `diagnostic` | The provider's own type and code, and its explanation. Kept next to the normalized event.                                                     |
+| `bounceClass`                    | Optional: `mailbox_unknown`, `mailbox_full`, `domain_invalid`, `policy_block`, `spam_block`, `reputation`, `temporary` or `other`. When it is empty, ReputeCast classifies bounces from `originalCode` and `diagnostic`. |
+| `url`, `userAgent`               | For opens and clicks.                                                                                                                                       |
+| `raw`                            | Required: the provider's event as JSON.                                                                                                                     |
+
+Only an address problem is a hard bounce: hard bounces and complaints go on the shared suppression list. Report a block caused by the sender (spam, reputation, policy) as a soft bounce.
+
+### `DNSRecord` object
+
+```json title="DNSRecord"
+{ "purpose": "dkim", "type": "CNAME", "name": "rc1._domainkey.news.acme.io", "value": "rc1.dkim.example-esp.com", "status": "pending" }
+```
+
+`purpose` is `dkim`, `spf`, `return_path`, `dmarc` or `verification`. `type` is `CNAME`, `TXT` or `MX`. `status` is optional: `pending`, `verified`, `wrong_value` or `missing`.
+
+### `Quota` object
+
+```json title="Quota"
+{ "kind": "monthly_plan", "max": 50000, "used": 1234, "maxRate": 14, "sandbox": false, "account": "Growth · 50,000 per month" }
+```
+
+`kind` is `rolling_24h` or `monthly_plan`. `max` 0 means unknown or unlimited. `maxRate` is messages per second (0 when unknown). `sandbox` is true while the account can send only to verified addresses. Values can't be negative.
+
+### `Suppression` object
+
+```json title="Suppression"
+{ "email": "john@example.com", "reason": "hard_bounce", "code": "bounce", "createdAt": "2026-10-11T08:00:00Z" }
+```
+
+`reason` is `hard_bounce`, `complaint`, `unsubscribe` or `manual`. `code` is the provider's own reason.
+
+## Failures and the circuit breaker
+
+Community adapters report through the same provider health as built-in adapters: every failed call is recorded, the health job marks the provider down after repeated failures, routing fails over per stream policy, and Broadcasts wait for a decision (see [provider health and outages](/providers/health-and-outages/)).
+
+A misbehaving adapter can't stall sending:
+
+- Every call has a timeout and a size limit for its answer.
+- Each installed adapter has one circuit breaker. Five adapter failures in a row open it: connection errors, timeouts, `internal`, `unauthenticated`, `invalid_request` or `too_large` answers, and unsigned or invalid answers. While it is open, every call fails at once as "adapter unavailable", which provider health treats as an outage. After the pause (30 seconds, doubling up to 5 minutes while probes fail), one call goes through, and a success closes the breaker.
+- Provider errors (`provider_*`), `bad_signature` and `not_supported` don't count: they describe the provider, not the adapter.
+- At most 64 calls run against one adapter at a time; a call that can't get a slot before its deadline fails as busy.
+
+## Limits
+
+<LimitsTable area="adapters" />
+
+A `send` request carries at most `batch` messages and at most 24 MiB; ReputeCast splits a larger batch into several calls. Forwarded webhooks are at most 5 MiB, the ingest endpoint's limit. Identifiers in answers (`providerMessageId`, recipients, URLs, record names) longer than 512 characters make the answer invalid. Longer texts (`message`, `diagnostic`, `originalType`) are cut at 2,000 characters.
+
+## Security model
+
+- **Signed both ways** with a per-installation secret, sealed at rest with the instance's secret key and shown once. After a rotation the previous secret keeps working for 24 hours.
+- **An address only the operator sets**, called through the same SSRF-guarded client as built-in adapters: loopback and private addresses only with `providers.allow_private_networks`, metadata and link-local addresses never, no redirects. Anything reachable over the internet must use `https://`, because credentials travel with each call.
+- **Least privilege.** ReputeCast calls only the declared operations and sends only the declared connection values of the one provider a call is for. The SDK refuses network calls to hosts the manifest's `permissions.network` doesn't list.
+- **Write-only credentials.** Provider credentials and the signing secret are never returned by the API and never logged, by ReputeCast or the SDK.
+- **Webhooks** are stored as verified only after the adapter verified them.

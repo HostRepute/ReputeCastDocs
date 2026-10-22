@@ -1,0 +1,332 @@
+---
+title: Set up SPF, DKIM and DMARC
+description: SPF DKIM DMARC setup for a ReputeCast sending domain, with the exact records each sending provider needs, for Cloudflare, Amazon Route 53 or any DNS host.
+type: how-to
+audience: [admin]
+permissions: ['domains:manage']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: SPF DKIM DMARC setup
+sources:
+  - internal/connect/domainstep.go
+  - internal/domains/records.go
+  - internal/domains/attach.go
+  - internal/domains/check.go
+  - internal/domains/detail.go
+  - internal/domains/cloudflare.go
+  - internal/domains/api.go
+  - internal/dnscheck/auth.go
+  - internal/dnscheck/domain.go
+  - internal/readiness/assemble.go
+  - internal/providers/ses/ses.go
+  - web/src/features/connect/DomainStep.tsx
+  - web/src/features/connect/DomainRecords.tsx
+  - web/src/features/connect/domain.messages.ts
+  - web/src/features/senders
+sidebar:
+  order: 3
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[SPF](/reference/glossary/#spf), [DKIM](/reference/glossary/#dkim) and [DMARC](/reference/glossary/#dmarc) prove to
+mailbox providers that mail from your domain really comes from you. This SPF DKIM DMARC setup guide shows the records
+ReputeCast asks you to publish for a [sending domain](/reference/glossary/#sending-domain), how to add them at
+Cloudflare, Amazon Route 53 or any other DNS host, and how to read their live status.
+
+## What each record does
+
+<TableScroll label="SPF, DKIM and DMARC records">
+
+| Record | DNS type                 | Published at                                         | What it proves                                                                                |
+| ------ | ------------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| SPF    | TXT                      | The domain in the envelope sender (MAIL FROM)        | The server that handed over the message may send for that domain.                             |
+| DKIM   | CNAME or TXT             | `<selector>._domainkey.<domain>`                     | The message was signed by the sending provider with a key you published, and wasn't altered. |
+| DMARC  | TXT                      | `_dmarc.<domain>`, or the organizational domain      | What receivers do when neither SPF nor DKIM passes in line with the From address.             |
+
+</TableScroll>
+
+DMARC passes when SPF or DKIM passes **and** its domain is aligned with the domain in the From address. In relaxed
+mode, the default, both domains need the same organizational domain: `bounce.news.acme.io` aligns with
+`news.acme.io`. In strict mode they must be identical
+([RFC 7489, section 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), checked October 2026).
+
+That is why ReputeCast asks for a custom return path (MAIL FROM) on your own domain wherever the sending provider
+supports one: SPF is checked against the return path, so with the sending provider's default return path only DKIM
+can align. Send Readiness warns about that case ("uses the default MAIL FROM, so SPF doesn't align") but doesn't
+block, because DMARC still passes through DKIM.
+
+## The records ReputeCast shows
+
+ReputeCast lists the records in two places, with the same table:
+
+- In the connect wizard, at step 3, <UiPath path="connect.stepDomain" /> (see
+  [Connect a sending provider](/providers/connect/)).
+- Later, under <UiPath path="nav.settings > settings.senders" />: select <UiPath path="senders.records" /> next to a
+  domain. When several sending providers use the domain, a tab per provider filters the table.
+
+Each sending provider signs with its own DKIM key, so each one needs its own records. Sending providers with a domain
+API (Amazon SES, Mailgun, SendGrid, Resend, Mailjet, Brevo, SparkPost, and Postmark with an account token) return the
+exact records, and ReputeCast adds the domain-wide SPF and DMARC rows. For Amazon SES on `news.acme.io` the table
+looks like this:
+
+<TableScroll label="Records for Amazon SES on news.acme.io">
+
+| Purpose                    | Type  | Name                               | Value                                                         |
+| -------------------------- | ----- | ---------------------------------- | ------------------------------------------------------------- |
+| DKIM 1 of 3 (2 and 3 alike) | CNAME | `<token>._domainkey.news.acme.io` | `<token>.dkim.amazonses.com`                                  |
+| Return-path / MAIL FROM    | MX    | `bounce.news.acme.io`              | `10 feedback-smtp.us-east-1.amazonses.com`                    |
+| SPF for MAIL FROM          | TXT   | `bounce.news.acme.io`              | `v=spf1 include:amazonses.com ~all`                           |
+| SPF for the sending domain | TXT   | `news.acme.io`                     | Your current SPF record with `include:amazonses.com` added    |
+| DMARC                      | TXT   | `_dmarc.news.acme.io`              | `v=DMARC1; p=quarantine; adkim=s; aspf=r` (a suggestion)      |
+
+</TableScroll>
+
+<Screenshot
+  id="connect-domain"
+  alt="The domain verification step for Amazon SES on news.acme.io: seven records, from three DKIM CNAMEs to DMARC, all Verified, with the Cloudflare and zone-file buttons above the table."
+>
+  1. The first of three DKIM records Amazon SES signs with, each a 2048-bit key.
+  2. The return path (MAIL FROM) on `bounce.news.acme.io`, so bounces and SPF align with your domain.
+  3. The SPF record of the sending domain, merged with the record you already publish.
+  4. DMARC: here `news.acme.io` follows the policy of `acme.io`, so the record lives at `_dmarc.acme.io`.
+  5. The live status line: when every record is verified, it shows the time of the last check.
+</Screenshot>
+
+Some sending providers have no domain API in ReputeCast: SMTP servers, Postal, Azure Communication Services, the
+generic HTTP adapter, and Postmark without an account token.
+For them the table holds only the SPF row of the sending domain and DMARC. Add the domain in the sending provider
+itself and publish the DKIM record it shows there; ReputeCast checks SPF and DMARC right away and DKIM with the first
+send. For an SMTP server or Postal, the SPF row authorizes the server's host name with `a:<host>`.
+
+### How the SPF value is built
+
+A domain can have only one SPF record, so ReputeCast never asks for a second one. It reads the record you publish
+and inserts the mechanisms each sending provider needs before the closing `all`, `redirect=` or `exp=` term. Terms you
+already have stay as they are; if nothing is missing, the value is your record unchanged. Without any record,
+ReputeCast proposes `v=spf1 <mechanisms> -all`.
+
+```txt title="SPF merge examples"
+Published:  v=spf1 include:_spf.google.com ~all
+Proposed:   v=spf1 include:_spf.google.com include:amazonses.com ~all
+
+Published:  v=spf1 mx
+Proposed:   v=spf1 mx include:spf.mtasv.net -all
+```
+
+### The DMARC row
+
+When no DMARC record exists for the domain or its organizational domain, ReputeCast suggests
+`v=DMARC1; p=quarantine; adkim=s; aspf=r`, plus `rua=mailto:` with HostRepute's report address when
+[HostRepute](/reference/glossary/#hostrepute) is connected. The row counts as verified as soon as any valid DMARC
+record is published at `_dmarc.<domain>` or at the organizational domain, including `p=none`. Read
+[Choose a DMARC policy](#choose-a-dmarc-policy) before you publish the suggestion.
+
+## Before you begin
+
+- You need `domains:manage` to add domains and change their records (Owner and Admin have it). In the connect wizard
+  you also need `providers:manage`. See [Permissions and roles](/reference/permissions/).
+- You need access to the DNS of the domain, at the DNS host its nameservers point to.
+- List every other service that sends mail as this domain, such as your office mail, a help desk or a CRM. Their SPF
+  mechanisms must stay in the record, and each of them should sign with its own DKIM key.
+
+## Open the records
+
+<Steps>
+
+1. Open <UiPath path="nav.settings > settings.senders" /> and select <UiPath path="senders.records" /> next to the
+   domain. If the domain isn't listed yet, add it first ([Add sending domains and senders](/providers/senders-and-domains/)).
+   During the connect wizard you are already on the right screen.
+
+2. If more than one sending provider uses the domain, choose a provider tab or keep all providers.
+
+3. Look at the badge above the table. When ReputeCast recognizes your DNS host from the nameservers, it shows it, for
+   example **Nameservers: Cloudflare**. Pick the matching tab below.
+
+</Steps>
+
+<Screenshot
+  id="settings-sender-domain"
+  alt="DNS records for news.acme.io under Settings, Senders: tabs for all providers, Amazon SES, Postmark and Postal, the Nameservers: Cloudflare badge, and 11 of 11 records verified."
+/>
+
+## Publish the records at your DNS host
+
+<Tabs syncKey="dns">
+<TabItem label="Cloudflare">
+
+When the nameservers are Cloudflare's, ReputeCast can add the records for you through the Cloudflare API.
+
+<Steps>
+
+1. In the Cloudflare dashboard, go to **My Profile** > **API Tokens**, select **Create Token** and use the **Edit zone
+   DNS** template. Under zone resources, choose the zone of your domain, then select **Continue to summary** and
+   **Create Token** ([Cloudflare, "Create API token"](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/),
+   checked October 2026).
+
+2. In ReputeCast, select <UiPath path="connect.domain.addViaCloudflare" />, paste the token and select
+   <UiPath path="connect.domain.addRecords" />. The token needs **Zone › DNS › Edit** on this zone. ReputeCast uses it
+   for this one request and never stores it.
+
+3. Read the result. ReputeCast adds the records that are missing and fixes those with a wrong value; records it
+   doesn't need stay as they are:
+
+   - An existing SPF record is edited in place, so the zone never ends up with two.
+   - An existing DMARC record is left alone.
+   - CNAME records are created as **DNS only** (not proxied) with an automatic TTL.
+
+   Records Cloudflare refused are listed in the notice; add those by hand.
+
+</Steps>
+
+To add records by hand instead, go to **DNS** > **Records** in the Cloudflare dashboard, select **Add record**, choose
+the type, fill in the name and value, and select **Save**
+([Cloudflare, "Manage DNS records"](https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/),
+checked October 2026). Set **Proxy status** to **DNS only** on CNAME records: Cloudflare recommends DNS only for email
+records ([Cloudflare, "Proxy status"](https://developers.cloudflare.com/dns/proxy-status/), checked October 2026).
+
+Adding records through the API needs a signed-in member with `domains:manage`. API keys and AI agents can't use it.
+
+</TabItem>
+<TabItem label="Amazon Route 53">
+
+ReputeCast has no Route 53 integration; add the records in the Route 53 console.
+
+<Steps>
+
+1. Open the Route 53 console, choose **Hosted zones** and the zone of your domain.
+
+2. For each row in the ReputeCast table, choose **Create record**:
+
+   - **Record name**: the part of the name before the hosted zone. In the `acme.io` zone, the MAIL FROM records are
+     `bounce.news`. Leave it empty for a record at the zone itself.
+   - **Record type**: the type from the table.
+   - **Value**: the value from the table. Enclose TXT values in double quotation marks. A TXT value longer than 255
+     characters goes in as several quoted strings on one line: `"first part" "second part"`.
+
+3. If the name already has a TXT record (an SPF record at the zone itself, for example), edit that record instead of
+   creating another one. Route 53 keeps every TXT value of a name in one record, one value per line; replace the old
+   `v=spf1` value with the merged one rather than adding a second `v=spf1` line.
+
+4. Choose **Create records**. Changes usually reach every Route 53 name server within 60 seconds
+   ([AWS, "Creating records by using the Amazon Route 53 console"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating.html)
+   and ["Supported DNS record types"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html#TXTFormat),
+   checked October 2026).
+
+</Steps>
+
+Route 53 can also import a zone file (<UiPath path="connect.domain.copyZone" /> gives you one), but the import fails
+when the zone already holds any of the records in the file, and no records are created
+([AWS, "Creating records by importing a zone file"](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating-import.html),
+checked October 2026). For an existing zone, create the records one by one.
+
+</TabItem>
+<TabItem label="Any DNS host">
+
+<Steps>
+
+1. Select <UiPath path="connect.domain.copyZone" />. ReputeCast copies every row of the table to the clipboard as zone
+   file lines with a TTL of 3600 seconds. It doesn't download a file.
+
+   ```txt title="Zone file lines (example)"
+   bounce.news.acme.io. 3600 IN MX 10 feedback-smtp.us-east-1.amazonses.com.
+   bounce.news.acme.io. 3600 IN TXT "v=spf1 include:amazonses.com ~all"
+   ```
+
+2. If your DNS host imports zone files, paste or upload the lines there. Otherwise create each record by hand and use
+   the **Copy** button on each row for the value.
+
+3. Check how your DNS host expects names. Many add the zone name for you, so `bounce.news.acme.io` is entered as
+   `bounce.news` in the `acme.io` zone. Entering the full name there creates `bounce.news.acme.io.acme.io`.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Wait for the records to verify
+
+ReputeCast checks the records while the table is open: every 30 seconds until all of them are verified, with the line
+"Checking every 30 s · last check …". Opening the page checks again if the last check is more than 20 seconds old,
+and a background job checks every domain every 30 minutes, so a change you make later also shows up in
+[Send Readiness](/reference/glossary/#send-readiness) within the hour.
+
+| Status                              | Meaning                                                                                   |
+| ----------------------------------- | ----------------------------------------------------------------------------------------- |
+| Verified                            | The record is published with the right value.                                             |
+| Pending                             | Not found yet, or not checked yet.                                                        |
+| Pending · old value still cached    | A TXT record still answers with its old value; it updates once the TTL shown has passed. |
+| Wrong value                         | A CNAME or MX record points somewhere else; the value found is shown under it.            |
+| Missing                             | No record of that type exists at that name.                                               |
+| Couldn't check                      | The DNS lookup failed. ReputeCast tries again on the next check.                         |
+
+Most DNS hosts publish changes within minutes; some take up to 48 hours. Until SPF authorizes the sending provider
+and DKIM is verified, Send Readiness blocks campaigns from this domain, and a missing DMARC record blocks them too.
+
+## Choose a DMARC policy
+
+`p=none` asks receivers to deliver mail that fails DMARC as usual and only send you reports. `p=quarantine` sends it
+to spam, and `p=reject` refuses it. Gmail, Yahoo and Microsoft accept `p=none` from bulk senders
+([Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)).
+
+- **Other services send as the domain, or you aren't sure:** start with `p=none` and a `rua` address that collects
+  aggregate reports. ReputeCast's DMARC tip says the same when its suggestion would be too strict.
+- **Only the sending providers in ReputeCast send as the domain:** ReputeCast's suggestion, `p=quarantine`, is safe
+  once every record in the table is verified.
+
+```txt title="_dmarc.news.acme.io TXT (starting policy)"
+v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
+```
+
+Then read the reports for a few weeks and raise the policy once every legitimate source passes, as described in
+[Read DMARC aggregate reports](/deliverability/dmarc-reports/). A DMARC record at the organizational domain
+(`_dmarc.acme.io`) also covers subdomains such as `news.acme.io`; its `sp=` tag sets their policy, and ReputeCast
+reads it when the subdomain has no record of its own.
+
+## Check that it worked
+
+- The table title reads "Records · 7 of 7 verified" (with your counts), and the status line says "All records
+  verified".
+- In the domains table under <UiPath path="nav.settings > settings.senders" />, SPF shows `pass`, DKIM shows
+  `Verified` (or, with several sending providers, a count such as `3 of 3 providers`) and DMARC shows the policy, such
+  as `p=quarantine`. `p=none` is shown as a warning, not an error.
+- The Authentication group in [Send Readiness](/campaigns/send-readiness/) passes for a campaign from this domain: "SPF
+  authorizes …", "DKIM signing on …", "DMARC p=…" and, where the sending provider supports it, "Custom MAIL FROM domain
+  verified".
+- A [placement test](/deliverability/placement-tests/) shows the SPF, DKIM and DMARC results that real mailboxes
+  recorded for the copies.
+
+## Troubleshooting
+
+- **SPF shows Invalid.** The domain publishes two `v=spf1` records, which makes SPF fail with a permanent error
+  ([RFC 7208, section 4.5](https://www.rfc-editor.org/rfc/rfc7208#section-4.5), checked October 2026). Merge them into
+  one record with the value ReputeCast shows, and delete the other.
+- **SPF shows Too many lookups.** SPF allows at most 10 DNS lookups across `include`, `a`, `mx`, `ptr`, `exists` and
+  `redirect` terms, including nested includes
+  ([RFC 7208, section 4.6.4](https://www.rfc-editor.org/rfc/rfc7208#section-4.6.4), checked October 2026). Remove
+  includes for services you no longer use; `ip4` and `ip6` terms don't count. ReputeCast doesn't count the lookups of
+  a merged value before you publish it, so look at the status after publishing.
+- **SPF ends in `+all`.** ReputeCast treats it as invalid, because it lets anyone send as the domain. Use `~all` or
+  `-all`.
+- **A record stays Missing although you added it.** Check the name for a doubled zone (`news.acme.io.acme.io`) and
+  that you edited the zone at the DNS host the nameservers point to.
+- **A DKIM CNAME at Cloudflare stays Pending.** Check that the record is **DNS only**, not proxied.
+- **Send Readiness warns that DKIM keys are under 1024 bits.** Mailbox providers expect at least 1024-bit keys;
+  generate a longer key at the sending provider and publish the new record.
+- **"Cloudflare rejected this token."** The token lacks **Zone › DNS › Edit** on this zone. Create a token with the
+  **Edit zone DNS** template for the right zone.
+- **"No Cloudflare zone … is visible to this token."** The token's zone resources don't include the domain's zone.
+- **The Cloudflare button isn't there.** The nameservers aren't Cloudflare's, or ReputeCast hasn't looked them up
+  yet. Use the zone file.
+- **Gmail rejects mail with 550 5.7.26.** The message failed authentication; see
+  [Gmail 550 5.7.26](/smtp-errors/gmail-550-5-7-26/).
+
+## Related
+
+- [Read DMARC aggregate reports](/deliverability/dmarc-reports/)
+- [Set up BIMI](/deliverability/bimi/)
+- [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)
+- [Add sending domains and senders](/providers/senders-and-domains/)
+- [Monitor domain and provider health](/deliverability/health/)

@@ -1,0 +1,235 @@
+---
+title: Write a community adapter
+description: Use the TypeScript SDK and template to build email provider adapter code for any sending provider, pass the contract suite, then install and check it.
+type: tutorial
+audience: [developer, operator]
+uiPath: 'nav.providers > providers.tabAdapters > providers.adapters.communityTitle'
+primaryKeyword: build email provider adapter
+sources:
+  - sdk/adapter-template
+  - sdk/adapter-sdk
+  - internal/cli/adapter.go
+  - internal/providers/remote
+  - internal/providers/manage/adapters.go
+  - docs/adapters.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps, FileTree, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+In this tutorial you use ReputeCast's template to build email provider adapter code for a [sending provider](/reference/glossary/#sending-provider) that has no built-in adapter, run the contract suite against it, then install it on a test instance and check that ReputeCast can call it. It takes about 30 minutes.
+
+A [community adapter](/reference/glossary/#community-adapter) is a small process that speaks the [adapter protocol](/adapters/protocol/): ReputeCast sends it signed JSON requests (send these messages, verify this webhook), and it calls the provider's API. The template is a working adapter for Example ESP, a fictional provider with a typical API, written with the TypeScript SDK `@reputecast/adapter-sdk`.
+
+## Before you begin
+
+- Node.js 24.11 or later, pnpm and Git.
+- A test ReputeCast instance on the same machine, where you can run the `reputecast` CLI. An installed adapter applies to every workspace on the instance, so don't try this on a production instance.
+- `providers.allow_private_networks: true` on that instance, for the server and for the CLI (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). The adapter listens on `127.0.0.1`, and ReputeCast refuses loopback addresses without it.
+
+## Build and install the adapter
+
+<Steps>
+
+1. Copy the template out of the ReputeCast repository:
+
+   ```sh title="Terminal"
+   git clone https://github.com/hostrepute/reputecast.git
+   cp -r reputecast/sdk/adapter-template my-esp-adapter
+   cd my-esp-adapter
+   ```
+
+   <FileTree>
+   - my-esp-adapter/
+     - src/
+       - adapter.ts the adapter: `defineAdapter({ id, capabilities, terms, send, … })`
+       - main.ts starts the protocol server
+     - test/
+       - adapter.test.ts unit tests
+       - contract.test.ts
+       - fake-api.ts a fake of Example ESP's API
+       - fixtures/
+         - webhooks.json recorded webhooks and the events they must produce
+     - manifest.json what ReputeCast reads at install time
+     - reputecast.contract.ts the contract suite's setup
+     - .env.example
+     - Dockerfile
+     - package.json
+   </FileTree>
+
+2. Install the dependencies:
+
+   ```sh title="Terminal"
+   pnpm install
+   ```
+
+   This installs `@reputecast/adapter-sdk` (Node 24, TypeScript 6, no runtime dependencies) from npm.
+
+   <Aside type="note">
+     If pnpm reports that `@reputecast/adapter-sdk` is not in the npm registry, work inside the repository instead: run `pnpm install` in `reputecast/sdk/`, then use `reputecast/sdk/adapter-template`. Inside the repository, the template is linked to the workspace's copy of the SDK, which the install builds.
+   </Aside>
+
+3. Run the tests:
+
+   ```sh title="Terminal"
+   pnpm test
+   ```
+
+   `pnpm test` runs the unit tests with Vitest, then the contract suite (`reputecast-adapter test`). The contract suite starts the adapter, calls it over the protocol against the fake API in `test/fake-api.ts` and runs the same scenarios ReputeCast's Go suite runs against built-in adapters:
+
+   ```txt title="Output"
+   Contract suite for example-esp (adapter protocol 1)
+   ✓ Registration (40 ms)
+   ✓ Health (90 ms)
+   ✓ Authentication (56 ms)
+   ✓ Send (29 ms)
+   ✓ SendRejected (17 ms)
+   ✓ SendOutage (17 ms)
+   ✓ SendAuth (33 ms)
+   ✓ SendIdempotent (36 ms)
+   ✓ Verify (81 ms)
+   ✓ Quota (8 ms)
+   ✓ SuppressionsPull (26 ms)
+   ✓ Webhook/Delivered (54 ms)
+   ✓ Webhook/HardBounce (63 ms)
+   ✓ Webhook/SoftBounce (42 ms)
+   ✓ Webhook/Batch (24 ms)
+
+   15 passed, 0 failed, 0 skipped
+   ```
+
+   The suite checks the manifest against the code, signed health and authentication, a send, a permanent rejection (the fake refuses `rejected@contract.test`), an outage, rejected credentials, an idempotent retry, and each recorded webhook: valid, already verified and tampered with.
+
+4. Read how the adapter is declared. `src/adapter.ts` maps Example ESP's API:
+
+   ```ts title="src/adapter.ts (excerpt)"
+   export default defineAdapter<ExampleEvent>({
+     id: 'example-esp',
+     capabilities: { webhooks: true, batch: 100, suppressionSync: 'pull', quotaDiscovery: true },
+     terms: { bulkMarketing: 'allowed' },
+     http: {
+       name: 'Example ESP',
+       baseUrl: () => process.env['EXAMPLE_ESP_API_URL'] ?? API_URL,
+       headers: (ctx) => ({ authorization: `Bearer ${String(ctx.credentials['api_key'] ?? '')}` }),
+     },
+
+     async send(msg, ctx) {
+       const r = await ctx.http.post<{ id: string }>('/v1/messages', toPayload(msg))
+       return { providerMessageId: r.data.id }
+     },
+
+     verifyWebhook(req, ctx) {
+       /* checks X-Example-Signature with verifyTimestampedHmac */
+     },
+
+     normalizeEvent(raw) {
+       /* maps one Example ESP event to a ReputeCast event */
+     },
+   })
+   ```
+
+   Each declared capability needs its hook (`webhooks` needs `verifyWebhook` and `normalizeEvent`, `quotaDiscovery` needs `discoverQuota`, a `pull` sync needs `syncSuppressions`), and `defineAdapter` stops the process at start when one is missing. `manifest.json` must declare the same id, capabilities and terms; the server refuses to start when they differ. `ctx.http` reaches only the hosts in the manifest's `permissions.network`, and maps the provider's answers to protocol errors: 401 and 403 become `provider_auth`, 429 `provider_throttled`, 5xx and timeouts `provider_unavailable`, and any other 4xx a refusal of that one message.
+
+5. On the machine that runs ReputeCast, install the adapter from its manifest and give the address the process will listen on:
+
+   ```sh title="Terminal"
+   reputecast adapter install ./manifest.json --url http://127.0.0.1:4600
+   ```
+
+   ```txt title="Output"
+   Installed Example ESP 0.1.0 as community:example-esp.
+
+   Signing secret (shown once):
+
+     rcas_…
+
+   Set it on the adapter process as REPUTECAST_ADAPTER_SECRET.
+   Then check it: reputecast adapter check example-esp
+   ```
+
+   Copy the signing secret now: ReputeCast stores it sealed and never shows it again. If you lose it, `reputecast adapter secret example-esp` issues a new one.
+
+   <Aside type="note">
+     When ReputeCast runs in Docker Compose, the CLI runs inside the app container (`docker compose exec app /usr/local/bin/reputecast …`), where your `./manifest.json` and `127.0.0.1` don't exist. Run the adapter as a container on the same network (step 9) and install it from the manifest's `https://` URL with `--url http://example-esp:4600`.
+   </Aside>
+
+6. Give the adapter its secret and start it:
+
+   ```sh title="Terminal"
+   cp .env.example .env
+   ```
+
+   Set `REPUTECAST_ADAPTER_SECRET` in `.env` to the secret from step 5 (`PORT=4600` and `HOST=127.0.0.1` are already there), then start the process:
+
+   ```sh title="Terminal"
+   pnpm dev
+   ```
+
+   ```txt title="Output"
+   {"time":"2026-10-22T12:20:56.017Z","level":"info","msg":"adapter listening","adapter":"example-esp","url":"http://127.0.0.1:4600","protocol":1}
+   ```
+
+   `pnpm dev` restarts the process when the code changes. Without a secret it doesn't start: it asks you to set `REPUTECAST_ADAPTER_SECRET`. `GET /healthz` answers `{"ok":true}` for container health checks, and every other request must be signed by ReputeCast:
+
+   ```sh title="Terminal"
+   curl -s -X POST http://127.0.0.1:4600/v1/health -d '{}'
+   ```
+
+   ```json title="Output"
+   {"protocol":1,"idempotencyKey":"","error":{"code":"unauthenticated","message":"Refused: the request is not signed, or its timestamp is more than 5 minutes off."}}
+   ```
+
+7. Check that ReputeCast reaches the adapter with its secret:
+
+   ```sh title="Terminal"
+   reputecast adapter check example-esp
+   ```
+
+   ```txt title="Output"
+   community:example-esp: Answered as example-esp 0.1.0, protocol 1.
+   ```
+
+   `reputecast adapter check` calls the signed `health` operation and records the result. `reputecast adapter list` shows each installed adapter with its address, when its secret was issued, its last check and how many providers use it. Within 15 seconds every ReputeCast process picks the adapter up, and Example ESP appears under <UiPath path="providers.adapters.communityTitle" /> on <UiPath path="nav.providers > providers.tabAdapters" /> and in <UiPath path="providers.overview.addProvider" /> in every workspace.
+
+8. Map your own provider. Stop `pnpm dev`, then:
+   - Change `id` in `src/adapter.ts` and `manifest.json`, and the `name`, `maintainer` and links. The id (2 to 40 characters: `a-z`, `0-9` and `-`, starting with a letter) becomes `community:<id>` and appears in webhook URLs, so keep it stable across versions.
+   - Rewrite `send` (or `sendBatch` for a batch API), `verifyWebhook` and `normalizeEvent` for your provider's API, with the helpers `verifyHmac`, `verifyTimestampedHmac`, `verifyBasicAuth` and `classifyBounce`. Send every header in `msg.headers` and pass `msg.id` back on events.
+   - In `manifest.json`, declare the capabilities and terms, the provider's `pricing` (required), the connection form under `config` (mark keys and tokens `"secret": true`) and the provider's hosts under `permissions.network`. The [protocol reference](/adapters/protocol/) lists what each capability makes ReputeCast call.
+   - Record a few real webhooks, with personal data removed, in `test/fixtures/webhooks.json` with the events they must produce, and adapt `test/fake-api.ts`.
+
+   Run `pnpm test` and `pnpm typecheck` until both pass. Then install the manifest again with `reputecast adapter install ./manifest.json --url http://127.0.0.1:4600`. A new id is a new install: it prints a new secret for `.env`, and `reputecast adapter remove example-esp` uninstalls the template's adapter. The same id updates the installed manifest and keeps the secret. Start `pnpm dev` again.
+
+9. Ship it as a container:
+
+   ```sh title="Terminal"
+   pnpm build && pnpm start
+   docker build -t example-esp-adapter .
+   docker run -d --name example-esp -p 127.0.0.1:4600:4600 \
+     -e REPUTECAST_ADAPTER_SECRET=rcas_… example-esp-adapter
+   ```
+
+   `pnpm start` runs the build with Node's permission model. The template's image runs as the non-root `node` user, reads only its own files, can't start child processes or workers, and answers its `HEALTHCHECK` on `/healthz`. It installs with `pnpm install --frozen-lockfile`, so commit the `pnpm-lock.yaml` that step 2 created. Limit the container's network egress to the provider's API where your platform allows it.
+
+   Publish the image and `manifest.json` at an `https://` URL. Operators install it with `reputecast adapter install <manifest URL> --url <where it runs>`, or with <UiPath path="providers.adapters.installFromRegistry" /> on the Adapters tab; the tab shows no secret, so they issue one with `reputecast adapter secret <id>` and set the address with `reputecast adapter set-url <id> <url>`.
+
+</Steps>
+
+<Aside type="tip">
+  To rotate the signing secret without downtime, run `reputecast adapter secret <id>` and set both secrets on the process, new first: `REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old`. The previous secret keeps working in ReputeCast for 24 hours.
+</Aside>
+
+## What you built
+
+You have an adapter process that passes the same contract scenarios as ReputeCast's built-in adapters, installed on your instance for every workspace, and signed in both directions with its own secret. Once it talks to your real provider, any workspace admin connects it from <UiPath path="providers.overview.addProvider" /> like a built-in adapter: the credentials they enter are sealed in ReputeCast and sent with each call, and the adapter never stores them.
+
+`reputecast adapter remove <id>` uninstalls it again; ReputeCast refuses while a connected provider uses it. The [CLI reference](/reference/cli/#adapter) lists every `adapter` command.
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Adapter protocol v1" description="Every header, operation, data type and error code your adapter answers." href="/adapters/protocol/" />
+  <LinkCard title="Connect a sending provider" description="The wizard a workspace admin uses to connect a provider through your adapter." href="/providers/connect/" />
+  <LinkCard title="Generic HTTP adapter reference" description="Map a simple HTTP API with a JSON mapping instead of running a process." href="/adapters/generic-http/" />
+</CardGrid>

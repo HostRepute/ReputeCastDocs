@@ -11,8 +11,10 @@ import {
   locateEntry,
   parseFrontmatter,
   type CheckContext,
+  type Issue,
   type Page,
 } from './lib.ts'
+import { topics } from '../../src/lib/topics.ts'
 
 const root = new URL('../../', import.meta.url).pathname
 const docsDir = join(root, 'src/content/docs')
@@ -49,10 +51,18 @@ function shotFiles(locale: string): Set<string> {
   )
 }
 
-const pages: Page[] = walk(docsDir).map((full) => {
+const parseIssues: Issue[] = []
+const pages: Page[] = walk(docsDir).flatMap((full) => {
+  const file = relative(root, full)
   const { locale, path } = locateEntry(relative(docsDir, full))
-  const { data, body } = parseFrontmatter(readFileSync(full, 'utf8'))
-  return { file: relative(root, full), locale, path, data, body }
+  try {
+    const { data, body } = parseFrontmatter(readFileSync(full, 'utf8'))
+    return [{ file, locale, path, data, body }]
+  } catch (error) {
+    // e.g. an unquoted ": " inside a value; quote the value.
+    parseIssues.push({ file, rule: 'frontmatter', detail: `invalid YAML: ${(error as Error).message.split('\n')[0]}` })
+    return []
+  }
 })
 
 const ctx: CheckContext = {
@@ -71,7 +81,16 @@ const dataIssues = readdirSync(dataDir)
     checkDataLinks(`src/data/${f}`, dataLinks(parseYaml(readFileSync(join(dataDir, f), 'utf8'))), enPaths),
   )
 
-const issues = [...checkPages(pages, ctx), ...dataIssues]
+// Every sidebar group directory must hold at least one English page (an empty group never ships).
+const groupIssues = topics.flatMap((topic) =>
+  topic.sidebar.flatMap((spec) =>
+    (spec.kind === 'group' || spec.kind === 'flat') && ![...enPaths].some((p) => p.startsWith(`${spec.directory}/`))
+      ? [{ file: 'src/lib/topics.ts', rule: 'sidebar', detail: `group directory "${spec.directory}" has no pages` }]
+      : [],
+  ),
+)
+
+const issues = [...parseIssues, ...checkPages(pages, ctx), ...dataIssues, ...groupIssues]
 if (issues.length > 0) {
   console.error(formatIssues(issues))
   console.error(`\n${issues.length} content issue(s) in ${new Set(issues.map((i) => i.file)).size} file(s).`)

@@ -1,0 +1,154 @@
+---
+title: Provider health and outages
+description: What ReputeCast does during an email provider outage, from health checks and Down or Degraded states to automatic failover, held Broadcasts and the switch back.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: email provider outage
+sources:
+  - internal/providers/manage/health.go
+  - internal/providers/manage/actions.go
+  - internal/providers/state/state.go
+  - internal/routing/routing.go
+  - internal/sending/engine/guard.go
+  - web/src/features/providers/messages.ts
+  - web/src/features/providers/overview.messages.ts
+  - web/src/features/providers/incidents.messages.ts
+sidebar:
+  order: 18
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast checks every connected sending provider in the background and gives it a status. When an email provider
+outage starts, mail that must keep going out moves to its fallback on its own, a campaign's share on the failing
+provider waits for your decision, and traffic switches back once the provider has been healthy for 10 minutes.
+
+## What the statuses mean
+
+<UiPath path="nav.providers > providers.tabProviders" /> shows a card per provider with its status, the streams it
+carries, its webhook freshness, its API error rate, quota and send rate, its cost this month and its capabilities.
+
+<Screenshot
+  id="providers-list"
+  alt="The providers page: Amazon SES and Postmark are Healthy and Postal is Warming up on day 9 of 21, each card with the streams it carries, bounce and complaint rates against their limits, quota, send rate and capability chips."
+/>
+
+<TableScroll label="Provider statuses">
+
+| Status                                                   | Meaning                                                                                 | Takes new mail          |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------- |
+| <UiPath path="providers.statusHealthy" />                | The last checks passed.                                                                 | Yes                     |
+| <UiPath path="providers.statusWarmingUp" /> · day N of M | A [warm-up plan](/providers/warm-up/) is running; its daily cap applies to Broadcasts.  | Yes, up to today's cap  |
+| <UiPath path="providers.statusSandbox" />                | The account can only send to verified addresses, such as the Amazon SES sandbox.        | Only to those addresses |
+| <UiPath path="providers.statusDegraded" /> · webhooks silent | The provider accepts mail but has reported no events for 6 hours.                    | No, until events resume |
+| <UiPath path="providers.statusDown" />                   | Calls are failing, or the provider rejected the credentials ("Down · auth failed").     | No                      |
+| <UiPath path="providers.statusPaused" />                 | The provider is paused.                                                                 | No                      |
+
+</TableScroll>
+
+The bounce and complaint rates on a card cover the last 7 days (or are the provider's own figures, where it reports
+them). They are shown against the provider account's limits, such as the Amazon SES review and pause levels, so you can
+see how close your account is to them. You can change the limits shown in the provider's
+<UiPath path="providers.overview.settings" />. They are for reference only: the thresholds that pause a send are the
+[workspace sending defaults](/providers/workspace-defaults/).
+
+## How health is checked
+
+1. Every 5 minutes, ReputeCast makes a read-only call to each provider (for example `GetAccount` for Amazon SES or
+   `GET /server` for Postmark) and records the result, the quota and the send rate it reports. While a provider is
+   Down or Degraded, it checks every minute.
+2. Real sends count too: every API call during a send is recorded.
+3. A provider is marked **Down** after 2 failed checks in a row, or when at least half of at least 5 calls in the last 3
+   minutes failed. A `401` or similar "credentials rejected" answer marks it Down at once.
+4. A provider is marked **Degraded** when it has accepted mail but reported no delivery, bounce or complaint event for 6
+   hours. SMTP servers are exempt because their bounces come from a mailbox.
+5. A Down provider counts as recovered once calls succeed again (fewer than 1 in 10 failing) for 10 minutes. After you
+   replace rejected credentials, it recovers at the next successful check.
+
+The outage banner has a button to re-check the provider now instead of waiting for the next check.
+
+## What happens during an outage
+
+When a provider goes down, ReputeCast handles each stream that routes mail through it, following the stream's
+[failover policy](/providers/routing/):
+
+- **Automations, System and Transactional** switch to the stream's fallback automatically, if the fallback is available.
+  The banner says how many emails were rerouted. Without an available fallback, new mail for the stream waits until the
+  provider recovers.
+- **Broadcasts** follow the Broadcasts policy. With the default, pause and ask, each campaign that is sending through
+  the provider has that provider's share held, while the other shares keep sending. Members who can send campaigns get
+  a notification that the campaign is waiting for a decision. With warmed-up-only or automatic failover, the share moves
+  to the fallback when the policy allows it.
+
+For a held Broadcast share, the outage banner on the providers page offers three choices:
+
+- **Wait** for the provider: the share resumes on its own after the provider has been healthy for 10 minutes.
+- **Move** the held recipients to another provider you pick. If that provider is still warming up, ReputeCast warns you
+  when the move would exceed its cap for today.
+- <UiPath path="providers.incidents.cancelSend" />: the held recipients don't get the campaign. What was already sent
+  stays sent. This can't be undone.
+
+Waiting and moving resume the send and need `campaigns:send`; cancelling needs `campaigns:pause`.
+
+A provider can also fail while a campaign is sending, before the next health check: the send holds that provider's share
+after its calls have failed for 3 minutes (at least 5 calls), and the live monitor asks what to do with it. Read
+[Monitor a send and auto-pause](/campaigns/live-monitor/).
+
+Members with `providers:manage` are notified when a provider goes down. Every step (down, failover, waiting, switched
+back, recovered) is written to the <UiPath path="providers.incidents.timelineTitle" />, and the outage is recorded in the
+[audit log](/team/audit-log/).
+
+### Switching back
+
+After 10 healthy minutes, streams that failed over return to their primary, and Broadcast shares set to wait resume
+where they stopped.
+
+### Silent webhooks
+
+While a provider is Degraded, sending works but the status of new messages is unknown, so bounce protection for that
+route is blind. Until events arrive again, new mail is routed as if the provider were down: its share of Broadcasts is
+held, and other streams use their fallback when they have one. The banner shows what ReputeCast checked (the
+API, whether the webhook is still registered at the provider, whether ReputeCast's endpoint is reachable from the
+internet), the likely causes and the messages still waiting for a status. From there you can choose
+<UiPath path="providers.incidents.sendTestEvent" />, <UiPath path="providers.incidents.reregister" /> or, where the
+provider's API keeps past events, backfill their status. The banner clears as soon as events arrive.
+
+### Rejected credentials
+
+When a provider answers that the credentials are no longer valid, for example because someone rotated the API key at the
+provider, it is marked Down at once and its streams fail over as above. Replace the credentials in the provider's
+<UiPath path="providers.overview.settings" />: ReputeCast checks the new ones with the provider before it stores them.
+
+## Defaults and limits
+
+<LimitsTable area="providers" />
+
+## When to change them
+
+- **Give every stream a fallback.** A second provider turns an outage into a short failover for Automations, System and
+  Transactional mail. Read [Route mail across providers](/providers/routing/).
+- **Choose the Broadcasts policy deliberately.** Pause and ask is the safe default. Fail over automatically, only to a
+  warmed-up provider, if you'd rather keep campaigns moving and your fallback has a sending history.
+- **Make sure the webhooks can reach you.** Silent webhooks are usually a reverse proxy, a firewall or a public URL
+  problem. Read [Reverse proxy and TLS](/self-hosting/reverse-proxy/) and
+  [Troubleshooting](/self-hosting/troubleshooting/).
+
+<Aside type="tip">
+Provider account health beyond ReputeCast's own checks, such as blocklists and mailbox provider reputation, is on the
+Deliverability pages. Read [Monitor domain and provider health](/deliverability/health/).
+</Aside>
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Route mail across providers" href="/providers/routing/" />
+  <LinkCard title="Monitor a send and auto-pause" href="/campaigns/live-monitor/" />
+  <LinkCard title="Delivery events and suppression sync" href="/providers/events-and-sync/" />
+  <LinkCard title="Notifications" href="/team/notifications/" />
+</CardGrid>

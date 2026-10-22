@@ -1,0 +1,149 @@
+---
+title: Delivery events and suppression sync
+description: How ReputeCast receives email bounce webhook events from each sending provider, normalizes them, keeps the original code and syncs one suppression list.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: email bounce webhook events
+sources:
+  - internal/ingest
+  - internal/suppressions/sync.go
+  - internal/providers/provider.go
+  - internal/providers/manage/health.go
+  - internal/app/wire_providers.go
+  - web/src/features/providers/EventsPage.tsx
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  order: 17
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Every sending provider reports what happened to your mail in its own format: Amazon SES through SNS notifications,
+Postmark and Mailgun through webhooks, an SMTP server through bounce messages in a mailbox. ReputeCast turns these email
+bounce webhook events, deliveries and complaints into one [normalized event](/reference/glossary/#normalized-event)
+model, keeps the provider's original code next to it, and shares every bounce and complaint through one
+[suppression list](/reference/glossary/#suppression-list).
+
+## How events arrive
+
+1. **The provider calls ReputeCast.** Each connected provider has its own webhook address,
+   `https://<public URL>/hooks/<adapter>/<token>`. The connect wizard registers it at the provider for you, or shows it to
+   paste in. Read [Connect a sending provider](/providers/connect/).
+2. **ReputeCast checks the signature.** Each adapter verifies the request the way its provider signs it (an SNS
+   signature for Amazon SES, an HMAC for Mailgun, an ECDSA signature for SendGrid, a shared secret for providers that
+   don't sign). A request that fails is answered `401` and never processed; the first 2 KB of it are kept for diagnosis.
+3. **It stores the raw payload and answers at once.** A verified payload is saved as it arrived and the provider gets
+   `200` straight away, so slow processing never makes a provider retry or give up. If ReputeCast can't store it, it
+   answers `429` with `Retry-After: 30` rather than a `5xx`, because some providers drop events after a server error.
+4. **A background job normalizes it.** The payload becomes one or more normalized events, matched to the message
+   ReputeCast sent. Redelivered events are recognized and counted once.
+5. **The event takes effect.** It updates the message's status, the campaign's counters per mailbox provider and sending
+   provider, and the provider's daily statistics. Hard bounces, complaints and unsubscribes reported by the provider add
+   the address to the shared suppression list, and the contact is marked bounced or complained.
+
+Providers without webhooks take the same path from step 4: ReputeCast reads bounces from an SMTP server's
+[bounce mailbox](/reference/glossary/#bounce-mailbox) every minute, and polls the events API of Mailgun or SparkPost
+every minute when you chose polling in the connect wizard.
+
+## Normalized events
+
+<TableScroll label="Normalized event types">
+
+| Event         | Meaning                                                                    | Suppresses the address |
+| ------------- | -------------------------------------------------------------------------- | ---------------------- |
+| `delivered`   | The receiving mail server accepted the message.                            | No                     |
+| `deferred`    | Delivery was delayed with a temporary error; the provider retries.         | No                     |
+| `hard_bounce` | Delivery failed permanently, for example because the mailbox doesn't exist. | Yes                    |
+| `soft_bounce` | Delivery failed for a reason that may be temporary, such as a full mailbox. | No                     |
+| `complaint`   | The recipient marked the message as spam (a feedback-loop report).        | Yes                    |
+| `rejected`    | The provider refused to send the message at all.                           | No                     |
+| `open`        | An open the provider tracked.                                              | No                     |
+| `click`       | A click the provider tracked.                                              | No                     |
+| `unsubscribe` | An unsubscribe the provider received.                                      | Yes                    |
+
+</TableScroll>
+
+Every event keeps the provider's original event type (such as `Bounce · Permanent · General` or `HardFail`), its
+original code (such as `550 5.1.1`) and the diagnostic text. Bounces also get a
+[bounce class](/reference/glossary/#bounce-class): `mailbox_unknown`, `mailbox_full`, `domain_invalid`, `policy_block`,
+`spam_block`, `reputation`, `temporary` or `other`. The class tells you why mail failed regardless of how each provider
+words it; read [Bounces, complaints and provider limits](/deliverability/bounces-and-complaints/) and the
+[SMTP error codes](/smtp-errors/).
+
+ReputeCast tracks opens and clicks itself. A provider's own `open` and `click` events only count when you chose to keep
+that provider's tracking (see [Provider-side tracking check](#provider-side-tracking-check)).
+
+## The event log
+
+<UiPath path="nav.providers > providers.tabEvents" /> starts with the <UiPath path="providers.events.logTitle" />: every
+raw provider event beside its normalized form, its original code and diagnostic, the masked recipient and the campaign,
+automation or system mail it belongs to. Filter by sending provider or event type, or search for a recipient or a message
+ID.
+
+<Screenshot
+  id="providers-events"
+  alt="The event log: raw events from Postmark, Amazon SES and Postal next to their normalized types (delivered, hard bounce, deferred, complaint, soft bounce, rejected), each with its original SMTP code and diagnostic."
+/>
+
+<UiPath path="providers.events.exportCsv" /> downloads the filtered events. Recipients stay masked unless you have the
+`subscribers:export` permission, and every export is recorded in the [audit log](/team/audit-log/).
+
+## Suppression sync
+
+A bounce or complaint at one provider stops mail to that address on every provider. The
+<UiPath path="providers.events.syncTitle" /> card shows how each provider takes part:
+
+- **Two-way**: ReputeCast pulls the provider's own suppressions into the shared list and pushes new shared suppressions
+  to the provider's suppression list.
+- **Pull only**: the provider lists its suppressions but its API can't take new ones (Brevo). ReputeCast pulls them.
+- **Local only** (shown as Enforced locally): the provider has no suppression API (Postal, SMTP, Azure Communication
+  Services, the generic HTTP adapter). ReputeCast checks the shared list before every send.
+
+Sync runs every 15 minutes for every provider, and soon after an event adds new suppressions. To run it now, choose
+<UiPath path="providers.events.syncAll" /> (needs `providers:manage`). The card shows what each provider pulled in and
+pushed out, the last sync and any error. Read [The suppression list](/audience/suppressions/) to add, upload or remove
+addresses by hand.
+
+## Provider-side tracking check
+
+Some providers add their own open pixel or rewrite links for click tracking. With ReputeCast's tracking on top, opens
+are counted twice and links are rewritten twice. Once a day, ReputeCast reads each provider's tracking settings, and
+the <UiPath path="providers.events.trackingTitle" /> card lists what it found. For a provider that tracks, you can:
+
+- turn its tracking off through the provider's API (where the API allows it),
+- keep the provider's tracking and ignore ReputeCast's, or
+- go back to ReputeCast's tracking.
+
+Brevo adds its own tracking by default; read [Send with Brevo](/providers/brevo/).
+
+## Defaults and limits
+
+<LimitsTable area="providers" />
+
+## When to change them
+
+- **Events stop arriving**: ReputeCast marks a provider Degraded when its webhooks stay silent while it accepts mail.
+  Read [Provider health and outages](/providers/health-and-outages/).
+- **You rotated webhook secrets**: providers whose webhook you set up by hand need the new secret, or their events are
+  refused. Read [Workspace sending defaults](/providers/workspace-defaults/).
+- **You moved from another platform**: pull your old provider's suppressions before your first send. Read
+  [Move to ReputeCast without losing consent](/migrate/overview/).
+
+<Aside type="note">
+Raw provider payloads are kept for 90 days, and the event log shows the last 90 days of events.
+</Aside>
+
+## Related
+
+<CardGrid>
+  <LinkCard title="The suppression list" href="/audience/suppressions/" />
+  <LinkCard title="Bounces, complaints and provider limits" href="/deliverability/bounces-and-complaints/" />
+  <LinkCard title="Read campaign reports" href="/campaigns/reports/" />
+  <LinkCard title="Receive webhooks" href="/developers/webhooks/" />
+</CardGrid>

@@ -1,0 +1,158 @@
+---
+title: Upgrade ReputeCast
+description: Upgrade ReputeCast to a new release with Docker Compose or the binary, apply database migrations, check the result and roll back safely.
+type: how-to
+audience: [operator]
+primaryKeyword: upgrade ReputeCast
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance'
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - .goreleaser.yaml
+  - internal/cli/migrate.go
+  - internal/cli/serve.go
+  - internal/db/db.go
+  - internal/version/version.go
+  - internal/instance/updates.go
+  - web/src/features/admin/instance/InstancePage.tsx
+sidebar:
+  order: 10
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+To upgrade ReputeCast, you replace the image or binary with a newer release and let it apply its database migrations;
+everything else (configuration, secret key, data) stays as it is.
+
+## See which version you run
+
+An [instance admin](/reference/glossary/#instance-admin) sees the installed version, the latest release and its
+changelog under <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, in the
+<UiPath path="admin.versionCard" /> card. From the command line, `reputecast version` prints the same:
+`reputecast <version> (<commit>) <Go version>`.
+
+<Screenshot
+  id="instance-settings"
+  alt="The Version & updates card shows the installed version, the latest release v1.5.0 with its changelog, the upgrade command and the daily release check switched on."
+/>
+
+- The badge <UiPath path="admin.updateAvailable" /> appears when the latest release is newer than the installed
+  version. Builds without a release version number (such as `dev`) never show it.
+- Under <UiPath path="admin.upgradeOnServer" />, the card shows the Docker Compose command
+  `cd /opt/reputecast && docker compose pull && docker compose up -d`. Replace `/opt/reputecast` with the folder that
+  holds your `docker-compose.yml`.
+- The switch <UiPath path="admin.updateCheck" /> fetches the latest release from `api.github.com` once a day. The
+  request carries no version number and no instance ID; it is the only outbound call ReputeCast makes on its own.
+  Switch it off here, or set `updates.check: false` in the [configuration](/reference/configuration/) to turn it off
+  for the whole instance (the switch is then locked).
+
+## Before you begin
+
+- Read the release notes of every version between yours and the new one, on the
+  [GitHub releases page](https://github.com/hostrepute/reputecast/releases).
+- [Back up the database and the secret key](/self-hosting/backups/). Migrations change the schema, and a backup is the
+  reliable way back.
+- Plan a short interruption while the app restarts.
+
+## Upgrade
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Go to the folder with your `docker-compose.yml` and take a backup:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. If you pin a version in `.env` (`REPUTECAST_VERSION=v1.4.2`), change it to the new release tag. Image tags are the
+   release tags with their leading `v`, plus `latest`. Without `REPUTECAST_VERSION`, the compose file uses `latest`.
+
+3. Pull the new image and recreate the app container:
+
+   ```sh
+   docker compose pull && docker compose up -d
+   ```
+
+   The image starts with `serve --auto-migrate`, so it applies pending migrations before it serves requests. The logs
+   show one `migration applied` line per migration.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binary">
+
+<Steps>
+
+1. Take a backup (see [back up and restore](/self-hosting/backups/)).
+
+2. Download the archive for your platform and `checksums.txt` from the
+   [release page](https://github.com/hostrepute/reputecast/releases), and check the download:
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   ```
+
+3. Stop every ReputeCast process, for example `sudo systemctl stop reputecast`.
+
+4. Replace the binary (for example `/usr/local/bin/reputecast`) with the new one.
+
+5. Apply the migrations once, with the same environment the service uses:
+
+   ```sh
+   reputecast migrate up
+   ```
+
+   It applies ReputeCast's migrations, then those of the job queue, and ends with `Database is up to date.`
+
+6. Start every process again. If you run [several roles](/self-hosting/scaling/), upgrade all of them to the same
+   version.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+  A process started without `--auto-migrate` on a database with pending migrations keeps running and only logs
+  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate``. Run the migrations before you
+  rely on the new version.
+</Aside>
+
+## Check that it worked
+
+- <UiPath path="admin.versionCard" /> shows the new version as installed.
+- `reputecast migrate status` lists every migration with an applied date and none as `pending`. In Docker:
+  `docker compose exec app /usr/local/bin/reputecast migrate status`.
+- `/readyz` answers `ready` ([health checks, metrics and logs](/self-hosting/monitoring/)).
+
+## Roll back
+
+Going back to the previous image or binary does not undo migrations: the database keeps the newer schema.
+
+- **Restore the backup** for an exact return to the state before the upgrade: stop ReputeCast, restore the dump you
+  took (see [restore](/self-hosting/backups/#restore)), then start the version you ran before. Changes made after the
+  upgrade are lost.
+- **Pin the previous version** (`REPUTECAST_VERSION` in `.env`, then `docker compose up -d`), as the
+  <UiPath path="admin.versionCard" /> card suggests, when you want to keep the data written since the upgrade.
+- `reputecast migrate down` rolls back only the latest ReputeCast migration, one per run, and leaves the job queue's
+  tables alone. Prefer a restore.
+
+## Troubleshooting
+
+- **The new container exits at start**: read `docker compose logs app`. A failed migration stops the start with
+  `migrate: …`; restore the backup and report the error with the release version.
+- **The version card says the update check failed**: the server can't reach `api.github.com`, or GitHub answered with an
+  error. Nothing else is affected; the next check runs the following day.
+- **The latest release shows a dash**: the check is off, or has not run yet.
+
+## Related
+
+- [Back up and restore](/self-hosting/backups/)
+- [Instance admin](/self-hosting/instance-admin/): the rest of <UiPath path="admin.instance" />.
+- [CLI reference](/reference/cli/): `migrate`, `version` and every other command.

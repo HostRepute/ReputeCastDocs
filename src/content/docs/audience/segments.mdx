@@ -1,0 +1,206 @@
+---
+title: Build segments
+description: Email list segmentation in ReputeCast. Combine conditions in groups, watch the live count, and write read-only SQL segments when the builder isn't enough.
+type: how-to
+audience: [publisher]
+permissions: ['segments:edit', 'segments:sql']
+uiPath: 'nav.audience > audience.tabSegments'
+primaryKeyword: email list segmentation
+sources:
+  - internal/segments
+  - internal/ai/segments.go
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - web/src/features/audience/SegmentBuilder.tsx
+  - web/src/features/audience/segments.messages.ts
+  - web/src/features/ai/segment.tsx
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+A [segment](/reference/glossary/#segment) picks contacts by what they are and what they did: their lists, tier,
+mailbox provider, opens, clicks, fields, score and more. Email list segmentation in ReputeCast happens in the
+condition builder, with a live count as you edit; workspace admins can also write the query in SQL.
+
+## Before you begin
+
+- Building and saving segments needs `segments:edit` (Owner, Admin and Editor). Anyone who can see contacts can see
+  segments and their counts.
+- SQL segments need `segments:sql` (Owner and Admin; sensitive) and a database role your server operator sets up
+  once (see [Set up the database role](#set-up-the-database-role)).
+
+## Build a segment
+
+<Steps>
+
+1. Go to <UiPath path="nav.audience > audience.tabSegments" /> and select
+   <UiPath path="audience.segments.newSegment" />.
+
+2. Name the segment and choose how it refreshes under <UiPath path="audience.segments.refresh" />:
+
+   - <UiPath path="audience.segments.dynamic" /> (default): membership is worked out each time a send prepares its
+     audience. The saved count is updated every night.
+   - <UiPath path="audience.segments.static" />: the members are fixed each time you save, and nothing else changes
+     them.
+
+3. Under **Conditions**, pick a field, an operator and a value. Inside a group, choose
+   <UiPath path="audience.segments.matchAll" /> or <UiPath path="audience.segments.matchAny" />. Select
+   <UiPath path="audience.segments.addCondition" /> for another condition in the same group, or
+   <UiPath path="audience.segments.addGroup" /> for a new group. Groups always combine with AND.
+
+   <Screenshot
+     id="segments"
+     alt="A segment named Engaged Outlook users on paid plans: Group 1 matches all of mailbox provider Outlook, opened any email in the last 30 days and list Weekly Digest; the live count shows 2,118 contacts, 4.4% of the workspace."
+   />
+
+4. Watch the live count on the right. It shows how many contacts match, their share of the workspace and the tier
+   mix of the segment, and updates as you edit.
+
+5. Select <UiPath path="audience.segments.save" />.
+
+</Steps>
+
+Suppressed and role addresses are always left out at send time, whatever the segment says.
+
+### Conditions you can use
+
+<TableScroll label="Segment conditions">
+
+| Field | Operators |
+| --- | --- |
+| Mailbox provider (Gmail, Outlook, Yahoo, iCloud, Other) | is, is not |
+| Email domain, referring domain | is, is not, ends with |
+| List membership (subscribed members) | includes, excludes |
+| Tier (Active, Cooling, At risk, Sunset) | is, is not |
+| Last open | in the last, not in the last, never (days or weeks) |
+| Opened any email, clicked any email, joined | in the last, not in the last |
+| Opened campaign (recent campaigns) | opened, didn't open |
+| Score (0–100) | is at least, is at most, is between |
+| Score band (Cold, Warm, Hot) | is, is not |
+| Consent (Double opt-in, Single opt-in, Imported, pending) | is, is not |
+| Source, growth source, country, language | is, is not |
+| UTM source, UTM medium, UTM campaign | is, is not, contains |
+| Tag | has, doesn't have |
+| Custom field, text | equals, not equals, is one of, contains, is empty, is not empty |
+| Custom field, number | equals, not equals, greater than, less than, is empty, is not empty |
+| Custom field, date | before, after, is empty, is not empty |
+| Custom field, yes/no | is true, is false |
+
+</TableScroll>
+
+Conditions for referrals, phone and SMS, paid subscriptions, purchases, website sign-ins, push, WhatsApp and store
+customers appear once those features are in use.
+
+<Aside type="note">
+  **Last open** includes machine opens, and **Clicked any email** includes clicks from link scanners. **Opened any
+  email** and **Opened campaign** count [human opens](/reference/glossary/#human-opens) only. Use them when you want
+  people who really read your email.
+</Aside>
+
+### Draft conditions from a description
+
+With an [AI model connected](/integrations/ai-assistant/), the **Describe the segment** card turns a sentence such as
+"Team-plan customers who clicked something in the last 30 days" into builder conditions, marked as added or
+removed, with the live count. Only your description and the condition schema are sent: field names and types, and
+list, segment and tag names. Values from contacts are never sent. It needs `ai:use` and never writes SQL.
+
+### See the generated query
+
+Every builder segment shows the exact query it runs under <UiPath path="audience.segments.generated" /> (read only).
+Select **Copy** to reuse it.
+
+## Use a segment
+
+- Campaign audience: pick it under **Segments** in the campaign's audience picker. SMS, push, WhatsApp and digest
+  audiences offer segments too.
+- [Conditional content](/campaigns/conditional-content/): show or hide a block for a segment.
+- <UiPath path="nav.audience > audience.tabContacts" />: <UiPath path="audience.segments.previewContacts" /> opens the
+  contacts filtered by the saved segment.
+
+<UiPath path="audience.segments.useInCampaign" /> opens a new campaign draft; choose the segment in its audience.
+Automations don't start from segments; use a list, tag, score or other [trigger](/automations/triggers-and-steps/).
+
+Deleting a segment can't be undone. If a conditional block uses it, the page warns you, and Send Readiness blocks
+that campaign until you fix the block.
+
+## Write the query yourself
+
+<Steps>
+
+1. In the builder, select <UiPath path="audience.segments.openSql" />. The generated SQL is copied into the editor.
+
+2. Write one `SELECT` (or `WITH … SELECT`) that returns contact ids in a column named `id`:
+
+   ```sql title="Segment SQL"
+   SELECT c.id
+   FROM contacts c
+   WHERE c.tier = 'active'
+     AND c.mailbox_provider = 'outlook'
+     AND c.score >= 50
+   ```
+
+3. Check the live count, then select <UiPath path="audience.segments.save" />.
+
+</Steps>
+
+The query runs read-only, with a 10-second limit, against views of the current workspace only:
+
+<TableScroll label="Views for SQL segments">
+
+| View | Columns |
+| --- | --- |
+| `contacts` | `id`, `email`, `first_name`, `last_name`, `company`, `country`, `timezone`, `language`, `mailbox_provider`, `tier`, `consent`, `source`, `status`, `tags`, `fields` (custom fields, jsonb), `role_address`, `created_at`, `last_open_at`, `last_human_open_at`, `last_click_at`, `suppressed_at`, `score`, `score_band`, `growth_source`, `utm_source`, `utm_medium`, `utm_campaign`, `referring_domain`, `signed_in_at`, `referrals_counted`, `referral_milestones`, `phone`, `phone_country`, `sms_lists`, `last_text_at`, `last_text_click_at` |
+| `list_members` | `contact_id`, `list_id`, `list`, `status`, `subscribed_at`, `unsubscribed_at` |
+| `events` | `contact_id`, `type`, `human`, `occurred_at`, `campaign_id`, `url`, `mailbox_provider` |
+| `lists` | `id`, `name` |
+| `paid_members` | `contact_id`, `status`, `kind`, `period`, `started_at`, `ended_at`, `tier_id`, `tier_rank`, `access`, `paid` |
+| `paid_tiers` | `id`, `name`, `rank` |
+| `purchases` | `contact_id`, `product_id`, `product`, `status`, `paid`, `currency`, `paid_at` |
+
+</TableScroll>
+
+Creating or changing a SQL segment needs `segments:sql`; an Editor can open one but can't save it. **Back to the
+builder** drops the SQL text without asking.
+
+### Set up the database role
+
+If <UiPath path="audience.segments.openSql" /> says "SQL segments are turned off on this database", the
+`reputecast_segments` role is missing. Your server operator creates it and runs the migrations, as described in
+[PostgreSQL: SQL segments](/self-hosting/postgres/#sql-segments), then restarts ReputeCast so it notices the change.
+
+## Defaults and limits
+
+<LimitsTable area="segments" />
+
+At send time, builder segments have 30 seconds to resolve and SQL segments keep their 10-second limit; static
+segments use the members saved with them.
+
+## Check that it worked
+
+- The segment appears under **Saved segments** with its count.
+- <UiPath path="audience.segments.previewContacts" /> lists the contacts you expected.
+
+## Troubleshooting
+
+- **The live count says "Timed out"** → counting took longer than 10 seconds, usually on large workspaces with event
+  conditions. The last known count is shown instead, and builder segments still resolve at send time. Ask your
+  operator to tune PostgreSQL (see [PostgreSQL](/self-hosting/postgres/)).
+- **"A segment can have at most 20 groups"** or **"A group can have at most 50 conditions"** → split the segment, or
+  write it in SQL.
+- **"Your SQL can only read the contacts, list_members, … views"** → the query names another table. Use the views
+  above.
+- **"Only one statement is allowed"** → remove the semicolon and anything after it.
+- **Open in SQL editor is disabled** → you don't have `segments:sql`, or SQL segments are turned off on the database.
+
+## Related
+
+- [Manage contacts](/audience/contacts/)
+- [Keep your list healthy](/audience/list-health/)
+- [Score contacts by interest](/audience/scoring/)
+- [Schedule and send a campaign](/campaigns/schedule-and-send/)

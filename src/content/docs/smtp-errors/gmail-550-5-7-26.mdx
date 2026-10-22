@@ -1,0 +1,129 @@
+---
+title: 'Gmail 550 5.7.26: unauthenticated email blocked'
+description: Gmail 550 5.7.26 blocks mail that fails SPF and DKIM or the From domain's DMARC policy. See why it happens and how to fix authentication in ReputeCast.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: Gmail 550 5.7.26
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - internal/audience/suppressions.go
+  - internal/providers/{ses,resend,postal,smtp,postmark,sendgrid,mailjet,sparkpost,mailgun,brevo,azureacs,httpgeneric}
+  - web/src/features/senders
+sidebar:
+  label: Gmail 550 5.7.26
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 550 5.7.26 is a permanent refusal: the message failed email authentication, so Gmail blocked it. The fix is in
+your DNS records, not in your list. This page shows how to read the reply and get SPF, DKIM and DMARC passing for every
+sending provider you use.
+
+## What Gmail means
+
+Gmail sends the code with one of three texts:
+
+> This email has been blocked because the sender is unauthenticated. Gmail requires all senders to authenticate with
+> either SPF or DKIM. Authentication results: DKIM = did not pass SPF [_domain-name_] with ip: [_ip-address_] = did not
+> pass.
+
+> The (E)MAIL FROM domain [_domain-name_] has an SPF record with a hard fail policy (-all) but it fails to pass SPF checks
+> with the ip: [_ip-address_]. To best protect our users from spam and phishing, the message has been blocked.
+
+> Unauthenticated email from _domain-name_ is not accepted due to domain's DMARC policy. Contact the administrator of
+> _domain-name_ domain if this was legitimate email.
+
+Gmail also has temporary versions: 421 4.7.26 rate limits unauthenticated mail instead of blocking it, and 451 4.7.26
+means temporary DNS failures prevented the DMARC check. Source:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Google Workspace Help. Checked October 2026.
+
+## Why it happens
+
+- **Neither SPF nor DKIM passed.** The sending provider's DKIM records aren't published, or SPF doesn't list the sending
+  provider.
+- **SPF hard-failed.** Your SPF record ends in `-all` and doesn't include the server that sent the message, for example a
+  sending provider you added to a [route](/reference/glossary/#route) later.
+- **DMARC failed.** Your DMARC policy is `quarantine` or `reject`, and neither SPF nor DKIM is
+  [aligned](/reference/glossary/#alignment) with the From domain. This happens when the sending provider signs DKIM with
+  its own domain and uses its own return path.
+
+## How ReputeCast classifies it
+
+- [Bounce class](/reference/glossary/#bounce-class): `policy_block` for the first and third texts. The SPF hard-fail
+  text mentions spam, so it is `spam_block`. The bare code without text is `policy_block`.
+- Report row: <UiPath path="reports.bounceType.blocked" />.
+- Suppression: the refusal is about your domain, not the address. Most built-in adapters record it as a soft bounce, so
+  nothing is suppressed. With Amazon SES, Resend, Postal, SendGrid, Mailjet and SMTP bounce mailboxes it can be recorded
+  as a hard bounce, depending on how the sending provider reports it, and then the address is suppressed. See
+  [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address).
+
+Send Readiness checks the same records before every campaign. In its <UiPath path="review.groupAuthentication" /> group,
+a missing SPF record, an SPF record that doesn't authorize one of the campaign's sending providers, unverified DKIM, or a
+missing or invalid DMARC record blocks the send. Less than 90% of mail aligned with DMARC over the last 7 days is a
+warning.
+
+## Before you begin
+
+- `domains:manage` to see and check the DNS records of a sending domain.
+- Access to the DNS host of your domain.
+- `providers:view` to read the event log.
+
+## Fix authentication
+
+<Steps>
+
+1. Read Gmail's text. Open <UiPath path="nav.providers > providers.tabEvents" />, filter
+   <UiPath path="providers.events.typeFilter" /> to <UiPath path="providers.events.optionSoftBounce" /> or
+   <UiPath path="providers.events.optionHardBounce" /> and search for a Gmail recipient.
+   <UiPath path="providers.events.colCode" /> shows which check failed and, in the first text, the domain and IP address
+   Gmail tested.
+2. Open <UiPath path="nav.settings > settings.senders" /> and the sending domain. Its records page lists the exact DNS
+   records each sending provider needs for the domain, each with a status (<UiPath path="connect.domain.statusVerified" />,
+   <UiPath path="connect.domain.statusPending" /> or <UiPath path="connect.domain.statusMissing" />), and checks them
+   every 30 seconds while it is open.
+3. Publish the missing or wrong records at your DNS host. A domain name can have only one SPF record
+   ([RFC 7208, section 3.2](https://www.rfc-editor.org/rfc/rfc7208#section-3.2), checked October 2026), so merge what
+   the records page asks for into the existing one. Follow [set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+   for the exact steps.
+4. Where the sending provider supports a custom MAIL FROM (return path) domain, set it up so SPF aligns with your From
+   domain as well as DKIM.
+5. Wait for the records to show <UiPath path="connect.domain.statusVerified" />. ReputeCast also checks DNS every 30
+   minutes, and a change shows up in Send Readiness within the hour. Then open the next campaign's
+   <UiPath path="composer.reviewSend" />: the [Send Readiness](/campaigns/send-readiness/)
+   <UiPath path="review.groupAuthentication" /> group must pass.
+
+</Steps>
+
+## Check that it worked
+
+- Every record on the sending domain's page shows <UiPath path="connect.domain.statusVerified" />.
+- The <UiPath path="review.groupAuthentication" /> group of Send Readiness passes for the campaign.
+- The next campaign's report has no 550 5.7.26 in <UiPath path="reports.colCodes" />.
+
+## Troubleshooting
+
+- **Only one sending provider triggers it.** Its DKIM records or its SPF `include:` are missing. Routes split mail across
+  providers, so check every sending provider on the campaign's route.
+- **DMARC passes for some mail and fails for the rest.** Read the [DMARC aggregate reports](/deliverability/dmarc-reports/)
+  to find the sources that fail alignment.
+- **Addresses were suppressed for this bounce.** After you fix authentication, you can remove them from
+  <UiPath path="nav.audience > audience.tabSuppressions" /> with <UiPath path="audience.suppressions.removeButton" />.
+
+<Aside type="caution">
+A contact removed from the suppression list after a hard bounce goes back to pending consent. It gets mail again only
+after a new opt-in.
+</Aside>
+
+## Related
+
+- [SMTP error codes](/smtp-errors/)
+- [Outlook 550 5.7.515](/smtp-errors/outlook-550-5-7-515/), Microsoft's authentication requirement
+- [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)
+- [Add sending domains and senders](/providers/senders-and-domains/)

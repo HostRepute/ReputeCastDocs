@@ -1,0 +1,131 @@
+---
+title: Scale with web, ingest and worker roles
+description: Scale ReputeCast by splitting one process into web, ingest and worker roles behind your proxy, with a Compose example, shared files and pool sizing.
+type: how-to
+audience: [operator]
+primaryKeyword: scale ReputeCast
+sources:
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/app/register.go
+  - internal/app/wire_smtprelay.go
+  - internal/app/wire_publicurl.go
+  - internal/cli/serve.go
+  - internal/jobs/jobs.go
+  - internal/providers/remote/runtime.go
+  - README.md
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ArchitectureDiagram from '~/components/diagrams/ArchitectureDiagram.astro'
+
+To scale ReputeCast, you run the same binary as several processes, each with some of its three roles, all sharing one
+PostgreSQL database. One process with every role is the default and is enough for most instances; split the roles
+when sending, webhook traffic or the web app need more capacity than one machine gives.
+
+<ArchitectureDiagram />
+
+One binary serves the browser, the API, MCP agents and providers' webhooks, and runs the background jobs; PostgreSQL
+holds the data and the job queue, and the sending providers deliver the mail.
+
+## The roles
+
+| Role     | What it runs                                                                                                                                                                                   |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web`    | The web app, the API under `/api/`, public pages (`/p/…`, `/t/…`, `/r/…`), `/mcp`, sign-in callbacks, Let's Encrypt challenges and the [SMTP relay](/transactional/smtp-relay/).                |
+| `ingest` | Webhooks from sending providers and connected services under `/hooks/…`: it checks each one, stores it and answers `200` at once.                                                              |
+| `worker` | The job queue in PostgreSQL: sends, event processing, syncs, health checks, warm-up, automations, imports, reports and retention. Scheduled jobs run only in worker processes.                  |
+
+- `reputecast serve` runs all three; `serve --role=web,ingest` (or `REPUTECAST_ROLES=web,ingest`) runs some;
+  `reputecast worker` is the same as `serve --role=worker`.
+- A process has an HTTP listener (with `/healthz`, `/readyz` and `/metrics`) only when it runs `web` or `ingest`. Give
+  a worker-only process `metrics.addr`, such as `:9090`, to expose its metrics.
+
+## Before you begin
+
+- ReputeCast runs as one process, installed with [Docker Compose](/self-hosting/docker/) or
+  [the binary](/self-hosting/binary/), and you have a [backup](/self-hosting/backups/).
+- Your PostgreSQL accepts the extra connections ([size the pool](/self-hosting/postgres/#size-the-connection-pool)).
+
+## Split the roles
+
+<Steps>
+
+1. Give every process the same configuration: `database.url`, `http.public_url`, `http.trusted_proxies` and the same
+   secret key. On several machines, set `secrets.key` (`REPUTECAST_SECRETS__KEY`) on all of them instead of a key
+   file; with Docker, copy the existing key out with `docker compose cp app:/var/lib/reputecast/secret.key .` and use
+   its contents.
+
+2. Give web and worker processes the same `files.dir` (product files and lead magnets), on a shared volume or network
+   file system.
+
+3. Run one or more `serve --role=web,ingest` processes behind your [reverse proxy](/self-hosting/reverse-proxy/), and
+   at least one `worker`. Several workers share the queue through PostgreSQL. To grow webhook capacity separately, run
+   `--role=ingest` processes and route `/hooks/` to them in the proxy.
+
+4. Apply migrations from one place only: one process with `--auto-migrate`, or `reputecast migrate up` before you
+   start the new version everywhere. A `worker` never migrates.
+
+5. Run the same ReputeCast version in every process.
+
+</Steps>
+
+This Compose example runs the web and ingest roles in `app` and the jobs in a separate `worker` container, on one
+server, sharing the `appdata` volume (secret key and files):
+
+```yaml title="docker-compose.override.yml"
+services:
+  app:
+    command: ["serve", "--role=web,ingest", "--auto-migrate", "--auto-install"]
+
+  worker:
+    image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+    restart: unless-stopped
+    command: ["worker"]
+    depends_on:
+      - app
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+      REPUTECAST_METRICS__ADDR: ":9090"
+    volumes:
+      - appdata:/var/lib/reputecast
+```
+
+<Aside type="caution">
+  Split an instance after its first start, when the secret key file exists. A worker that starts on an empty volume
+  before the app could create a different key.
+</Aside>
+
+## What the processes share
+
+- **PostgreSQL**: data, the job queue and job scheduling. Each process opens up to `database.max_conns` connections
+  (default 20) and `worker.concurrency` (default 50) sets how many jobs a worker runs at once.
+- **Settings saved in the app**: every process reads the public URL saved in Instance admin again every 30 seconds,
+  and installed community adapters every 15 seconds.
+- **Files**: `files.dir`, as above.
+
+## Check that it worked
+
+- `curl http://<web process>:8080/readyz` answers `ready` on every web and ingest process.
+- `curl http://<worker>:9090/metrics` answers on a worker with `metrics.addr`.
+- The `http listening` log line of each web process shows its roles, and each worker logs `workers started` with its
+  concurrency.
+- Scheduled sends start and the live monitor moves: workers are processing the queue.
+
+## Troubleshooting
+
+- **Nothing is sent and imports never finish**: no process runs the `worker` role.
+- **Stored provider credentials can't be decrypted in one process**: its secret key differs; give every process the
+  same `secrets.key` or key file.
+- **Product downloads fail from some processes**: `files.dir` is not shared.
+- **`FATAL: sorry, too many clients already`**: lower `database.max_conns` per process.
+- **A worker has no `/healthz`**: expected; it has no HTTP listener. Watch its `metrics.addr` instead.
+
+## Related
+
+- [Health checks, metrics and logs](/self-hosting/monitoring/)
+- [Configure ReputeCast](/self-hosting/configuration/)
+- [How ReputeCast works](/getting-started/concepts/)

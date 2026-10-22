@@ -1,0 +1,254 @@
+---
+title: Back up and restore
+description: Back up ReputeCast with pg_dump, the secret key and the files folder, then restore all three in the right order and test the restore.
+type: how-to
+audience: [operator]
+primaryKeyword: back up ReputeCast with pg_dump
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/accounts/signin.go
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - migrations/00300_composer.sql
+  - web/src/features/admin/instance/InstancePage.tsx
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Back up ReputeCast with pg_dump, the secret key and the files folder: a restore needs all three, and the database alone
+is not enough.
+
+## What a backup contains
+
+| Part                   | What it holds                                                                                                                                                                                 | Where it is                                                                                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PostgreSQL database    | Everything else: workspaces, contacts, campaigns, uploaded images, the job queue, the [audit log](/reference/glossary/#audit-log), and every stored credential in encrypted form.             | The database in `database.url`.                                                                                                                             |
+| Secret key             | The AES-256-GCM key that encrypts provider credentials, OIDC client secrets, HostRepute tokens and authenticator (TOTP) seeds in the database.                                               | `REPUTECAST_SECRETS__KEY` when you set it; otherwise the key file `secrets.key_file`: `/var/lib/reputecast/secret.key` in Docker, `data/secret.key` for the binary (relative to the directory ReputeCast starts in). |
+| Files folder           | Digital products' files and lead magnets, which are too large for the database.                                                                                                               | `files.dir`; by default a `files` folder next to the key file (`/var/lib/reputecast/files` in Docker). It appears once someone uploads a file.              |
+
+Keep your configuration too: the `.env` file or shell variables you start Docker Compose with, or your YAML config file
+and environment file for the binary. The [configuration reference](/reference/configuration/) lists every setting.
+
+<Aside type="caution" title="The key is not optional">
+  If you restore the database without its secret key, ReputeCast starts, writes a new key and logs `generated a new secret
+  key; back it up together with the database`. Every value encrypted with the old key is then unreadable: signing in with
+  an authenticator app fails with `secrets: cannot decrypt value`, and each workspace has to enter its provider
+  credentials again. Links in emails you already sent (unsubscribe, preference center, open and click tracking) stop
+  working too, because they are signed with a key derived from the secret key. Recovery codes and passkeys still work,
+  because they are not encrypted with the key.
+</Aside>
+
+<Aside type="danger" title="Store the key apart from the dumps">
+  A database dump plus its key opens every stored credential. Keep the key somewhere else than the dump files, for
+  example in your password manager, and limit who can read both. Dumps also hold your contacts' personal data.
+</Aside>
+
+## Before you begin
+
+- Shell access to the server, and the Docker Compose project directory (the one with `docker-compose.yml`) or the
+  binary's environment file.
+- For the binary: `pg_dump`, `pg_restore` and `psql` of the same PostgreSQL major version as your server, or newer.
+- Enough disk space outside the data volume for the dumps.
+
+## Back up
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+The shipped compose file names the project `reputecast`, so its volumes are `reputecast_pgdata` and
+`reputecast_appdata`. The app volume holds the key file and the files folder.
+
+<Steps>
+
+1. Dump the database from inside the `postgres` container, so client and server versions always match. `-T` turns off
+   the terminal, which would otherwise corrupt the binary dump:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-$(date +%F).dump
+   ```
+
+   `pg_dump` takes a consistent snapshot while ReputeCast keeps running.
+
+2. Archive the app volume (secret key and files folder) with a short-lived container. Any image with `tar` works:
+
+   ```sh title="Terminal"
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar czf /backup/appdata-$(date +%F).tar.gz -C /data .
+   ```
+
+   `tar` keeps the owner (user 65532, the image's non-root user) and the `0600` mode of `secret.key`.
+
+3. If you set `REPUTECAST_SECRETS__KEY` yourself instead of using the key file, store that value with your
+   configuration backup.
+
+4. Copy the dump and the archive off the server.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binary">
+
+<Steps>
+
+1. Dump the database. Use the connection details from `REPUTECAST_DATABASE__URL`:
+
+   ```sh
+   pg_dump "postgres://reputecast:secret@localhost:5432/reputecast" -Fc -f reputecast-$(date +%F).dump
+   ```
+
+2. Copy the key file and the files folder. With the defaults both live in the `data` folder of the directory
+   ReputeCast runs in; if you set `secrets.key_file` or `files.dir`, copy those paths instead:
+
+   ```sh
+   tar czf reputecast-data-$(date +%F).tar.gz -C /path/to/reputecast data
+   ```
+
+3. If you set `REPUTECAST_SECRETS__KEY` instead of using a key file, back up the environment file that holds it.
+
+4. Copy the dump and the archive off the server.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Restore
+
+Restore the database before ReputeCast starts. The Docker image runs with `--auto-install`: started on an empty
+database, it creates a new first Owner, which you don't want on top of a restore.
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Stop the app and keep PostgreSQL running. On a new server, start only PostgreSQL:
+
+   ```sh title="Terminal"
+   docker compose stop app
+   docker compose up -d --wait postgres
+   ```
+
+2. Replace the database with an empty one:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres dropdb -U reputecast --force --if-exists reputecast
+   docker compose exec -T postgres psql -U reputecast -d postgres -c 'CREATE DATABASE reputecast'
+   ```
+
+3. On a new PostgreSQL server, create the role that [SQL segments](/self-hosting/postgres/#sql-segments) run as.
+   `pg_dump` copies one database, not the server's roles, and without this role the restore stops with
+   `role "reputecast_segments" does not exist`:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres psql -U reputecast -d postgres \
+     -c 'CREATE ROLE reputecast_segments NOLOGIN NOINHERIT' \
+     -c 'GRANT reputecast_segments TO reputecast'
+   ```
+
+4. Restore the dump:
+
+   ```sh
+   docker compose exec -T postgres pg_restore -U reputecast -d reputecast --exit-on-error < reputecast-2026-10-22.dump
+   ```
+
+5. Put the secret key and files back into the app volume. `docker compose create app` creates the container and its
+   volume without starting it:
+
+   ```sh title="Terminal"
+   docker compose create app
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar xzf /backup/appdata-2026-10-22.tar.gz -C /data
+   ```
+
+6. Start ReputeCast:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   If the image is newer than the backup, it applies the pending migrations at start.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binary">
+
+<Steps>
+
+1. Stop ReputeCast, for example `sudo systemctl stop reputecast`.
+
+2. Recreate the database, as a user that may create databases:
+
+   ```sh title="Terminal"
+   dropdb --force --if-exists reputecast
+   psql -d postgres -c 'CREATE DATABASE reputecast OWNER reputecast'
+   ```
+
+3. On a new PostgreSQL server, create the SQL segments role first and grant it to the app's user (`reputecast` here):
+
+   ```sql title="segments-role.sql"
+   CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+4. Restore the dump as the app's user:
+
+   ```sh
+   pg_restore -d "postgres://reputecast:secret@localhost:5432/reputecast" --exit-on-error reputecast-2026-10-22.dump
+   ```
+
+5. Put the key file and the files folder back where `secrets.key_file` and `files.dir` point, readable only by the user
+   ReputeCast runs as:
+
+   ```sh
+   tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
+   ```
+
+6. If the binary is newer than the backup, run `reputecast migrate up`, then start ReputeCast again.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Check that it worked
+
+- `curl -s http://localhost:8080/readyz` answers `ready`. See [health checks, metrics and logs](/self-hosting/monitoring/).
+- The app logs don't contain `generated a new secret key`. If they do, ReputeCast didn't find the restored key: stop it,
+  put the key back and start it again.
+- Sign in with your password and authenticator app. A working authenticator sign-in proves the key matches the
+  database.
+- Open <UiPath path="nav.providers" /> in a workspace: connected sending providers keep their status instead of asking
+  for credentials.
+
+Test a restore before you need one: restore the latest backup into a second Compose project on another port (for
+example `docker compose -p reputecast-restore-test` with `REPUTECAST_PORT=8090`) and sign in there.
+
+## Troubleshooting
+
+- **`role "reputecast_segments" does not exist` during `pg_restore`**: the server is new. Create the role (step 3 of
+  the restore), recreate the empty database and restore again.
+- **Authenticator sign-in fails with `secrets: cannot decrypt value`**: the database was restored without its key, or
+  with the wrong one. Put the original key back. If it is lost, people sign in with a recovery code or passkey, an
+  instance admin removes their authenticator with
+  [`reputecast user reset-2fa`](/self-hosting/account-recovery/), and each workspace enters its provider credentials
+  again.
+- **A new Owner with a temporary password appears in the logs**: the app started before the database was restored.
+  Stop it, recreate the database and restore again.
+- **`pg_restore: error: unsupported version` or similar**: your `pg_restore` is older than the `pg_dump` that wrote
+  the file. Run the restore inside the `postgres` container, or install a newer client.
+
+## Related
+
+- [Upgrade ReputeCast](/self-hosting/upgrades/): take a backup before every upgrade.
+- [Security and hardening](/self-hosting/security/): how the secret key protects credentials, and how to rotate it.
+- [PostgreSQL](/self-hosting/postgres/): versions, pool size and the SQL segments role.
+- [Recover access from the command line](/self-hosting/account-recovery/).

@@ -27,10 +27,54 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm check
+      - name: Vale (English pages)
+        uses: errata-ai/vale-action@v2
+        with:
+          files: src/content/docs
+          vale_flags: '--glob=!src/content/docs/vi/**'
+          fail_on_error: true
+          filter_mode: nofilter
       - run: pnpm test
-      - run: pnpm build
+      - name: Build (links are validated during the build)
+        run: pnpm build
+        env:
+          # Everything except main is a preview deployment: X-Robots-Tag noindex on every response.
+          DOCS_PREVIEW: ${{ github.ref == 'refs/heads/main' && '0' || '1' }}
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - run: pnpm lhci
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-reports
+          path: |
+            playwright-report
+            test-results
+            .lighthouseci
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: site-dist
           path: dist
           if-no-files-found: error
+
+  deploy:
+    needs: check
+    # Pull requests from forks have no access to the Cloudflare secrets.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-dist
+          path: dist
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.151.3'
+          command: pages deploy dist --project-name=reputecast-docs --branch=${{ github.head_ref || github.ref_name }}

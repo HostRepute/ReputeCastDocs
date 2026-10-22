@@ -1,0 +1,113 @@
+---
+title: Send with SparkPost
+description: Send a SparkPost newsletter through ReputeCast with an API key for your US or EU account; webhooks, DKIM and suppression sync are set up.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: SparkPost newsletter
+sources:
+  - internal/providers/sparkpost
+  - internal/connect
+  - internal/domains/attach.go
+  - web/src/features/connect
+sidebar:
+  order: 8
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+To send a SparkPost newsletter from ReputeCast, you connect an API key and the region of your SparkPost account (US
+or EU). ReputeCast registers a webhook protected by basic auth, sets up DKIM for your sending domain, turns
+SparkPost's tracking off on every message and keeps both suppression lists in sync.
+
+<ProviderMatrix family="email" id="sparkpost" />
+
+## Before you begin
+
+- **A SparkPost account** at `app.sparkpost.com` (US) or `app.eu.sparkpost.com` (EU). The adapter speaks SparkPost's
+  API; Bird Email accounts use a different API and can't be connected with it.
+- **An API key** with the Transmissions, Webhooks, Sending Domains, Suppression Lists, Account, Metrics and Message
+  Events permissions, created under Configuration › API Keys in SparkPost
+  ([SparkPost: Create API keys](https://support.sparkpost.com/docs/getting-started/create-api-keys), checked October
+  2026). EU accounts create keys in the EU app.
+- **Permissions.** Connecting needs `providers:manage`; adding a new sending domain needs `domains:manage`.
+- **A public HTTPS address** for the webhook: `<public URL>/hooks/sparkpost/<token>`. SparkPost posts a test batch
+  to the address before it saves a webhook, so the address must be reachable. Until it is, ReputeCast can poll
+  SparkPost's events API every minute.
+
+## Connect SparkPost
+
+<Steps>
+
+1. Open <UiPath path="nav.providers" />, choose <UiPath path="providers.overview.addProvider" /> and pick SparkPost in
+   the catalog. [Connect a sending provider](/providers/connect/) explains the steps every provider shares.
+
+2. Paste the <UiPath path="providers.fields.apiKey" /> and pick the <UiPath path="providers.fields.region" />: `us`
+   for `api.sparkpost.com`, `eu` for `api.eu.sparkpost.com`. Under the extra SparkPost settings you can name an
+   <UiPath path="providers.fields.ipPool" /> of dedicated IPs to send through.
+
+3. Choose <UiPath path="connect.connection.connect" />. ReputeCast reads your account and its usage with the key,
+   then stores it encrypted. The card shows the account ID, its status and your plan.
+
+4. In <UiPath path="connect.connection.webhooksTitle" />, ReputeCast tests its own public URL, then creates (or
+   updates) a webhook named "ReputeCast" with basic auth (user `reputecast`, a secret ReputeCast generates) for
+   deliveries, bounces, out-of-band bounces, delays, spam complaints, policy rejections, generation failures and
+   unsubscribes. Open and click events aren't subscribed. If the endpoint isn't reachable yet, choose
+   <UiPath path="connect.connection.usePolling" />.
+
+5. Choose <UiPath path="connect.connection.continueDomain" /> and enter your sending domain. ReputeCast adds it as a
+   SparkPost sending domain with a 2048-bit DKIM key and lists the DKIM TXT record. For a subdomain such as
+   `news.acme.io` it also lists the bounce CNAME (to `sparkpostmail.com`, or `eu.sparkpostmail.com` in the EU); an apex
+   domain such as `acme.io` can't hold a CNAME, so it gets DKIM only. ReputeCast suggests DMARC if the domain has none.
+
+6. In <UiPath path="connect.stepTest" />, send a test and watch the delivery event arrive.
+
+7. In <UiPath path="connect.stepStreams" /> and <UiPath path="connect.stepContacts" />, pick the streams and keep the
+   option to pull SparkPost's existing suppressions ticked.
+
+</Steps>
+
+## Check that it worked
+
+- The SparkPost card on <UiPath path="nav.providers > providers.tabProviders" /> shows
+  <UiPath path="providers.statusHealthy" /> and your monthly or daily sending limit with its usage.
+- In SparkPost, the webhook list has a "ReputeCast" webhook that points at `/hooks/sparkpost/…` with basic auth.
+- Deliveries and bounces appear under <UiPath path="nav.providers > providers.tabEvents" />.
+
+SparkPost doesn't sign webhooks, so ReputeCast relies on the basic-auth credentials and the unguessable URL.
+ReputeCast sends one transmission per message, with an idempotency key so a retried call never sends twice, and
+with open and click tracking off. Every message goes out as transactional in SparkPost's terms, because SparkPost
+adds its own `List-Unsubscribe` header to other mail and ReputeCast already adds one with one-click unsubscribe. For
+the same reason, ReputeCast pushes each suppressed address to both of SparkPost's suppression lists, and pulls
+SparkPost's bounce, spam complaint and unsubscribe entries back.
+
+## Troubleshooting
+
+- **"SparkPost rejected this key"** with `401 Unauthorized`. The key is wrong, lacks permissions, or belongs to the
+  other region. Check the key's permissions and that the region matches the app you created it in.
+- **Webhook registration fails.** SparkPost tests the URL before it saves a webhook, so registration fails while
+  SparkPost can't reach ReputeCast. Fix the public URL (see [Reverse proxy and TLS](/self-hosting/reverse-proxy/)),
+  then choose <UiPath path="connect.connection.registerAgain" />.
+- **The domain step lists only a DKIM record.** You entered an apex domain. Send from a subdomain if you want
+  SparkPost's bounce domain to align with yours.
+- **Sending slows down with HTTP 420 errors.** SparkPost answers 420 when your daily or monthly sending limit is used
+  up. ReputeCast treats it as throttling and retries later; raise the limit in SparkPost or route part of the
+  traffic to another provider.
+- **The catalog shows a "Sandbox domain" badge.** ReputeCast has no SparkPost sandbox mode: connect a real sending
+  domain.
+- **Account-level tracking is on.** The tracking check on the Events & sync tab says so even though ReputeCast turns
+  tracking off on every message it sends. To change the account defaults through the API, the key needs write access
+  to Account.
+- **You disconnected SparkPost.** ReputeCast deletes the webhooks that point at its URL. The sending domain and the
+  pushed suppressions stay in SparkPost.
+
+## Related
+
+- [Connect a sending provider](/providers/connect/)
+- [Delivery events and suppression sync](/providers/events-and-sync/)
+- [One-click unsubscribe (RFC 8058)](/deliverability/one-click-unsubscribe/)
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Choose a sending provider](/providers/choose/)

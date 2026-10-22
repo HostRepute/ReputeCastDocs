@@ -1,0 +1,105 @@
+---
+title: Migrate from Notifuse
+description: Migrate from Notifuse to ReputeCast with a workspace API key. Contacts, lists with each subscription status and your email templates come over in one import.
+type: how-to
+audience: [publisher, admin]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: migrate from Notifuse
+sources:
+  - internal/imports/notifuse.go
+  - internal/imports/templates.go
+  - internal/imports/connect.go
+  - internal/transactional/importer/notifuse.go
+  - internal/transactional/importer/notifuse_import.go
+  - internal/transactional/importer/liquid.go
+  - web/src/features/transactional-import/NotifuseOption.tsx
+sidebar:
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+To migrate from Notifuse, you connect ReputeCast to your Notifuse instance with a workspace API key and import its lists, each contact's status on every list, and, if you want, its email templates. ReputeCast only reads from the Notifuse API; nothing changes in Notifuse.
+
+## Before you begin
+
+- You need the `subscribers:import` permission (Owner, Admin and Editor have it).
+- Create an API key in the Notifuse workspace you're moving. Only the workspace owner can create one, and the token is shown once. ReputeCast only reads, so a key scoped to Contacts read and Lists read is enough, plus Templates read to bring the templates. Source: [Notifuse, Admins & API Keys](https://docs.notifuse.com/features/admins-api-keys) (checked October 2026).
+- ReputeCast must reach your Notifuse instance over HTTP or HTTPS. An instance on a private or internal network is refused unless the instance turns on `providers.allow_private_networks` (see the [configuration reference](/reference/configuration/)).
+- Read [how a migration carries consent](/migrate/overview/) if this is your first import.
+
+## Import your Notifuse workspace
+
+<Steps>
+
+1. Open <UiPath path="shell.importContacts" /> and choose **Notifuse**.
+
+2. Enter the <UiPath path="imports.serverAddress" /> of your Notifuse instance, such as `https://notifuse.example.com`, paste the key into <UiPath path="imports.apiKey" /> and select <UiPath path="imports.connect" />. ReputeCast finds the workspace the key belongs to and lists its lists with their counts.
+
+3. Tick the lists to import and pick the ReputeCast list each one goes into. Leave <UiPath path="imports.notifuse.templatesOption" /> on to bring the templates (see below). Keep pulling suppressions from your sending providers on, then continue to field mapping.
+
+4. Map the fields. `email` is required; the other Notifuse contact fields and your custom fields are matched by name.
+
+5. Check the consent step (see the next section), run the preview and start the import. The templates are imported when the contacts are in.
+
+</Steps>
+
+## What moves from Notifuse
+
+- **Lists** become the ReputeCast lists you chose. A contact's status is read on each list, but a suppression is per address: an unsubscribe, bounce or complaint on any one Notifuse list suppresses the address for every ReputeCast list.
+- **Contact fields:** `first_name`, `last_name`, `full_name`, `external_id`, `phone`, `country`, `language`, `timezone`, `job_title` and the address fields.
+- **Custom fields** (`custom_string_1`, `custom_number_1` and so on) arrive under the label you gave them in Notifuse, such as `plan` for a field labelled "Plan". Number and date fields are offered with those types, and JSON fields arrive as JSON text. Labelled fields are always offered; unlabelled ones only when the first 100 contacts of a chosen list use them.
+- **Dates:** the date a contact joined a list becomes the contact's creation date and, for active subscriptions, its consent evidence.
+- **Phone numbers** can be mapped to the contact's phone. SMS consent comes in only when columns for the consent and its date, source and text are mapped, so a Notifuse number usually arrives without SMS consent.
+
+| Status on a Notifuse list | Becomes in ReputeCast                                                                 |
+| ------------------------- | ------------------------------------------------------------------------------------- |
+| `active`                  | Subscribed · confirmed, with the subscription date as evidence (or pending, or Skip)  |
+| `pending`                 | Subscribed · pending, with a re-permission email (or Skip)                            |
+| `unsubscribed`            | Suppressed · unsubscribed: no Broadcasts or Automations, System mail allowed (locked) |
+| `bounced`                 | Suppressed · hard bounce, all streams (locked)                                        |
+| `complained`              | Suppressed · complaint, all streams (locked)                                          |
+
+### Templates
+
+With <UiPath path="imports.notifuse.templatesOption" /> on, ReputeCast reads the workspace's email templates after the contacts:
+
+- **Transactional templates** become [transactional template](/transactional/templates/) drafts. Nothing is published, so your app keeps sending the live versions until someone publishes a draft. Contact fields such as `contact.first_name` become plain variables (`first_name`), because transactional mail is sent to an address, not a contact profile.
+- **Marketing, welcome and other templates** become saved templates in the [composer](/campaigns/templates/), keeping their contact fields. A name that's already taken gets a number, such as "Welcome (2)".
+- **Notifuse's own system emails** (double opt-in, unsubscribe, bounce and blocklist emails) stay behind: ReputeCast sends its own.
+
+Templates built in Notifuse's visual editor arrive as MJML; code-mode templates bring their MJML source. The import log and summary say how many arrived and how many need a manual fix, such as a Liquid filter ReputeCast doesn't have. [Import transactional templates](/migrate/transactional-templates/) explains each conversion note. If the template step fails, the contacts are imported anyway and the log says why.
+
+### What stays in Notifuse
+
+Broadcasts and their statistics, automations, segments, message history, webhooks and provider settings are not imported. Rebuild segments and automations with [segments](/audience/segments/) and [automations](/automations/overview/).
+
+## Rate limits
+
+ReputeCast reads 100 contacts per request, one request at a time, and backs off when the instance answers 429 or a 5xx error:
+
+<LimitsTable area="imports" />
+
+## Check that it worked
+
+- The summary shows how many contacts were imported, merged, suppressed, left pending and skipped, and how many templates arrived as drafts and saved templates.
+- Open <UiPath path="nav.transactional" />: the imported transactional templates are listed as drafts.
+- Open <UiPath path="nav.audience > audience.tabSuppressions" />: unsubscribed, bounced and complained contacts are there.
+
+## Troubleshooting
+
+- **"Notifuse rejected the API key: it isn't attached to a workspace."**: the key was removed, or it belongs to another instance. Create a new key in the right workspace.
+- **"Use the full address, like https://lists.example.com."**: the address has no `http://` or `https://`.
+- **"That address is on a private or internal network."**: use the instance's public address, or have the operator turn on `providers.allow_private_networks`.
+- **"Notifuse rejected the API key (…)" while reading contacts or templates**: Notifuse names the area the key's scope is missing (Contacts, Lists or Templates read). Widen the key on the Notifuse Team page, then connect again.
+- **"Templates weren't imported: …"** in the log: the contacts are in. Open <UiPath path="nav.transactional > transactional.common.importTemplates" /> to bring the transactional templates on their own ([import transactional templates](/migrate/transactional-templates/)).
+
+## Related
+
+- [Move to ReputeCast without losing consent](/migrate/overview/)
+- [Import transactional templates](/migrate/transactional-templates/)
+- [Create and publish transactional templates](/transactional/templates/)
+- [Lists, consent and double opt-in](/audience/lists-and-consent/)

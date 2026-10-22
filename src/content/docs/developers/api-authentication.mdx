@@ -1,0 +1,130 @@
+---
+title: Authentication and API keys
+description: API key authentication for the ReputeCast REST API. Key prefixes, the Bearer header, permissions and list scope, expiry, rotation and the 401 answers.
+type: reference
+audience: [developer, admin]
+permissions: ['apikeys:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: API key authentication
+sources:
+  - internal/api/auth.go
+  - internal/api/api.go
+  - internal/apikeys
+  - internal/authn/tokens.go
+  - internal/authz/authz.go
+  - internal/app/app.go
+  - internal/smtprelay/relay.go
+  - web/src/features/keys
+sidebar:
+  order: 3
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+This page covers API key authentication for the ReputeCast REST API: the credentials it accepts, what a key may do,
+and how keys are created, rotated, revoked and refused. For a first call, follow [make your first API
+call](/developers/api-quickstart/).
+
+## Send the key
+
+Send the key in the `Authorization` header with the `Bearer` scheme on every request:
+
+```http title="Request"
+GET /api/v1/workspaces/acme-newsletter/campaigns HTTP/1.1
+Host: reputecast.example.com
+Authorization: Bearer rc_live_…
+```
+
+- When a request carries a bearer token, the key alone decides who is calling; session cookies are ignored.
+- A key belongs to one [workspace](/reference/glossary/#workspace). Using it in another workspace's path answers
+  `403` with the detail "This key belongs to another workspace."
+- The only operation that needs no workspace in its path is [`GET /api/v1/integration`](/api/operations/get-integration/):
+  it answers with the calling key's workspace slug, name and permissions.
+
+## Credentials
+
+Every secret is a prefix followed by 64 hexadecimal characters. ReputeCast shows it once, when it is created or
+rotated, and stores only its SHA-256 hash.
+
+| Credential                                                                    | Created in                                                                                                                                                         | Used for                                                                                                                                  |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [API key](/reference/glossary/#api-key) <br /> `rc_live_`                     | <UiPath path="nav.settings > settings.keys > keys.createApiKey" />                                                                                                 | The REST API.                                                                                                                             |
+| [Integration key](/reference/glossary/#integration-key) <br /> `rc_live_`     | <UiPath path="nav.settings > settings.integrations" />, when you connect Zapier, Make, n8n or WordPress                                                             | The REST API, limited to the triggers and actions turned on for the integration.                                                          |
+| [Send-only key](/reference/glossary/#send-only-key) <br /> `rc_live_`         | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createKey" />, or <UiPath path="keys.presetSendOnly" /> in the create dialog | The transactional send API. It holds `transactional:send` and nothing else.                                                               |
+| Send-only key in test mode <br /> `rc_test_`                                  | The same dialog, with <UiPath path="transactional.setup.mode" /> set to <UiPath path="transactional.setup.modeTest" />                                             | The transactional send API. It delivers only to the workspace's members and the key's allowed test addresses.                            |
+| SMTP credential <br /> `rc_smtp_`                                             | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createCredential" />                                                         | The password for the [SMTP relay](/transactional/smtp-relay/); the username is the key's ID.                                              |
+| [MCP agent](/reference/glossary/#mcp-agent) token <br /> `rc_agent_`          | <UiPath path="nav.settings > settings.keys > keys.addAgent" />                                                                                                     | The MCP server at `/mcp` (see [connect AI agents with MCP](/developers/mcp/)). The REST API also accepts it, with the agent's permissions. |
+
+The web app signs people in with the `rc_session` cookie. Scripts and services use keys.
+
+## What a key may do
+
+- **Permissions.** You pick 1 to 60 [permission](/reference/glossary/#permission) keys, the same keys roles use.
+  You can grant only permissions you hold yourself; asking for more answers `403` with the code
+  `escalation_denied`. Permissions that only people may hold never reach a key (see the holder rules in
+  [permissions and roles](/reference/permissions/)).
+- **Never more than the creator.** On every call, a key's permissions are cut down to what the member who created it
+  holds at that moment. When the creator loses a permission, the key loses it too. When the creator leaves the
+  workspace, the key keeps authenticating but every operation that needs a permission answers `403`; an integration
+  key answers `owner_deactivated` instead, and someone with `integrations:manage` can take it over.
+- **List scope.** A key can be limited to lists (up to 100; none means all lists). It can't reach lists outside its
+  creator's own scope.
+- **Integration keys** work only for the operations of the triggers and actions turned on for their integration;
+  any other call answers `403` with the code `integration_operation_denied`. Twelve operations accept only an
+  integration's (or a WordPress site's) key.
+- **People only.** Creating and rotating keys, approving sends, account security and Instance admin need a
+  signed-in person. A key calling them gets `403` with the code `humans_only`. These operations are not in the
+  [API reference](/api/).
+
+The permission each operation needs is shown on its page in the API reference and in `x-permission` in the OpenAPI
+document.
+
+## Key lifecycle
+
+Managing keys needs the `apikeys:manage` permission (MCP agents: `mcp:manage`). Creating and rotating happen in the
+app, signed in.
+
+<TableScroll label="Key lifecycle">
+
+| Action                                | What happens                                                                                                                                                                                                                                                           |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Create                                | The secret is shown once. The audit log records `apikey.created` with the permissions and scope, never the secret.                                                                                                                                                    |
+| <UiPath path="keys.rotate" />         | A new secret with the same name, permissions and scope is shown once. **The old secret stops working at once.** A key with an expiry gets the same lifetime again, counted from today. Rotating an expired key replaces it.                                            |
+| Rotate an integration key             | Use <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: the old key keeps working for 24 hours. Rotating it in Keys & MCP answers `409` with the code `managed_by_integration`.                                       |
+| <UiPath path="keys.revoke" />         | The key stops working at once; calls get `401`. You can create a replacement with the same permissions and scope in the same dialog.                                                                                                                                  |
+| Expiry                                | After its expiry date the key answers `401`. Expired keys stay listed with the number of calls that still try to use them, so you can find what to update.                                                                                                             |
+| Delete                                | Removes an expired or revoked key from the list. Active keys must be revoked first.                                                                                                                                                                                   |
+
+</TableScroll>
+
+The keys list shows when each key was last used and from which IP address. Actions a key takes appear in the
+[audit log](/team/audit-log/) with the key as the actor.
+
+## Limits
+
+<LimitsTable area="api-keys" />
+
+## Refused keys
+
+A refused key answers `401` with the code `unauthenticated` and the header `WWW-Authenticate: Bearer realm="reputecast"`.
+The `detail` says why:
+
+| Situation                                        | `detail`                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------ |
+| No `Authorization` header and no session         | `Sign in to continue.`                                                   |
+| A token without a ReputeCast key prefix          | `Unknown API key.`                                                       |
+| An unknown or revoked key                        | `This API key is revoked or unknown.`                                    |
+| An expired key                                   | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
+
+Integration keys answer `401` with the codes `key_revoked` and `key_expired` instead, and their detail names the
+integration to reconnect. When the database can't confirm who is calling, the answer is `503` with the code
+`unavailable`: retry, the key stays valid. Every code is listed in [errors](/developers/api-errors/).
+
+## Related
+
+- [Make your first API call](/developers/api-quickstart/)
+- [Rate limits](/developers/api-rate-limits/)
+- [Roles and permissions](/team/roles-and-permissions/)
+- [Security and hardening](/self-hosting/security/)

@@ -1,0 +1,268 @@
+---
+title: Connect AI agents with MCP
+description: "Connect Claude Code, Cursor or VS Code to an MCP server email marketing teams can control: per-agent tokens, permissions, audit and proposals for sends."
+type: how-to
+audience: [developer, admin]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: MCP server email marketing
+sources:
+  - internal/mcpserver/mcpserver.go
+  - internal/mcpserver/server.go
+  - internal/mcpserver/tools.go
+  - internal/mcpserver/transactional.go
+  - internal/mcpserver/resources.go
+  - internal/app/wire_mcpserver.go
+  - internal/authz/permissions.go
+  - web/src/features/keys/McpPage.tsx
+  - web/src/features/keys/CreateKeyDialog.tsx
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast includes a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server, so an AI assistant
+can read reports, check Send Readiness, draft campaigns or pause a send in your workspace: an MCP server email
+marketing teams can control. Each [MCP agent](/reference/glossary/#mcp-agent) gets its own token and permissions,
+never more than the person who created it, and anything that would send mail goes to a person as a proposal instead
+of running.
+
+## Before you begin
+
+- You need `mcp:manage` in the workspace (a [sensitive permission](/reference/glossary/#sensitive-permission)). You
+  can only give an agent permissions you hold yourself.
+- Your instance needs a public URL your MCP client can reach over HTTPS. The endpoint is `<public URL>/mcp`, served
+  by the web role.
+- If ReputeCast runs behind a reverse proxy, `/mcp` must stream responses without buffering. See
+  [Reverse proxy and TLS](/self-hosting/reverse-proxy/).
+
+## Create an agent
+
+<Steps>
+
+1. Open <UiPath path="nav.settings > settings.keys" />. The MCP card at the top shows the endpoint, for example
+   `https://reputecast.example.com/mcp`.
+
+2. Select <UiPath path="keys.addAgent" />. Give the agent a name that says who uses it, such as "Claude: analytics".
+
+3. Pick its permissions. Start with read access, such as `reports:view` and `deliverability:view`, and add more
+   later. A permission you don't hold is locked. Agents can never hold `subscribers:verify`, `placement:run`,
+   `placement:manage`, `integrations:manage`, `ai:use` or the agency permissions.
+
+4. Optionally limit the agent to some lists and set an expiry, then create it.
+
+5. Copy the token, `rc_agent_…`. It is shown once; ReputeCast keeps only its SHA-256 hash.
+
+</Steps>
+
+<Screenshot
+  id="settings-mcp"
+  alt="Settings, Keys & MCP: the MCP card with the endpoint and a client configuration snippet, and the agents matrix. One agent can read reports and contacts; an ops agent reads provider health and may pause sends but never start them."
+/>
+
+The agents matrix shows what each agent can do, derived from its permissions:
+
+<TableScroll label="Agent capabilities">
+
+| Column                    | Allow when the agent holds                                         | Notes                                                                    |
+| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Read reports and contacts | `reports:view` or `subscribers:view`                               | Shows "Allow · provider health" or "Allow · deliverability" for narrower read access. |
+| Draft campaigns           | `campaigns:edit`                                                   | Drafts only; nothing is sent.                                            |
+| Edit audience             | `subscribers:edit`, `segments:edit` or `lists:manage`              |                                                                          |
+| Schedule or send          | `campaigns:send` shows "Approve"; `campaigns:pause` alone shows "Pause only · never start" | Scheduling always needs a person. See [Proposals](#proposals-for-anything-that-sends). |
+| Change routing            | `providers:manage`                                                 |                                                                          |
+
+</TableScroll>
+
+## Connect your MCP client
+
+The server speaks MCP's **Streamable HTTP** transport. Every request carries the agent token as a bearer token:
+
+```http title="Request headers"
+Authorization: Bearer rc_agent_…
+```
+
+ReputeCast accepts only agent tokens here: an API key (`rc_live_…`) or a session cookie is refused. Pick your client
+below. The examples read the token from the `REPUTECAST_AGENT_TOKEN` environment variable; replace
+`reputecast.example.com` with your public URL.
+
+<Tabs syncKey="mcp-client">
+<TabItem label="Claude Code">
+
+```sh title="Terminal"
+claude mcp add --transport http reputecast https://reputecast.example.com/mcp \
+  --header "Authorization: Bearer $REPUTECAST_AGENT_TOKEN"
+```
+
+To share the server with a project, add it to `.mcp.json` at the project root instead. Claude Code needs
+`"type": "http"` on a server with a `url`; an entry without `type` is read as a local command and skipped:
+
+```json title=".mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Run `claude mcp get reputecast` to check the connection. Source:
+[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp), checked October 2026.
+
+</TabItem>
+<TabItem label="Cursor">
+
+Add the server to `~/.cursor/mcp.json` (every project) or `.cursor/mcp.json` (one project):
+
+```json title="~/.cursor/mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Cursor fills `${env:NAME}` from your environment. Source:
+[Cursor MCP documentation](https://cursor.com/docs/context/mcp), checked October 2026.
+
+</TabItem>
+<TabItem label="VS Code">
+
+Add the server to `.vscode/mcp.json` in your workspace. VS Code asks for the token once and stores it securely:
+
+```json title=".vscode/mcp.json"
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "reputecast-agent-token",
+      "description": "ReputeCast agent token (rc_agent_…)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${input:reputecast-agent-token}" }
+    }
+  }
+}
+```
+
+Source: [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration),
+checked October 2026.
+
+</TabItem>
+<TabItem label="Other clients">
+
+Any client that connects to a remote MCP server by URL and lets you set a request header works. Most use this shape;
+check your client's documentation for the file name and whether it also needs `"type": "http"`:
+
+```json title="mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer rc_agent_…" }
+    }
+  }
+}
+```
+
+A client that only starts local (stdio) servers needs a local bridge to a remote HTTP server; ReputeCast doesn't ship
+one.
+
+</TabItem>
+</Tabs>
+
+<Aside type="danger" title="Treat the token like a password">
+Anyone with the token can act as the agent. Keep it out of shared repositories: use an environment variable or your
+client's secret prompt, as above. If it leaks, revoke the agent in <UiPath path="nav.settings > settings.keys" />.
+</Aside>
+
+## What an agent can do
+
+The server offers 53 tools, 3 resources and 2 prompts. Each tool checks one permission, exactly like an API key, and
+campaigns can be named by their name or ID. The full list, with each tool's permission and effect, is in
+[MCP tools, resources and prompts](/reference/mcp-tools/).
+
+- **Read**: campaign lists and reports, Send Readiness, live send statistics, provider health, routing,
+  deliverability, placement tests, automations, digests, polls, growth, revenue and website content.
+- **Change**: create campaign, SMS, push, WhatsApp and website post drafts; update a campaign's content; create
+  segments; add addresses to the suppression list; change routing weights; pause and resume sends.
+- **Send a test**: `send_test_email` sends a campaign test only to members of the workspace, through the System
+  stream.
+- **Transactional email**: read-only. Agents list and render templates and search the message log, but never send
+  transactional messages.
+- **Resources**: a campaign's MJML, a report as CSV, and the latest 100 audit log entries.
+
+An agent's permissions are checked again on every call against its creator's current role. When the creator loses a
+permission, the agent loses it too; when the creator leaves the workspace or is deactivated, the agent can do nothing.
+
+## Proposals for anything that sends
+
+Agents don't start sends.
+
+- `schedule_campaign` never schedules. It records a proposal for the first member who holds `campaigns:send`, who
+  gets a notification ("Claude: analytics asked to schedule Weekly Digest #142") with a link to the campaign. That
+  person schedules it in ReputeCast, where Send Readiness and approvals apply as usual.
+- A call the agent lacks the permission for is denied. The agent gets an error that names the missing permission, the
+  denial is recorded in the audit log, and a proposal goes to the first member who holds it.
+- The notification states when the proposal expires: 2 hours by default, 1–168 hours under
+  <UiPath path="keys.changeLimits" />. ReputeCast never carries out a proposal itself, so the expiry tells the person
+  how long the request is current; nothing happens when it passes.
+- `pause_campaign` needs `campaigns:pause` and pauses at once. `resume_campaign` needs `campaigns:send` and resumes
+  at once: give `campaigns:send` to an agent only if it may restart a paused send.
+
+## Audit and limits
+
+Every tool call lands in the audit log with the agent as actor, the tool name and the result, including denied calls.
+<UiPath path="keys.recentAgentActions" /> on the same page shows the latest calls; open the
+[audit log](/team/audit-log/) for the rest.
+
+<UiPath path="keys.changeLimits" /> sets the calls per minute per agent and the proposal expiry for the workspace, and
+turns the MCP server off. While it is off, every agent token is refused. An agent over its limit gets `429` with
+`Retry-After: 60`.
+
+<LimitsTable area="mcp" />
+
+## Check that it worked
+
+- Ask your assistant to list the tools of the `reputecast` server, or to call `list_campaigns`. It should list your
+  campaigns.
+- In <UiPath path="nav.settings > settings.keys" />, the agent's last call appears in the agents matrix and under
+  <UiPath path="keys.recentAgentActions" />.
+
+## Troubleshooting
+
+- **401 "use an MCP agent token (rc_agent_…)"**: the client sends an API key or no header. Create an agent and use
+  its token.
+- **401 "this agent was revoked" or "… expired"**: create a new agent or rotate its token in
+  <UiPath path="nav.settings > settings.keys" />.
+- **401 "the MCP server is off"**: turn it on under <UiPath path="keys.changeLimits" />.
+- **The client connects but every tool is denied**: the agent lacks the permission, or its creator no longer holds it.
+  The error names the permission.
+- **Claude Code skips the server**: the `.mcp.json` entry has a `url` but no `"type": "http"`.
+- **Calls hang or time out behind a proxy**: the proxy buffers `/mcp` responses. Turn off buffering for that path.
+- **429 errors**: the agent made more calls than the workspace allows per minute. Raise the limit or slow the agent.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="MCP tools, resources and prompts" href="/reference/mcp-tools/" description="Every tool with its permission and effect." />
+  <LinkCard title="Roles and permissions" href="/team/roles-and-permissions/" description="The permission model agents share with members and keys." />
+  <LinkCard title="Authentication and API keys" href="/developers/api-authentication/" description="Keys for scripts and services that call the REST API." />
+  <LinkCard title="Use the AI assistant with your own model" href="/integrations/ai-assistant/" description="The assistant built into the composer, for people." />
+</CardGrid>

@@ -1,0 +1,100 @@
+---
+title: Provider adapters
+description: How ReputeCast reaches each sending provider through an email provider adapter, built in, mapped over HTTP without code, or run as its own process.
+type: explanation
+audience: [developer, operator, admin]
+uiPath: 'nav.providers > providers.tabAdapters'
+primaryKeyword: email provider adapter
+sources:
+  - docs/adapters.md
+  - internal/providers/provider.go
+  - internal/providers/optional.go
+  - internal/providers/runtime.go
+  - internal/providers/httpgeneric
+  - internal/providers/remote
+  - internal/providers/manage/adapters.go
+  - internal/connect/catalog.go
+  - web/src/features/providers/AdaptersPage.tsx
+  - web/src/features/providers/adapters.messages.ts
+sidebar:
+  order: 1
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+An email provider adapter is the code that talks to one [sending provider](/reference/glossary/#sending-provider): it sends mail, verifies and normalizes the provider's webhooks, and declares what the provider can do. ReputeCast's core never calls a provider directly. It finds adapters in a registry and uses them through one contract, so routing, failover, [Send Readiness](/reference/glossary/#send-readiness), auto-pause and the shared suppression list work the same way for every provider.
+
+## How adapters work
+
+1. **Registration.** Every adapter registers under a key, with a descriptor: its name, capabilities, the provider's terms and the connection form. Built-in adapters use short keys (`ses`, `postmark`); installed adapters use `community:<id>`. Every ReputeCast process re-reads the installed adapters every 15 seconds.
+2. **Catalog.** The setup catalog, the connect wizard and <UiPath path="nav.providers > providers.tabAdapters" /> read the registry, so a new adapter appears in all three.
+3. **Connection.** A workspace admin connects a provider through an adapter from <UiPath path="nav.providers > providers.overview.addProvider" />. Its credentials are sealed at rest and never returned.
+4. **Sending.** The sending engine renders and personalizes each message, then hands the adapter up to its batch size at a time. The adapter returns one result per message.
+5. **Events.** The provider posts webhooks to `/hooks/<adapter key>/<token>`. ReputeCast verifies each request through the adapter before storing it, then the adapter maps it to [normalized events](/providers/events-and-sync/). Hard bounces and complaints go on the shared suppression list.
+6. **Health.** The health job checks each provider's credentials or quota through the adapter. Repeated failures mark the provider down, and routing fails over per stream (see [provider health and outages](/providers/health-and-outages/)).
+
+<Screenshot id="providers-adapters" alt="The Adapters tab lists 11 built-in adapters, from Amazon SES to Generic SMTP, with version, maintainer, events, domain setup, suppression sync and status, and below them community adapters such as Scaleway Transactional Email 0.6.1 with an update available." />
+
+## Three kinds of adapters
+
+<TableScroll label="Kinds of provider adapters">
+
+| Kind         | Runs as                                                      | Written by                                         | Registry key                                       | Installed with                                                                              |
+| ------------ | ------------------------------------------------------------ | -------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Built-in     | Go code inside the ReputeCast binary, tested against the shared contract suite | HostRepute and contributors, released with ReputeCast | `ses`, `postmark`, `mailgun`, …                    | Every release                                                                               |
+| Generic HTTP | A JSON mapping of one provider's HTTP API, run inside the binary | Any instance admin, without code                  | `httpgeneric`, or `community:<name>` once saved    | The form on the Adapters tab, or a manifest of kind `http`                                  |
+| Community    | Its own process, in any language (TypeScript with the SDK)  | Anyone                                             | `community:<id>`                                   | `reputecast adapter install`, or <UiPath path="providers.adapters.installFromRegistry" />  |
+
+</TableScroll>
+
+Built-in adapters exist for Amazon SES, Postmark, Postal, Mailgun, SendGrid, Resend, SparkPost, Mailjet, Brevo, Azure Communication Services and any SMTP server; [choose a sending provider](/providers/choose/) compares them. Every installed community adapter shows its version, maintainer, the capabilities its manifest declares and its update status. One without a release for a year is marked Unmaintained and is no longer offered for new connections.
+
+## What an adapter declares
+
+Each adapter states what the provider can do. These declarations become the badges in the catalog and on the routing screen:
+
+- **Bulk-marketing terms:** allowed, Broadcast streams only, not allowed, or "your policy" for self-hosted servers and mapped APIs. Routing and Send Readiness use them.
+- **Webhooks:** whether the provider reports deliveries, bounces and complaints. Without webhooks, ReputeCast gets no bounces or complaints from that provider (generic SMTP reads a bounce mailbox instead).
+- **Domain setup:** through the provider's API, or manual DNS records.
+- **Suppression sync:** two-way, pull only, or local only. With local only, ReputeCast enforces the shared suppression list itself before sending.
+- **Batch size:** how many distinct messages go in one API call.
+- **Sandbox, quota and rate discovery, dedicated IPs and pricing**, and whether the provider tracks opens and clicks by default.
+
+## Choose an adapter
+
+- **A built-in adapter exists for your provider:** use it. Built-in adapters cover the provider's domain, webhook and suppression APIs where they exist, and they are tested with every release.
+- **The provider takes one HTTP request per message and posts JSON webhooks** with an HMAC signature, Standard Webhooks, basic auth or a secret header: map it with the [generic HTTP adapter](/adapters/generic-http/). A mapping sends one message per request, uses manual DNS and local-only suppressions, and has no quota discovery. The how-to is [connect any HTTP email API](/providers/generic-http/).
+- **You need batches, a domain API, suppression sync, quota discovery, subscription handshakes or logic a mapping can't express:** [write a community adapter](/adapters/community/). It runs in its own process, reaches only the hosts its manifest declares, and talks to ReputeCast over the signed [adapter protocol](/adapters/protocol/).
+- **The provider should ship with ReputeCast for everyone:** [contribute a built-in adapter](/adapters/built-in/) in Go.
+
+## Who does what
+
+- **The adapter author** writes the adapter and publishes its image and `manifest.json`.
+- **The operator** who runs the ReputeCast server runs the adapter process and tells ReputeCast where it listens, with its signing secret.
+- **An instance admin** installs the adapter. Installed adapters apply to every workspace, so only instance admins can install, update or remove them.
+- **A workspace admin** with `providers:manage` connects a provider through it, like any built-in adapter.
+
+## Defaults and limits
+
+These limits apply to community adapters that run in their own process:
+
+<LimitsTable area="adapters" />
+
+## When to change them
+
+- Declare `capabilities.batch` (1 to 1,000) in the manifest when the provider's API accepts several distinct, personalized messages in one call.
+- Turn on `providers.allow_private_networks` only when an adapter process or a mapped API runs on a loopback or private address, such as a sidecar container. Link-local and cloud metadata addresses stay refused.
+- The SDK remembers successful answers for 15 minutes (`serve({ idempotencyTtlMs })`). The protocol requires at least 15 minutes, so don't lower it.
+
+Every other limit is fixed.
+
+## Related
+
+- [Generic HTTP adapter reference](/adapters/generic-http/) lists every field of a mapping.
+- [Write a community adapter](/adapters/community/) builds, tests and installs an adapter from the template.
+- [Adapter protocol v1](/adapters/protocol/) is the wire reference for community adapters.
+- [Contribute a built-in adapter](/adapters/built-in/) covers the Go contract and the contract suite.
+- [Supported services](/reference/supported-services/) lists every provider ReputeCast works with.

@@ -1,0 +1,181 @@
+---
+title: Recover access from the command line
+description: Reset admin password, two-factor and sign-in lockouts from the server with the reputecast user commands, in Docker or with the binary.
+type: how-to
+audience: [operator]
+primaryKeyword: reset admin password
+sources:
+  - internal/cli/user.go
+  - internal/cli/root.go
+  - internal/accounts/reset.go
+  - internal/accounts/signin.go
+  - internal/store/queries/users.sql
+  - internal/store/queries/throttle.sql
+  - internal/instance/users.go
+  - web/src/features/admin/users/UsersPage.tsx
+  - web/src/features/admin/users/UserDialogs.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+When nobody can fix an account in the app, reset admin password, two-factor and lockouts from the server with the
+`reputecast user` commands. They talk to the database directly, so they work before any sending provider is connected
+and while every admin is locked out.
+
+## Before you begin
+
+- Shell access to the server that runs ReputeCast.
+- The commands need the same configuration as the server, at least the database URL:
+  - **Docker Compose:** run them inside the running app container, which already has its environment:
+    `docker compose exec app /usr/local/bin/reputecast user …`
+  - **Binary:** load the environment the service uses first, for example `set -a; . /etc/reputecast/env; set +a`,
+    then run `reputecast user …`.
+- The person's account email. Every command takes `--email`.
+
+Each command writes an [audit log](/reference/glossary/#audit-log) entry with the actor **CLI (server)**. The commands
+exit with `0` on success, `2` for a usage error (a missing `--reason`, a password that is too short) and `1` for other
+errors, such as `Error: no account for <email>`.
+
+| Situation                                     | Command                                                         |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| Forgotten password                            | `reputecast user reset-password --email <address>`              |
+| Forgotten password, and no way to pass a link | `reputecast user reset-password --email <address> --password …` |
+| Lost authenticator app                        | `reputecast user reset-2fa --email <address> --reason "…"`      |
+| Locked out after failed sign-ins              | See [clear a sign-in lockout](#clear-a-sign-in-lockout)         |
+| No instance admin left                        | `reputecast user make-admin --email <address>`                  |
+
+## Reset a forgotten password
+
+<Steps>
+
+1. Print a one-time reset link:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io
+   ```
+
+   ```txt title="Output"
+   One-time password reset link for aisha@acme.io (works once, until 12:39 UTC):
+
+     https://reputecast.acme.io/reset-password/<token>
+
+   Send it to them privately. Their current password keeps working until they use it.
+   ```
+
+   The link uses the public URL saved in <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, or
+   `http.public_url` before one is saved. A deactivated account is refused:
+   `<email> is deactivated; reactivate the account first`.
+
+2. Send the link to the person over a private channel. It works once, for 15 minutes.
+
+3. They open it and choose a new password. The instance's password policy applies (length, re-use, breach check).
+   Setting it signs out every session and clears a sign-in lockout; the next sign-in still asks for their second factor.
+
+</Steps>
+
+When no sending provider can send on the System stream yet, the sign-in page's <UiPath path="auth.forgotPassword" />
+link shows this same command instead of sending an email.
+
+### Set a password directly
+
+With `--password`, the command sets the password at once instead of printing a link:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io --password 'a long passphrase here'
+```
+
+It answers `Password set for aisha@acme.io. Every session was signed out.` and cancels open reset links. The password
+must meet `auth.password_min_length` from the [configuration](/reference/configuration/) (default 12 characters),
+not the policy in Instance admin; a shorter one stops with `Error: Use at least 12 characters. Passphrases are fine.`
+
+<Aside type="caution">
+  A password on the command line lands in your shell history. Prefer the reset link, or have the person change the
+  password right after they sign in.
+</Aside>
+
+## Remove a lost authenticator
+
+<Steps>
+
+1. Confirm the request comes from the person, for example on a call, not from an email asking for it.
+
+2. Remove their authenticator app with a reason, which goes into the audit log:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-2fa --email aisha@acme.io --reason "lost phone, verified by video call"
+   ```
+
+   It answers `Two-factor reset for aisha@acme.io. They have 72 hours to set it up again.` Without `--reason` it stops
+   with `Error: --reason is required; it's written to the audit log`.
+
+3. The person signs in with their password. The command removed their authenticator and recovery codes and signed out
+   their sessions; their passkeys stay. They are asked to add a passkey or an authenticator again, and must do so
+   within 72 hours.
+
+</Steps>
+
+A person who still has a [recovery code](/reference/glossary/#recovery-code) doesn't need this: they choose the
+recovery code option at the second sign-in step. In the app, an instance admin can do the same reset with
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, then **⋯** › <UiPath path="admin.resetTwoFactor" />.
+That version asks for the admin's password, notifies the person and uses the policy's grace period instead of 72
+hours.
+
+## Clear a sign-in lockout
+
+After too many failed passwords (10 by default), sign-in for that email answers
+`Sign-in is locked after too many attempts. Try again after <time>, reset your password, or use a passkey.`
+
+- **In the app:** <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, then **⋯** ›
+  <UiPath path="admin.unlockSignIn" /> lifts the lock at once.
+- **With a reset link:** setting a new password through a `reputecast user reset-password` link lifts the lock.
+- **By waiting:** the lock ends by itself after the lock period (15 minutes by default).
+
+`reputecast user unlock --email <address>` answers `<email> can sign in again.` and clears the account's failed-attempt
+count. In this version it does not lift the lock that password sign-in checks first, so password sign-in stays locked
+until the lock period ends. Use one of the three ways above.
+
+## Make someone an instance admin
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user make-admin --email linh@acme.io
+```
+
+It answers `linh@acme.io is now an instance admin.` The command only grants the flag. To take it away, use
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, then **⋯** › <UiPath path="admin.removeInstanceAdmin" />.
+
+<Aside type="tip" title="When single sign-on is down">
+  On a domain where [SSO is enforced](/self-hosting/sso/), password sign-in is off, so a password reset doesn't help.
+  Owners at that domain marked as break-glass, including the first Owner created by `reputecast install`, keep password
+  and two-factor sign-in. If none can sign in, make an account at another domain an instance admin and turn enforcement
+  off in <UiPath path="shell.userMenuInstanceAdmin > admin.sso" />.
+</Aside>
+
+## Check that it worked
+
+- The person signs in, or opens their reset link before it expires.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> lists the command with the actor **CLI (server)**.
+
+## Troubleshooting
+
+- **`Error: no account for <email>`**: the email doesn't match an account. The commands match the address
+  case-insensitively; check for typos or an old address.
+- **The reset link points at `http://localhost:8080`**: no public URL is saved yet, and `http.public_url` is the default.
+  Set the public URL, or replace the host in the link with the address people use.
+- **The command can't connect to the database** with the binary: it doesn't have the server's database URL and falls
+  back to the default `localhost:5432`. Load the service's environment first.
+- **Still locked after `reputecast user unlock`**: expected in this version. Use
+  <UiPath path="admin.unlockSignIn" /> in the app, a reset link, or wait for the lock to end.
+
+## Defaults and limits
+
+<LimitsTable area="authentication" />
+
+## Related
+
+- [Instance admin](/self-hosting/instance-admin/): the same actions in the app.
+- [Secure your account](/team/account-security/): passwords, passkeys, authenticator apps and recovery codes.
+- [CLI reference](/reference/cli/): every `reputecast` command and flag.

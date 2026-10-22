@@ -13,14 +13,18 @@ export type UiLabelReport = {
 export type ReadFile = (path: string) => string | undefined
 
 /**
- * The upstream file holding the Vietnamese text of `source`: `messages.ts` → `messages.vi.ts`,
- * `x.messages.ts` → `x.messages.vi.ts`, `messages/en.json` → `messages/vi.json`.
- * Undefined for sources with no translation file convention (`.tsx` screens with hard-coded English).
+ * Upstream files that may hold the Vietnamese text of `source`, in order: `messages.ts` → `messages.vi.ts`,
+ * `x.messages.ts` → `x.messages.vi.ts`, `common.ts` → `common.vi.ts` or `common.messages.vi.ts`,
+ * `messages/en.json` → `messages/vi.json`. Empty for sources with no translation file convention (`.tsx` screens
+ * with hard-coded English).
  */
-export function viSibling(source: string): string | undefined {
-  if (source.endsWith('/en.json') || source === 'en.json') return source.replace(/en\.json$/, 'vi.json')
-  if (source.endsWith('.ts') && !source.endsWith('.vi.ts')) return source.replace(/\.ts$/, '.vi.ts')
-  return undefined
+export function viSiblings(source: string): string[] {
+  if (source.endsWith('/en.json') || source === 'en.json') return [source.replace(/en\.json$/, 'vi.json')]
+  if (!source.endsWith('.ts') || source.endsWith('.vi.ts')) return []
+  const plain = source.replace(/\.ts$/, '.vi.ts')
+  return source.endsWith('.messages.ts') || source.endsWith('/messages.ts') || source === 'messages.ts'
+    ? [plain]
+    : [plain, source.replace(/\.ts$/, '.messages.vi.ts')]
 }
 
 /**
@@ -63,7 +67,8 @@ export function checkUiLabels(rows: readonly Record<string, unknown>[], readFile
       continue
     }
     if (!hasLiteral(src, en, source.endsWith('.tsx'))) problems.push(`${id}: English "${en}" not found in ${source}`)
-    const sibling = viSibling(source)
+    const candidates = viSiblings(source)
+    const sibling = candidates.find((path) => readFile(path) !== undefined) ?? candidates[0]
     const viSrc = sibling === undefined ? undefined : readFile(sibling)
     if (vi !== undefined) {
       if (viSrc === undefined)

@@ -1,0 +1,217 @@
+---
+title: Record events and conversions
+description: Use the conversion tracking API to credit upgrades and orders to the email that brought them, and send API events that start automations.
+type: how-to
+audience: [developer]
+permissions: ['conversions:create', 'subscribers:edit']
+uiPath: 'nav.earn > earn.tabSettings > earn.settings.tabAttribution'
+primaryKeyword: conversion tracking API
+sources:
+  - internal/automations/events.go
+  - internal/automations/graph.go
+  - internal/automations/api.go
+  - internal/revenue/conversions.go
+  - internal/revenue/attribution.go
+  - internal/revenue/api.go
+  - internal/clicktoken/clicktoken.go
+  - internal/earn/hooks.go
+  - web/src/features/earn/revenue/attribution.messages.ts
+  - web/src/features/keys/CreateKeyDialog.tsx
+  - src/data/api-samples/send-automation-event.yaml
+  - src/data/api-samples/create-conversion.yaml
+sidebar:
+  order: 11
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Your product knows things ReputeCast doesn't: a trial started, a plan was upgraded, an order was paid. Two endpoints
+bring those facts in. **API events** start and steer [automations](/reference/glossary/#automation). The
+**conversion tracking API** records what an action was worth and credits it to the campaign or automation email the
+reader clicked, so revenue shows up next to your emails.
+
+## Before you begin
+
+- An API key. API events need `subscribers:edit`. Conversions need `conversions:create`; the
+  <UiPath path="keys.presetConversions" /> preset in <UiPath path="nav.settings > settings.keys" /> holds that permission
+  and nothing else and expires after 1 year by default. <UiPath path="earn.attribution.createKey" /> under
+  <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" /> opens the same dialog.
+- The contact must already exist in the workspace. Neither endpoint creates contacts; use
+  [Create or update a contact](/developers/integration-api/#actions) first.
+
+## Send an API event
+
+`POST /api/v1/workspaces/<workspace>/automations/events` records an event for one contact:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:edit.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/automations/events \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "event": "trial.started",
+    "email": "sam.rivera@outlook.com",
+    "properties": { "plan": "team", "trial_days": 14 }
+  }'
+```
+
+- `event` names it: letters, numbers and `. _ : -`, starting with a letter or number, up to 100 characters
+  (`trial.started`, `workspace.created`).
+- Say who it is about with `email` or `contactId`. An unknown address answers `404`: add the contact first.
+- `properties` is any JSON object up to 16 KB.
+
+The answer is `202` with the contact and the number of live automations the event starts:
+
+```json title="202 Accepted"
+{ "accepted": true, "contactId": "0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f", "flows": 1 }
+```
+
+### Use the event in an automation
+
+<Steps>
+
+1. In <UiPath path="nav.automations" />, open a flow and set its trigger to
+   <UiPath path="automations.graph.kindApiEvent" />.
+
+2. Type the same <UiPath path="automations.panels.eventName" /> your product sends, for example `trial.started`.
+   The match is exact.
+
+3. Publish the flow. Contacts enroll within seconds of each event.
+
+</Steps>
+
+Goals and branches can wait for an event too, with the <UiPath path="automations.panels.condEvent" /> condition. The
+full list of triggers and steps is in [Triggers and steps](/automations/triggers-and-steps/).
+
+Events are contact activity, like opens and clicks, so they don't appear in the audit log. Each call records a new
+event: don't retry a call that was answered `202`.
+
+## Record a conversion
+
+`POST /api/v1/workspaces/<workspace>/conversions` records something valuable a reader did in your product:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with conversions:create.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# Add "click_token" with the rc_click value of the link the reader followed, when you have it.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/conversions \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: order-1042' \
+  --data '{
+    "name": "Upgraded to Team plan",
+    "value": "29.00",
+    "currency": "USD",
+    "email": "sam.rivera@outlook.com",
+    "metadata": { "order_id": "1042" }
+  }'
+```
+
+<TableScroll label="Conversion fields">
+
+| Field         | Required          | What it holds                                                                                  |
+| ------------- | ----------------- | ---------------------------------------------------------------------------------------------- |
+| `name`        | Yes               | What happened, up to 120 characters: "Upgraded to Team plan".                                  |
+| `value`       | Yes               | A decimal **string**, `"29.00"`, not `29`. No more decimals than the currency has.             |
+| `currency`    | Yes               | A three-letter ISO 4217 code: `USD`, `EUR`, `JPY`.                                             |
+| `email`       | One of the two    | The reader's address.                                                                          |
+| `click_token` | One of the two    | The `rc_click` value from the link the reader followed. See [Pass the click token](#pass-the-click-token). |
+| `occurred_at` | No                | When it happened, as RFC 3339. Up to 30 days back; now when you leave it out.                  |
+| `metadata`    | No                | Your own fields, kept with the conversion (up to 8 KB).                                         |
+
+</TableScroll>
+
+Send an `Idempotency-Key` header (up to 200 characters), such as your order ID. Sending the same key again with the
+same body answers with the first conversion instead of recording a second; the same key with a different body
+answers `409 idempotency_key_reused`. Keys are remembered per API key.
+
+The answer is `202` and says how the conversion was matched:
+
+```json title="202 Accepted"
+{
+  "id": "0192f1c4-9e21-7a40-8c3b-2d4f6a8b0c1e",
+  "matched": "click_token",
+  "credited": { "kind": "campaign", "id": "0192f0aa-1b2c-7d3e-9f40-5a6b7c8d9e0f", "name": "Weekly Digest #142" }
+}
+```
+
+## How a conversion is credited
+
+ReputeCast credits a conversion to the last campaign or automation email the reader clicked within the
+**attribution window**: 7 days by default, 1–30 days under
+<UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution > earn.attribution.windowTitle" />.
+
+1. With a valid `click_token`, the email that carried the clicked link, when the click falls within the window before
+   `occurred_at`. `matched` is `click_token`.
+2. Otherwise, with an `email` that matches a contact: `matched` is `email`, and the conversion is credited to the last
+   email that contact clicked within the window, if there is one.
+3. Otherwise `matched` is `none`. The conversion is kept, credited to nothing.
+
+When nothing is credited, the answer has no `credited` field.
+
+A credited conversion fires the `conversion.recorded` webhook event ([Webhook events](/reference/webhook-events/)).
+Conversions appear in <UiPath path="earn.attribution.logTitle" /> and as product conversions on the revenue overview;
+they don't count toward MRR ([Revenue metrics explained](/earn/revenue/)).
+
+### Pass the click token
+
+Matching by email only works when the reader is a known contact who clicked. The click token also works when the
+reader signs up with another address:
+
+<Steps>
+
+1. Turn on <UiPath path="earn.attribution.tokenTitle" /> and add the domains of your product, such as
+   `app.example.com`.
+
+2. Links in your emails to those domains then carry `rc_click=…`. The token is opaque and signed, and it is never
+   added to links to other domains, sponsor links included.
+
+3. In your product, read `rc_click` from the landing URL and keep it with the visitor (for example, in their session
+   or on the signup record).
+
+4. Send it as `click_token` when the conversion happens. A token older than the attribution window no longer
+   credits anything.
+
+</Steps>
+
+## Errors and limits
+
+- `422 missing_identity`: send `email`, `click_token` or both.
+- `422 invalid_value`: send the value as a decimal string with no more decimals than the currency allows.
+- `422 invalid_currency`: use a three-letter ISO 4217 code.
+- `422 occurred_at_out_of_range`: `occurred_at` is more than 30 days ago or in the future.
+- `409 idempotency_key_reused`: the key came with a different body.
+- `429 rate_limited`: each key records up to 600 conversions per minute; wait for `Retry-After`.
+
+Every code is listed in [Errors](/developers/api-errors/).
+
+## Check that it worked
+
+- Under <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" />,
+  <UiPath path="earn.attribution.sendTest" /> records a test conversion for your own address. Your product's
+  conversions show up in <UiPath path="earn.attribution.logTitle" />, newest first.
+- An API event's answer says how many live flows it started (`flows`). The automation's step statistics show the
+  contact entering.
+
+## Troubleshooting
+
+- **`matched: "none"` or no `credited`**: the reader didn't click an email within the window, or the address isn't a
+  contact. Pass the click token, or widen the window.
+- **`flows: 0`**: no live automation has an API event trigger with exactly this event name. Check the spelling and
+  that the flow is published.
+- **`404` on an API event**: the contact doesn't exist; create it first.
+- **Duplicate conversions**: send an `Idempotency-Key` and reuse it on retries.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Earn from your newsletter" href="/earn/overview/" description="Paid subscriptions, revenue and attribution." />
+  <LinkCard title="Build automations" href="/automations/overview/" description="Flows that react to your product's events." />
+  <LinkCard title="Build an integration" href="/developers/integration-api/" description="Contacts, lists, tags and events from other tools." />
+  <LinkCard title="API reference" href="/api/operations/create-conversion/" description="The create-conversion operation in full." />
+</CardGrid>

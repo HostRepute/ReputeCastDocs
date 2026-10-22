@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { checkUiLabels, checkUiLabelsAt, hasLiteral, viSibling } from '../../scripts/upstream/lib/ui-labels.ts'
+import { checkUiLabels, checkUiLabelsAt, hasLiteral, viSiblings } from '../../scripts/upstream/lib/ui-labels.ts'
 
 // Verbatim snippets of the upstream files named in `source`, at their upstream-relative paths.
 const root = join(import.meta.dirname, '../fixtures/upstream')
@@ -81,13 +81,28 @@ describe('hasLiteral', () => {
   })
 })
 
-describe('viSibling', () => {
+describe('viSiblings', () => {
   it('maps message sources to their Vietnamese files', () => {
-    expect(viSibling('web/src/features/settings/messages.ts')).toBe('web/src/features/settings/messages.vi.ts')
-    expect(viSibling('web/src/features/audience/health.messages.ts')).toBe(
+    expect(viSiblings('web/src/features/settings/messages.ts')).toEqual(['web/src/features/settings/messages.vi.ts'])
+    expect(viSiblings('web/src/features/audience/health.messages.ts')).toEqual([
       'web/src/features/audience/health.messages.vi.ts',
-    )
-    expect(viSibling('internal/pagelabels/messages/en.json')).toBe('internal/pagelabels/messages/vi.json')
-    expect(viSibling('web/src/features/keys/KeysPage.tsx')).toBeUndefined()
+    ])
+    expect(viSiblings('web/src/i18n/common.ts')).toEqual([
+      'web/src/i18n/common.vi.ts',
+      'web/src/i18n/common.messages.vi.ts',
+    ])
+    expect(viSiblings('internal/pagelabels/messages/en.json')).toEqual(['internal/pagelabels/messages/vi.json'])
+    expect(viSiblings('web/src/features/keys/KeysPage.tsx')).toEqual([])
+  })
+
+  it('reads Vietnamese from common.messages.vi.ts when common.vi.ts does not exist', () => {
+    const files: Record<string, string> = {
+      'web/src/i18n/common.ts': "export const common = { save: 'Save changes' }",
+      'web/src/i18n/common.messages.vi.ts': "export default { save: 'Lưu thay đổi' }",
+    }
+    const rows = [
+      { id: 'common.saveChanges', en: 'Save changes', vi: 'Lưu thay đổi', source: 'web/src/i18n/common.ts' },
+    ]
+    expect(checkUiLabels(rows, (p) => files[p])).toEqual({ problems: [], viAvailable: [] })
   })
 })

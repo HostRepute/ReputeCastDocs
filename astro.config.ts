@@ -9,6 +9,8 @@ import previewNoindex from './src/integrations/preview-noindex.ts'
 import { sidebarTopics } from './src/lib/sidebar.ts'
 
 const isPreview = process.env.DOCS_PREVIEW === '1'
+// Pages whose #anchors come from reference components (glossary terms, CLI commands, keys, tables).
+const COMPONENT_ANCHORS = /^\/(vi\/)?(reference\/[^/#]+|developers\/api-errors)\/#/
 // Placeholder that starlight-openapi fills with the generated API reference pages (Developers topic).
 const apiSidebarGroup = createOpenAPISidebarGroup()
 const topicsConfig = sidebarTopics(apiSidebarGroup)
@@ -76,7 +78,13 @@ export default defineConfig({
           exclude: ['/', '/vi/'],
           topics: { developers: ['/api/**'] },
         }),
-        starlightLinksValidator(),
+        starlightLinksValidator({
+          // Install guides link to the reader's own instance on localhost.
+          errorOnLocalLinks: false,
+          // Anchors rendered by data components and the generated API pages are invisible to the validator;
+          // scripts/content/check-links.ts checks them in dist/ after the build.
+          exclude: ({ link }) => /^\/(vi\/)?api\//.test(link) || (link.includes('#') && COMPONENT_ANCHORS.test(link)),
+        }),
         starlightImageZoom(),
         starlightLlmsTxt({
           projectName: 'ReputeCast',

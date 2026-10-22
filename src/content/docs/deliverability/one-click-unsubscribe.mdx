@@ -1,0 +1,182 @@
+---
+title: One-click unsubscribe (RFC 8058)
+description: How ReputeCast supports one-click unsubscribe RFC 8058, with the exact List-Unsubscribe headers it adds, the POST endpoint, what changes, and a curl test.
+type: explanation
+audience: [publisher, admin, developer]
+primaryKeyword: one-click unsubscribe RFC 8058
+sources:
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/automation.go
+  - internal/providers/provider.go
+  - internal/publicurl/publicurl.go
+  - internal/publicpages/publicpages.go
+  - internal/publicpages/tokens.go
+  - internal/publicpages/notifications.go
+  - internal/audience/signup.go
+  - internal/linktoken/linktoken.go
+  - internal/transactional/send.go
+  - internal/readiness/assemble.go
+  - internal/providers/brevo/brevo.go
+  - internal/providers/azureacs/azureacs.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[One-click unsubscribe](/reference/glossary/#one-click-unsubscribe) lets a reader leave your newsletter from the
+Unsubscribe button their mail app shows next to the sender, without opening a web page. RFC 8058 defines how it works:
+two message headers and an HTTPS POST. ReputeCast adds the one-click unsubscribe RFC 8058 headers to every Broadcast
+and Automation message and answers the POST itself, so you don't configure anything; this page explains what it sends
+and how to test it.
+
+## The headers ReputeCast adds
+
+Every Broadcast and Automation message carries these headers (`TOKEN` stands for the signed token of one recipient):
+
+```txt title="Headers of a Broadcast message"
+List-Unsubscribe: <https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN>, <mailto:digest@news.acme.io?subject=unsubscribe%20TOKEN>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Feedback-ID: 0199ab12:acme-newsletter:broadcast:reputecast
+```
+
+- **The HTTPS address** is your instance's public URL, then `/p/<workspace>/unsubscribe/<token>`. It always uses the
+  instance's public URL, also when the workspace's public pages run on a [custom domain](/forms/branding-and-domain/).
+- **The token** identifies the workspace, the message and the contact. It is signed with an HMAC derived from the
+  instance's secret key, carries no personal data in clear text, and doesn't expire.
+- **The `mailto:` address** is the campaign's Reply-To address, or the sender's Reply-To, or else the From address,
+  with the subject `unsubscribe <token>`. It is there for mail apps that can't send the POST. ReputeCast doesn't read
+  mail sent to it: those requests arrive in that mailbox, and you unsubscribe the contact by hand in
+  [Manage contacts](/audience/contacts/).
+- **`Feedback-ID`** is for Gmail's feedback loop: the start of the campaign ID, the workspace, the stream and
+  `reputecast`.
+
+RFC 8058 requires one HTTPS URI in `List-Unsubscribe`, the exact value `List-Unsubscribe=One-Click` in
+`List-Unsubscribe-Post`, and a DKIM signature that covers both headers
+([RFC 8058, sections 3.1 and 4](https://www.rfc-editor.org/rfc/rfc8058#section-3.1), checked October 2026). The DKIM
+signature comes from your sending provider, so it depends on [DKIM being set up](/deliverability/spf-dkim-dmarc/).
+
+### Which messages carry them
+
+<TableScroll label="One-click unsubscribe headers by stream">
+
+| Messages                                                   | Headers                                                                                         |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Broadcasts (campaigns)                                     | `List-Unsubscribe` with the HTTPS address and `mailto:`, and `List-Unsubscribe-Post`             |
+| Automations                                                | The same                                                                                        |
+| Transactional email in an Optional category                | `List-Unsubscribe` with the HTTPS address only, and `List-Unsubscribe-Post`                      |
+| Transactional email in an Essential category               | None. These can't be turned off; their unsubscribe link opens the preference center              |
+| System mail: confirmations, password resets, test sends    | None                                                                                            |
+| Placement test copies                                      | The Broadcast headers, but an unsubscribe from a copy changes nothing                            |
+
+</TableScroll>
+
+Gmail and Yahoo require one-click unsubscribe for marketing mail only; transactional messages are exempt
+([Google, Email sender guidelines FAQ](https://support.google.com/a/answer/14229414), checked October 2026). See
+[Transactional email in ReputeCast](/transactional/overview/) for the categories.
+
+Two sending providers change this:
+
+- **Brevo** removes ReputeCast's two headers and sets its own, so one-click unsubscribes go to Brevo, which reports them
+  to ReputeCast through its unsubscribe webhook. ReputeCast then adds the address to the suppression list. See
+  [Send with Brevo](/providers/brevo/).
+- **Azure Communication Services** doesn't cover `List-Unsubscribe` with its DKIM signature, so Gmail and Yahoo
+  one-click unsubscribe can't be relied on there. See
+  [Send with Azure Communication Services](/providers/azure-communication-services/).
+
+## How a one-click unsubscribe works
+
+1. At send time, ReputeCast signs a token for each recipient and puts the address in the headers and in the
+   `{{ unsubscribe_url }}` link of the footer.
+2. The mail app shows its Unsubscribe button. Gmail shows it only for messages that pass its own eligibility checks,
+   even when the headers are correct ([FAQ](https://support.google.com/a/answer/14229414), checked October 2026).
+3. When the reader confirms, the mail app sends an HTTPS POST with the body `List-Unsubscribe=One-Click`, without
+   cookies or any login.
+4. ReputeCast checks the token and unsubscribes the contact in the same request, then answers `200` with the text
+   `Unsubscribed.`
+5. From then on, Broadcasts and Automations skip the address.
+
+```http title="The request a mail app sends"
+POST /p/acme-newsletter/unsubscribe/TOKEN HTTP/1.1
+Host: reputecast.acme.io
+Content-Type: application/x-www-form-urlencoded
+
+List-Unsubscribe=One-Click
+```
+
+| Answer | When                                                                                                  |
+| ------ | ----------------------------------------------------------------------------------------------------- |
+| `200`  | `Unsubscribed.` The contact is unsubscribed, or already was. Repeating the request changes nothing. |
+| `400`  | The body couldn't be read.                                                                            |
+| `404`  | The token is invalid, damaged, or belongs to another workspace.                                       |
+| `500`  | The database failed: "Couldn't unsubscribe right now; try again in a minute."                         |
+
+The endpoint reads the field from the body only, sent as `application/x-www-form-urlencoded` or
+`multipart/form-data`, and never redirects a one-click POST. A `GET` on the same address opens the unsubscribe page
+(with the optional "fewer emails" offer and reason) and changes nothing until the reader confirms there. A `HEAD`
+request, which link scanners send, changes nothing either.
+
+## What an unsubscribe changes
+
+- **Lists:** the contact leaves every list of the workspace, not only the list of the campaign, and the contact's
+  status becomes unsubscribed.
+- **Suppression list:** the address is added with the reason Unsubscribed and the scope
+  <UiPath path="audience.suppressions.marketingOnly" />: Broadcasts and Automations stop, while System mail (such as
+  password resets) and transactional email still arrive. See [The suppression list](/audience/suppressions/).
+- **Consent history:** one event per list left, with the source one-click, the IP address and the browser or mail app.
+- **Reports:** the unsubscribe counts for the campaign the message came from. One-click unsubscribes carry no reason.
+- **Transactional email:** a one-click unsubscribe from an Optional category turns off only that category.
+
+## Requirements
+
+- **An HTTPS public URL.** Mail apps send the POST only to an HTTPS address. When the instance's public URL isn't
+  `https://`, Send Readiness warns in its Compliance group: "One-click unsubscribe needs an HTTPS address". Set the
+  public URL as described in [Configure ReputeCast](/self-hosting/configuration/).
+- **A reverse proxy that passes POST requests** to `/p/` paths unchanged
+  ([Reverse proxy and TLS](/self-hosting/reverse-proxy/)).
+- **DKIM at the sending provider**, covering the headers, as RFC 8058 requires.
+- **A visible unsubscribe link** in the email body too. The headers don't replace it: Send Readiness blocks a campaign
+  whose body has no unsubscribe link or postal address
+  ([Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)).
+
+## Test one-click unsubscribe
+
+<Aside type="caution">
+A successful test unsubscribes the contact for real. Use a contact with your own address on a test list.
+</Aside>
+
+<Steps>
+
+1. Send a campaign to a list that holds only your own address. Test sends from the composer go out as System mail
+   and carry no `List-Unsubscribe` header.
+
+2. In your mail app, open the message source and copy the HTTPS address from the `List-Unsubscribe` header.
+
+3. Send the one-click request:
+
+   ```sh title="Terminal"
+   curl -i -X POST 'https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data 'List-Unsubscribe=One-Click'
+   ```
+
+4. Check the answer: status `200`, `Content-Type: text/plain; charset=utf-8`, and the body `Unsubscribed.` The status
+   line reads `HTTP/1.1 200 OK` or `HTTP/2 200`, depending on your proxy.
+
+5. Open the contact in <UiPath path="nav.audience" />: the profile shows the contact unsubscribed from every list, and
+   the suppression list holds the address with the scope <UiPath path="audience.suppressions.marketingOnly" />. To undo
+   the test, open the HTTPS address in a browser and resubscribe from the page.
+
+</Steps>
+
+To test without unsubscribing anyone, use the address from a [placement test](/deliverability/placement-tests/) copy:
+the same POST answers `200` with "This is a placement test copy. Nobody was unsubscribed."
+
+## Related
+
+- [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)
+- [Subscribe, preference and unsubscribe pages](/forms/public-pages/)
+- [The suppression list](/audience/suppressions/)
+- [Public URLs and endpoints](/reference/public-urls/)

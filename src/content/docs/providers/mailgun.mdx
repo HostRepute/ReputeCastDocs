@@ -1,0 +1,129 @@
+---
+title: Send with Mailgun
+description: Send a Mailgun newsletter through ReputeCast. Connect a Private API key and region; webhooks, DNS records and two-way suppression sync are set up for you.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Mailgun newsletter
+sources:
+  - internal/providers/mailgun
+  - internal/providers/webhookauth
+  - internal/connect
+  - internal/domains/attach.go
+  - web/src/features/connect
+sidebar:
+  order: 5
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+To send a Mailgun newsletter from ReputeCast, you connect a Private API key, the region your Mailgun account lives
+in and the Mailgun domain you send from. ReputeCast registers the webhooks on that domain, adds and verifies sending
+domains, detects sandbox domains and keeps suppressions in sync both ways.
+
+<ProviderMatrix family="email" id="mailgun" />
+
+## Before you begin
+
+- **A Mailgun domain** (for example `mg.acme.io`) that already exists in your Mailgun account, in the region you
+  connect. The connection is checked against it, so create it in Mailgun first, or connect the sandbox domain to try
+  things out.
+- **A Private API key** from Mailgun › API Security. A Domain Sending key or the HTTP webhook signing key won't work.
+- **Permissions.** Connecting needs `providers:manage`; adding a new sending domain needs `domains:manage`.
+- **A public HTTPS address** for webhooks: `<public URL>/hooks/mailgun/<token>`. If ReputeCast isn't reachable from
+  the internet yet, it can poll Mailgun's events API every minute instead.
+
+Mailgun signs every webhook with your account-wide HTTP webhook signing key, which is not your API key
+([Mailgun: Securing webhooks](https://documentation.mailgun.com/docs/mailgun/user-manual/webhooks/securing-webhooks),
+checked October 2026). ReputeCast reads that key through the API, so you don't paste it unless your API key can't
+read it.
+
+## Connect Mailgun
+
+<Steps>
+
+1. Open <UiPath path="nav.providers" />, choose <UiPath path="providers.overview.addProvider" /> and pick Mailgun in
+   the catalog. [Connect a sending provider](/providers/connect/) explains the steps every provider shares.
+
+2. Paste the <UiPath path="providers.fields.mailgun.apiKey" />, pick the <UiPath path="providers.fields.region" />
+   (`US · api.mailgun.net` or `EU · api.eu.mailgun.net`, wherever the domain was created) and enter the
+   <UiPath path="providers.fields.mailgun.domain" />. The extra Mailgun settings hold your
+   <UiPath path="providers.fields.monthlyLimit" /> (used for the quota bar when the account has no custom sending
+   limit) and the <UiPath path="providers.fields.mailgun.webhookSigningKey" />.
+
+3. Choose <UiPath path="connect.connection.connect" />. ReputeCast reads the domain with your key, then the account's
+   monthly sending limit, and stores the key encrypted. Nothing is saved when the check fails.
+
+4. In <UiPath path="connect.connection.webhooksTitle" />, ReputeCast tests its own public URL and registers it on the
+   domain for `delivered`, `permanent_fail`, `temporary_fail`, `complained` and `unsubscribed`. Opens and clicks are
+   not registered: ReputeCast tracks them itself. If the endpoint isn't reachable, choose
+   <UiPath path="connect.connection.usePolling" /> and fix the public URL later.
+
+   <Screenshot
+     id="connect-mailgun-error"
+     alt="A failed Mailgun connection: the Private API key was rejected with 401 Unauthorized, and the webhook self-test failed because ReputeCast runs on localhost, with three ways to fix it."
+   />
+
+5. Choose <UiPath path="connect.connection.continueDomain" /> and enter your sending domain. If it isn't in Mailgun
+   yet, ReputeCast adds it (automatic sender security, 2048-bit DKIM) and lists the SPF, DKIM and MX records to
+   publish. Mailgun's tracking CNAME is left out because ReputeCast tracks opens and clicks itself.
+
+6. In <UiPath path="connect.stepTest" />, send a test and watch the `delivered` webhook arrive.
+
+7. In <UiPath path="connect.stepStreams" /> and <UiPath path="connect.stepContacts" />, pick the streams and keep the
+   option to pull Mailgun's existing bounces, complaints and unsubscribes ticked.
+
+</Steps>
+
+## Check that it worked
+
+- The Mailgun card on <UiPath path="nav.providers > providers.tabProviders" /> shows
+  <UiPath path="providers.statusHealthy" /> with your domain and its state (for example "Domain mg.acme.io · active").
+  A sandbox domain shows <UiPath path="providers.statusSandbox" /> instead.
+- In Mailgun, the domain's webhooks list your ReputeCast URL for the five events.
+- Deliveries and bounces appear under <UiPath path="nav.providers > providers.tabEvents" />.
+
+ReputeCast sends one API call per message, with Mailgun's open, click and unsubscribe tracking turned off on each
+message. If unsubscribe tracking is on for the domain, Mailgun adds its own unsubscribe link and footer next to
+ReputeCast's; [Send Readiness](/reference/glossary/#send-readiness) warns about it, and the
+<UiPath path="providers.events.trackingTitle" /> on the Events & sync tab can turn it off. The shared
+[suppression list](/reference/glossary/#suppression-list) is pushed to Mailgun's unsubscribes table (for all tags),
+so every address ReputeCast suppresses, bounced ones included, shows up there.
+
+Mailgun's sandbox domain only delivers to authorized recipients, up to 5
+([Mailgun: Sandbox domain](https://documentation.mailgun.com/docs/mailgun/user-manual/domains/domains-sandbox),
+checked October 2026). While Mailgun is connected with a sandbox domain, Send Readiness blocks Broadcasts through it.
+
+## Troubleshooting
+
+- **"Mailgun rejected this key"** with `401 Unauthorized`. Use a Private API key from the same account, not a
+  Sending key or the webhook signing key.
+- **"Mailgun rejected this key"** with `404 Not Found · domain_not_found`. The key is fine, but Mailgun doesn't know
+  the sending domain in the selected region. Check the domain's spelling and the region, or create the domain in
+  Mailgun first.
+- **"Mailgun allows three URLs per event"** when registering webhooks. One of the events already posts to three
+  addresses. Remove an old URL in Mailgun, then choose <UiPath path="connect.connection.registerAgain" />.
+- **The webhook self-test fails** (`ECONNREFUSED`, "localhost only works on this machine"). Set
+  `REPUTECAST_PUBLIC_URL` to the HTTPS address your reverse proxy exposes, use a tunnel while testing, or poll for
+  now. See [Reverse proxy and TLS](/self-hosting/reverse-proxy/).
+- **Webhooks arrive but fail verification, and the provider turns "Webhooks silent".** Your API key can't read the
+  account's webhook signing key. Copy it from Settings › API Security › HTTP webhook signing key in Mailgun into
+  <UiPath path="providers.overview.settings > providers.overview.credentials" /> on the provider card.
+- **Test recipients are refused with `unauthorized_recipient`.** The domain is Mailgun's sandbox: add the address as
+  an authorized recipient in Mailgun, or connect a verified domain.
+- **Transactional messages with Cc, Bcc or attachments fail.** The Mailgun adapter can't send copies or attachments;
+  route those templates through another provider.
+- **You disconnected Mailgun.** ReputeCast removes its URL from each webhook event. The domain and the pushed
+  unsubscribes stay in Mailgun.
+
+## Related
+
+- [Connect a sending provider](/providers/connect/)
+- [Delivery events and suppression sync](/providers/events-and-sync/)
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Provider health and outages](/providers/health-and-outages/)
+- [Choose a sending provider](/providers/choose/)

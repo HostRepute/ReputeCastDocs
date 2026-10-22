@@ -1,0 +1,130 @@
+---
+title: 'Gmail 421 4.7.28: unusual rate of email'
+description: Gmail 421 4.7.28 means Gmail saw an unusual rate of email from you and is rate limiting it for now. Learn why it happens and how to recover in ReputeCast.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Gmail 421 4.7.28
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/analysis.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  label: Gmail 421 4.7.28
+  order: 1
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 421 4.7.28 is a temporary refusal: Gmail has seen an unusual rate of email, often unsolicited, from your IP
+address, your domain or a link domain in your messages, and slows that mail down until the rate looks normal again. This
+page explains the reply and how to bring your sending back to a pace Gmail accepts.
+
+## What Gmail means
+
+Gmail sends the code with one of several texts. The most common one names the sending IP address:
+
+> Gmail has detected an unusual rate of email originating from your IP address _ip-address_. To protect our users from
+> spam, email sent from your IP address has been temporarily rate limited.
+
+The other variants name what Gmail is limiting:
+
+- your IP netblock ("unusual rate of unsolicited email originating from your IP Netblock")
+- your DKIM domain or your SPF domain ("unusual rate of unsolicited email originating from your DKIM domain")
+- a link domain ("unusual rate of unsolicited email containing one of your URL domains")
+- your IP address, blocked for now instead of rate limited ("an unusual amount of unsolicited email originating from
+  your IP address")
+- repeated Message-IDs ("this sender exceeded the quota for sending messages that have the same Message-ID")
+
+Each variant points to Google's [email sender guidelines](https://support.google.com/mail/answer/81126). Source:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Google Workspace Help. Checked October 2026.
+
+## Why it happens
+
+Gmail rate limits when your volume, or the share of your mail its users don't want, grows faster than your
+[sender reputation](/reference/glossary/#sender-reputation) supports. Common causes:
+
+- A jump in volume from an IP address, domain or sending provider that hasn't been [warmed up](/providers/warm-up/).
+- Mail to people who didn't ask for it or stopped reading it, which raises the spam rate. Google asks senders to keep the
+  spam rate reported in Postmaster Tools below 0.3% ([email sender guidelines](https://support.google.com/mail/answer/81126),
+  checked October 2026).
+- A link domain in your content that Gmail sees in a lot of unwanted mail (the URL-domain variant).
+
+## How ReputeCast classifies it
+
+- While the sending provider retries, each refused attempt arrives as a [deferral](/reference/glossary/#deferral): a
+  <UiPath path="providers.events.optionDeferred" /> event in the event log. Deferrals don't appear in the campaign
+  report's bounces table.
+- Deferrals count toward the deferral rate of the Gmail mailbox provider during a send. Above 5.0% (fixed; it counts
+  after 500 messages to Gmail and at least 5 deferrals, with about 90% confidence), ReputeCast
+  [auto-pauses](/reference/glossary/#auto-pause) the Gmail share of the campaign, or the whole campaign when the pause
+  scope is set to the campaign.
+- If the sending provider stops retrying, it reports a bounce. Gmail's text contains the word "spam", so the
+  [bounce class](/reference/glossary/#bounce-class) is `spam_block` and the report row is
+  <UiPath path="reports.bounceType.blocked" />. A bounce with a 4xx reply is recorded as a soft bounce and doesn't
+  suppress the address, unless the sending provider itself calls it permanent (Amazon SES and Resend follow their own
+  bounce type; see [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address)).
+- The Message-ID variant, or the bare code without Gmail's text, is `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+[SMTP error codes](/smtp-errors/#how-reputecast-picks-a-bounce-class) explains the classifier.
+
+## Before you begin
+
+- `providers:view` to read the event log.
+- `providers:manage` to change the throttles in <UiPath path="nav.settings > settings.providers" />.
+- `campaigns:send` to resume an auto-paused send.
+
+## Recover from the rate limit
+
+<Steps>
+
+1. Find the variant. Open <UiPath path="nav.providers > providers.tabEvents" />, set
+   <UiPath path="providers.events.typeFilter" /> to <UiPath path="providers.events.optionDeferred" /> and search for a
+   Gmail recipient. <UiPath path="providers.events.colCode" /> shows Gmail's text, which says whether Gmail limits an IP
+   address, a domain or a link.
+2. Slow down to Gmail. Gmail has no throttle by default. In
+   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />, set a Gmail rate in messages
+   per second. If a send is already auto-paused, the [live monitor](/campaigns/live-monitor/) recommends a lower rate
+   for the Gmail share; resume with that change.
+3. Send to engaged readers first. Contacts who stopped opening raise the share of unwanted mail. Use the
+   [list health tiers](/audience/list-health/) and let Send Readiness exclude unengaged contacts when it warns about
+   them.
+4. If the IP address, domain or sending provider is new, follow a [warm-up plan](/providers/warm-up/) instead of sending
+   the full list at once.
+5. For the URL-domain variant, review the links in the campaign. [Content checks](/campaigns/content-checks/) flag
+   shortened and blocklisted links; link to your own domain instead of a public link shortener.
+6. For the DKIM-domain and SPF-domain variants, watch your domain's spam rate in Google Postmaster Tools. ReputeCast
+   shows Postmaster data on <UiPath path="nav.deliverability > placement.health" /> once it receives it; see
+   [monitor domain and provider health](/deliverability/health/).
+
+</Steps>
+
+## Check that it worked
+
+- On the next send, the live monitor's Gmail deferral rate stays low and the send isn't auto-paused.
+- The event log shows delivered events for Gmail recipients instead of new 421 4.7.28 deferrals.
+
+## Troubleshooting
+
+- **Deferrals continue for days.** Lower the Gmail throttle further and send only to your most engaged contacts until
+  the deferrals stop, then raise the volume step by step.
+- **The event log shows the code without Gmail's text.** Some sending providers report only the code. The class is then
+  `temporary`; the fix is the same.
+- **Complaints are high as well.** Read [bounces, complaints and provider limits](/deliverability/bounces-and-complaints/)
+  and check that every message has [one-click unsubscribe](/deliverability/one-click-unsubscribe/).
+
+## Related
+
+- [SMTP error codes](/smtp-errors/)
+- [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)
+- [Monitor a send and auto-pause](/campaigns/live-monitor/)
+- [Yahoo 421 4.7.0 \[TSS04\]](/smtp-errors/yahoo-421-4-7-0-tss04/), Yahoo's temporary deferral

@@ -1,0 +1,232 @@
+---
+title: Read DMARC aggregate reports
+description: Collect DMARC aggregate report files through HostRepute or your own mailbox, upload them to ReputeCast, and find which sending sources pass, fail or align.
+type: how-to
+audience: [admin]
+permissions: ['deliverability:view', 'domains:manage']
+uiPath: 'nav.deliverability > placement.health'
+primaryKeyword: DMARC aggregate report
+sources:
+  - internal/deliverability/dmarc.go
+  - internal/deliverability/api.go
+  - internal/deliverability/deliverability.go
+  - internal/domains/records.go
+  - internal/hostrepute/client.go
+  - internal/hostrepute/sync.go
+  - internal/readiness/assemble.go
+  - web/src/features/deliverability/DmarcCard.tsx
+  - web/src/features/deliverability/dmarc.messages.ts
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+A [DMARC aggregate report](/reference/glossary/#dmarc-aggregate-report) tells you which servers sent mail as your
+domain and whether that mail passed DMARC. This guide shows how to collect the reports, bring them into ReputeCast
+and read them under <UiPath path="nav.deliverability > placement.health" />, so you can move your
+[DMARC](/reference/glossary/#dmarc) policy from `p=none` to `quarantine` or `reject` without losing real mail.
+
+Mailbox providers that support DMARC send these reports as XML files, by default once a day, to the addresses in the
+`rua` tag of your DMARC record ([RFC 7489, section 6.3](https://www.rfc-editor.org/rfc/rfc7489#section-6.3), checked
+October 2026). ReputeCast has no inbox of its own for them: either [HostRepute](/reference/glossary/#hostrepute)
+collects and parses them for you, or you receive them in your own mailbox and upload them.
+
+## Before you begin
+
+- Your sending domain publishes a DMARC record. If it doesn't, start with
+  [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/).
+- Reading the reports needs `deliverability:view`, which every built-in role has. Uploading a report needs
+  `domains:manage` (Owner and Admin).
+- Decide where the reports go: HostRepute, a mailbox you own, or both. `rua` takes several addresses separated by
+  commas.
+
+## Collect the reports
+
+### Through HostRepute
+
+<Steps>
+
+1. Connect HostRepute ([Connect HostRepute](/deliverability/hostrepute/)). On an empty DMARC card,
+   <UiPath path="deliverability.dmarc.useHostRepute" /> takes you there.
+
+2. Copy the report address HostRepute gives your account. The DMARC card shows it ("aggregate reports to …"), and
+   ReputeCast's suggested DMARC record includes it as `rua=mailto:…` once HostRepute is connected.
+
+3. Add the address to the `rua` tag of your DMARC record at your DNS host.
+
+</Steps>
+
+HostRepute parses the reports, and ReputeCast reads the last 7 days of results with its hourly sync.
+
+### In your own mailbox
+
+<Steps>
+
+1. Add a mailbox you own to the `rua` tag:
+
+   ```txt title="_dmarc.acme.io TXT"
+   v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
+   ```
+
+2. If the mailbox is on a different organizational domain than the DMARC record, that other domain has to accept
+   the reports by publishing a TXT record `v=DMARC1` at `<your domain>._report._dmarc.<its domain>`, for example
+   `acme.io._report._dmarc.example.net`. Without it, mailbox providers don't send the reports there
+   ([RFC 7489, section 7.1](https://www.rfc-editor.org/rfc/rfc7489#section-7.1), checked October 2026).
+
+3. Save the report attachments as they arrive. They usually come as `.xml.gz` or `.zip` files.
+
+</Steps>
+
+## Upload a report
+
+<Steps>
+
+1. Open <UiPath path="nav.deliverability > placement.health" />. While no report covers the last 7 days, the card
+   reads **DMARC report summary** with the badge **No reports yet**.
+
+2. Select <UiPath path="deliverability.dmarc.uploadButton" /> and choose one file: the `.xml` report, or the `.xml.gz`
+   or `.zip` it came in. A `.zip` must hold the `.xml` report; ReputeCast reads the first one inside. The file can be
+   up to 20 MiB, compressed and uncompressed.
+
+3. Select <UiPath path="deliverability.dmarc.upload" />. The notice names the organization that sent the report, the
+   number of messages and the domain.
+
+</Steps>
+
+ReputeCast stores only the report's counts: the policy that was published, and per sending IP the message count,
+what the receiver did, and the SPF and DKIM results. Uploading the same report again (same organization and report ID)
+replaces the earlier copy, so nothing is counted twice.
+
+The upload button exists only on the empty card. Once reports from the last 7 days are shown, upload further reports
+with the API operation [Upload a DMARC aggregate report](/api/operations/upload-dmarc-report/), which takes the raw file and needs
+an API key with `domains:manage`:
+
+```sh title="Upload a DMARC aggregate report with the API"
+curl -X POST "https://reputecast.example.com/api/v1/workspaces/acme-newsletter/deliverability/dmarc/reports" \
+  -H "Authorization: Bearer $REPUTECAST_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.xml.gz
+```
+
+A successful upload returns `201` with the organization, report ID, domain, period and message count. See
+[Authentication and API keys](/developers/api-authentication/) to create a key.
+
+## Read the DMARC card
+
+<Screenshot
+  id="deliverability"
+  alt="Deliverability Health for Acme Newsletter. Bottom left, the DMARC reports card shows 99.6% pass over 7 days: Amazon SES, Postal and Postmark aligned, and an unknown source at 198.51.100.77 that failed and was quarantined."
+  caption="The DMARC reports card is at the bottom left, next to the incident timeline."
+>
+  1. Health per sending domain and dedicated IP, including DMARC alignment over 7 days.
+  2. Blocklist results for the same domains and IPs.
+  3. Account health per sending provider.
+</Screenshot>
+
+The card is titled **DMARC reports · last 7 days** and summarizes every report whose period ended in the last 7 days.
+Its badge is the pass rate: the share of messages that passed DMARC through SPF or DKIM. It is green from 98%, amber
+from 90%, and red below.
+
+<TableScroll label="DMARC card columns">
+
+| Column   | What it shows                                                                                                                                   |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source   | The sending provider for its shared pool (`Amazon SES`), the provider and IP for a dedicated IP (`Postal · 203.0.113.25`), or `Unknown · <IP>`. |
+| Messages | Messages from that source in the reports.                                                                                                       |
+| SPF      | `aligned` when at least half of the messages passed SPF in line with the From domain; otherwise the most common result, such as `fail`.       |
+| DKIM     | The same, for DKIM.                                                                                                                             |
+| Result   | `pass` when SPF or DKIM is aligned. Otherwise `quarantined` or `rejected` when at least half were treated that way, else `fail`.               |
+
+</TableScroll>
+
+Only mail with a From domain of this workspace counts. Known sending providers come first, by volume, then unknown
+sources, which are tinted red and marked "not one of your providers".
+
+<Aside type="caution" title="Shared pools in uploaded reports">
+ReputeCast recognizes a shared pool, such as Amazon SES or Postmark, by the reverse DNS name of the sending IP.
+Uploaded reports don't carry that name, so mail from shared pools shows up as `Unknown · <IP>` in uploaded reports.
+Only IPs listed on a sending provider, such as your dedicated IPs, are recognized. Look an unknown IP up before you
+treat it as a stranger.
+</Aside>
+
+### Investigate a source
+
+When an unknown source sent mail as your domain, the card adds a line under the table, for example "Someone is sending
+as news.acme.io from an unknown host; p=quarantine kept it out of inboxes." With `p=none` it says receivers may still
+deliver that mail.
+
+<Steps>
+
+1. Select <UiPath path="deliverability.dmarc.investigate" />.
+
+2. Read the dialog: messages and reports in the last 7 days, the dates seen, which organizations reported it, the
+   reverse DNS name, the From domains used, the SPF and DKIM results with their domains, and what receivers did with
+   the mail (delivered, quarantined or rejected).
+
+3. Decide what the source is:
+   - **A service you use**, such as a CRM, a help desk or an invoicing tool: add it to the SPF record of the domain
+     and turn on DKIM signing in that service.
+   - **Not yours:** nothing to fix on your side. If receivers still delivered the mail, raise your DMARC policy.
+
+</Steps>
+
+## Move to quarantine or reject
+
+Raise the policy once every source you recognize shows `aligned` for SPF or DKIM, and only unknown sources fail.
+Microsoft advises moving in steps, from `none` to `quarantine` to `reject`, to avoid losing mail
+([Microsoft, "Outlook's new requirements for high-volume senders"](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730),
+FAQ, checked October 2026).
+
+<Steps>
+
+1. Fix the remaining sources you recognize, as in [Investigate a source](#investigate-a-source).
+
+2. Change `p=none` to `p=quarantine` in the DMARC record at your DNS host. Keep the `rua` tag:
+
+   ```txt title="_dmarc.acme.io TXT"
+   v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@acme.io
+   ```
+
+3. Watch the card for a few weeks. Mail that fails now shows `quarantined` in the Result column.
+
+4. When nothing legitimate is quarantined, change the policy to `p=reject`.
+
+</Steps>
+
+[BIMI](/deliverability/bimi/) needs `p=quarantine` or `p=reject` applied to all mail, so don't lower `pct` below 100
+if you plan to show your logo.
+
+## Check that it worked
+
+- In the domains table under <UiPath path="nav.settings > settings.senders" />, the DMARC column shows the new policy.
+  `p=none` is shown as a warning, `p=quarantine` and `p=reject` as passing.
+- In [Send Readiness](/campaigns/send-readiness/), the DMARC row reads, for example, "DMARC p=quarantine, 99.6% of mail
+  aligned over the last 7 days". Under 90% aligned, it warns.
+- The domain card on the Health tab shows **DMARC alignment, 7 d** with the same percentage.
+
+## Troubleshooting
+
+- **No reports arrive.** Check the `rua` address for typos and, for a mailbox on another domain, the
+  `_report._dmarc` record from [In your own mailbox](#in-your-own-mailbox). Reports are usually sent once a day, so
+  wait at least a day after publishing.
+- **"This report is for …, which isn't a sending domain of this workspace."** The report's domain doesn't share an
+  organizational domain with any domain of this workspace. Upload it in the workspace that sends as that domain, or
+  [add the domain](/providers/senders-and-domains/) first.
+- **"This isn't a DMARC aggregate report."** Only aggregate (`rua`) reports are accepted. Failure reports from `ruf`
+  and other XML files are refused.
+- **"The zip file has no .xml report."** Extract the archive and upload the `.xml` file.
+- **The upload button is missing or disabled.** The card already shows reports from the last 7 days (use the API), or
+  you don't have `domains:manage`; the disabled button says who can help.
+- **Amazon SES or Postmark shows as Unknown.** The report was uploaded; see
+  [Shared pools in uploaded reports](#read-the-dmarc-card).
+
+## Related
+
+- [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
+- [Connect HostRepute](/deliverability/hostrepute/)
+- [Monitor domain and provider health](/deliverability/health/)
+- [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)

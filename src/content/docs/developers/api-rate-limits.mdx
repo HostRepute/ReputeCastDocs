@@ -1,0 +1,109 @@
+---
+title: Rate limits
+description: API rate limits in ReputeCast. Requests per minute per key, sign-in and MCP limits, transactional send rates, the X-RateLimit headers and handling 429.
+type: reference
+audience: [developer, operator]
+primaryKeyword: API rate limits
+sources:
+  - internal/server/ratelimit.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/send.go
+  - internal/revenue/conversions.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 6
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+These are the API rate limits of a ReputeCast instance: how many requests each caller may make, how the server
+counts them, and what it answers when a caller goes over.
+
+## Limits
+
+<LimitsTable area="rate-limits" />
+
+- Calls with an API key are counted per key, whatever address they come from. Calls without a bearer token (browser
+  sessions) are counted per client IP address.
+- Transactional send and batch calls don't count against the per-key request limit; each key has its own message rate
+  instead (see [send transactional email with the API](/developers/transactional-api/)).
+- Public pages, tracking links and provider webhooks (`/p/`, `/t/`, `/hooks/`) are outside these limits. Signup forms
+  have their own limits (see [signup forms](/forms/signup-forms/)).
+- Each server process counts on its own. With several web nodes behind a load balancer, a caller can reach the limit
+  on each node.
+
+## Headers
+
+<TableScroll label="Rate limit headers">
+
+| Header                  | Sent on                                                                  | Value                                                                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-RateLimit-Limit`     | Every `/api/` answer except transactional send and batch                 | Requests allowed per minute for this caller.                                                                                                          |
+| `X-RateLimit-Remaining` | The same                                                                 | Requests left in the current window.                                                                                                                  |
+| `X-RateLimit-Reset`     | The same                                                                 | When the current window ends, in Unix seconds.                                                                                                        |
+| `Retry-After`           | `429` answers                                                            | Seconds to wait. `60` for the per-key, sign-in and MCP limits; for transactional sends and conversions, the time until the key has room again (at least 1). |
+
+</TableScroll>
+
+```http title="Response headers"
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Ratelimit-Limit: 600
+X-Ratelimit-Remaining: 590
+X-Ratelimit-Reset: 1792671646
+```
+
+HTTP header names are case-insensitive; read them without depending on case.
+
+## Answers when a limit is reached
+
+Over the per-key request limit:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+The "1,000 items" in this message holds for adding suppressions; the transactional batch operation takes up to 100
+messages.
+
+Over a send-only key's message rate (here 50 per second), with `Retry-After: 1`:
+
+```json title="429 Too Many Requests"
+{
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This key sends at most 50 messages per second. Wait 1 second (Retry-After) and send again with the same idempotency key.",
+  "code": "rate_limited"
+}
+```
+
+Over the sign-in limit, the detail is "Too many sign-in attempts from your network. Wait a minute and try again."
+The MCP server answers its limit with plain text and `Retry-After: 60`: "Rate limit reached: 120 calls per minute
+per agent. Calls resume within a minute." (with the agent's own limit in place of 120). See [errors](/developers/api-errors/)
+for the problem format.
+
+## Stay under the limits
+
+- Read `X-RateLimit-Remaining` and slow down before it reaches 0.
+- On `429`, wait the number of seconds in `Retry-After`, then retry. Retrying sooner only gets another `429`.
+- Use batch operations and the largest page size you need (see [pagination](/developers/api-pagination/)).
+- [Receive webhooks](/developers/webhooks/) instead of polling for changes.
+- Retry transactional sends with the same `Idempotency-Key`, so a message is sent once.
+- Give each job its own key, so one busy job doesn't use up another's limit.
+
+## Change the limits
+
+Server operators set the request limits in the configuration: `http.rate_limit_api` for API calls and
+`http.rate_limit_auth` for sign-in (see the [configuration reference](/reference/configuration/)). Setting
+`http.rate_limit_api` to 0 turns off both. When ReputeCast runs behind a reverse proxy, set `http.trusted_proxies`
+so callers without a key are counted by their own address, not the proxy's (see [reverse proxy and
+TLS](/self-hosting/reverse-proxy/)). A send-only key's message rate is set when the key is created, and an MCP
+agent's call limit in the workspace's MCP settings.

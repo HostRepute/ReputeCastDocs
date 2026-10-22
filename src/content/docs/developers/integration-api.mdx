@@ -1,0 +1,238 @@
+---
+title: Build an integration
+description: "Build email marketing integrations on the ReputeCast API the way the Zapier, Make, n8n and WordPress apps do: keys, triggers, actions and kept consent."
+type: how-to
+audience: [developer]
+permissions: ['webhooks:manage', 'subscribers:create', 'subscribers:edit']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: build email marketing integration
+sources:
+  - docs/integrations/hub.md
+  - internal/integrations/api.go
+  - internal/integrations/actions.go
+  - internal/integrations/catalog.go
+  - internal/integrations/hub.go
+  - internal/api/integrations.go
+  - internal/api/api.go
+  - internal/webhooks/webhooks.go
+  - src/data/api-samples/upsert-contact.yaml
+  - src/data/api-samples/add-contact-to-list.yaml
+sidebar:
+  order: 10
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+The Zapier, Make and n8n apps and the WordPress plugin that ReputeCast publishes use only the public REST API. This
+page shows how to build email marketing integrations the same way: authenticate, find the workspace, subscribe to
+events and call the five actions the official apps offer, without ever undoing a contact's consent.
+
+## Before you begin
+
+- A ReputeCast instance reachable over HTTPS from where your integration runs, and its public URL (the "instance
+  URL"). Every path below starts with `/api/v1`.
+- An API key. For your own app or service, create one in <UiPath path="nav.settings > settings.keys" /> with
+  <UiPath path="keys.createApiKey" /> and give it only what the integration needs: `webhooks:manage` for triggers,
+  `subscribers:create` and `subscribers:edit` for contact actions, `transactional:send` to send transactional email.
+  See [Authentication and API keys](/developers/api-authentication/).
+- The official apps get a different kind of key, an [integration key](/reference/glossary/#integration-key), from
+  <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.connect" />. ReputeCast creates
+  integration keys only for Zapier, Make, n8n and WordPress ([Connect other tools](/integrations/overview/)).
+
+## Connect and test
+
+<Steps>
+
+1. Ask the user for the instance URL and the key. Store the key encrypted; send it as
+   `Authorization: Bearer rc_live_…` on every call.
+
+2. Call `GET /api/v1/integration`. Any API key may call it, with no permission, and it answers which workspace the
+   key belongs to:
+
+   ```sh title="Terminal"
+   curl https://reputecast.example.com/api/v1/integration \
+     --header "Authorization: Bearer $REPUTECAST_API_KEY"
+   ```
+
+   ```json title="200 OK"
+   {
+     "workspace": "acme-newsletter",
+     "workspaceName": "Acme Newsletter",
+     "integration": "",
+     "key": "CRM sync",
+     "triggers": [],
+     "actions": [],
+     "permissions": ["subscribers:create", "subscribers:edit", "webhooks:manage"]
+   }
+   ```
+
+3. Use `workspace` in every other path (`/api/v1/workspaces/acme-newsletter/…`) and check `permissions` before
+   offering a feature. `integration`, `triggers` and `actions` are filled only for integration keys.
+
+</Steps>
+
+## Triggers: subscribe to events
+
+Your integration hears about changes through [outgoing webhooks](/developers/webhooks/). When a user turns on a
+trigger, create an endpoint for it; when they turn it off, delete it.
+
+```sh title="Terminal"
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/acme-newsletter/webhooks \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{ "name": "CRM sync · unsubscribes", "url": "https://crm.example.com/hooks/reputecast", "events": ["contact.unsubscribed"] }'
+```
+
+The `201` answer carries the endpoint under `webhook` and its signing secret under `secret`, shown only in this
+answer. Store the secret with the subscription and verify every delivery with it
+([verify the signature](/developers/webhooks/#verify-the-signature)). `DELETE …/webhooks/<webhookId>` unsubscribes.
+The events most integrations offer as triggers:
+
+| Trigger                       | Event                  | The key needs        |
+| ----------------------------- | ---------------------- | -------------------- |
+| Contact subscribed            | `contact.subscribed`   | `subscribers:view`   |
+| Contact unsubscribed          | `contact.unsubscribed` | `subscribers:view`   |
+| Contact updated               | `contact.updated`      | `subscribers:view`   |
+| Form submitted                | `form.submitted`       | `subscribers:view`   |
+| Campaign sent                 | `campaign.completed`   | `campaigns:view`     |
+| Transactional message bounced | `message.bounced`      | `transactional:view` |
+
+Every other event in [Webhook events](/reference/webhook-events/) works the same way. `form.submitted` fires when a
+signup is confirmed (at once for single opt-in) and carries the form's ID, so your app can filter by form.
+
+The official apps use REST hooks instead: `POST …/integration/hooks` with `{ "event", "url" }` creates a managed
+endpoint, and an endpoint that answers `410 Gone` is removed. Those operations, and the sample, list, field and
+template lookups under `…/integration/`, accept only integration keys
+([Integration API reference](/api/operations/tags/integration-api/)).
+
+## Actions
+
+<TableScroll label="Integration actions">
+
+| Action                     | Call                                                      | The key needs                                                  |
+| -------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| Create or update a contact | `POST …/contacts/upsert`                                  | `subscribers:create`; `subscribers:edit` to update a contact   |
+| Add a contact to a list    | `POST …/lists/<listId>/contacts`                          | `subscribers:edit`                                             |
+| Add tags to a contact      | `POST …/contacts/tags`                                    | `subscribers:edit`                                             |
+| Record an event            | `POST …/automations/events`                               | `subscribers:edit`                                             |
+| Send a transactional email | `POST …/transactional/messages`                           | `transactional:send` ([sensitive](/reference/glossary/#sensitive-permission)) |
+
+</TableScroll>
+
+**Create or update a contact** matches by email, so repeating it updates the same contact instead of creating a
+second one:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:create (and subscribers:edit to update contacts).
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# List IDs come from GET /api/v1/workspaces/your-workspace/lists.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/contacts/upsert \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "email": "sam.rivera@outlook.com",
+    "firstName": "Sam",
+    "lastName": "Rivera",
+    "language": "en-US",
+    "tags": ["trial"],
+    "lists": ["0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f"],
+    "consent": "double"
+  }'
+```
+
+- `consent: "single"` adds the contact to the lists now; `"double"` sends the confirmation email first, and the list
+  shows `pending` until the click. Without `consent`, each list's own setting applies.
+- `language` takes a BCP 47 code. Values such as `Spanish` or `es_MX` are normalized (`es`, `es-MX`); an unknown
+  value answers `422`, naming the closest match when there is one.
+- Lists hold up to 20 IDs per call and tags up to 50. Get list IDs from `GET …/lists` and custom field keys for
+  `fields` from `GET …/fields` (both need `subscribers:view`).
+- The answer says whether the contact was `created`, which lists it joined with which status, and whether a
+  confirmation email went out (`confirmationSent`).
+
+**Add a contact to a list** needs an existing contact; a new address answers `404`, so call the upsert first.
+**Record an event** is covered in [Record events and conversions](/developers/events-and-conversions/), and
+**Send a transactional email** in [Send transactional email with the API](/developers/transactional-api/).
+
+## Consent is kept
+
+An action never adds someone back to a list they left and never adds a suppressed address. Instead, it answers
+`409`:
+
+```json title="409 Conflict"
+{
+  "status": 409,
+  "title": "Conflict",
+  "code": "unsubscribed",
+  "detail": "rob@example.net left Beta Program on 2 Oct. ReputeCast doesn't add people back to a list they left.",
+  "meta": { "list": "Beta Program", "listId": "0192…", "leftAt": "2026-10-02T13:41:00Z" }
+}
+```
+
+`409 suppressed` carries `meta.reason` and `meta.since`. Treat both as "skipped" for that record, not as a failed
+workflow: report it to the user and carry on with the rest.
+
+## Retries and idempotency
+
+- The transactional send and the conversions API accept an `Idempotency-Key` header: a retry with the same key gets
+  the first answer and doesn't send or record twice. Use your platform's run or record ID in the key, as the official
+  apps do (`make-<scenario ID>-<value>`, `n8n-<workflow ID>-<value>`).
+- The other actions don't take a key. Retry them only after a network error or a `429`/`5xx` answer, and never after
+  a `2xx`.
+- Answer `429` by waiting for `Retry-After`. The general limit is 600 requests per minute per key
+  ([Rate limits](/developers/api-rate-limits/)).
+
+## Integration keys and workflow names
+
+If you maintain one of the official apps, its key comes from <UiPath path="nav.settings > settings.integrations" />
+and follows extra rules:
+
+- It works only for the operations of the triggers and actions the user turned on, even where its permissions would
+  allow more. Anything else answers `403 integration_operation_denied`.
+- <UiPath path="integrations.rotateKey" /> keeps the old key working for 24 hours, so the app can be updated without
+  failed runs; <UiPath path="integrations.stopOldKey" /> ends the overlap.
+- When the key's owner is deactivated or removed, calls answer `403 owner_deactivated` until a member with
+  `integrations:manage` selects <UiPath path="integrations.takeOver" />. A revoked or expired key answers
+  `401 key_revoked` or `401 key_expired`.
+- Every call is kept for 7 days in the integration's call log. Send the workflow's name and ID with each call so the
+  log can show them:
+
+  ```http title="Request header"
+  X-ReputeCast-Workflow: Beta application (Typeform) → ReputeCast contact; id=284113907
+  ```
+
+  Percent-encode (UTF-8) characters outside printable ASCII and `%`, `;`, `=` and `"`; ReputeCast decodes them.
+  `name="…"` and RFC 8187 `name*=UTF-8''…` forms are accepted too.
+
+<LimitsTable area="integrations" />
+
+## Check that it worked
+
+- `GET /api/v1/integration` answers `200` with the workspace and permissions you expect.
+- After creating an endpoint, <UiPath path="nav.settings > settings.webhooks" /> lists it, and its
+  <UiPath path="webhooks.sendTestEvent" /> reaches your receiver.
+- After an upsert, the contact appears in <UiPath path="nav.audience" /> with the lists, tags and consent you sent.
+
+## Troubleshooting
+
+- **`403 permission_denied`**: the key lacks the permission named in `permission`; the `helpers` field names members
+  who can grant it.
+- **`422 private_address` when creating an endpoint**: the URL points to a private network. Use a public address, or
+  ask an instance admin to set `webhooks.allow_private_networks`.
+- **`404` on add to list**: the contact doesn't exist yet; upsert it first.
+- **`409 unsubscribed` or `409 suppressed`**: expected; skip the record.
+- **`403 integration_operation_denied`**: the integration key isn't allowed this call. Change what the integration
+  can do in <UiPath path="nav.settings > settings.integrations" />.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Receive webhooks" href="/developers/webhooks/" description="Envelope, headers, signatures and retries." />
+  <LinkCard title="Connect other tools" href="/integrations/overview/" description="The integrations catalog in the app." />
+  <LinkCard title="Errors" href="/developers/api-errors/" description="Problem documents and every error code." />
+  <LinkCard title="API reference" href="/api/" description="Every operation an API key can call." />
+</CardGrid>
