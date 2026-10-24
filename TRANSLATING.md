@@ -22,8 +22,8 @@ viên, Người xem"), "không gian làm việc" for workspace, "nhà cung cấp
 chặn gửi" for the suppression list.
 
 - Address the reader as **bạn**. Sentence case. No exclamation marks.
-- UI labels in prose come only from `<UiPath>`; it shows the label from upstream `messages.vi.ts` and falls back
-  to the English label where the app has no Vietnamese yet, so the docs always match the screen.
+- UI labels in prose come only from `<UiPath>`; it shows the label from upstream `messages.vi.ts`, so the docs always
+  match the screen. It falls back to the English label only for an id whose `vi` value is empty.
 - Never translate: product and provider names, permission keys, API error codes, environment variables,
   configuration keys, CLI commands and output, DNS record names and values, HTTP headers, code.
 
@@ -56,9 +56,11 @@ Docs-only terms (not in the app glossary):
 
 ## Screenshots
 
-`pnpm shots --locale vi` captures the Vietnamese app. Screens whose upstream feature has no Vietnamese messages
-yet are English-only (see `scripts/screenshots/manifest.ts`); Vietnamese pages show the English image with the
-note "Ảnh chụp này hiển thị giao diện tiếng Anh." `pnpm upstream:check` reports when a screen can be recaptured.
+`pnpm shots --locale vi` captures the Vietnamese app. Upstream has Vietnamese for every screen
+(`COMPLETE_LANGUAGES = ['en', 'vi']` in `web/src/i18n/status.gen.ts`), but shots captured while their feature had no
+Vietnamese are still English-only in `scripts/screenshots/manifest.ts` until they are recaptured; Vietnamese pages
+show the English image with the note "Ảnh chụp này hiển thị giao diện tiếng Anh." `pnpm upstream:check` reports
+which screens can be recaptured.
 
 ## Review
 

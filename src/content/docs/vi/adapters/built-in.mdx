@@ -7,6 +7,7 @@ primaryKeyword: adapter email bằng Go
 sources:
   - docs/adapters.md
   - internal/providers/provider.go
+  - internal/providers/text.go
   - internal/providers/optional.go
   - internal/providers/extras.go
   - internal/providers/contracttest
@@ -14,10 +15,13 @@ sources:
   - internal/providers/webhookauth
   - internal/providers/bounce
   - internal/providers/resend
+  - internal/sms
   - internal/app/wire_adapters.go
   - internal/providers/manage/adapters.go
   - internal/connect/catalog.go
   - internal/connect/copy.go
+  - internal/connect/messages/en.json
+  - docs/i18n/glossary-vi.md
   - Makefile
 sidebar:
   order: 5
@@ -55,17 +59,17 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
 
    | Interface                                | Dùng cho                                                                                                                                       |
    | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `Verifier`, `QuotaReporter`              | Bước kết nối và tác vụ kiểm tra tình trạng (5 phút một lần, mỗi phút khi nhà cung cấp đang ngừng hoạt động). `Quota` được ưu tiên khi có cả hai. |
+   | `Verifier`, `QuotaReporter`              | Bước kết nối và tác vụ kiểm tra tình trạng (5 phút một lần, mỗi phút khi nhà cung cấp đang gián đoạn). `Quota` được ưu tiên khi có cả hai. |
    | `ReputationReporter`                     | Tỷ lệ trả thư và tỷ lệ khiếu nại do chính nhà cung cấp đo, là các tỷ lệ mà ngưỡng xem xét của họ áp dụng.                                     |
    | `DomainManager`                          | Bản ghi DNS kèm trạng thái trực tiếp cho bước tên miền và mục Khả năng vào hộp thư.                                                            |
    | `WebhookRegistrar`, `WebhookUnregistrar` | Đăng ký webhook của ReputeCast, và gỡ webhook đó khi nhà cung cấp bị xóa.                                                                       |
-   | `WebhookInspector`, `WebhookTester`      | Chẩn đoán "webhook không có tin" và nút "Gửi sự kiện thử".                                                                                     |
+   | `WebhookInspector`, `WebhookTester`      | Chẩn đoán "webhook im lặng" và nút "Gửi sự kiện thử".                                                                                          |
    | `WebhookVerifier`, `WebhookHandshaker`   | Xác minh trước khi bộ tiếp nhận (ingest) lưu một yêu cầu; trả lời các lần bắt tay (đăng ký SNS, xác thực Event Grid) mà không lưu chúng.       |
    | `WebhookSecrets`                         | Khai báo các header mang nguyên văn một khóa bí mật webhook dùng chung, để bộ tiếp nhận bỏ chúng ra khỏi sự kiện gốc được lưu.                 |
    | `SuppressionSyncer`                      | Đồng bộ hai chiều với danh sách chặn gửi dùng chung. Trả về `providers.ErrNotSupported` từ `AddSuppressions` nếu chỉ kéo về.                  |
    | `TrackingManager`                        | Đọc và tắt tính năng theo dõi phía nhà cung cấp, để lượt mở và lượt nhấp không bị tính hai lần.                                                |
-   | `EventBackfiller`                        | Lấy trạng thái thư khi webhook không có tin.                                                                                                    |
-   | `StatusPage`, `StatusReporter`           | Nút trạng thái và nội dung sự cố khi có sự cố ngừng hoạt động.                                                                                  |
+   | `EventBackfiller`                        | Lấy trạng thái thư khi webhook im lặng.                                                                                                         |
+   | `StatusPage`, `StatusReporter`           | Nút trạng thái và nội dung sự cố khi có sự cố gián đoạn.                                                                                        |
    | `BroadcastStreamCreator`                 | Nhà cung cấp có điều khoản yêu cầu một luồng riêng cho thư hàng loạt (Postmark).                                                               |
    | `ExtrasSender`                           | Gửi bản sao và tệp đính kèm; thư có phần bổ sung (extras) chỉ đi qua nhà cung cấp hỗ trợ chúng.                                                 |
 
@@ -78,20 +82,29 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
      - example.go chú thích package nêu điều khoản của nhà cung cấp, Descriptor, settings, credentials, New, Send
      - webhook.go VerifyWebhook, ParseWebhook, chuẩn hóa
      - account.go Verify hoặc Quota, tên miền, đăng ký webhook, danh sách chặn gửi, theo dõi, lấy bù trạng thái
+     - lang.go catalog thông điệp và các thông điệp của adapter (văn bản cho người đọc)
+     - messages/
+       - en.json câu tiếng Anh mà người dùng đọc
+       - vi.json bản dịch của nó
      - example_test.go API giả lập, contracttest.Run, kiểm thử riêng của adapter
      - testdata/ payload webhook đã ghi lại
    </FileTree>
 
-3. Viết descriptor và đăng ký nó từ `init`:
+3. Viết descriptor, đăng ký nó từ `init`, và lấy câu chữ của nó từ catalog thông điệp của adapter:
 
    ```go title="internal/providers/example/example.go"
+   //go:embed messages/*.json
+   var messagesFS embed.FS
+
+   var msgs = i18n.MustLoad(messagesFS, "providers.example")
+
    func init() { providers.Register(Descriptor()) }
 
    func Descriptor() providers.Descriptor {
    	return providers.Descriptor{
    		Adapter: "example",
    		Name:    "Example ESP",
-   		Kind:    "api", // api, smtp, self_hosted
+   		Kind:    "api", // api, smtp, self_hosted, http
    		Capabilities: providers.Capabilities{
    			Bulk:            providers.BulkAllowed, // cite the AUP in the package comment
    			Webhooks:        "Registered",
@@ -100,43 +113,66 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
    			BatchSize:       1,
    			Sandbox:         "mode",
    			QuotaDiscovery:  true,
-   			Pricing:         "plan, from $10 per month",
+   			// Pricing and DedicatedIPs are in messages/en.json.
    		},
    		Version:    version.Version,
    		Maintainer: "HostRepute",
-   		Terms: []providers.Terms{{Bulk: providers.BulkAllowed, Note: "Opted-in lists only.",
+   		Terms: []providers.Terms{{Bulk: providers.BulkAllowed,
    			Streams: []providers.Stream{providers.StreamBroadcast, providers.StreamAutomation, providers.StreamSystem}}},
-   		Events: "Webhooks", DomainSetup: "API", SuppressionMode: "Two-way",
    		Fields: []providers.Field{
-   			{Key: "api_key", Label: "API key", Secret: true, Required: true, Help: "Example ESP › Settings › API keys."},
-   			{Key: "region", Label: "Region", Options: []string{"us", "eu"}},
+   			{Key: "api_key", Secret: true, Required: true},
+   			{Key: "region", Options: []string{"us", "eu"}},
    		},
    		New: New,
-   	}
+   	}.WithMessages(msgs)
+   }
+   ```
+
+   Câu chữ mà người dùng đọc nằm trong `messages/en.json`, kèm một `note` khi người dịch cần giải thích, còn bản dịch
+   nằm trong `messages/vi.json`, theo thuật ngữ của `docs/i18n/glossary-vi.md`:
+
+   ```json title="internal/providers/example/messages/en.json"
+   {
+     "pricing": { "message": "plan, from $10 per month", "note": "on a capability chip: Pricing · …" },
+     "terms.0.note": { "message": "Opted-in lists only…", "note": "what the terms allow, on Routing" },
+     "events": "Webhooks",
+     "domainSetup": "API",
+     "suppressionMode": "Two-way",
+     "field.api_key.label": "API key",
+     "field.api_key.help": { "message": "Example › Settings › API keys.", "note": "Example's own menus" },
+     "field.region.label": "Region"
    }
    ```
 
    Các huy hiệu phải đúng với nhà cung cấp tại thời điểm hiện tại:
-   - **Bulk:** `BulkAllowed`, `BulkBroadcastStreams` (chỉ trên một luồng riêng), `BulkForbidden` hoặc `BulkYourPolicy` (tự triển khai). Trích dẫn chính sách sử dụng được chấp nhận của nhà cung cấp trong chú thích package, kèm URL và ngày bạn kiểm tra, và ghi các điều kiện quan trọng vào `Terms.Note`: màn hình định tuyến hiển thị nội dung này.
+   - **Bulk:** `BulkAllowed`, `BulkBroadcastStreams` (chỉ trên một luồng riêng), `BulkForbidden` hoặc `BulkYourPolicy` (tự triển khai). Trích dẫn chính sách sử dụng được chấp nhận của nhà cung cấp trong chú thích package, kèm URL và ngày bạn kiểm tra, và ghi các điều kiện quan trọng vào `Terms.Note` (thông điệp `terms.0.note`): màn hình định tuyến hiển thị nội dung này.
    - **Sandbox:** `detection`, `test token`, `mode` hoặc `test addresses`; để trống nếu không có.
    - **Tự phát hiện hạn mức và tốc độ:** chỉ đặt khi một lệnh gọi API trả về các giá trị này.
-   - **Giá và IP riêng:** tóm tắt ngắn; nên ghi tên gói thay vì một mức giá sẽ sớm lỗi thời.
+   - **Giá và IP riêng:** tóm tắt ngắn trong các thông điệp `pricing` và `dedicatedIps`; nên ghi tên gói thay vì một mức giá sẽ sớm lỗi thời.
    - **Theo dõi:** đặt `RewritesLinks` hoặc `AddsOpenPixel` khi nhà cung cấp theo dõi theo mặc định và adapter không tắt được tính năng này cho từng thư.
-   - `Events`, `DomainSetup` và `SuppressionMode` là các từ mà tab Adapter hiển thị, như "SNS webhooks", "API" và "Two-way".
+   - Các thông điệp `events`, `domainSetup` và `suppressionMode` là các từ mà tab Adapter hiển thị, như "SNS webhooks", "API" và "Two-way".
 
-4. Xử lý settings và thông tin xác thực. `providers.Config.Settings` chứa các trường không bí mật; `Config.Credentials` chứa các giá trị bí mật đã giải mã dưới dạng một đối tượng JSON phẳng, có khóa là khóa của các trường `Secret`. Thông tin xác thực là chỉ ghi: được niêm phong khi lưu trữ, không bao giờ được API trả về, và được thay thế từng khóa một. Hãy đánh dấu `Secret` cho mọi trường có khóa trông giống bí mật (`password`, `token`, `secret`, hoặc kết thúc bằng `api_key`), nếu không bộ kiểm thử hợp đồng sẽ báo lỗi.
+4. Viết văn bản cho người đọc. Những gì adapter nói với người dùng hiển thị bằng ngôn ngữ của từng người đọc: văn bản máy chủ theo ngôn ngữ ứng dụng của người đọc (`i18n.LangFrom(ctx)`), còn client API không gửi `Accept-Language` nhận tiếng Anh. Catalog là toàn cục, nên mã lõi đọc được một thông điệp đã lưu mà không cần import adapter.
+   - **Câu chữ của descriptor.** `WithMessages(msgs)` điền descriptor từ các khóa quy ước: `field.<key>.label` và `field.<key>.help`, `terms.<n>.variant` và `terms.<n>.note` (`Terms` thứ n, tính từ 0), `pricing`, `dedicatedIps`, và các từ của tab Adapter `events`, `domainSetup` và `suppressionMode`. Logic vẫn so sánh theo câu tiếng Anh.
+   - **Những gì adapter viết lúc chạy** giữ thông điệp của nó bên cạnh câu tiếng Anh: `Quota.AccountText` (tình trạng tài khoản), `ConnectionReport.SummaryText`, `ProvisionStep.LabelText`, `ProvisionResult.DoneText`, `Tracking.DetailText` và `ScopeText`, `ServiceStatus.SummaryText`, và `CallError.Text` cho lỗi do adapter tự diễn đạt. Hãy trả về câu tiếng Anh như trước và thông điệp bằng `msg.Keep(args)`; phần lớn adapter có một hàm hỗ trợ `say(m, args)` trong `lang.go` trả về cả hai. Truyền số dưới dạng số và thời gian dưới dạng `time.Time`, để `{n, number}` và `{at, time}` theo định dạng khu vực của người đọc.
+   - **Tên giữ nguyên:** tên nhà cung cấp và từ ngữ riêng của họ cho gói, khóa, menu và loại luồng, các phản hồi của họ (mã lỗi, thông điệp API), tên sự kiện, log và lỗi nội bộ.
+   - **Văn bản được lưu.** Mã lưu văn bản của adapter cho người đọc sau này (tình trạng nhà cung cấp, trạng thái thiết lập, một sự cố) lưu câu tiếng Anh và thông điệp. Một dòng được ghi trước khi thông điệp của nó được lưu sẽ hiển thị bằng tiếng Anh.
+
+   Adapter SMS (`internal/sms/<name>`) hoạt động theo cùng cách: namespace catalog của chúng là `sms.<name>`, `Manifest.WithMessages` đọc các khóa `summary`, `badge.<capability>.note`, `field.<key>.label` và `field.<key>.help`, và `internal/sms/contracttest` kiểm tra các văn bản này.
+
+5. Xử lý settings và thông tin xác thực. `providers.Config.Settings` chứa các trường không bí mật; `Config.Credentials` chứa các giá trị bí mật đã giải mã dưới dạng một đối tượng JSON phẳng, có khóa là khóa của các trường `Secret`. Thông tin xác thực là chỉ ghi: được niêm phong khi lưu trữ, không bao giờ được API trả về, và được thay thế từng khóa một. Hãy đánh dấu `Secret` cho mọi trường có khóa trông giống bí mật (`password`, `token`, `secret`, hoặc kết thúc bằng `api_key`), nếu không bộ kiểm thử hợp đồng sẽ báo lỗi.
 
    `New` không được thực hiện I/O mạng và không được thất bại vì thiếu một giá trị tùy chọn; hãy báo thiếu thông tin xác thực từ lệnh gọi đầu tiên. Factory tạo một adapter cho mỗi yêu cầu, nên hãy giữ những gì đáng dùng lại trong một bộ nhớ đệm cấp package, theo khóa là tài khoản. Hãy giữ vật liệu ký (signing material) đọc từ API của nhà cung cấp trong một `webhookauth.Material`; nó đọc lại vật liệu này khi một chữ ký không khớp (tối đa mỗi phút một lần) và mỗi giờ.
 
-5. Triển khai `Send`:
-   - Trả về một `SendError` cho từng thư khi lời từ chối chỉ liên quan đến thư đó (địa chỉ không hợp lệ, người gửi chưa xác minh). Trả về một lỗi khi tài khoản hoặc dịch vụ gặp sự cố, bọc `providers.ErrUnauthorized` (thông tin xác thực bị từ chối) hoặc `providers.ErrUnavailable` (sự cố ngừng hoạt động). `apiclient` thực hiện việc ánh xạ này: `Do` cho lệnh gọi JSON, `Exec` cho nội dung dạng form hoặc multipart, yêu cầu có ký và header phản hồi. 401 và 403 trở thành thông tin xác thực bị từ chối, 429 là giới hạn tốc độ, 408 và 5xx là sự cố ngừng hoạt động; `apiclient.MessageError` biến các phản hồi 4xx khác thành một `SendError` vĩnh viễn.
+6. Triển khai `Send`:
+   - Trả về một `SendError` cho từng thư khi lời từ chối chỉ liên quan đến thư đó (địa chỉ không hợp lệ, người gửi chưa xác minh). Trả về một lỗi khi tài khoản hoặc dịch vụ gặp sự cố, bọc `providers.ErrUnauthorized` (thông tin xác thực bị từ chối) hoặc `providers.ErrUnavailable` (sự cố gián đoạn). `apiclient` thực hiện việc ánh xạ này: `Do` cho lệnh gọi JSON, `Exec` cho nội dung dạng form hoặc multipart, yêu cầu có ký và header phản hồi. 401 và 403 trở thành thông tin xác thực bị từ chối, 429 là giới hạn tốc độ, 408 và 5xx là sự cố gián đoạn; `apiclient.MessageError` biến các phản hồi 4xx khác thành một `SendError` vĩnh viễn.
    - Với API nhận một lệnh gọi cho mỗi thư, hãy dùng `apiclient.Fanout`: hàm này giữ đúng thứ tự kết quả, không bắt đầu lệnh gọi mới sau một lỗi cấp tài khoản, và gán lỗi tạm thời cho các thư chưa gửi để bộ máy gửi thử lại.
    - Gửi kèm mã thư ReputeCast vào bất kỳ trường nào mà nhà cung cấp trả lại trong sự kiện (custom args, tag, metadata), và gửi header `X-ReputeCast-Message`.
    - Nếu nhà cung cấp hỗ trợ idempotency, hãy suy ra khóa từ mã thư, để một lần thử lại sau khi hết thời gian chờ không bao giờ gửi hai lần.
    - Tắt tính năng theo dõi lượt mở và lượt nhấp của nhà cung cấp trên mọi thư: ReputeCast tự theo dõi.
    - Không bao giờ đánh dấu một thư đã được chấp nhận là thất bại. Nếu nhà cung cấp chấp nhận thư nhưng không trả về mã, hãy dùng mã ReputeCast làm mã của nhà cung cấp.
 
-6. Xác minh và chuẩn hóa webhook:
+7. Xác minh và chuẩn hóa webhook:
    - `VerifyWebhook` phải trả về một lỗi bọc `providers.ErrBadSignature` cho mọi thất bại, kể cả "không lấy được khóa". Nếu nhận bất kỳ lỗi nào khác, bộ tiếp nhận vẫn lưu yêu cầu như thể đã được xác minh.
    - `ParseWebhook` xác minh, trừ khi `providers.SignatureVerified(ctx)` đã được đặt. Tác vụ chuẩn hóa đặt giá trị này khi phân tích lại một payload đã lưu, vốn không còn URL gốc hay header `Authorization`.
    - Dùng cơ chế mà nhà cung cấp dùng để ký; `internal/providers/webhookauth` có Standard Webhooks, các hàm hỗ trợ HMAC và phép so sánh thời gian hằng định. Nếu nhà cung cấp không ký, hãy đăng ký webhook bằng basic auth hoặc một bearer token mang `Config.WebhookSecret`; giá trị này đi trong `Authorization` và không bao giờ được lưu.
@@ -144,7 +180,7 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
    - Ánh xạ mọi sự kiện liên quan đến việc gửi thành `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` hoặc `unsubscribe`. Giữ loại sự kiện của nhà cung cấp trong `OriginalType`, mã của họ trong `OriginalCode` (tách bằng `bounce.Split`), phần còn lại trong `Diagnostic`, và đặt `BounceClass` bằng `bounce.Classify`. Viết thường địa chỉ người nhận, giữ JSON gốc trong `Raw`, và không trả về sự kiện nào cho những thứ không phải kết quả gửi (sent, processed, thư trả lời tự động, ping thử).
    - Đừng chặn gửi dựa trên phỏng đoán: một thất bại vĩnh viễn do phía người gửi gây ra (bị chặn vì spam hoặc uy tín, hết lượt thử lại) là trả thư tạm thời. Chỉ lỗi về địa chỉ mới là trả thư vĩnh viễn, vì các trường hợp trả thư vĩnh viễn và khiếu nại được đưa vào [danh sách chặn gửi](/vi/audience/suppressions/) dùng chung.
 
-7. Kiểm thử bằng bộ kiểm thử hợp đồng. Mọi adapter đều phải vượt qua `internal/providers/contracttest`. Bộ kiểm thử này kiểm tra việc đăng ký, khả năng, một lần gửi, một lần từ chối vĩnh viễn, một sự cố ngừng hoạt động và thông tin xác thực bị từ chối với API giả lập của bạn, cùng mọi webhook đã ghi lại: được xác minh, được chuẩn hóa, được phân tích lại với context đã xác minh, và bị từ chối khi bị sửa đổi.
+8. Kiểm thử bằng bộ kiểm thử hợp đồng. Mọi adapter đều phải vượt qua `internal/providers/contracttest`. Bộ kiểm thử này kiểm tra việc đăng ký, khả năng, một lần gửi, một lần từ chối vĩnh viễn, một sự cố gián đoạn và thông tin xác thực bị từ chối với API giả lập của bạn, cùng mọi webhook đã ghi lại: được xác minh, được chuẩn hóa, được phân tích lại với context đã xác minh, và bị từ chối khi bị sửa đổi. Bài kiểm thử con `Texts` kiểm tra văn bản cho người đọc: một adapter có sẵn thuộc loại `api`, `smtp`, `self_hosted` hoặc `http` phải có catalog, mọi văn bản nó khai báo đều có một thông điệp với câu tiếng Anh đúng bằng văn bản đó, và mọi thông điệp đều được dịch sang từng ngôn ngữ của ứng dụng. `contracttest.CheckText` kiểm tra một văn bản mà adapter viết lúc chạy.
 
    ```go title="internal/providers/example/example_test.go"
    func TestContract(t *testing.T) {
@@ -168,10 +204,10 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
 
    Kiểm thử không dùng mạng: hãy chạy một bản giả lập API của nhà cung cấp, ghi lại payload webhook từ tài liệu của nhà cung cấp làm fixture, và ký chúng ngay trong kiểm thử bằng một khóa thử. Nếu nhà cung cấp công bố vector kiểm thử chữ ký, hãy kiểm thử với vector đó. Hãy kiểm thử các interface tùy chọn, việc ánh xạ lỗi và mọi điểm bất thường mà bạn phải xử lý riêng (mã lớn hơn 2^53, một trường lúc là chuỗi lúc là mảng, một phản hồi 400 mang kết quả theo từng thư).
 
-8. Đăng ký adapter vào bản dựng:
+9. Đăng ký adapter vào bản dựng:
    - Thêm một blank import của package vào `internal/app/wire_adapters.go`. Đăng ký cùng một khóa hai lần sẽ gây panic khi khởi động.
    - Thêm khóa vào `adapterOrder` trong `internal/providers/manage/adapters.go` (thứ tự trên tab Adapter) và vào `catalogOrder` trong `internal/connect/catalog.go` (thứ tự trong danh mục thiết lập).
-   - Không bắt buộc: thêm câu chữ cho trình hướng dẫn kết nối trong `copyTable` tại `internal/connect/copy.go`; nếu không có mục nào, trình hướng dẫn dùng tên và các trường của descriptor.
+   - Không bắt buộc: thêm câu chữ cho trình hướng dẫn kết nối trong `copyTable` tại `internal/connect/copy.go`, với câu chữ là các thông điệp `adapter.<key>.*` trong `internal/connect/messages/en.json` và `vi.json`; nếu không có mục nào, trình hướng dẫn dùng tên và các trường của descriptor.
    - Adapter có sẵn mang phiên bản ReputeCast (`version.Version`) và người duy trì "HostRepute".
 
 </Steps>
@@ -193,6 +229,8 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
 
 - **Máy chủ panic với `providers: duplicate adapter <key>`:** một adapter khác đã đăng ký khóa đó. Hãy chọn một khóa `Adapter` không trùng.
 - **Bộ kiểm thử hợp đồng báo lỗi một trường kết nối:** khóa của trường trông giống bí mật (`password`, `token`, `secret`, `…api_key`). Hãy đặt `Secret: true`.
+- **Bài kiểm thử `Texts` của bộ kiểm thử hợp đồng báo adapter "keeps no catalog":** descriptor không nạp thông điệp của nó. Hãy nhúng `messages/*.json`, nạp chúng bằng `i18n.MustLoad`, và kết thúc `Descriptor()` bằng `.WithMessages(msgs)`.
+- **`Texts` báo một văn bản "has no message" hoặc catalog "isn't translated into Tiếng Việt":** hãy thêm khóa vào `messages/en.json` với đúng câu tiếng Anh mà adapter dùng, hoặc thêm bản dịch của nó vào `messages/vi.json`.
 - **Một webhook bị sửa đổi vẫn được chấp nhận, hoặc một webhook bị từ chối lại được lưu là đã xác minh:** `VerifyWebhook` đã trả về một lỗi không bọc `providers.ErrBadSignature`.
 - **Webhook đã lưu thất bại khi được chuẩn hóa:** `ParseWebhook` xác minh lại dù `providers.SignatureVerified(ctx)` đã được đặt; yêu cầu đã lưu không có header `Authorization`.
 - **Sự kiện không khớp với thư:** nhà cung cấp không gửi lại mã thư ReputeCast. Hãy truyền mã này trong metadata, tag hoặc custom args của nhà cung cấp, và gửi header `X-ReputeCast-Message`.

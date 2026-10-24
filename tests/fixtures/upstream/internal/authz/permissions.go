@@ -29,29 +29,29 @@ const (
 )
 
 // Defs is the catalogue of permissions in display order.
-var Defs = []Def{
-	{Key: CampaignsView, Group: "Campaigns", Label: "View campaigns", Description: "See campaigns, their content, audience and status."},
-	{Key: CampaignsEdit, Group: "Campaigns", Label: "Edit campaigns", Description: "Create and edit drafts, request approval.", Implies: []Permission{CampaignsView}},
-	{Key: CampaignsApprove, Group: "Campaigns", Label: "Approve campaigns", Description: "Approve, reject or request changes on sends that need approval.", Sensitive: true, Implies: []Permission{CampaignsView}},
-	{Key: TemplatesView, Group: "Templates", Label: "View templates", Description: "See saved templates and sections."},
-	{Key: TransactionalView, Group: "Transactional", Label: "View templates, messages and reports", Description: "See transactional templates, the message log and its numbers. Never message content."},
-	{Key: AutomationsView, Group: "Automations", Label: "View automations", Description: "See flows and their live stats."},
-	{Key: SubscribersView, Group: "Contacts", Label: "View contacts", Description: "See contacts, profiles and activity."},
-	{Key: SegmentsEdit, Group: "Lists and segments", Label: "Edit segments", Description: "Build segments with the condition builder.", Implies: []Permission{SubscribersView}},
-	{Key: SegmentsSQL, Group: "Lists and segments", Label: "Write SQL segments", Description: "Write read-only SQL against a contacts view.", Sensitive: true, Implies: []Permission{SegmentsEdit, SubscribersView}},
-	{Key: ReportsView, Group: "Reports", Label: "View reports", Description: "See campaign and automation reports."},
-	{Key: DeliverabilityView, Group: "Deliverability", Label: "View deliverability", Description: "See domain, IP and provider health."},
-	{Key: ProvidersView, Group: "Sending", Label: "View sending providers", Description: "See provider status and routing. Never credentials."},
-	{Key: TeamView, Group: "Team", Label: "View the team", Description: "See members, roles and invitations."},
-	{Key: IntegrationsView, Group: "Integrations", Label: "See integrations, their activity and webhooks", Description: "See the integrations hub, each integration's health, activity and managed webhooks."},
-	{Key: GrowView, Group: "Grow", Label: "View referral and recommendation results", Description: "See referrals, referrers, rewards and recommendations."},
-	{Key: EarnView, Group: "Earn", Label: "View revenue, paid members, gifts and sponsors", Description: "See Earn's numbers, paid members, gifts and sponsor bookings."},
-	{Key: WebsiteView, Group: "Website and pages", Label: "View posts, pages and website numbers", Description: "See the website's posts, pages, members and numbers."},
-	{Key: ProductsView, Group: "Products and orders", Label: "View products and orders", Description: "See digital products, their sales and orders."},
-	{Key: AuditView, Group: "Audit", Label: "View the audit log", Description: "See who did what, when and from where."},
-	{Key: WorkspaceTransfer, Group: "Workspace", Label: "Transfer ownership", Description: "Make another member the Owner.", Sensitive: true, OwnerOnly: true},
-	{Key: WorkspaceDelete, Group: "Workspace", Label: "Delete the workspace", Description: "Delete the workspace and everything in it.", Sensitive: true, OwnerOnly: true},
-}
+var Defs = described([]Def{
+	{Key: CampaignsView, Group: g("campaigns")},
+	{Key: CampaignsEdit, Group: g("campaigns"), Implies: []Permission{CampaignsView}},
+	{Key: CampaignsApprove, Group: g("campaigns"), Sensitive: true, Implies: []Permission{CampaignsView}},
+	{Key: TemplatesView, Group: g("templates")},
+	{Key: TransactionalView, Group: g("transactional")},
+	{Key: AutomationsView, Group: g("automations")},
+	{Key: SubscribersView, Group: g("contacts")},
+	{Key: SegmentsEdit, Group: g("lists"), Implies: []Permission{SubscribersView}},
+	{Key: SegmentsSQL, Group: g("lists"), Sensitive: true, Implies: []Permission{SegmentsEdit, SubscribersView}},
+	{Key: ReportsView, Group: g("reports")},
+	{Key: DeliverabilityView, Group: g("deliverability")},
+	{Key: ProvidersView, Group: g("sending")},
+	{Key: TeamView, Group: g("team")},
+	{Key: IntegrationsView, Group: g("integrations")},
+	{Key: GrowView, Group: g("grow")},
+	{Key: EarnView, Group: g("earn")},
+	{Key: WebsiteView, Group: g("website")},
+	{Key: ProductsView, Group: g("products")},
+	{Key: AuditView, Group: g("audit")},
+	{Key: WorkspaceTransfer, Group: g("workspace"), Sensitive: true, OwnerOnly: true},
+	{Key: WorkspaceDelete, Group: g("workspace"), Sensitive: true, OwnerOnly: true},
+})
 
 // Built-in role keys.
 const (
@@ -71,7 +71,7 @@ var viewAll = []Permission{
 // BuiltinRoles in display order. Their permissions always come from here,
 // never from the database, so upgrades can add permissions to them.
 var BuiltinRoles = []BuiltinRole{
-	{Key: RoleOwner, Name: "Owner", Description: "Everything, including transferring ownership and deleting the workspace", Permissions: All()},
-	{Key: RoleAdmin, Name: "Admin", Description: "Everything except transferring ownership and deleting the workspace", Permissions: AllGrantable()},
-	{Key: RoleViewer, Name: "Viewer", Description: "Read-only. Never sees secrets", Permissions: NewSet(viewAll...)},
+	{Key: RoleOwner, Name: "Owner", Description: roleAbout(RoleOwner), Permissions: All()},
+	{Key: RoleAdmin, Name: "Admin", Description: roleAbout(RoleAdmin), Permissions: AllGrantable()},
+	{Key: RoleViewer, Name: "Viewer", Description: roleAbout(RoleViewer), Permissions: NewSet(viewAll...)},
 }

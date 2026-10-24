@@ -160,8 +160,8 @@ import UiPath from '~/components/UiPath.astro'
   ```
 
 - `alt` is required. Describe what the screen shows and why it matters on this page, not "screenshot of".
-- Vietnamese pages show Vietnamese screenshots when the app screen is translated, else the English image with a
-  note under it.
+- Vietnamese pages show the Vietnamese capture of a screenshot when one exists, else the English image with a note
+  under it.
 
 ## SEO rules (checked by `pnpm check`)
 

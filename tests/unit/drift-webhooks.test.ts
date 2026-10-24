@@ -6,7 +6,7 @@ const root = new URL('../fixtures/upstream/', import.meta.url).pathname
 const read = (path: string) => readFileSync(`${root}${path}`, 'utf8')
 
 describe('parseWebhookEvents', () => {
-  it('reads the positional rows of the Events catalogue, past comments', () => {
+  it('reads the keyed rows of the Events catalogue, past comments', () => {
     expect(parseWebhookEvents(read('internal/webhooks/webhooks.go'))).toEqual([
       'contact.subscribed',
       'contact.unsubscribed',

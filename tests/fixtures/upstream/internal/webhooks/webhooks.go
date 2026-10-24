@@ -2,11 +2,11 @@ package webhooks
 
 // Events is the catalogue of events, in display order.
 var Events = []WebhookEventInfo{
-	{"contact.subscribed", "Contacts", "A contact joined a list (after double opt-in when it's on)."},
-	{"contact.unsubscribed", "Contacts", "A contact left a list or unsubscribed from everything."},
-	{"contact.updated", "Contacts", "Fields, tags or preferences changed."},
-	{"contact.erased", "Contacts", "Personal data was erased."},
+	{Name: "contact.subscribed", Group: "Contacts"},
+	{Name: "contact.unsubscribed", Group: "Contacts"},
+	{Name: "contact.updated", Group: "Contacts"},
+	{Name: "contact.erased", Group: "Contacts"},
 	// Grow (design expansion phase 5): referral programs.
-	{"referral.counted", "Referrals", "A referral counted: its subscriber confirmed and stayed through the hold."},
-	{"referral.held", "Referrals", "A referral was held for review by a suspicion rule."},
+	{Name: "referral.counted", Group: "Referrals"},
+	{Name: "referral.held", Group: "Referrals"},
 }

@@ -94,12 +94,12 @@ export const providerSchema = z.object({
   id: z.string(),
   name: z.string(),
   family: z.enum(['email', 'sms', 'verification', 'ai', 'payments', 'stores', 'push', 'whatsapp', 'seed', 'import']),
-  kind: z.string().optional(),
-  bulk: z.string().optional(),
-  webhooks: z.string().optional(),
-  domainApi: z.string().optional(),
-  suppressionSync: z.string().optional(),
-  batch: z.string().optional(),
+  kind: loc.optional(),
+  bulk: loc.optional(),
+  webhooks: loc.optional(),
+  domainApi: loc.optional(),
+  suppressionSync: loc.optional(),
+  batch: loc.optional(),
   notes: loc.optional(),
   page: z.string().optional(), // docs path
 })

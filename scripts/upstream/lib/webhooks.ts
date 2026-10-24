@@ -5,12 +5,12 @@ import { globSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Catalog } from './types.ts'
 
-/** Event names declared in one Go file: positional `{"name", "Group", "…"}` rows of `var Events` and keyed appends. */
+/** Event names declared in one Go file: keyed `{Name: "…", Group: …}` rows of `var Events` and keyed appends. */
 export function parseWebhookEvents(src: string): string[] {
   const go = src.replace(/^[ \t]*\/\/.*$/gm, '')
   const events = go.match(/^var Events = \[\]WebhookEventInfo\{\n([\s\S]*?)^\}/m)?.[1] ?? ''
   return [
-    ...[...events.matchAll(/^\s*\{"([^"]+)",/gm)].map((m) => m[1]),
+    ...[...events.matchAll(/^\s*\{Name: "([^"]+)",/gm)].map((m) => m[1]),
     ...[...go.matchAll(/\bWebhookEventInfo\{Name: "([^"]+)"/g)].map((m) => m[1]),
   ]
 }

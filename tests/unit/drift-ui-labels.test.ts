@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { checkUiLabels, checkUiLabelsAt, hasLiteral, viSiblings } from '../../scripts/upstream/lib/ui-labels.ts'
@@ -34,26 +35,56 @@ describe('checkUiLabelsAt', () => {
     expect(checkUiLabelsAt(root, rows)).toEqual({ problems: [], viAvailable: ['settings.roles'] })
   })
 
-  it('finds hard-coded English as JSX text, including HTML entities, and never expects vi for .tsx', () => {
+  it('finds labels shown as ICU select or plural options and as messages with inline tags', () => {
+    const notifications = 'web/src/features/notifications/messages.ts'
+    const keys = 'web/src/features/keys/messages.ts'
     const rows = [
-      { id: 'webhooks.addEndpoint', en: 'Add endpoint', source: 'web/src/features/webhooks/WebhooksPage.tsx' },
-      { id: 'webhooks.empty', en: 'No webhooks', source: 'web/src/features/webhooks/WebhooksPage.tsx' },
-      { id: 'admin.versionCard', en: 'Version & updates', source: 'web/src/features/admin/instance/InstancePage.tsx' },
+      { id: 'notifications.tabUnread', en: 'Unread', vi: 'Chưa đọc', source: notifications },
+      { id: 'notifications.tabAll', en: 'All', vi: 'Tất cả', source: notifications },
+      { id: 'keys.expiresIn30Days', en: 'In 30 days', vi: 'Sau 30 ngày', source: keys },
+      { id: 'keys.listScope', en: 'List scope · optional', vi: 'Phạm vi danh sách · không bắt buộc', source: keys },
+      {
+        id: 'ses.enforcementShutdown',
+        en: 'sending paused by AWS',
+        vi: 'AWS đã tạm dừng gửi',
+        source: 'internal/providers/ses/messages/en.json',
+      },
     ]
     expect(checkUiLabelsAt(root, rows)).toEqual({ problems: [], viAvailable: [] })
   })
 
+  it('reports a label that upstream quotes only in a comment', () => {
+    const sso = 'web/src/features/admin/sso/setup.messages.ts'
+    const rows = [
+      { id: 'sso.cardConnection', en: '2 · Connection', source: sso },
+      { id: 'sso.presetApp', en: 'Entra app registration', source: sso },
+    ]
+    expect(checkUiLabelsAt(root, rows).problems).toEqual([
+      `sso.presetApp: English "Entra app registration" not found in ${sso}`,
+    ])
+  })
+
+  it('reads the Vietnamese of xMessages.ts from x.messages.vi.ts', () => {
+    const digests = 'web/src/features/digests/settingsMessages.ts'
+    const row = { id: 'digestSettings.weekly', en: 'Weekly', source: digests }
+    expect(checkUiLabelsAt(root, [{ ...row, vi: 'Hằng tuần' }])).toEqual({ problems: [], viAvailable: [] })
+    expect(checkUiLabelsAt(root, [row])).toEqual({ problems: [], viAvailable: ['digestSettings.weekly'] })
+  })
+
   it('reports missing sources, a vi without a translation file, and duplicate ids', () => {
-    const page = 'web/src/features/webhooks/WebhooksPage.tsx'
+    const languages = 'web/src/i18n/languages.ts'
+    const go = 'internal/webhooks/webhooks.go'
     const rows = [
       { id: 'gone', en: 'Gone', source: 'web/src/features/gone/messages.ts' },
-      { id: 'webhooks.addEndpoint', en: 'Add endpoint', vi: 'Thêm endpoint', source: page },
-      { id: 'webhooks.addEndpoint', en: 'Add endpoint', source: page },
+      { id: 'language.pseudoLocale', en: 'Pseudo (+40%)', vi: 'Giả lập (+40%)', source: languages },
+      { id: 'language.pseudoLocale', en: 'Pseudo (+40%)', source: languages },
+      { id: 'webhooks.groupContacts', en: 'Contacts', vi: 'Liên hệ', source: go },
     ]
     expect(checkUiLabelsAt(root, rows).problems).toEqual([
       'gone: source web/src/features/gone/messages.ts not found upstream',
-      `webhooks.addEndpoint: has vi but ${page} has no translation file`,
-      'webhooks.addEndpoint: duplicate id',
+      'language.pseudoLocale: has vi but web/src/i18n/languages.vi.ts not found',
+      'language.pseudoLocale: duplicate id',
+      `webhooks.groupContacts: has vi but ${go} has no translation file`,
     ])
   })
 })
@@ -75,9 +106,35 @@ describe('hasLiteral', () => {
     expect(hasLiteral(src, 'Save')).toBe(false)
   })
 
-  it('accepts JSX text only when asked', () => {
-    expect(hasLiteral('<b>\n  Export CSV\n</b>', 'Export CSV')).toBe(false)
-    expect(hasLiteral('<b>\n  Export CSV\n</b>', 'Export CSV', true)).toBe(true)
+  it('ignores text quoted in comments, also after an apostrophe in a comment', () => {
+    const sales = readFileSync(join(root, 'web/src/features/products/sales.messages.ts'), 'utf8')
+    const sso = readFileSync(join(root, 'web/src/features/admin/sso/setup.messages.ts'), 'utf8')
+    const languages = readFileSync(join(root, 'web/src/i18n/languages.ts'), 'utf8')
+    expect(hasLiteral(sales, 'Product sales')).toBe(false)
+    expect(hasLiteral(sales, 'Product sales · 30 days')).toBe(true)
+    expect(hasLiteral(sso, 'Entra ID')).toBe(false)
+    expect(hasLiteral(sso, '3 · Claim mapping')).toBe(true)
+    expect(hasLiteral(languages, 'Tiếng Việt')).toBe(true)
+  })
+
+  it('matches the text of ICU options with # as a number, never a plain argument, and drops inline tags', () => {
+    const sales = readFileSync(join(root, 'web/src/features/products/sales.messages.ts'), 'utf8')
+    const keys = readFileSync(join(root, 'web/src/features/keys/messages.ts'), 'utf8')
+    const notifications = readFileSync(join(root, 'web/src/features/notifications/messages.ts'), 'utf8')
+    expect(hasLiteral(sales, 'orders')).toBe(true)
+    expect(hasLiteral(sales, 'refunded · 2 orders')).toBe(true)
+    expect(hasLiteral(sales, 'refunded · orders')).toBe(false)
+    expect(hasLiteral(keys, 'In 1 day')).toBe(true)
+    expect(hasLiteral(keys, 'List scope · optional')).toBe(true)
+    expect(hasLiteral(keys, 'List scope')).toBe(false)
+    expect(hasLiteral(notifications, 'HostRepute')).toBe(true)
+    expect(hasLiteral(notifications, 'Unread · 3')).toBe(false)
+  })
+
+  it("resolves ICU apostrophe quoting ('{{ tier }}' is literal text)", () => {
+    // internal/earn/messages/en.json:202
+    const src = `  "starter.member-welcome.heading": "Welcome to '{{ tier }}'",`
+    expect(hasLiteral(src, 'Welcome to {{ tier }}')).toBe(true)
   })
 })
 
@@ -92,6 +149,9 @@ describe('viSiblings', () => {
       'web/src/i18n/common.messages.vi.ts',
     ])
     expect(viSiblings('internal/pagelabels/messages/en.json')).toEqual(['internal/pagelabels/messages/vi.json'])
+    expect(viSiblings('web/src/features/digests/settingsMessages.ts')).toEqual([
+      'web/src/features/digests/settings.messages.vi.ts',
+    ])
     expect(viSiblings('web/src/features/keys/KeysPage.tsx')).toEqual([])
   })
 

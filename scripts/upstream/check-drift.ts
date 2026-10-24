@@ -48,7 +48,14 @@ for (const file of readdirSync(libDir)
   for (const catalog of mod.catalogs ?? []) {
     const rows = readYaml(catalog.dataFile)
     const data = catalog.dataIds ? catalog.dataIds(rows) : rows.map((r) => String(r.id))
-    const found = catalog.extract(upstream)
+    let found: string[]
+    try {
+      found = catalog.extract(upstream)
+    } catch (error) {
+      // Upstream restructured the source this extractor reads: report it and check the other catalogs.
+      fail(`${catalog.name}: extractor failed: ${(error as Error).message}`)
+      continue
+    }
     const { added, removed } = diffIds(data, found)
     if (added.length === 0 && removed.length === 0) console.log(`  ✓ ${catalog.name}: ${found.length}`)
     else {

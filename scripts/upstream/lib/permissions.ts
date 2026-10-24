@@ -13,9 +13,9 @@ const AUTHZ_FILES = ['internal/authz/permissions.go', 'internal/authz/agency.go'
 /** Drops whole-line `//` comments so commented-out code never counts. */
 const code = (src: string) => src.replace(/^[ \t]*\/\/.*$/gm, '')
 
-/** Body of a top-level `var <name> = []T{ … }` composite literal. */
+/** Body of a top-level `var <name> = []T{ … }` literal, also when wrapped in a call: `described([]Def{ … })`. */
 function sliceBody(src: string, name: string): string {
-  const m = code(src).match(new RegExp(`^var ${name} = \\[\\]\\w+\\{\\n([\\s\\S]*?)^\\}`, 'm'))
+  const m = code(src).match(new RegExp(`^var ${name} = (?:\\w+\\()?\\[\\]\\w+\\{\\n([\\s\\S]*?)^\\}`, 'm'))
   if (!m) throw new Error(`authz: no "var ${name}" slice found`)
   return m[1]
 }
