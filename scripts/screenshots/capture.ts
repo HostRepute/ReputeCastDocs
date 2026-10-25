@@ -37,7 +37,7 @@ import {
 import sharp from 'sharp'
 import { setLanguage, signIn } from './lib/auth.ts'
 import { toMarker, type Box, type MarkerFile } from './lib/markers.ts'
-import { resolvePath } from './lib/resolve.ts'
+import { parsePlaceholders, resolvePath } from './lib/resolve.ts'
 import {
   buildCli,
   parseTempPassword,
@@ -76,6 +76,7 @@ const viewports = {
   desktop: { width: 1440, height: 900, deviceScaleFactor: 1 },
   tablet: { width: 834, height: 1112, deviceScaleFactor: 1 },
   mobile: { width: 390, height: 844, deviceScaleFactor: 2 },
+  hero: { width: 1280, height: 800, deviceScaleFactor: 2 },
 }
 
 const { values: opts } = parseArgs({
@@ -105,6 +106,11 @@ const results: Result[] = []
 let browser: Browser
 let sessions = new Map<User, Session>()
 let ownerPassword = ''
+/**
+ * Paths with their placeholders resolved, per database. The API names some demo records in the member's language
+ * (a placement test's "SES vs Postal", the Sunset tier), so placeholders are looked up in English, once.
+ */
+let resolvedPaths = new Map<string, string>()
 
 /** Signs `user` in once per database (sign-in is limited to 30 per minute per IP) and keeps the cookies. */
 async function session(user: User): Promise<Session | undefined> {
@@ -120,13 +126,17 @@ async function session(user: User): Promise<Session | undefined> {
   return s
 }
 
-/** Puts every signed-in member's language back as it was, and forgets the sessions (before a new database). */
+/**
+ * Puts every signed-in member's language back as it was, and forgets the sessions and resolved paths (before a new
+ * database).
+ */
 async function endSessions(): Promise<void> {
   for (const s of sessions.values()) {
     if (s.prefs && s.language) await s.api.put(`${app}/api/v1/me/language`, { data: s.prefs }).catch(() => undefined)
     await s.api.dispose()
   }
   sessions = new Map()
+  resolvedPaths = new Map()
 }
 
 async function goto(page: Page, url: string): Promise<void> {
@@ -141,6 +151,7 @@ async function goto(page: Page, url: string): Promise<void> {
 
 async function runStep(page: Page, step: NonNullable<Shot['before']>[number]): Promise<void> {
   if ('click' in step) await page.locator(step.click).first().click()
+  else if ('dblclick' in step) await page.locator(step.dblclick).first().dblclick()
   else if ('hover' in step) await page.locator(step.hover).first().hover()
   else if ('press' in step) await page.keyboard.press(step.press)
   else if ('fill' in step) await page.locator(step.fill[0]).first().fill(step.fill[1])
@@ -151,6 +162,21 @@ async function runStep(page: Page, step: NonNullable<Shot['before']>[number]): P
 async function capture(s: Shot, locale: Locale): Promise<number> {
   const user = s.user ?? 'linh'
   const auth = await session(user)
+  let path = resolvedPaths.get(s.path)
+  if (!path) {
+    if (!auth) {
+      // Only a member's API can look ids up.
+      if (parsePlaceholders(s.path).length) throw new Error('a visitor path has placeholders')
+      path = s.path
+    } else {
+      if (auth.language !== 'en') {
+        await setLanguage(auth.api, app, 'en')
+        auth.language = 'en'
+      }
+      path = await resolvePath(auth.api, app, s.path)
+    }
+    resolvedPaths.set(s.path, path)
+  }
   if (auth && auth.language !== locale) {
     await setLanguage(auth.api, app, locale)
     auth.language = locale
@@ -169,7 +195,6 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
   try {
     // Visitors (sign-in) pick their language in the card's menu, stored as JSON in rc.language.
     if (!auth) await ctx.addInitScript(`localStorage.setItem('rc.language', ${JSON.stringify(JSON.stringify(locale))})`)
-    const path = await resolvePath(ctx.request, app, s.path)
     const page = await ctx.newPage()
     let rateLimited = false
     page.on('response', (r) => {
@@ -244,7 +269,7 @@ async function captureAll(list: Shot[]): Promise<void> {
   for (const locale of runLocales) {
     for (const s of list) {
       if (!(s.locales ?? ['en', 'vi']).includes(locale)) {
-        results.push({ id: s.id, locale, result: 'skipped', note: 'English only (no Vietnamese UI upstream)' })
+        results.push({ id: s.id, locale, result: 'skipped', note: 'English only (see the manifest)' })
         continue
       }
       for (let attempt = 1; ; attempt++) {

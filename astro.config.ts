@@ -50,6 +50,7 @@ export default defineConfig({
         },
       },
       components: {
+        Hero: './src/components/overrides/Hero.astro',
         PageTitle: './src/components/overrides/PageTitle.astro',
         Footer: './src/components/overrides/Footer.astro',
       },

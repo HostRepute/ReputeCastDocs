@@ -20,6 +20,8 @@ export type CheckContext = {
   shotIds: Set<string>
   /** Screenshot ids that have an English file in src/assets/screenshots/en/. */
   shotFilesEn: Set<string>
+  /** Marker counts by `<locale>/<id>` from src/assets/screenshots/<locale>/<id>.json (0 when a shot has none). */
+  shotMarkers: Map<string, number>
   /** Ids in src/data/ui-labels.yaml. */
   uiLabels: Set<string>
   /** Ids in src/data/permissions.yaml. */
@@ -53,7 +55,13 @@ export function locateEntry(relativeFile: string): { locale: Locale; path: strin
   return { locale: 'en', path: withoutExt }
 }
 
-export type Tag = { name: string; attrs: Record<string, string>; line: number }
+export type Tag = {
+  name: string
+  attrs: Record<string, string>
+  line: number
+  /** What sits between `<Name …>` and `</Name>`; undefined for a self-closing tag. */
+  inner?: string
+}
 
 const ATTR = /([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*(?:"([^"]*)"|'([^']*)'|`([^`]*)`|([^}]*?))\s*\})/g
 
@@ -82,9 +90,25 @@ export function findTags(body: string, name: string): Tag[] {
     for (const a of raw.matchAll(ATTR)) {
       attrs[a[1]] = a[2] ?? a[3] ?? a[4] ?? a[5] ?? a[6] ?? a[7] ?? ''
     }
-    tags.push({ name, attrs, line: body.slice(0, m.index).split('\n').length })
+    const selfClosing = raw.trimEnd().endsWith('/')
+    const close = selfClosing ? -1 : body.indexOf(`</${name}>`, end)
+    const inner = close === -1 ? undefined : body.slice(end + 1, close)
+    tags.push({
+      name,
+      attrs,
+      line: body.slice(0, m.index).split('\n').length,
+      ...(inner === undefined ? {} : { inner }),
+    })
   }
   return tags
+}
+
+/** The numbers of a Screenshot legend's top-level ordered list items (`1. …` at the shallowest indent). */
+export function legendNumbers(inner: string): number[] {
+  const items = [...inner.matchAll(/^([ \t]*)(\d+)\.\s/gm)].map((m) => ({ indent: m[1].length, n: Number(m[2]) }))
+  if (items.length === 0) return []
+  const top = Math.min(...items.map((i) => i.indent))
+  return items.filter((i) => i.indent === top).map((i) => i.n)
 }
 
 function str(value: unknown): string | undefined {
@@ -157,6 +181,14 @@ export function checkPages(pages: Page[], ctx: CheckContext): Issue[] {
         else if (!ctx.shotFilesEn.has(id)) add(file, 'screenshot', `line ${tag.line}: "${id}" has no English file`)
       }
       if (!tag.attrs.alt?.trim()) add(file, 'screenshot', `line ${tag.line}: "${id ?? '?'}" has empty alt text`)
+      if (id && tag.inner !== undefined) {
+        const numbers = legendNumbers(tag.inner)
+        const markers = ctx.shotMarkers.get(`${page.locale}/${id}`) ?? ctx.shotMarkers.get(`en/${id}`) ?? 0
+        if (numbers.length > 0 && numbers.some((n, i) => n !== i + 1))
+          add(file, 'screenshot', `line ${tag.line}: "${id}" legend is numbered ${numbers.join(', ')}, not from 1 up`)
+        else if (numbers.length > 0 && numbers.length !== markers)
+          add(file, 'screenshot', `line ${tag.line}: "${id}" legend has ${numbers.length} items for ${markers} markers`)
+      }
     }
 
     for (const tag of findTags(page.body, 'UiPath')) {

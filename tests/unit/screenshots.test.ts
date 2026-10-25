@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { toMarker } from '../../scripts/screenshots/lib/markers.ts'
+import { badgeSide, toMarker } from '../../scripts/screenshots/lib/markers.ts'
 import { fillPath, parsePlaceholders, placeholderKinds, workspaceOf } from '../../scripts/screenshots/lib/resolve.ts'
 import { parseTempPassword } from '../../scripts/screenshots/lib/upstream.ts'
 import { englishOnlyFeatures, shots } from '../../scripts/screenshots/manifest.ts'
@@ -40,6 +40,33 @@ describe('toMarker', () => {
       w: 33.34,
       h: 33.34,
     })
+  })
+})
+
+describe('badgeSide', () => {
+  const box = { n: 1, w: 20, h: 10 }
+  const desktop = 1440 / 900
+
+  it('puts the number left of a box with room on its left', () => {
+    expect(badgeSide({ ...box, x: 18.1, y: 10 }, desktop)).toBe('left')
+  })
+
+  it('goes above a box at the left edge, measuring the room in the image height', () => {
+    // 6% of the width is 9.6% of a 1440×900 image's height, 2.6% of a 1440×3358 page's.
+    expect(badgeSide({ ...box, x: 0, y: 9.7 }, desktop)).toBe('top')
+    expect(badgeSide({ ...box, x: 0, y: 9.5 }, desktop)).not.toBe('top')
+    expect(badgeSide({ ...box, x: 0, y: 3 }, 1440 / 3358)).toBe('top')
+  })
+
+  it('falls back to the right, then below, then inside the corner', () => {
+    expect(badgeSide({ n: 1, x: 0, y: 0, w: 90, h: 50 }, desktop)).toBe('right')
+    expect(badgeSide({ n: 1, x: 0, y: 0, w: 100, h: 80 }, desktop)).toBe('bottom')
+    expect(badgeSide({ n: 1, x: 0, y: 0, w: 100, h: 100 }, desktop)).toBe('inside')
+  })
+
+  it("keeps the manifest's choice, even where another side has room", () => {
+    expect(badgeSide({ ...box, x: 18.1, y: 10 }, desktop, 'left-end')).toBe('left-end')
+    expect(badgeSide({ n: 1, x: 0, y: 0, w: 100, h: 100 }, desktop, 'top')).toBe('top')
   })
 })
 

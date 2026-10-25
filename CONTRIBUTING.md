@@ -26,7 +26,7 @@ group of a page come from its first path segment (`src/lib/topics.ts`). Order in
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Guides         | `getting-started`, `providers`, `campaigns`, `audience`, `migrate`, `automations`, `transactional`, `forms`, `grow`, `earn`, `channels`, `integrations`, `team` |
 | Deliverability | `deliverability`, `smtp-errors`                                                                                                                                 |
-| Self-hosting   | `self-hosting`                                                                                                                                                  |
+| Self-hosting   | `self-hosting`, `deploy` (one page per hosting platform)                                                                                                        |
 | Developers     | `developers`, `adapters`, generated `api`                                                                                                                       |
 | Reference      | `reference`                                                                                                                                                     |
 
@@ -151,7 +151,7 @@ import UiPath from '~/components/UiPath.astro'
 - At most 6 per page; one per meaningful screen change. Add a phone screenshot only where the phone layout differs
   (navigation, live monitor, composer).
 - Markers: up to 5 numbered regions per screenshot, defined in the manifest, with a matching `<ol>` legend inside
-  the component:
+  the component, one item per marker in marker order (`pnpm check` fails when the counts differ):
 
   ```mdx
   <Screenshot id="review-send" alt="Send Readiness shows Ready with warnings: 9 checks pass and one warns.">
@@ -159,6 +159,11 @@ import UiPath from '~/components/UiPath.astro'
   </Screenshot>
   ```
 
+  Each number sits outside its box, on the first side with room (left, top, right, bottom), so it never hides what
+  the box points at. When it lands on something the reader needs, set `badge` on that marker in the manifest.
+
+- Check every marker against the captured image after `pnpm shots`: the box must surround exactly the thing its
+  legend item names, in English and Vietnamese.
 - `alt` is required. Describe what the screen shows and why it matters on this page, not "screenshot of".
 - Vietnamese pages show the Vietnamese capture of a screenshot when one exists, else the English image with a note
   under it.

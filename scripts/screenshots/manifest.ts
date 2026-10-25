@@ -3,9 +3,11 @@
  * them with <Screenshot id="…">. Paths marked "qa-map: <Board>" are copied verbatim from that board's entry
  * in hostrepute/reputecast web/scripts/qa-map.ts.
  *
- * Features without Vietnamese UI upstream (no messages.vi.ts) are captured in English only; the drift check
- * (pnpm upstream:check) reports when one of them gains Vietnamese files.
+ * Public pages show the newsletter's own content languages, not the app's, and the Acme sample has no Vietnamese
+ * page copy: they are captured in English only. Every app screen is captured in English and Vietnamese.
  */
+
+import type { BadgeSide } from './lib/markers.ts'
 
 export type Shot = {
   id: string // file name, kebab-case
@@ -13,36 +15,29 @@ export type Shot = {
   feature: string // upstream web/src/features/<folder> the screen lives in ('shell', 'publicpages' allowed)
   sample?: 'acme' | 'northwind' | 'fresh' // default 'acme'
   user?: 'linh' | 'aisha' | 'tomas' | 'anon' | 'owner' // default 'linh'; 'owner' = fresh install owner
-  viewport?: 'desktop' | 'tablet' | 'mobile' // 1440×900 dsf1 | 834×1112 dsf1 | 390×844 dsf2; default desktop
+  // 1440×900 dsf1 | 834×1112 dsf1 | 390×844 dsf2 | 1280×800 dsf2 (the docs home page's hero); default desktop
+  viewport?: 'desktop' | 'tablet' | 'mobile' | 'hero'
   fullPage?: boolean // default false (viewport only)
   clip?: string // CSS selector: capture only this element at dsf 2
-  before?: ({ click: string } | { hover: string } | { press: string } | { fill: [string, string] } | { wait: number })[]
+  before?: (
+    | { click: string }
+    | { dblclick: string }
+    | { hover: string }
+    | { press: string }
+    | { fill: [string, string] }
+    | { wait: number }
+  )[]
   waitFor?: string // selector that must be visible before capture
   mask?: string[] // selectors masked (volatile values)
-  markers?: { n: number; selector: string }[] // numbered callouts; selectors must be structural (ids, hrefs, data-*, roles), never text
+  // numbered callouts; selectors must be structural (ids, hrefs, data-*, roles), never text. `badge` overrides the
+  // side the number goes on (default: the first side with room, see badgeSide in lib/markers.ts).
+  markers?: { n: number; selector: string; badge?: BadgeSide }[]
   locales?: ('en' | 'vi')[] // default both
   demoSend?: { campaign: string; scenario: 'normal' | 'outlook-complaints' | 'postal-outage'; elapsed: string }
 }
 
-/** Features with no Vietnamese message files upstream yet: their shots are English only. */
-export const englishOnlyFeatures = [
-  'whatsapp',
-  'push',
-  'transactional',
-  'products',
-  'pages',
-  'commerce',
-  'website',
-  'ai',
-  'verification',
-  'placement',
-  'surveys',
-  'polls',
-  'conditional',
-  'digests',
-  'page-languages',
-  'publicpages',
-]
+/** Features whose shots are English only: public pages, which show the newsletter's languages (see above). */
+export const englishOnlyFeatures = ['publicpages']
 
 const ws = '/w/acme-newsletter'
 const en: Shot['locales'] = ['en']
@@ -56,7 +51,8 @@ export const shots: Shot[] = [
     feature: 'overview',
     markers: [
       { n: 1, selector: 'section[aria-labelledby="ov-health-h"]' },
-      { n: 2, selector: 'section[aria-labelledby="ov-next-h"]' },
+      // Left of it, the number would sit on the health card's "Deliverability details" link.
+      { n: 2, selector: 'section[aria-labelledby="ov-next-h"]', badge: 'left-end' },
       { n: 3, selector: 'section[aria-labelledby="ov-providers-h"] > :has(> article)' },
     ],
   },
@@ -109,8 +105,9 @@ export const shots: Shot[] = [
     feature: 'composer',
     // Blocks panel, canvas, inspector, top bar actions.
     markers: [
-      { n: 1, selector: 'aside:has([id$="-trigger-blocks"])' },
-      { n: 2, selector: '#main [role="region"]' },
+      // Above the panel the number would cover the subject; inside the canvas's top-left it sits on the grey margin.
+      { n: 1, selector: 'aside:has([id$="-trigger-blocks"])', badge: 'right-end' },
+      { n: 2, selector: '#main [role="region"]', badge: 'inside' },
       { n: 3, selector: 'aside:has([id$="-trigger-style"])' },
       { n: 4, selector: 'header > :last-child' },
     ],
@@ -137,13 +134,11 @@ export const shots: Shot[] = [
     id: 'composer-visibility',
     path: `${ws}/campaigns/{campaign:Weekly Digest #143}/edit?select=7&panel=settings&left=layers`,
     feature: 'conditional',
-    locales: en,
   },
   {
     id: 'composer-poll',
     path: `${ws}/campaigns/{campaign:Weekly Digest #143}/edit?select=9&panel=settings`,
     feature: 'polls',
-    locales: en,
   },
   {
     id: 'composer-languages',
@@ -164,14 +159,19 @@ export const shots: Shot[] = [
     id: 'survey-builder',
     path: `${ws}/forms/surveys/{survey:Beta feedback · October 2026}?q=q3`,
     feature: 'surveys',
-    locales: en,
   },
   {
     id: 'poll-results',
     path: `${ws}/campaigns/{campaign:Weekly Digest #141}/report`,
     feature: 'polls',
-    locales: en,
     clip: 'main section.pr',
+  },
+  {
+    // The docs home page's hero (src/components/overrides/Hero.astro): Send Readiness at 2×, no markers.
+    id: 'home-hero',
+    path: `${ws}/campaigns/{campaign:Weekly Digest #142}/review`,
+    feature: 'review',
+    viewport: 'hero',
   },
   {
     id: 'review-send',
@@ -181,8 +181,9 @@ export const shots: Shot[] = [
     markers: [
       { n: 1, selector: 'main [role="status"]' },
       { n: 2, selector: 'main section[aria-label]' },
-      { n: 3, selector: 'section[aria-labelledby="rv-audience"]' },
-      { n: 4, selector: 'main [role="status"] .rv-vacts' },
+      // Left of these, the numbers would cover the Web card's Edit button and the banner's text.
+      { n: 3, selector: 'section[aria-labelledby="rv-audience"]', badge: 'left-end' },
+      { n: 4, selector: 'main [role="status"] .rv-vacts', badge: 'bottom' },
     ],
   },
   {
@@ -231,9 +232,10 @@ export const shots: Shot[] = [
     // Human vs machine opens, click map, per mailbox provider and per sending provider tables.
     markers: [
       { n: 1, selector: 'section[aria-labelledby="rep-eng-h"]' },
-      { n: 2, selector: 'section[aria-labelledby="rep-map-h"]' },
+      // Left of 2 and 4, the numbers would cover the chart's legend and the mailbox table's caption.
+      { n: 2, selector: 'section[aria-labelledby="rep-map-h"]', badge: 'left-end' },
       { n: 3, selector: 'section[aria-labelledby="rep-mb-h"]' },
-      { n: 4, selector: 'section[aria-labelledby="rep-sp-h"]' },
+      { n: 4, selector: 'section[aria-labelledby="rep-sp-h"]', badge: 'top' },
     ],
   },
   {
@@ -252,7 +254,6 @@ export const shots: Shot[] = [
     id: 'digest-overview',
     path: `${ws}/campaigns/digests/{digest:Engineering blog roundup}`,
     feature: 'digests',
-    locales: en,
   },
 
   // Audience and imports
@@ -273,13 +274,11 @@ export const shots: Shot[] = [
     id: 'verification-services',
     path: `${ws}/settings/integrations/verification`,
     feature: 'verification',
-    locales: en,
   },
   {
     id: 'verification-job',
     path: `${ws}/audience/verification/{verification:Sunset}`,
     feature: 'verification',
-    locales: en,
   },
 
   // Automations
@@ -288,23 +287,21 @@ export const shots: Shot[] = [
   { id: 'automation-channels', path: `${ws}/automations/{automation:Acme Summit reminders}`, feature: 'automations' },
 
   // Transactional
-  { id: 'transactional', path: `${ws}/transactional`, feature: 'transactional', locales: en },
-  { id: 'transactional-guide', path: `${ws}/transactional/guide?step=1`, feature: 'transactional', locales: en },
+  { id: 'transactional', path: `${ws}/transactional`, feature: 'transactional' },
+  { id: 'transactional-guide', path: `${ws}/transactional/guide?step=1`, feature: 'transactional' },
   {
     id: 'transactional-template',
     path: `${ws}/transactional/templates/password-reset`,
     feature: 'transactional',
-    locales: en,
   },
   {
     id: 'transactional-publish',
     path: `${ws}/transactional/templates/trial-ending?publish=1`,
     feature: 'transactional',
-    locales: en,
   },
-  { id: 'transactional-messages', path: `${ws}/transactional/messages`, feature: 'transactional', locales: en },
-  { id: 'transactional-setup', path: `${ws}/transactional/setup`, feature: 'transactional', locales: en },
-  { id: 'transactional-settings', path: `${ws}/transactional/settings`, feature: 'transactional', locales: en },
+  { id: 'transactional-messages', path: `${ws}/transactional/messages`, feature: 'transactional' },
+  { id: 'transactional-setup', path: `${ws}/transactional/setup`, feature: 'transactional' },
+  { id: 'transactional-settings', path: `${ws}/transactional/settings`, feature: 'transactional' },
 
   // Forms, public pages, website, landing pages
   { id: 'form-builder', path: `${ws}/forms?form={form:Newsletter signup}`, feature: 'forms' },
@@ -317,20 +314,18 @@ export const shots: Shot[] = [
   { id: 'public-subscribe', path: '/p/acme-newsletter/subscribe', feature: 'publicpages', user: 'anon', locales: en },
   { id: 'public-archive', path: '/p/acme-newsletter/archive', feature: 'publicpages', user: 'anon', locales: en },
   { id: 'forms-branding', path: `${ws}/forms/branding`, feature: 'forms' },
-  { id: 'website-posts', path: `${ws}/forms/website`, feature: 'website', locales: en },
-  { id: 'website-home', path: `${ws}/forms/website/home`, feature: 'website', locales: en },
+  { id: 'website-posts', path: `${ws}/forms/website`, feature: 'website' },
+  { id: 'website-home', path: `${ws}/forms/website/home`, feature: 'website' },
   {
     id: 'website-post-composer',
     path: `${ws}/forms/website/posts/{post:Inside our Postgres migration: the runbook}`,
     feature: 'website',
-    locales: en,
   },
-  { id: 'pages-list', path: `${ws}/forms/pages`, feature: 'pages', locales: en },
+  { id: 'pages-list', path: `${ws}/forms/pages`, feature: 'pages' },
   {
     id: 'page-builder',
     path: `${ws}/forms/pages/{page:The Deliverability Field Guide}?select=buy`,
     feature: 'pages',
-    locales: en,
   },
 
   // Grow and Earn
@@ -344,21 +339,20 @@ export const shots: Shot[] = [
   { id: 'earn-members', path: `${ws}/earn/members`, feature: 'earn' },
   { id: 'earn-gifts', path: `${ws}/earn/gifts`, feature: 'earn' },
   { id: 'earn-sponsors', path: `${ws}/earn/sponsors`, feature: 'earn' },
-  { id: 'products', path: `${ws}/earn/products?order={order:1311}`, feature: 'products', locales: en },
+  { id: 'products', path: `${ws}/earn/products?order={order:1311}`, feature: 'products' },
 
   // SMS, push and WhatsApp
   { id: 'sms-providers', path: `${ws}/providers/sms`, feature: 'sms' },
   { id: 'sms-routing', path: `${ws}/providers/sms/rules`, feature: 'sms' },
   { id: 'sms-composer', path: `${ws}/campaigns/{campaign:Summit: doors open}/sms`, feature: 'sms' },
   { id: 'sms-report', path: `${ws}/campaigns/{campaign:Summit: 8 days to go}/sms-report`, feature: 'sms' },
-  { id: 'push-setup', path: `${ws}/providers/push`, feature: 'push', locales: en },
+  { id: 'push-setup', path: `${ws}/providers/push`, feature: 'push' },
   {
     id: 'push-composer',
     path: `${ws}/campaigns/{campaign:New post: Feature flags at scale}/push`,
     feature: 'push',
-    locales: en,
   },
-  { id: 'whatsapp', path: `${ws}/providers/whatsapp`, feature: 'whatsapp', locales: en },
+  { id: 'whatsapp', path: `${ws}/providers/whatsapp`, feature: 'whatsapp' },
 
   // Integrations and AI
   { id: 'integrations-catalog', path: `${ws}/settings/integrations`, feature: 'integrations' },
@@ -368,10 +362,23 @@ export const shots: Shot[] = [
     id: 'integrations-shopify',
     path: `${ws}/settings/integrations/stores/{store:Acme Merch}`,
     feature: 'commerce',
-    locales: en,
   },
-  { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai', locales: en },
-  { id: 'ai-composer', path: `${ws}/campaigns/{campaign:Weekly Digest #143}/edit`, feature: 'ai', locales: en },
+  { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai' },
+  {
+    // A Shorten suggestion on #143's intro: edit the text block (the canvas is an iframe), then the text toolbar's
+    // first AI action. The demo model answers in a moment.
+    id: 'ai-composer',
+    path: `${ws}/campaigns/{campaign:Weekly Digest #143}/edit`,
+    feature: 'ai',
+    before: [
+      {
+        dblclick:
+          '#main iframe >> nth=0 >> internal:control=enter-frame >> div:has-text("schedule flag changes") >> nth=-1',
+      },
+      { click: '.rte .rsep + button[aria-pressed] >> visible=true' },
+      { wait: 4000 },
+    ],
+  },
   { id: 'settings-hostrepute', path: `${ws}/settings/integrations/hostrepute`, feature: 'hostrepute' },
 
   // Deliverability
@@ -387,14 +394,13 @@ export const shots: Shot[] = [
     ],
   },
   { id: 'deliverability-mobile', path: `${ws}/deliverability`, feature: 'deliverability', viewport: 'mobile' },
-  { id: 'placement-tests', path: `${ws}/deliverability/placement`, feature: 'placement', locales: en },
+  { id: 'placement-tests', path: `${ws}/deliverability/placement`, feature: 'placement' },
   {
     id: 'placement-result',
     path: `${ws}/deliverability/placement/{placement:Weekly Digest #142 · SES vs Postal}`,
     feature: 'placement',
-    locales: en,
   },
-  { id: 'placement-seeds', path: `${ws}/deliverability/placement/seeds`, feature: 'placement', locales: en },
+  { id: 'placement-seeds', path: `${ws}/deliverability/placement/seeds`, feature: 'placement' },
 
   // Workspace, team, account and instance admin
   { id: 'workspace-settings', path: `${ws}/settings`, feature: 'workspace' },

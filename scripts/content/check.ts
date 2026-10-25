@@ -51,6 +51,20 @@ function shotFiles(locale: string): Set<string> {
   )
 }
 
+/** Marker counts of every screenshot that has a marker file, keyed `<locale>/<id>`. */
+function shotMarkers(): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const locale of ['en', 'vi']) {
+    const dir = join(root, 'src/assets/screenshots', locale)
+    if (!existsSync(dir)) continue
+    for (const f of readdirSync(dir).filter((name) => name.endsWith('.json'))) {
+      const file = JSON.parse(readFileSync(join(dir, f), 'utf8')) as { markers: unknown[] }
+      counts.set(`${locale}/${f.slice(0, -5)}`, file.markers.length)
+    }
+  }
+  return counts
+}
+
 const parseIssues: Issue[] = []
 const pages: Page[] = walk(docsDir).flatMap((full) => {
   const file = relative(root, full)
@@ -68,6 +82,7 @@ const pages: Page[] = walk(docsDir).flatMap((full) => {
 const ctx: CheckContext = {
   shotIds: await shotIds(),
   shotFilesEn: shotFiles('en'),
+  shotMarkers: shotMarkers(),
   uiLabels: yamlIds('src/data/ui-labels.yaml'),
   permissions: yamlIds('src/data/permissions.yaml'),
   strictI18n: process.argv.includes('--strict-i18n'),

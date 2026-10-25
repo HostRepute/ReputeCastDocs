@@ -13,6 +13,7 @@ import {
 const ctx = (over: Partial<CheckContext> = {}): CheckContext => ({
   shotIds: new Set(['review-send']),
   shotFilesEn: new Set(['review-send']),
+  shotMarkers: new Map([['en/review-send', 2]]),
   uiLabels: new Set(['nav.settings', 'settings.keys']),
   permissions: new Set(['campaigns:send']),
   strictI18n: false,
@@ -104,6 +105,26 @@ describe('references', () => {
     expect(rules([page({ body: '<Screenshot id="review-send" alt="a" />' })], ctx({ shotFilesEn: new Set() }))).toEqual(
       ['screenshot: line 1: "review-send" has no English file'],
     )
+  })
+
+  it('checks that a legend numbers each marker once, from 1 up, falling back to the English markers', () => {
+    const shot = (items: string[]) =>
+      `<Screenshot id="review-send" alt="a">\n${items.map((i) => `  ${i}\n`).join('')}</Screenshot>`
+    const nested = shot(['1. Verdict.', '   1. a nested list', '   2. stays out of the count', '2. Groups.'])
+    expect(rules([page({ body: nested })])).toEqual([])
+    expect(rules([page({ body: shot(['1. Verdict.']) })])).toEqual([
+      'screenshot: line 1: "review-send" legend has 1 items for 2 markers',
+    ])
+    expect(rules([page({ body: shot(['1. Verdict.', '3. Groups.']) })])).toEqual([
+      'screenshot: line 1: "review-send" legend is numbered 1, 3, not from 1 up',
+    ])
+    const vi = page({ file: 'vi/a.mdx', locale: 'vi', body: shot(['1. Kết luận.', '2. Nhóm.', '3. Thêm.']) })
+    expect(rules([vi])).toEqual(['screenshot: line 1: "review-send" legend has 3 items for 2 markers'])
+    expect(rules([vi], ctx({ shotMarkers: new Map([['vi/review-send', 3]]) }))).toEqual([])
+    // A caption without a list, and a self-closing tag before a legend, are not legends.
+    const prose =
+      '<Screenshot id="review-send" alt="a" />\n\n1. A step after it.\n\n<Screenshot id="review-send" alt="b">\n  Text.\n</Screenshot>'
+    expect(rules([page({ body: prose })])).toEqual([])
   })
 
   it('checks UI label ids in frontmatter and components, and permission keys', () => {
