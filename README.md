@@ -1,5 +1,9 @@
 # ReputeCast Docs
 
+[![CI](https://github.com/hostrepute/reputecastdocs/actions/workflows/ci.yml/badge.svg)](https://github.com/hostrepute/reputecastdocs/actions/workflows/ci.yml)
+[![Code: MIT](https://img.shields.io/badge/code-MIT-0F766E)](LICENSE)
+[![Docs: CC BY 4.0](https://img.shields.io/badge/docs-CC%20BY%204.0-0F766E)](LICENSE-docs)
+
 Source of [docs.reputecast.com](https://docs.reputecast.com): the documentation for
 [ReputeCast](https://github.com/hostrepute/reputecast), the open-source (AGPL-3.0), self-hosted newsletter and email
 platform by [HostRepute](https://hostrepute.com).
@@ -42,8 +46,10 @@ English (root URLs) and Vietnamese (`/vi/`); the REST API reference is generated
   API keys, humanizes summaries, adds permission lines and merges samples from `src/data/api-samples/`.
 - **Screenshots**: `pnpm shots` drives the upstream dev build (`make dev` in `../ReputeCast`) with Playwright, reseeds
   the demo data, signs in as the demo users and writes `src/assets/screenshots/<locale>/<id>.webp` for every entry in
-  `scripts/screenshots/manifest.ts`. Use `--only id,id`, `--locale en|vi`, `--no-reseed`. The dev database is left
-  reseeded with the Acme demo when the run ends.
+  `scripts/screenshots/manifest.ts`, plus `<id>.json` with the numbered markers' boxes. Use `--only id,id`,
+  `--locale en|vi`, `--no-reseed`. The dev database is left reseeded with the Acme demo when the run ends; to keep
+  yours, run a second upstream stack on other ports and point the run at it with `REPUTECAST_SRC`, `PG_PORT` and
+  `--app`.
 
 ## Deployment
 
@@ -52,7 +58,7 @@ validation, built-site link check, Playwright SEO/accessibility/responsive/searc
 the same `dist/` artifact to Cloudflare Pages with Wrangler (Direct Upload). Pushes to `main` deploy production;
 pull-request branches deploy previews built with `DOCS_PREVIEW=1`, which adds `X-Robots-Tag: noindex` to every
 response. `.github/workflows/upstream-drift.yml` runs `pnpm upstream:check` against `hostrepute/reputecast` every
-Monday (set the `UPSTREAM_TOKEN` secret while that repository is private).
+Monday.
 
 One-time setup by the owner:
 
@@ -62,10 +68,12 @@ One-time setup by the owner:
 3. Search engines: verify the domain in Google Search Console and Bing Webmaster Tools with DNS TXT records and
    submit `https://docs.reputecast.com/sitemap-index.xml`.
 
-## Writing
+## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) (page types, voice, components, SEO rules) and, for Vietnamese,
-[TRANSLATING.md](TRANSLATING.md).
+Fixes and new pages are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) (page types, voice, components, SEO rules)
+and, for Vietnamese, [TRANSLATING.md](TRANSLATING.md). Everyone taking part follows the
+[code of conduct](CODE_OF_CONDUCT.md). For help, see [SUPPORT.md](SUPPORT.md); report security problems as
+[SECURITY.md](SECURITY.md) describes.
 
 ## Dependencies
 

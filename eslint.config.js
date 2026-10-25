@@ -14,6 +14,7 @@ export default defineConfig(
       'playwright-report',
       '.lighthouseci',
       'tests/fixtures',
+      '.shots-tmp',
     ],
   },
   js.configs.recommended,
