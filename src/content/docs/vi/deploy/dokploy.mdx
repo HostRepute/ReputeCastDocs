@@ -1,0 +1,148 @@
+---
+title: Triển khai ReputeCast trên Dokploy
+description: Triển khai ReputeCast trên Dokploy bằng một dịch vụ Docker Compose gồm PostgreSQL 18, tên miền Let's Encrypt, khóa bí mật và mật khẩu Chủ sở hữu đầu tiên.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên Dokploy
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/user.go
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast và PostgreSQL 18 trong cùng một dịch vụ Docker Compose trên Dokploy, sau một tên miền
+HTTPS dùng chứng chỉ Let's Encrypt. Hướng dẫn đã được kiểm tra với Dokploy v0.30.10.
+
+## Trước khi bắt đầu
+
+- Một máy chủ đã cài Dokploy và đã tạo tài khoản quản trị; proxy Traefik của Dokploy dùng cổng 80 và 443. Xem thêm
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/) của ReputeCast.
+- Một tên DNS như `news.example.com` có bản ghi `A` trỏ đến máy chủ. Hãy tạo bản ghi này trước khi thêm tên miền trong
+  Dokploy, nếu không Let's Encrypt không cấp được chứng chỉ.
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trên máy tính của bạn, tạo khóa bí mật và mật khẩu cơ sở dữ liệu:
+
+   ```sh
+   openssl rand -base64 32   # REPUTECAST_SECRETS__KEY
+   openssl rand -hex 24      # POSTGRES_PASSWORD
+   ```
+
+   <Aside type="caution">
+     Hãy lưu khóa bí mật vào trình quản lý mật khẩu: thiếu khóa này, thông tin xác thực nhà cung cấp mà ReputeCast lưu
+     sẽ không giải mã được, kể cả từ [bản sao lưu](/vi/self-hosting/backups/).
+   </Aside>
+
+2. Trong Dokploy, mở **Projects**, bấm **Create Project**, nhập **Name**, ví dụ `ReputeCast`, rồi bấm **Create**. Trong
+   môi trường `production` vừa mở, bấm **Create Service** › **Compose**, nhập **Name** là `ReputeCast`, giữ
+   **Compose Type** là **Docker Compose**, bấm **Create** rồi mở dịch vụ vừa tạo.
+
+3. Ở tab **General**, phần **Provider**, chọn **Raw**, dán tệp sau rồi bấm **Save**:
+
+   ```yaml title="docker-compose.yml"
+   services:
+     reputecast-db:
+       image: postgres:18-alpine
+       restart: unless-stopped
+       environment:
+         POSTGRES_USER: reputecast
+         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Environment tab}
+         POSTGRES_DB: reputecast
+       volumes:
+         - pgdata:/var/lib/postgresql
+       healthcheck:
+         test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+         interval: 5s
+         timeout: 3s
+         retries: 20
+
+     reputecast:
+       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       restart: unless-stopped
+       depends_on:
+         reputecast-db:
+           condition: service_healthy
+       environment:
+         REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD}@reputecast-db:5432/reputecast?sslmode=disable
+         REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_HTTP__PUBLIC_URL:?Set REPUTECAST_HTTP__PUBLIC_URL in the Environment tab}
+         REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:?Set REPUTECAST_ADMIN_EMAIL in the Environment tab}
+         REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY:?Set REPUTECAST_SECRETS__KEY in the Environment tab}
+       volumes:
+         - appdata:/var/lib/reputecast
+
+   volumes:
+     pgdata:
+     appdata:
+   ```
+
+   Tệp không có `ports:` hay `networks:`: khi triển khai, Dokploy tự thêm nhãn Traefik cho tên miền của bạn và nối
+   `reputecast` vào `dokploy-network`. Hãy giữ `appdata` (tệp tải lên) là volume có tên: Docker điền volume này từ image
+   nên nó thuộc về uid 65532; ReputeCast không ghi được vào bind mount `../files`. Lệnh mặc định của image tự chạy
+   migration và tạo Chủ sở hữu đầu tiên.
+
+4. Ở tab **Environment**, dán các giá trị của bạn rồi bấm **Save**:
+
+   ```sh title="Environment"
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-output-of-openssl-rand-base64-32
+   POSTGRES_PASSWORD=paste-the-output-of-openssl-rand-hex-24
+   ```
+
+   Dokploy ghi các dòng này vào tệp `.env` để điền các chỗ giữ chỗ `${…}`; Dokploy không tự truyền chúng vào container,
+   nên hãy thêm [các thiết lập khác](/vi/self-hosting/configuration/) vào mục `environment:` trong tệp Compose. Đừng đổi
+   `POSTGRES_PASSWORD` sau lần triển khai đầu: PostgreSQL chỉ áp dụng nó khi tạo một volume dữ liệu trống.
+
+5. Ở tab **Domains**, bấm **Add Domain**. Đặt **Service Name** là `reputecast`, **Host** là host trong URL công khai của
+   bạn (`news.example.com`), để trống **Path**, đặt **Container Port** là `8080`, bật **HTTPS**, chọn
+   **Let's Encrypt** cho **Certificate Provider** rồi bấm **Create**.
+
+6. Ở tab **General**, bấm **Deploy**, rồi **Confirm**. Dokploy mở **Deployments**; log kết thúc bằng
+   `Docker Compose Deployed: ✅`. Khi PostgreSQL đã healthy, ReputeCast chạy migration và tạo Chủ sở hữu.
+
+7. Ở tab **Logs**, chọn container có tên kết thúc bằng `reputecast-1`, chọn **1000 lines** rồi tìm `Password`. Dòng
+   đó có dạng `Password    XXXX-XXXX-XXXX-XXXX   (temporary: you'll replace it at first sign-in)`. Mở URL công khai và
+   đăng nhập: [lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu tạm thời, thêm khóa truy
+   cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận URL công khai và tạo không gian làm việc.
+
+</Steps>
+
+## Kiểm tra kết quả
+
+- Tab **Containers** cho thấy cả hai container ở trạng thái `running`, và trạng thái của `reputecast-db` kết thúc bằng
+  `(healthy)`.
+- Từ máy tính của bạn, `https://news.example.com/readyz` trả về `ready` (`503 database unavailable` khi không có
+  PostgreSQL) và `/healthz` trả về `ok`. Hãy giám sát uptime `/readyz` từ bên ngoài máy chủ.
+- Ở tab **Domains**, nút **Validate DNS** trên tên miền của bạn chuyển thành **DNS Valid**.
+
+## Nâng cấp
+
+Hãy đọc [ghi chú nâng cấp](/vi/self-hosting/upgrades/) và [sao lưu](/vi/self-hosting/backups/) trước; tab
+**Volume Backups** có thể chép volume có tên `pgdata` và `appdata` lên S3. Ở tab **General**, đổi tag image trong tệp
+Compose (ví dụ từ `v1.0.1` sang bản phát hành mới), bấm **Save**, rồi **Deploy** và **Confirm**. Compose tải image mới
+và tạo lại container; ReputeCast chạy các migration mới khi khởi động. Đừng bao giờ dùng **Fresh Volumes**: nút này
+xóa mọi volume của dịch vụ, kể cả cơ sở dữ liệu.
+
+## Khắc phục sự cố
+
+- **Log triển khai báo `required variable … is missing a value`**: hãy thêm biến đó ở tab **Environment**, bấm **Save**
+  rồi triển khai lại.
+- **Tên miền trả về 404 hoặc không có chứng chỉ hợp lệ**: với dịch vụ Compose, thay đổi tên miền chỉ có hiệu lực sau
+  khi triển khai lại. Nếu bản ghi `A` trỏ sai chỗ lúc bạn thêm tên miền, hãy sửa bản ghi, kiểm tra **Validate DNS**, xóa
+  rồi thêm lại tên miền, sau đó triển khai.
+- **Tên miền không bao giờ phản hồi sau khi bạn thêm `healthcheck:`**: một health check thất bại khiến tên miền không
+  hoạt động, và image không có shell hay `curl` để chạy nó. Hãy bỏ nó khỏi dịch vụ `reputecast`.
+- **Không thấy dòng mật khẩu trong log**: hãy chọn **5000 lines**. Vẫn không thấy? Cơ sở dữ liệu đã có người dùng; qua
+  SSH, chạy `docker exec <container-name> /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)).
+
+Tài liệu nền tảng (kiểm tra tháng 10/2026): [Docker Compose](https://docs.dokploy.com/docs/core/docker-compose), [tên miền cho Compose](https://docs.dokploy.com/docs/core/docker-compose/domains), [tên miền](https://docs.dokploy.com/docs/core/domains),
+[khắc phục sự cố tên miền và Traefik](https://docs.dokploy.com/docs/core/troubleshooting/domains), [Volume Backups](https://docs.dokploy.com/docs/core/volume-backups), [cài đặt](https://docs.dokploy.com/docs/core/installation).

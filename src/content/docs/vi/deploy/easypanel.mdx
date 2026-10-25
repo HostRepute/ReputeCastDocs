@@ -1,0 +1,184 @@
+---
+title: Triển khai ReputeCast trên Easypanel
+description: Triển khai ReputeCast trên Easypanel với dịch vụ Postgres, Docker image, tên miền HTTPS, khóa bí mật, volume và mật khẩu của Chủ sở hữu đầu tiên.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên Easypanel
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast trên Easypanel bằng hai dịch vụ trong cùng một project: dịch vụ Postgres của Easypanel và
+một dịch vụ App chạy Docker image của ReputeCast sau proxy của Easypanel, có HTTPS. Đã kiểm tra với Easypanel 2.38.0,
+tháng 10/2026.
+
+## Trước khi bắt đầu
+
+- Một máy chủ đã cài Easypanel (Ubuntu, ít nhất 2 GB RAM, cổng 80 và 443 còn trống) đáp ứng
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/) của ReputeCast, và một tài khoản quản trị Easypanel: chỉ quản trị
+  viên mới tạo được project.
+- Một tên DNS như `news.example.com` có bản ghi `A` trỏ đến máy chủ. Proxy của Easypanel lấy chứng chỉ Let's Encrypt
+  qua cổng 80, nên bản ghi phải phân giải được trước khi bạn thêm tên miền.
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trên dashboard của Easypanel, chọn **Create Project**, nhập **Name** là `reputecast` rồi chọn **Create**.
+
+2. Trong project, chọn **Service**, rồi **Postgres**. Nhập **Service Name** là `db`, để trống các trường còn lại và chọn
+   **Create**. Easypanel đặt tên cơ sở dữ liệu theo tên project, dùng người dùng `postgres`, tự tạo mật khẩu và chạy
+   `postgres:18`.
+
+3. Mở tab **Credentials** của dịch vụ `db` và sao chép **Internal Connection URL**, ví dụ
+   `postgres://postgres:<password>@reputecast_db:5432/reputecast?sslmode=disable`. Host `<project>_<service>` nằm trong
+   mạng riêng của Easypanel; PostgreSQL không được công bố ra ngoài máy chủ trừ khi bạn dùng **Expose**.
+
+4. Tạo khóa bí mật dùng để mã hóa thông tin xác thực của nhà cung cấp và các bí mật khác trong cơ sở dữ liệu bằng
+   `openssl rand -base64 32` (hoặc `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key`).
+
+   <Aside type="caution">
+     Hãy lưu khóa này vào trình quản lý mật khẩu. Nếu mất khóa, ReputeCast không thể giải mã những gì đã lưu, kể cả từ
+     [bản sao lưu](/vi/self-hosting/backups/).
+   </Aside>
+
+5. Trong project, chọn **Service**, rồi **App**. Nhập **Service Name** là `app` và chọn **Create**.
+
+6. Trong **Source**, chọn **Docker Image**, nhập **Image** là `ghcr.io/hostrepute/reputecast:v1.0.1` rồi chọn **Save**.
+   Image này công khai: để trống **Username** và **Password**.
+
+7. Mở **Environment**, nhập các biến sau với giá trị của bạn rồi chọn **Save**:
+
+   ```sh title="Environment"
+   REPUTECAST_DATABASE__URL=postgres://postgres:<password>@reputecast_db:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=<the key from step 4>
+   ```
+
+   Khi khóa được đặt ở đây, ReputeCast không bao giờ cần tệp khóa. Với mọi thiết lập khác, xem
+   [cấu hình ReputeCast](/vi/self-hosting/configuration/).
+
+8. Mở **Domains**. Chọn **Edit** trên tên miền mà Easypanel đã thêm cho dịch vụ, hoặc **Add Domain** nếu chưa có. Giữ
+   **HTTPS** bật, đặt **Host** là `news.example.com`, để nguyên cả hai trường **Path** là `/`, và trong **Destination**
+   đặt **Protocol** là `HTTP` và **Port** là `8080` (Easypanel điền sẵn `80`). Chọn **Save** hoặc **Create**.
+
+9. Mở **Storage**, chọn **Add Volume Mount**, nhập **Name** là `data` và **Mount Path** là `/var/lib/reputecast`, rồi
+   chọn **Create**. Volume này giữ các tệp tải lên. Easypanel cho mọi người dùng quyền ghi vào thư mục của volume, nên
+   người dùng của ứng dụng (uid 65532) ghi được vào đó.
+
+10. Chọn **Deploy**: thiết lập đã lưu chỉ đến dịch vụ đang chạy khi bạn triển khai. Ở lần khởi động đầu tiên, ReputeCast
+    áp dụng các migration cơ sở dữ liệu và tạo Chủ sở hữu đầu tiên.
+
+11. Chọn **Logs** trên thanh công cụ của dịch vụ và tìm thông báo sau, chỉ được in một lần khi Chủ sở hữu đầu tiên được
+    tạo:
+
+    ```txt title="Logs"
+      ReputeCast is installed.
+
+      Sign in at  https://news.example.com
+      Email       you@company.com
+      Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+    ```
+
+12. Mở URL công khai và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu,
+    thêm khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận URL công khai và tạo không gian làm việc đầu
+    tiên.
+
+</Steps>
+
+Tài liệu của Easypanel không nêu dải địa chỉ mà proxy của nó dùng để kết nối, nên `REPUTECAST_HTTP__TRUSTED_PROXIES` được
+để trống và ReputeCast thấy địa chỉ của proxy cho mọi người truy cập
+([proxy tin cậy](/vi/self-hosting/reverse-proxy/#đặt-url-công-khai-và-proxy-tin-cậy)).
+
+### Dùng dịch vụ Compose thay thế
+
+Để chạy cả hai container từ một tệp, chọn **Service**, rồi **Compose** (gắn nhãn Beta), nhập **Service Name** và chọn
+**Create**. Dán nội dung sau vào **Source** › **docker-compose.yml** › **Content** rồi chọn **Save**:
+
+```yaml title="docker-compose.yml"
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reputecast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: reputecast
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app:
+    image: ghcr.io/hostrepute/reputecast:v1.0.1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_PUBLIC_URL}
+      REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL}
+      REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY}
+    volumes:
+      - appdata:/var/lib/reputecast
+volumes:
+  pgdata:
+  appdata:
+```
+
+Trong **Environment**, đặt `POSTGRES_PASSWORD` (chỉ chữ và số: `openssl rand -hex 24`), `REPUTECAST_PUBLIC_URL`,
+`REPUTECAST_ADMIN_EMAIL` và `REPUTECAST_SECRETS__KEY`, bật **Create .env file** rồi chọn **Save**. Hãy thêm tên miền
+(**Compose Service** là `app`, **Port** là `8080`) trước khi chọn **Deploy**: Easypanel nối các dịch vụ Compose vào proxy
+của nó khi triển khai, và chỉ những dịch vụ có tên miền. Tính năng sao lưu cơ sở dữ liệu của Easypanel không áp dụng
+cho PostgreSQL này.
+
+## Kiểm tra kết quả
+
+- `https://news.example.com/healthz` trả về `ok`; `/readyz` trả về `ready`, hoặc `503 database unavailable`.
+- Dịch vụ App của Easypanel không có thiết lập health check và image cũng không có, nên không có kiểm tra nào chạy bên
+  trong container. Hãy trỏ một dịch vụ giám sát uptime đến `/readyz`
+  ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+
+## Nâng cấp
+
+1. Sao lưu trước: tab **Backups** của dịch vụ `db` chạy sao lưu cơ sở dữ liệu đến một nhà cung cấp lưu trữ, còn
+   **Storage** › **Volume Backups** tạo bản sao đồng bộ (mirror) của volume `data`
+   ([sao lưu và khôi phục](/vi/self-hosting/backups/)).
+2. Trong **Source** của dịch vụ `app`, đổi tag của **Image** sang bản phát hành mới (với dịch vụ Compose, đổi tag trong
+   tệp), chọn **Save**, rồi **Deploy**. ReputeCast áp dụng các migration mới khi khởi động
+   ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+Đừng đổi image của `db` sang một phiên bản chính (major) mới của PostgreSQL: Easypanel lưu ý rằng nâng cấp phiên bản
+chính cần một quy trình migration, không chỉ đổi tag.
+
+## Khắc phục sự cố
+
+- **Tên miền hiện trang lỗi thay vì ReputeCast**: tên miền vẫn trỏ đến cổng `80`. Trong **Domains**, chọn **Edit** và
+  đặt **Port** là `8080`.
+- **Ứng dụng khởi động lại liên tục và ghi log `Error: secret key file /var/lib/reputecast/secret.key: … permission denied`**:
+  thiếu `REPUTECAST_SECRETS__KEY` và tại `/var/lib/reputecast` là một bind mount mà ứng dụng không ghi được. Hãy thêm
+  khóa trong **Environment** (hoặc dùng volume mount) rồi chọn **Deploy**.
+- **`/readyz` trả về `database unavailable`**: `REPUTECAST_DATABASE__URL` không khớp với dịch vụ `db`, ví dụ sau khi
+  **Edit** trong **Credentials** đã đổi mật khẩu. Hãy sao chép lại **Internal Connection URL** rồi triển khai.
+- **Bạn cần dùng CLI của ReputeCast, ví dụ vì log không có thông báo** (cơ sở dữ liệu đã có người dùng): **Console** của
+  Easypanel cần shell, mà image không có. Hãy chạy lệnh qua SSH trên máy chủ
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)):
+
+  ```sh
+  docker exec "$(docker ps -q -f name=reputecast_app)" /usr/local/bin/reputecast user reset-password --email you@company.com
+  ```
+
+Tài liệu của nền tảng: [Getting Started](https://easypanel.io/docs), [App Service](https://easypanel.io/docs/services/app),
+[Postgres Service](https://easypanel.io/docs/services/postgres),
+[Compose Service](https://easypanel.io/docs/services/compose), [Volume Backups](https://easypanel.io/docs/backups/volumes),
+[changelog](https://easypanel.io/changelog).

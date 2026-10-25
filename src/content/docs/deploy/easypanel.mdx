@@ -1,0 +1,179 @@
+---
+title: Deploy ReputeCast on Easypanel
+description: Deploy ReputeCast on Easypanel with its Postgres service, the Docker image, an HTTPS domain, a secret key, a volume and the first Owner's password.
+type: how-to
+audience: [operator]
+primaryKeyword: deploy ReputeCast on Easypanel
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+This guide runs ReputeCast on Easypanel as two services in one project: Easypanel's Postgres service and an App
+service that runs the ReputeCast Docker image behind Easypanel's proxy, with HTTPS. Checked with Easypanel 2.38.0,
+October 2026.
+
+## Before you begin
+
+- A server with Easypanel (Ubuntu, at least 2 GB of RAM, ports 80 and 443 free) that meets the ReputeCast
+  [system requirements](/self-hosting/requirements/), and an Easypanel admin account: only admins create projects.
+- A DNS name such as `news.example.com` with an `A` record pointing at the server. Easypanel's proxy gets the
+  Let's Encrypt certificate through port 80, so the record must resolve before you add the domain.
+
+## Deploy ReputeCast
+
+<Steps>
+
+1. On the Easypanel dashboard, select **Create Project**, enter the **Name** `reputecast` and select **Create**.
+
+2. In the project, select **Service**, then **Postgres**. Enter the **Service Name** `db`, leave the other fields empty
+   and select **Create**. Easypanel names the database after the project, uses the user `postgres`, generates the
+   password and runs `postgres:18`.
+
+3. Open the `db` service's **Credentials** tab and copy the **Internal Connection URL**, such as
+   `postgres://postgres:<password>@reputecast_db:5432/reputecast?sslmode=disable`. The host `<project>_<service>` is on
+   Easypanel's private network; PostgreSQL stays unpublished unless you use **Expose**.
+
+4. Generate the secret key that encrypts provider credentials and other secrets in the database with
+   `openssl rand -base64 32` (or `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key`).
+
+   <Aside type="caution">
+     Save the key in your password manager. Without it, ReputeCast can't decrypt what it stored, even from a
+     [backup](/self-hosting/backups/).
+   </Aside>
+
+5. In the project, select **Service**, then **App**. Enter the **Service Name** `app` and select **Create**.
+
+6. In **Source**, select **Docker Image**, enter the **Image** `ghcr.io/hostrepute/reputecast:v1.0.1` and select
+   **Save**. The image is public: leave **Username** and **Password** empty.
+
+7. Open **Environment**, enter these variables with your values and select **Save**:
+
+   ```sh title="Environment"
+   REPUTECAST_DATABASE__URL=postgres://postgres:<password>@reputecast_db:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=<the key from step 4>
+   ```
+
+   With the key set here, ReputeCast never needs a key file. For every other setting, see
+   [configure ReputeCast](/self-hosting/configuration/).
+
+8. Open **Domains**. Select **Edit** on the domain Easypanel added to the service, or **Add Domain** if there is none.
+   Keep **HTTPS** on, set **Host** to `news.example.com`, leave both **Path** fields at `/`, and under **Destination**
+   set **Protocol** to `HTTP` and **Port** to `8080` (Easypanel fills in `80`). Select **Save** or **Create**.
+
+9. Open **Storage**, select **Add Volume Mount**, enter the **Name** `data` and the **Mount Path**
+   `/var/lib/reputecast`, then select **Create**. It keeps uploaded files. Easypanel makes a volume's folder writable
+   for every user, so the app's user (uid 65532) can write to it.
+
+10. Select **Deploy**: saved settings reach the running service only when you deploy. On its first start, ReputeCast
+    applies the database migrations and creates the first Owner.
+
+11. Select **Logs** in the service's toolbar and find the banner, printed once when the first Owner is created:
+
+    ```txt title="Logs"
+      ReputeCast is installed.
+
+      Sign in at  https://news.example.com
+      Email       you@company.com
+      Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+    ```
+
+12. Open the public URL and sign in. The [first sign-in](/self-hosting/first-run/) asks you to replace the password, add
+    a passkey or an authenticator app, save recovery codes, confirm the public URL and create the first workspace.
+
+</Steps>
+
+Easypanel doesn't document the addresses its proxy connects from, so `REPUTECAST_HTTP__TRUSTED_PROXIES` stays unset and
+ReputeCast sees the proxy's address for every visitor
+([trusted proxies](/self-hosting/reverse-proxy/#set-the-public-url-and-trusted-proxies)).
+
+### Use a Compose service instead
+
+To run both containers from one file instead, select **Service**, then **Compose** (marked Beta), enter a
+**Service Name** and select **Create**. Paste this into **Source** › **docker-compose.yml** › **Content** and select
+**Save**:
+
+```yaml title="docker-compose.yml"
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reputecast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: reputecast
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app:
+    image: ghcr.io/hostrepute/reputecast:v1.0.1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_PUBLIC_URL}
+      REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL}
+      REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY}
+    volumes:
+      - appdata:/var/lib/reputecast
+volumes:
+  pgdata:
+  appdata:
+```
+
+In **Environment**, set `POSTGRES_PASSWORD` (letters and digits: `openssl rand -hex 24`), `REPUTECAST_PUBLIC_URL`,
+`REPUTECAST_ADMIN_EMAIL` and `REPUTECAST_SECRETS__KEY`, turn on **Create .env file** and select **Save**. Add the domain
+(**Compose Service** `app`, **Port** `8080`) before you select **Deploy**: Easypanel connects Compose services to its
+proxy when it deploys, and only those with a domain. Easypanel's database backups don't cover this PostgreSQL.
+
+## Check that it works
+
+- `https://news.example.com/healthz` answers `ok`; `/readyz` answers `ready`, or `503 database unavailable`.
+- Easypanel's App service has no health check setting and the image has none, so no check runs inside the container.
+  Point an uptime monitor at `/readyz` ([health checks, metrics and logs](/self-hosting/monitoring/)).
+
+## Upgrade
+
+1. Back up: the `db` service's **Backups** tab runs database backups to a storage provider, and **Storage** ›
+   **Volume Backups** mirrors the `data` volume ([back up and restore](/self-hosting/backups/)).
+2. In the `app` service's **Source**, change the **Image** tag to the new release (in a Compose service, the tag in the
+   file), select **Save**, then **Deploy**. ReputeCast applies new migrations when it starts
+   ([upgrade ReputeCast](/self-hosting/upgrades/)).
+
+Don't move the `db` image to a new PostgreSQL major version: Easypanel warns that a major upgrade needs a migration, not
+only a new tag.
+
+## Troubleshooting
+
+- **The domain shows an error page instead of ReputeCast**: the domain still points at port `80`. In **Domains**,
+  select **Edit** and set **Port** to `8080`.
+- **The app restarts and logs `Error: secret key file /var/lib/reputecast/secret.key: … permission denied`**:
+  `REPUTECAST_SECRETS__KEY` is missing and a bind mount the app can't write is at `/var/lib/reputecast`. Add the key
+  in **Environment** (or use a volume mount) and select **Deploy**.
+- **`/readyz` answers `database unavailable`**: `REPUTECAST_DATABASE__URL` doesn't match the `db` service, for example
+  after **Edit** in **Credentials** changed the password. Copy the **Internal Connection URL** again and deploy.
+- **You need the ReputeCast CLI, for example because the logs have no banner** (the database already had users):
+  Easypanel's **Console** needs a shell, which the image doesn't have. Run the command over SSH on the server
+  ([recover access](/self-hosting/account-recovery/)):
+
+  ```sh
+  docker exec "$(docker ps -q -f name=reputecast_app)" /usr/local/bin/reputecast user reset-password --email you@company.com
+  ```
+
+Platform docs: [Getting Started](https://easypanel.io/docs), [App Service](https://easypanel.io/docs/services/app),
+[Postgres Service](https://easypanel.io/docs/services/postgres),
+[Compose Service](https://easypanel.io/docs/services/compose), [Volume Backups](https://easypanel.io/docs/backups/volumes),
+[changelog](https://easypanel.io/changelog).

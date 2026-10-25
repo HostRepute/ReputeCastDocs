@@ -1,0 +1,161 @@
+---
+title: Triển khai ReputeCast trên CapRover
+description: Triển khai ReputeCast trên CapRover với ứng dụng one-click PostgreSQL, Docker image, thư mục lưu trữ lâu dài, HTTPS, cập nhật trực tiếp và Chủ sở hữu đầu tiên.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên CapRover
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/serve.go
+  - internal/cli/install.go
+  - internal/app/app.go
+  - internal/sending/engine/api.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast trên một máy chủ CapRover dưới dạng hai ứng dụng, PostgreSQL từ các ứng dụng one-click của
+CapRover và Docker image của ReputeCast, kèm một thư mục lưu trữ lâu dài và chứng chỉ Let's Encrypt. Hướng dẫn đã được
+kiểm tra với CapRover 1.15.5.
+
+## Trước khi bắt đầu
+
+- Một máy chủ CapRover được thiết lập theo hướng dẫn [Getting Started](https://caprover.com/docs/get-started) của
+  CapRover, đã bật HTTPS cho tên miền gốc: CapRover từ chối bật HTTPS cho ứng dụng khi tên miền gốc chưa có HTTPS.
+- Một tên miền cho ReputeCast, ví dụ `news.example.com`, có bản ghi `A` trỏ thẳng đến máy chủ (CapRover không chính thức
+  hỗ trợ các proxy DNS như của Cloudflare), hoặc địa chỉ mặc định của ứng dụng `reputecast.<tên miền gốc>`.
+- Quyền truy cập SSH vào máy chủ, cùng OpenSSL hoặc Docker để tạo khóa bí mật. Xem thêm
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/).
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trong dashboard, mở **Apps**, bấm **One-Click Apps/Databases** và chọn **PostgreSQL** (khi máy chủ đã có ứng dụng,
+   hãy bấm **Create A New App** trước để hiện các lựa chọn này). Đặt **App Name** là `reputecast-db`, **Version** là `18`
+   (giá trị mặc định `14.5` cũ hơn các phiên bản 16, 17 hoặc 18 mà ReputeCast cần), **Username** và
+   **Default Database** là `reputecast`. Sao chép **Password** được tạo sẵn (gồm chữ và số, dùng an toàn trong URL) rồi
+   bấm **Deploy**. Mẫu này lưu dữ liệu trong volume `reputecast-db-data` và không công khai PostgreSQL ra web.
+
+2. Trong **Apps**, bấm **Create A New App**, nhập `reputecast`, chọn **Has Persistent Data** (không đổi được về sau) rồi
+   bấm **Create New App**. Mở `reputecast` từ **Your Apps**.
+
+3. Trên tab **HTTP Settings**, nhập tên miền của bạn, bấm **Connect New Domain**, rồi bấm **Enable HTTPS** trên dòng của
+   tên miền đó (với địa chỉ mặc định, dùng nút **Enable HTTPS** bên cạnh địa chỉ). Chọn tên miền của bạn ở
+   **Redirect all domains to:**, đặt **Container HTTP Port** là `8080`, chọn
+   **Force HTTPS by redirecting all HTTP traffic to HTTPS** và bấm **Save & Restart**.
+
+4. NGINX của CapRover đệm các phản hồi, khiến theo dõi trực tiếp (Server-Sent Events) và
+   [endpoint MCP](/vi/developers/mcp/) nhận dữ liệu chậm. Vẫn trên **HTTP Settings**, bấm
+   **Edit Default Nginx Configurations**, dán khối sau ngay bên dưới dòng bắt đầu bằng `set $upstream` rồi bấm
+   **Save & Restart** (CapRover từ chối cấu hình không vượt qua `nginx -t`):
+
+   ```nginx title="Bên dưới set $upstream"
+           # ReputeCast: no buffering for the live monitor (Server-Sent Events) and MCP.
+           location ~ ^(/mcp|/api/v1/workspaces/[^/]+/campaigns/[^/]+/live/stream)$ {
+               proxy_pass $upstream;
+               proxy_set_header Host $host;
+               proxy_set_header X-Real-IP $remote_addr;
+               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+               proxy_set_header X-Forwarded-Proto $scheme;
+               proxy_buffering off;
+               proxy_cache off;
+               proxy_read_timeout 1h;
+           }
+   ```
+
+5. Tạo khóa bí mật và lưu vào trình quản lý mật khẩu của bạn: `openssl rand -base64 32`, hoặc trên máy chủ
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key` (44 ký tự, kết thúc bằng `=`).
+
+6. Trên tab **App Configs**, bật **Bulk Edit** ở mục **Environment Variables** và dán các dòng sau, thay bằng mật khẩu
+   cơ sở dữ liệu, tên miền, email và khóa của bạn. Ở mục **Persistent Directories**, bấm **Add Persistent Directory**,
+   đặt **Path in App** là `/var/lib/reputecast` và **Label** là `reputecast-data`, rồi bấm **Save & Restart**.
+
+   ```sh title="Environment Variables"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:PASSWORD@reputecast-db:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-5
+   ```
+
+   - Các ứng dụng khác kết nối đến cơ sở dữ liệu qua tên ứng dụng, `reputecast-db`; tên `srv-captain--reputecast-db` mà
+     ứng dụng one-click hiển thị cũng dùng được. Kết nối này chỉ đi trong mạng nội bộ của CapRover.
+   - Thư mục này là một volume Docker do CapRover quản lý: một volume mới và trống nhận chủ sở hữu của thư mục tương ứng
+     trong image (uid 65532), nên ReputeCast ghi được tệp tải lên vào đó. Nếu dùng **Set specific host path**, thư mục
+     trên máy chủ phải có sẵn và thuộc về người dùng đó (`chown 65532:65532 /path/on/host`).
+   - CapRover không công bố dải địa chỉ mà NGINX của nó dùng để kết nối, nên hãy để trống
+     `REPUTECAST_HTTP__TRUSTED_PROXIES`. Các thiết lập khác: [cấu hình](/vi/self-hosting/configuration/).
+
+7. Trên tab **Deployment**, ở mục **Method 6: Deploy via ImageName**, nhập `ghcr.io/hostrepute/reputecast:v1.0.1` rồi
+   bấm **Deploy Now**. Ở lần khởi động đầu tiên, ReputeCast áp dụng các migration và tạo Chủ sở hữu đầu tiên.
+
+8. Trên tab **Logs**, gõ `Password` vào ô tìm kiếm. Tab này chỉ hiện 500 dòng gần nhất; qua SSH, hãy chạy
+   `docker service logs reputecast 2>&1 | grep -A4 "ReputeCast is installed"`.
+
+   ```txt title="Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+9. Mở URL công khai và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu, thêm
+   khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo không gian làm
+   việc.
+
+</Steps>
+
+<Aside type="caution">
+  Hãy giữ một bản sao `REPUTECAST_SECRETS__KEY` bên ngoài CapRover: không có khóa này, thông tin xác thực của nhà cung cấp
+  lưu trong cơ sở dữ liệu sẽ không giải mã được.
+</Aside>
+
+## Kiểm tra kết quả
+
+- `curl https://news.example.com/readyz` trả về `ready`, hoặc `database unavailable` (mã 503) khi ReputeCast không kết
+  nối được PostgreSQL.
+- CapRover không có kiểm tra tình trạng qua HTTP: nó dựa vào lệnh `HEALTHCHECK` của Docker trong image. Image ReputeCast
+  không có lệnh này, cũng không có shell hay `curl` để chạy, nên đừng thêm lệnh nào trong **Service Update Override**.
+  Thay vào đó, hãy trỏ một công cụ giám sát uptime đến `/readyz` ([giám sát](/vi/self-hosting/monitoring/)).
+
+## Nâng cấp
+
+1. Đọc ghi chú phát hành và [sao lưu](/vi/self-hosting/backups/) cơ sở dữ liệu, trên máy chủ:
+
+   ```sh
+   docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast-db -q | head -n1)" \
+     pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. Trên tab **Deployment**, ở mục **Method 6: Deploy via ImageName**, nhập tag mới, ví dụ
+   `ghcr.io/hostrepute/reputecast:v1.0.2`, rồi bấm **Deploy Now**. ReputeCast áp dụng các migration mới khi khởi động. Với
+   ứng dụng có dữ liệu lâu dài, CapRover dừng container cũ trước, nên ứng dụng sẽ gián đoạn trong chốc lát.
+
+**Revert to this version** trong **Version History** đưa image cũ trở lại, nhưng không đưa lược đồ cơ sở dữ liệu trở lại:
+hãy khôi phục bản sao lưu để hoàn tác một lần nâng cấp
+([nâng cấp ReputeCast](/vi/self-hosting/upgrades/#quay-lại-phiên-bản-trước)).
+
+## Khắc phục sự cố
+
+- **Tên miền hiện trang 502 của CapRover**: **Container HTTP Port** chưa phải `8080`, hoặc ứng dụng đã dừng; hãy xem tab
+  **Logs**.
+- **`1107 : Verification Failed.`**: bản ghi `A` của tên miền chưa trỏ đến máy chủ, hoặc có một proxy như của Cloudflare
+  đứng trước. Hãy trỏ bản ghi thẳng đến máy chủ rồi thử lại.
+- **`Error: secret key file /var/lib/reputecast/secret.key: open /var/lib/reputecast/secret.key: permission denied`**:
+  chưa đặt `REPUTECAST_SECRETS__KEY` và thư mục là đường dẫn trên máy chủ thuộc về root. Hãy đặt khóa, chạy
+  `chown 65532:65532` cho thư mục đó rồi bấm **Save & Restart**.
+- **Log không có thông báo cài đặt**: cơ sở dữ liệu đã có người dùng. Hãy đặt lại mật khẩu của Chủ sở hữu qua SSH
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)):
+  `docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast -q | head -n1)" /usr/local/bin/reputecast user reset-password --email you@company.com`
+
+Tài liệu của nền tảng (kiểm tra tháng 10/2026): [Getting started](https://caprover.com/docs/get-started),
+[One-click apps](https://caprover.com/docs/one-click-apps), [App configuration](https://caprover.com/docs/app-configuration),
+[Persistent apps](https://caprover.com/docs/persistent-apps), [Deployment methods](https://caprover.com/docs/deployment-methods),
+[Database connection](https://caprover.com/docs/database-connection), [NGINX config](https://caprover.com/docs/nginx-customization),
+[Zero downtime](https://caprover.com/docs/zero-downtime), [Troubleshooting](https://caprover.com/docs/troubleshooting).

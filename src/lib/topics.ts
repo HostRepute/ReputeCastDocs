@@ -77,6 +77,7 @@ const input: TopicInput[] = [
     icon: 'setting',
     sidebar: [
       { kind: 'flat', directory: 'self-hosting' },
+      group('Deploy on a platform', 'Triển khai trên nền tảng', 'deploy', false),
       {
         kind: 'links',
         label: { en: 'In other guides', vi: 'Trong các hướng dẫn khác' },

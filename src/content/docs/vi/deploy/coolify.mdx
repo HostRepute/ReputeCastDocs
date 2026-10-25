@@ -1,0 +1,156 @@
+---
+title: Triển khai ReputeCast trên Coolify
+description: 'Triển khai ReputeCast trên Coolify bằng một tệp Docker Compose: PostgreSQL 18, khóa bí mật tự sinh, tên miền với HTTPS và mật khẩu của Chủ sở hữu đầu tiên.'
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên Coolify
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/install.go
+  - internal/cli/user.go
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Hướng dẫn này chạy ReputeCast trên Coolify dưới dạng một dịch vụ Docker Compose, gồm PostgreSQL 18 và ứng dụng, phía
+sau proxy của Coolify với HTTPS trên tên miền của bạn.
+
+## Trước khi bắt đầu
+
+- Một máy chủ do Coolify v4.5 trở lên quản lý (các nhãn bên dưới lấy từ v4.5.0), đang chạy proxy của Coolify (Traefik,
+  mặc định, hoặc Caddy) và đáp ứng [yêu cầu hệ thống](/vi/self-hosting/requirements/).
+- Một tên DNS như `news.example.com` có bản ghi A (và AAAA nếu bạn dùng IPv6) trỏ đến máy chủ đó, cùng cổng 80 và 443
+  đang mở để proxy lấy được chứng chỉ Let's Encrypt.
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trong Coolify, mở **Projects**, chọn **New project**, nhập **Name** rồi chọn **Create project**. Coolify mở môi
+   trường `production` vừa được tạo.
+
+2. Chọn **New resource**, rồi chọn thẻ **Docker Compose** (có ghi **Docker source**). Nếu Coolify hỏi, hãy chọn máy chủ
+   ở **Select a server** và đích triển khai ở **Select a destination**.
+
+3. Dán tệp này vào **Docker Compose file** rồi chọn **Create service**:
+
+   ```yaml title="Docker Compose file"
+   services:
+     postgres:
+       image: postgres:18-alpine
+       environment:
+         POSTGRES_USER: reputecast
+         POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
+         POSTGRES_DB: reputecast
+       volumes:
+         - pgdata:/var/lib/postgresql
+       healthcheck:
+         test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+         interval: 5s
+         timeout: 3s
+         retries: 20
+
+     app:
+       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       depends_on:
+         postgres:
+           condition: service_healthy
+       environment:
+         SERVICE_URL_APP_8080:
+         REPUTECAST_HTTP__PUBLIC_URL: ${SERVICE_URL_APP}
+         REPUTECAST_DATABASE__URL: postgres://reputecast:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/reputecast?sslmode=disable
+         REPUTECAST_SECRETS__KEY: ${SERVICE_REALBASE64_32_SECRETKEY}
+         REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:?}
+       volumes:
+         - appdata:/var/lib/reputecast
+
+   volumes:
+     pgdata:
+     appdata:
+   ```
+
+4. Mở **Domains** và chọn **Add domain**: **Service application** `app`, **Protocol** `https`, **Domain**
+   `news.example.com`, **Port** `8080`, rồi chọn **Save**. Sau đó xóa tên miền mà Coolify đã sinh cho `app` (một tên
+   `sslip.io`, hoặc một tên thuộc wildcard domain của bạn) bằng nút **Remove domain** của nó: URL công khai của
+   ReputeCast lấy từ tên miền đầu tiên.
+
+5. Mở **Environment Variables**. Chọn `REPUTECAST_ADMIN_EMAIL` (có nhãn **Required**), nhập email của Chủ sở hữu đầu
+   tiên vào **Value** rồi chọn **Update variable**. Sau đó sao chép `SERVICE_REALBASE64_32_SECRETKEY` bằng nút
+   **Copy value** vào trình quản lý mật khẩu của bạn.
+
+   <Aside type="caution">
+     Giá trị đó là khóa bí mật của ReputeCast: thiếu nó, các thông tin bí mật lưu trong cơ sở dữ liệu không thể giải mã
+     được. Hãy giữ một bản sao bên ngoài Coolify cùng với [bản sao lưu](/vi/self-hosting/backups/) của bạn.
+   </Aside>
+
+6. Chọn **Deploy**. Coolify khởi động PostgreSQL, chờ đến khi nó ở trạng thái healthy, rồi khởi động ứng dụng; ứng dụng
+   áp dụng các migration và tạo Chủ sở hữu đầu tiên.
+
+7. Mở **Runtime Logs**, chọn `app` ở **Service** và gõ `temporary` vào **Find in logs** (chọn **All** nếu không thấy
+   dòng nào). Xóa ô tìm kiếm để xem toàn bộ thông báo, kèm địa chỉ đăng nhập và email.
+
+   ```txt title="Runtime Logs"
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+8. Mở `https://news.example.com` và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn đặt
+   mật khẩu mới, thêm khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và
+   tạo không gian làm việc đầu tiên.
+
+</Steps>
+
+Những điểm tệp này dựa vào:
+
+- `SERVICE_URL_APP_8080` định tuyến tên miền của `app` đến cổng 8080; `${SERVICE_URL_APP}` là chính URL đó nhưng
+  không có cổng.
+- `SERVICE_PASSWORD_POSTGRES` là mật khẩu ngẫu nhiên 32 ký tự, không có ký hiệu; `SERVICE_REALBASE64_32_SECRETKEY` là
+  chuỗi mã hóa Base64 của 32 byte ngẫu nhiên, đúng định dạng `REPUTECAST_SECRETS__KEY` cần (`SERVICE_BASE64_*` không
+  phải Base64). Coolify giữ nguyên cả hai giữa các lần triển khai. `${REPUTECAST_ADMIN_EMAIL:?}` chặn việc triển khai
+  cho đến khi biến này có giá trị.
+- `appdata` lưu các tệp tải lên. Coolify thêm UUID của dịch vụ vào đầu tên volume và liệt kê chúng, ở chế độ chỉ đọc,
+  trong **Persistent Storage**. Hãy giữ `appdata` là named volume: Docker điền nội dung từ image vào volume, thuộc sở
+  hữu của người dùng của ứng dụng (uid 65532).
+- Không có `ports:` (proxy tham gia network của dịch vụ), không có `healthcheck` cho `app` (image không có shell, curl
+  hay wget), và không có `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify không công bố dải địa chỉ cố định nào cho proxy của
+  mình, nên ReputeCast ghi nhận địa chỉ của proxy cho mọi người truy cập ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)).
+
+## Kiểm tra kết quả
+
+- Trên trang **General** của dịch vụ, **Compose resources** hiển thị `postgres` là **Running (healthy)** và `app` là
+  **Running (unknown)**: `app` không có health check, và proxy vẫn định tuyến lưu lượng đến nó.
+- `https://news.example.com/readyz` trả về `ready` (`503 database unavailable` khi không kết nối được PostgreSQL) và
+  `/healthz` trả về `ok`. Hãy trỏ công cụ giám sát uptime đến `/readyz` ([giám sát](/vi/self-hosting/monitoring/)).
+- **Environment Variables** hiển thị `SERVICE_URL_APP` là `https://news.example.com`.
+
+## Nâng cấp
+
+Hãy [sao lưu](/vi/self-hosting/backups/) trước. Trên trang **General**, chọn **Edit Compose file**, đổi `v1.0.1` trong
+image của `app` sang tag mới rồi chọn **Save changes**. Sau đó mở menu bên cạnh **Restart current version** và chọn
+**Pull latest and restart**. Ứng dụng áp dụng các migration mới khi khởi động
+([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+## Khắc phục sự cố
+
+- **Coolify hiển thị `Deploy (missing required env vars)`**: hãy đặt `REPUTECAST_ADMIN_EMAIL` trong
+  **Environment Variables**.
+- **Tên miền trả về `No Available Server`**: container `app` không chạy; hãy đọc **Runtime Logs** của nó. Đừng thêm
+  `healthcheck` cho `app`: các kiểm tra bằng curl, wget và `CMD-SHELL` đều thất bại trong image này, và Traefik không
+  định tuyến đến container ở trạng thái unhealthy.
+- **Thông báo ghi `Sign in at http://app-….sslip.io`**: tên miền do Coolify sinh vẫn đứng đầu. Hãy xóa nó trong
+  **Domains**, chọn **Restart current version**, rồi sửa URL công khai ở bước <UiPath path="setup.instanceBasics" />
+  của lần đăng nhập đầu tiên.
+- **Không thấy thông báo trong Runtime Logs**: thông báo chỉ được in một lần, và mỗi lần triển khai hoặc khởi động lại
+  đều tạo lại container, làm mất log trước đó. **Terminal** của Coolify không mở được `app` (image không có shell), nên
+  hãy đặt lại mật khẩu của Chủ sở hữu trên máy chủ, với UUID nằm sau `/service/` trong địa chỉ của Coolify:
+  `docker exec app-<service UUID> /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([khôi phục quyền truy cập](/vi/self-hosting/account-recovery/)).
+
+Tài liệu của nền tảng (kiểm tra tháng 10/2026): [Docker Compose](https://coolify.io/docs/applications/builds/docker-compose),
+[Docker Compose của Service](https://coolify.io/docs/services/configuration/docker-compose), [biến môi trường](https://coolify.io/docs/services/configuration/environment-variables),
+[lưu trữ bền vững](https://coolify.io/docs/services/configuration/persistent-storage), [tên miền](https://coolify.io/docs/core/networking/domains),
+[proxy](https://coolify.io/docs/core/networking/proxy/overview), [No Available Server](https://coolify.io/docs/troubleshoot/applications/no-available-server).

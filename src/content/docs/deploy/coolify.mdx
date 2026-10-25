@@ -1,0 +1,152 @@
+---
+title: Deploy ReputeCast on Coolify
+description: "Deploy ReputeCast on Coolify from one Docker Compose file: PostgreSQL 18, a generated secret key, your domain with HTTPS, and the first Owner's password."
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast on Coolify
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/install.go
+  - internal/cli/user.go
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+This guide runs ReputeCast on Coolify as one Docker Compose service, PostgreSQL 18 and the app, behind Coolify's proxy
+with HTTPS on your own domain.
+
+## Before you begin
+
+- A server managed by Coolify v4.5 or later (labels below are from v4.5.0) with the Coolify proxy running (Traefik, the
+  default, or Caddy), and that meets the [system requirements](/self-hosting/requirements/).
+- A DNS name such as `news.example.com` with an A record (and AAAA, if you use IPv6) pointing at that server, and ports
+  80 and 443 open so the proxy can get a Let's Encrypt certificate.
+
+## Deploy ReputeCast
+
+<Steps>
+
+1. In Coolify, open **Projects**, select **New project**, enter a **Name** and select **Create project**. Coolify opens
+   the new `production` environment.
+
+2. Select **New resource**, then the **Docker Compose** card (marked **Docker source**). If Coolify asks, choose a
+   server under **Select a server** and a destination under **Select a destination**.
+
+3. Paste this file into **Docker Compose file** and select **Create service**:
+
+   ```yaml title="Docker Compose file"
+   services:
+     postgres:
+       image: postgres:18-alpine
+       environment:
+         POSTGRES_USER: reputecast
+         POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
+         POSTGRES_DB: reputecast
+       volumes:
+         - pgdata:/var/lib/postgresql
+       healthcheck:
+         test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+         interval: 5s
+         timeout: 3s
+         retries: 20
+
+     app:
+       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       depends_on:
+         postgres:
+           condition: service_healthy
+       environment:
+         SERVICE_URL_APP_8080:
+         REPUTECAST_HTTP__PUBLIC_URL: ${SERVICE_URL_APP}
+         REPUTECAST_DATABASE__URL: postgres://reputecast:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/reputecast?sslmode=disable
+         REPUTECAST_SECRETS__KEY: ${SERVICE_REALBASE64_32_SECRETKEY}
+         REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:?}
+       volumes:
+         - appdata:/var/lib/reputecast
+
+   volumes:
+     pgdata:
+     appdata:
+   ```
+
+4. Open **Domains** and select **Add domain**: **Service application** `app`, **Protocol** `https`, **Domain**
+   `news.example.com`, **Port** `8080`, then **Save**. Then delete the domain Coolify generated for `app` (an
+   `sslip.io` name, or one under your wildcard domain) with its **Remove domain** button: ReputeCast's public URL
+   comes from the first domain.
+
+5. Open **Environment Variables**. Select `REPUTECAST_ADMIN_EMAIL` (marked **Required**), enter the first Owner's email
+   as **Value** and select **Update variable**. Then copy `SERVICE_REALBASE64_32_SECRETKEY` with **Copy value** into
+   your password manager.
+
+   <Aside type="caution">
+     That value is ReputeCast's secret key: without it, the secrets stored in the database can't be decrypted. Keep a
+     copy outside Coolify with your [backups](/self-hosting/backups/).
+   </Aside>
+
+6. Select **Deploy**. Coolify starts PostgreSQL, waits until it is healthy, then starts the app, which applies the
+   migrations and creates the first Owner.
+
+7. Open **Runtime Logs**, choose `app` under **Service** and type `temporary` in **Find in logs** (select **All** if no
+   line appears). Clear the search to see the whole banner with the sign-in address and email.
+
+   ```txt title="Runtime Logs"
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+8. Open `https://news.example.com` and sign in. The [first sign-in](/self-hosting/first-run/) asks you to set a new
+   password, add a passkey or authenticator app, save recovery codes, confirm the instance basics and create the first
+   workspace.
+
+</Steps>
+
+What the file relies on:
+
+- `SERVICE_URL_APP_8080` routes the `app` domain to port 8080; `${SERVICE_URL_APP}` is the same URL without the port.
+- `SERVICE_PASSWORD_POSTGRES` is a random 32-character password without symbols; `SERVICE_REALBASE64_32_SECRETKEY` is
+  the Base64 encoding of 32 random bytes, the format `REPUTECAST_SECRETS__KEY` needs (`SERVICE_BASE64_*` is not
+  Base64). Coolify keeps both between deployments. `${REPUTECAST_ADMIN_EMAIL:?}` blocks deployment until it is set.
+- `appdata` keeps uploaded files. Coolify prefixes volume names with the service UUID and lists them, read-only, under
+  **Persistent Storage**. Keep it a named volume: Docker fills it from the image, owned by the app's user (uid 65532).
+- No `ports:` (the proxy joins the service's network), no `healthcheck` for `app` (the image has no shell, curl or
+  wget), and no `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify documents no fixed address range for its proxy, so
+  ReputeCast records the proxy's address for every visitor ([trusted proxies](/self-hosting/docker/#trusted-proxies)).
+
+## Check that it works
+
+- On the service's **General** page, **Compose resources** shows `postgres` as **Running (healthy)** and `app` as
+  **Running (unknown)**: no health check is configured, and the proxy routes traffic to it anyway.
+- `https://news.example.com/readyz` answers `ready` (`503 database unavailable` without PostgreSQL) and `/healthz`
+  answers `ok`. Point your uptime monitor at `/readyz` ([monitoring](/self-hosting/monitoring/)).
+- **Environment Variables** shows `SERVICE_URL_APP` as `https://news.example.com`.
+
+## Upgrade
+
+[Back up](/self-hosting/backups/) first. On the **General** page, select **Edit Compose file**, change `v1.0.1` in the
+`app` image to the new tag and select **Save changes**. Then open the menu next to **Restart current version** and
+select **Pull latest and restart**. The app applies new migrations when it starts
+([upgrade ReputeCast](/self-hosting/upgrades/)).
+
+## Troubleshooting
+
+- **Coolify shows `Deploy (missing required env vars)`**: set `REPUTECAST_ADMIN_EMAIL` in **Environment Variables**.
+- **The domain answers `No Available Server`**: the `app` container isn't running; read its **Runtime Logs**. Don't add
+  a `healthcheck` to `app`: curl, wget and `CMD-SHELL` checks fail in this image, and Traefik doesn't route to an
+  unhealthy container.
+- **The banner says `Sign in at http://app-….sslip.io`**: the generated domain was still first. Remove it in
+  **Domains**, select **Restart current version**, and correct the public URL in the
+  <UiPath path="setup.instanceBasics" /> step of the first sign-in.
+- **No banner in the Runtime Logs**: it is printed once, and every deploy or restart recreates the containers, which
+  discards their earlier logs. Coolify's **Terminal** can't open `app` (the image has no shell), so reset the Owner's
+  password on the server, with the UUID that follows `/service/` in the Coolify address:
+  `docker exec app-<service UUID> /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([recover access](/self-hosting/account-recovery/)).
+
+Platform docs (checked October 2026): [Docker Compose](https://coolify.io/docs/applications/builds/docker-compose),
+[Service Compose](https://coolify.io/docs/services/configuration/docker-compose), [environment variables](https://coolify.io/docs/services/configuration/environment-variables),
+[persistent storage](https://coolify.io/docs/services/configuration/persistent-storage), [domains](https://coolify.io/docs/core/networking/domains),
+[proxy](https://coolify.io/docs/core/networking/proxy/overview), [No Available Server](https://coolify.io/docs/troubleshoot/applications/no-available-server).

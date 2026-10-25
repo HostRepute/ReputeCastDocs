@@ -1,0 +1,160 @@
+---
+title: Triển khai ReputeCast trên Railway
+description: Triển khai ReputeCast trên Railway với mẫu PostgreSQL, Docker image, volume, tên miền công khai, health check và mật khẩu của Chủ sở hữu đầu tiên.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên Railway
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/cli/install.go
+  - internal/db/db.go
+sidebar:
+  order: 6
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast trên Railway dưới dạng hai dịch vụ trong một project: cơ sở dữ liệu PostgreSQL của Railway
+và Docker image của ReputeCast, kèm một volume cho tệp tải lên và HTTPS trên tên miền của Railway hoặc của bạn.
+
+## Trước khi bắt đầu
+
+- Một tài khoản Railway dùng gói Hobby hoặc Pro. Gói Free chỉ cho một volume mỗi project, và mẫu PostgreSQL đã dùng
+  volume đó. Gói Trial dùng được để thử, nhưng Limited Trial (tài khoản chưa xác minh) giới hạn truy cập mạng ra ngoài,
+  vốn là thứ ReputeCast cần để kết nối với nhà cung cấp gửi thư.
+- Docker hoặc OpenSSL trên máy tính của bạn, để tạo khóa bí mật. Xem thêm
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/).
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trên dashboard của Railway, nhấn **New Project** rồi chọn **Empty Project**.
+
+2. Nhấn **+ New**, rồi **Database**, rồi **PostgreSQL**. Railway triển khai PostgreSQL 18 thành một dịch vụ tên
+   `Postgres`, có volume riêng và biến `DATABASE_URL` dùng mạng riêng (private network).
+
+3. Nhấn **+ New**, rồi **Docker Image**, nhập `ghcr.io/hostrepute/reputecast:v1.0.1`, nhấn Enter rồi nhấn **Deploy**.
+   Bản triển khai đầu tiên này sẽ lỗi vì dịch vụ chưa có thiết lập nào.
+
+4. Tạo khóa bí mật trên máy tính của bạn và lưu nó vào trình quản lý mật khẩu. Hai lệnh sau in ra khóa cùng định dạng
+   (44 ký tự, kết thúc bằng `=`): `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key`
+   hoặc `openssl rand -base64 32`.
+
+5. Mở dịch vụ ReputeCast. Trong **Settings** → **Networking** → **Public Networking**, nhấn **Generate Domain** (nếu
+   Railway hỏi cổng, nhập `8080`). Railway phục vụ tên miền `*.up.railway.app` qua HTTPS.
+
+6. Ở thẻ **Variables**, nhấn **Raw Editor**, dán các dòng sau với email và khóa của bạn, rồi lưu:
+
+   ```sh title="Raw Editor"
+   REPUTECAST_DATABASE__URL=${{Postgres.DATABASE_URL}}
+   REPUTECAST_HTTP__PUBLIC_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-4
+   PORT=8080
+   RAILWAY_RUN_UID=0
+   ```
+
+   - `${{Postgres.DATABASE_URL}}` tham chiếu chuỗi kết nối của cơ sở dữ liệu (`Postgres` là tên dịch vụ). Hãy giữ
+     nguyên: khi không có tham số `sslmode`, ReputeCast dùng TLS mà image PostgreSQL của Railway đã bật sẵn.
+   - `${{RAILWAY_PUBLIC_DOMAIN}}` là tên miền ở bước 5. Nếu dùng [tên miền của bạn](#dùng-tên-miền-của-bạn), hãy ghi
+     thẳng URL.
+   - `REPUTECAST_ADMIN_EMAIL` là email của Chủ sở hữu đầu tiên, chỉ được dùng khi cơ sở dữ liệu chưa có người dùng nào.
+   - `PORT=8080` cho health check của Railway biết cần gọi cổng nào. ReputeCast lắng nghe ở cổng 8080 và không đọc
+     `PORT`.
+   - `RAILWAY_RUN_UID=0` chạy ứng dụng với quyền root: Railway gắn volume với chủ sở hữu là root, nên người dùng của
+     image (uid 65532) không ghi vào được.
+   - Railway không công bố dải địa chỉ mà edge proxy của họ dùng để kết nối, nên hãy để trống
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)). Các thiết lập khác:
+     [cấu hình](/vi/self-hosting/configuration/).
+
+7. Nhấn chuột phải vào canvas của project (hoặc nhấn <kbd>⌘</kbd> <kbd>K</kbd> hay <kbd>Ctrl</kbd> <kbd>K</kbd>), tạo
+   một volume, nối nó với dịch vụ ReputeCast và đặt đường dẫn gắn (mount path) là `/var/lib/reputecast`.
+
+8. Trong **Settings** → **Deploy**, đặt **Healthcheck Path** là `/readyz`. Khi đó Railway chờ tối đa 300 giây để nhận
+   phản hồi `2xx` rồi mới chuyển lưu lượng sang bản triển khai mới; ReputeCast trả về `2xx` khi đã kết nối được cơ sở
+   dữ liệu.
+
+9. Nhấn **Deploy** trên thanh thông báo ở canvas liệt kê các thay đổi đang chờ áp dụng. Ở lần khởi động đầu tiên,
+   ReputeCast áp dụng các migration cơ sở dữ liệu và tạo Chủ sở hữu đầu tiên.
+
+10. Ở thẻ **Deployments**, nhấn vào bản triển khai để mở log của nó và lọc theo `Password`. Với Railway CLI, trong một
+    thư mục đã liên kết với project: `railway logs --lines 500 --filter "Password"`.
+
+    ```txt title="Log triển khai"
+      ReputeCast is installed.
+
+      Sign in at  https://reputecast-production-1a2b.up.railway.app
+      Email       you@company.com
+      Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+    ```
+
+11. Mở URL công khai và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu,
+    thêm khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo một
+    không gian làm việc.
+
+</Steps>
+
+<Aside type="caution">
+  Hãy giữ một bản sao của `REPUTECAST_SECRETS__KEY` bên ngoài Railway: không có nó, thông tin xác thực của nhà cung cấp
+  lưu trong cơ sở dữ liệu sẽ không giải mã được. Để ẩn giá trị này trên dashboard, chọn **Seal** trong menu ba chấm của
+  biến (biến đã niêm phong không thể đọc lại hay bỏ niêm phong).
+</Aside>
+
+### Dùng tên miền của bạn
+
+1. Trong **Settings** → **Networking** → **Public Networking**, nhấn **+ Custom Domain**, nhập tên miền (ví dụ
+   `news.example.com`) và chọn cổng `8080`.
+2. Tạo cả hai bản ghi Railway hiển thị, một `CNAME` và một `TXT`, ở nhà cung cấp DNS của bạn. Railway xác minh tên miền
+   (dấu tích xanh) và cấp chứng chỉ Let's Encrypt, thường trong vòng một giờ.
+3. Ở thẻ **Variables**, đặt `REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com` rồi triển khai thay đổi. Hãy làm việc
+   này trước lần đăng nhập đầu tiên: ReputeCast gắn khóa truy cập với tên miền của URL công khai và đưa URL đó vào mọi
+   liên kết nó gửi đi.
+
+Nếu dùng proxy của Cloudflare, hãy đặt chế độ SSL/TLS của Cloudflare là **Full**; Railway cho biết **Full (Strict)**
+không hoạt động như mong muốn. Gói Trial cho 1 tên miền tùy chỉnh, gói Hobby cho 2 tên miền mỗi dịch vụ.
+
+## Kiểm tra kết quả
+
+- Thẻ **Deployments** hiển thị bản triển khai ở trạng thái `Active`: kiểm tra tình trạng `/readyz` đã đạt.
+- `curl https://news.example.com/readyz` trả về `ready`, hoặc `database unavailable` (mã 503) khi ReputeCast không kết
+  nối được PostgreSQL. Railway chỉ gọi `/readyz` khi một bản triển khai khởi động, nên hãy trỏ một công cụ giám sát
+  uptime vào đó để kiểm tra liên tục ([giám sát](/vi/self-hosting/monitoring/)).
+
+## Nâng cấp
+
+1. Đọc ghi chú phát hành và [sao lưu](/vi/self-hosting/backups/). Thẻ **Backups** của dịch vụ PostgreSQL sao lưu volume
+   của nó theo yêu cầu hoặc theo lịch hằng ngày, hằng tuần hay hằng tháng.
+2. Trong **Settings** → **Source** → **Source Image** của dịch vụ ReputeCast, nhấn biểu tượng chỉnh sửa và đổi tag, ví
+   dụ thành `ghcr.io/hostrepute/reputecast:v1.0.2`. Khi Railway báo có bản cập nhật cho image, nút nâng cấp của nó sẽ
+   đưa tag mới vào danh sách thay đổi đang chờ cho bạn.
+3. Nhấn **Deploy**. ReputeCast áp dụng các migration mới khi khởi động. Dịch vụ có volume không bao giờ chạy hai bản
+   triển khai cùng lúc, nên sẽ có một khoảng gián đoạn ngắn.
+
+Để Railway tự áp dụng bản phát hành mới trong khung giờ bảo trì, dùng **Configure Auto Updates** trong cùng mục đó
+([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+## Khắc phục sự cố
+
+- **`Error: secret key file /var/lib/reputecast/secret.key: open /var/lib/reputecast/secret.key: permission denied`**:
+  volume thuộc sở hữu của root và chưa đặt `REPUTECAST_SECRETS__KEY`. Hãy đặt khóa và `RAILWAY_RUN_UID=0`, rồi triển
+  khai lại.
+- **Tên miền hiển thị "Application failed to respond"**: cổng đích (target port) của tên miền không phải 8080. Trong
+  **Settings** → **Networking**, nhấn biểu tượng chỉnh sửa cạnh tên miền và đặt `8080`.
+- **Bản triển khai không qua được kiểm tra tình trạng**: `/readyz` trả về 503 khi ReputeCast không kết nối được
+  PostgreSQL. Hãy kiểm tra `REPUTECAST_DATABASE__URL` có ghi đúng tên dịch vụ cơ sở dữ liệu như trên canvas, trong cùng
+  một môi trường.
+- **Nhà cung cấp gửi thư qua SMTP không kết nối được**: Railway tắt SMTP ra ngoài trên các gói Free, Trial và Hobby. Hãy
+  dùng nhà cung cấp có API qua HTTPS, như Amazon SES, Postmark hoặc Resend, hoặc chuyển sang gói Pro rồi triển khai lại.
+
+Tài liệu nền tảng (kiểm tra tháng 10/2026): [Quick start](https://docs.railway.com/quick-start),
+[PostgreSQL](https://docs.railway.com/databases/postgresql), [Variables](https://docs.railway.com/variables),
+[Variables reference](https://docs.railway.com/variables/reference), [Volumes](https://docs.railway.com/volumes),
+[Volumes reference](https://docs.railway.com/volumes/reference), [Services](https://docs.railway.com/services),
+[Healthchecks](https://docs.railway.com/deployments/healthchecks), [Logs](https://docs.railway.com/observability/logs),
+[Domains](https://docs.railway.com/networking/domains/working-with-domains), [Plans](https://docs.railway.com/pricing/plans),
+[Image auto updates](https://docs.railway.com/deployments/image-auto-updates), [Free trial](https://docs.railway.com/pricing/free-trial),
+[Outbound networking](https://docs.railway.com/networking/outbound-networking).

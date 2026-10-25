@@ -1,0 +1,158 @@
+---
+title: Deploy ReputeCast on CapRover
+description: Deploy ReputeCast on CapRover with the PostgreSQL one-click app, the Docker image, a persistent directory, HTTPS, live updates and the first Owner.
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast on CapRover
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/serve.go
+  - internal/cli/install.go
+  - internal/app/app.go
+  - internal/sending/engine/api.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+This guide runs ReputeCast on a CapRover server as two apps, PostgreSQL from CapRover's one-click apps and the
+ReputeCast Docker image, with a persistent directory and a Let's Encrypt certificate. It was checked with CapRover 1.15.5.
+
+## Before you begin
+
+- A CapRover server set up as in CapRover's [getting started](https://caprover.com/docs/get-started) guide, with HTTPS
+  turned on for its root domain: CapRover refuses to enable HTTPS for an app before that.
+- A domain for ReputeCast, such as `news.example.com`, with an `A` record that points straight at the server (CapRover
+  doesn't officially support DNS proxies such as Cloudflare's), or the app's default address `reputecast.<root domain>`.
+- SSH access to the server, and OpenSSL or Docker to generate the secret key. See also the
+  [system requirements](/self-hosting/requirements/).
+
+## Deploy ReputeCast
+
+<Steps>
+
+1. In the dashboard, open **Apps**, click **One-Click Apps/Databases** and choose **PostgreSQL** (once the server has
+   apps, click **Create A New App** first to show these options). Set **App Name** to `reputecast-db`, **Version** to
+   `18` (the default, `14.5`, is older than the 16, 17 or 18 that ReputeCast needs), **Username** and
+   **Default Database** to `reputecast`. Copy the generated **Password** (letters and digits, safe in a URL) and click
+   **Deploy**. The template keeps the data in the volume `reputecast-db-data` and doesn't expose PostgreSQL to the web.
+
+2. On **Apps**, click **Create A New App**, type `reputecast`, tick **Has Persistent Data** (it can't be changed later)
+   and click **Create New App**. Open `reputecast` from **Your Apps**.
+
+3. On the **HTTP Settings** tab, type your domain, click **Connect New Domain**, then **Enable HTTPS** in its row (for the
+   default address, the **Enable HTTPS** button next to it). Choose your domain under **Redirect all domains to:**, set
+   **Container HTTP Port** to `8080`, tick **Force HTTPS by redirecting all HTTP traffic to HTTPS** and click
+   **Save & Restart**.
+
+4. CapRover's NGINX buffers responses, which holds back the live monitor's Server-Sent Events and the
+   [MCP endpoint](/developers/mcp/). On **HTTP Settings**, click **Edit Default Nginx Configurations**, paste this block
+   below the line that starts with `set $upstream` and click **Save & Restart** (CapRover rejects a configuration that
+   fails `nginx -t`):
+
+   ```nginx title="Below set $upstream"
+           # ReputeCast: no buffering for the live monitor (Server-Sent Events) and MCP.
+           location ~ ^(/mcp|/api/v1/workspaces/[^/]+/campaigns/[^/]+/live/stream)$ {
+               proxy_pass $upstream;
+               proxy_set_header Host $host;
+               proxy_set_header X-Real-IP $remote_addr;
+               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+               proxy_set_header X-Forwarded-Proto $scheme;
+               proxy_buffering off;
+               proxy_cache off;
+               proxy_read_timeout 1h;
+           }
+   ```
+
+5. Generate the secret key and save it in your password manager: `openssl rand -base64 32`, or on the server
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key` (44 characters ending in `=`).
+
+6. On the **App Configs** tab, switch on **Bulk Edit** next to **Environment Variables** and paste these lines with your
+   database password, domain, email and key. Under **Persistent Directories**, click **Add Persistent Directory**, set
+   **Path in App** to `/var/lib/reputecast` and **Label** to `reputecast-data`, then click **Save & Restart**.
+
+   ```sh title="Environment Variables"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:PASSWORD@reputecast-db:5432/reputecast?sslmode=disable
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-5
+   ```
+
+   - Other apps reach the database by its app name, `reputecast-db`; `srv-captain--reputecast-db`, which the one-click
+     app shows, works too. The connection stays on CapRover's internal network.
+   - The directory is a Docker volume that CapRover manages: a new, empty volume takes the owner of the image's folder,
+     uid 65532, so ReputeCast can write its uploaded files there. With **Set specific host path**, the folder on the
+     server must exist and belong to that user (`chown 65532:65532 /path/on/host`).
+   - CapRover doesn't document the address range its NGINX connects from, so leave `REPUTECAST_HTTP__TRUSTED_PROXIES`
+     unset. Other settings: [configuration](/self-hosting/configuration/).
+
+7. On the **Deployment** tab, under **Method 6: Deploy via ImageName**, enter `ghcr.io/hostrepute/reputecast:v1.0.1`
+   and click **Deploy Now**. On its first start, ReputeCast applies the migrations and creates the first Owner.
+
+8. On the **Logs** tab, type `Password` in the search box. The tab shows the last 500 lines; over SSH, run
+   `docker service logs reputecast 2>&1 | grep -A4 "ReputeCast is installed"`.
+
+   ```txt title="Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+9. Open the public URL and sign in. The [first sign-in](/self-hosting/first-run/) asks you to replace the password,
+   add a passkey or an authenticator app, save recovery codes, confirm the instance basics and create a workspace.
+
+</Steps>
+
+<Aside type="caution">
+  Keep a copy of `REPUTECAST_SECRETS__KEY` outside CapRover: without it, the provider credentials stored in the database
+  can't be decrypted.
+</Aside>
+
+## Check that it works
+
+- `curl https://news.example.com/readyz` answers `ready`, or `database unavailable` (status 503) when ReputeCast can't
+  reach PostgreSQL.
+- CapRover has no HTTP health check of its own: it relies on a Docker `HEALTHCHECK` command in the image. The ReputeCast
+  image has none, and no shell or `curl` to run one, so don't add one in **Service Update Override**. Point an uptime
+  monitor at `/readyz` instead ([monitoring](/self-hosting/monitoring/)).
+
+## Upgrade
+
+1. Read the release notes and [back up](/self-hosting/backups/) the database, on the server:
+
+   ```sh
+   docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast-db -q | head -n1)" \
+     pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. On the **Deployment** tab, under **Method 6: Deploy via ImageName**, enter the new tag, such as
+   `ghcr.io/hostrepute/reputecast:v1.0.2`, and click **Deploy Now**. ReputeCast applies new migrations when it starts.
+   For an app with persistent data, CapRover stops the old container first, so expect a short downtime.
+
+**Revert to this version** in **Version History** brings back the previous image, not the database schema: restore the
+backup to undo an upgrade ([upgrade ReputeCast](/self-hosting/upgrades/#roll-back)).
+
+## Troubleshooting
+
+- **The domain shows CapRover's 502 page**: **Container HTTP Port** isn't `8080`, or the app stopped; read the **Logs**
+  tab.
+- **`1107 : Verification Failed.`**: the domain's `A` record doesn't point at the server yet, or a proxy such as
+  Cloudflare's sits in front of it. Point the record straight at the server and try again.
+- **`Error: secret key file /var/lib/reputecast/secret.key: open /var/lib/reputecast/secret.key: permission denied`**:
+  `REPUTECAST_SECRETS__KEY` isn't set and the directory is a host path owned by root. Set the key, run
+  `chown 65532:65532` on the host folder and click **Save & Restart**.
+- **No banner in the logs**: the database already had users. Reset the Owner's password over SSH
+  ([recover access](/self-hosting/account-recovery/)):
+  `docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast -q | head -n1)" /usr/local/bin/reputecast user reset-password --email you@company.com`
+
+Platform docs (checked October 2026): [Getting started](https://caprover.com/docs/get-started),
+[One-click apps](https://caprover.com/docs/one-click-apps), [App configuration](https://caprover.com/docs/app-configuration),
+[Persistent apps](https://caprover.com/docs/persistent-apps), [Deployment methods](https://caprover.com/docs/deployment-methods),
+[Database connection](https://caprover.com/docs/database-connection), [NGINX config](https://caprover.com/docs/nginx-customization),
+[Zero downtime](https://caprover.com/docs/zero-downtime), [Troubleshooting](https://caprover.com/docs/troubleshooting).

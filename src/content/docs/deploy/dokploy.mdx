@@ -1,0 +1,147 @@
+---
+title: Deploy ReputeCast on Dokploy
+description: Deploy ReputeCast on Dokploy as one Docker Compose service with PostgreSQL 18, a Let's Encrypt domain, a saved secret key and the first Owner's password.
+type: how-to
+audience: [operator]
+primaryKeyword: deploy ReputeCast on Dokploy
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/user.go
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+This guide runs ReputeCast and PostgreSQL 18 as one Docker Compose service on Dokploy, behind an HTTPS domain with a
+Let's Encrypt certificate. It was checked against Dokploy v0.30.10.
+
+## Before you begin
+
+- A server with Dokploy installed and its admin account created; Dokploy's Traefik proxy uses ports 80 and 443. See
+  also ReputeCast's [system requirements](/self-hosting/requirements/).
+- A DNS name such as `news.example.com` with an `A` record pointing at the server. Create it before you add the domain
+  in Dokploy, or Let's Encrypt can't issue the certificate.
+
+## Deploy ReputeCast
+
+<Steps>
+
+1. On your computer, generate the secret key and a database password:
+
+   ```sh
+   openssl rand -base64 32   # REPUTECAST_SECRETS__KEY
+   openssl rand -hex 24      # POSTGRES_PASSWORD
+   ```
+
+   <Aside type="caution">
+     Save the secret key in your password manager: without it, the provider credentials ReputeCast stores can't be
+     decrypted, even from a [backup](/self-hosting/backups/).
+   </Aside>
+
+2. In Dokploy, open **Projects**, click **Create Project**, enter a **Name** such as `ReputeCast` and click **Create**.
+   In the `production` environment that opens, click **Create Service** › **Compose**, enter the **Name** `ReputeCast`,
+   keep **Compose Type** on **Docker Compose**, click **Create** and open the new service.
+
+3. On the **General** tab, under **Provider**, choose **Raw**, paste this file and click **Save**:
+
+   ```yaml title="docker-compose.yml"
+   services:
+     reputecast-db:
+       image: postgres:18-alpine
+       restart: unless-stopped
+       environment:
+         POSTGRES_USER: reputecast
+         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Environment tab}
+         POSTGRES_DB: reputecast
+       volumes:
+         - pgdata:/var/lib/postgresql
+       healthcheck:
+         test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+         interval: 5s
+         timeout: 3s
+         retries: 20
+
+     reputecast:
+       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       restart: unless-stopped
+       depends_on:
+         reputecast-db:
+           condition: service_healthy
+       environment:
+         REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD}@reputecast-db:5432/reputecast?sslmode=disable
+         REPUTECAST_HTTP__PUBLIC_URL: ${REPUTECAST_HTTP__PUBLIC_URL:?Set REPUTECAST_HTTP__PUBLIC_URL in the Environment tab}
+         REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:?Set REPUTECAST_ADMIN_EMAIL in the Environment tab}
+         REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY:?Set REPUTECAST_SECRETS__KEY in the Environment tab}
+       volumes:
+         - appdata:/var/lib/reputecast
+
+   volumes:
+     pgdata:
+     appdata:
+   ```
+
+   There is no `ports:` or `networks:`: at deploy time Dokploy adds the Traefik labels for your domain and connects
+   `reputecast` to `dokploy-network`. Keep `appdata` (uploaded files) a named volume, which Docker fills from the image
+   so it belongs to uid 65532; ReputeCast can't write to a `../files` bind mount. The image's default command applies
+   migrations and creates the first Owner.
+
+4. On the **Environment** tab, paste your values and click **Save**:
+
+   ```sh title="Environment"
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-output-of-openssl-rand-base64-32
+   POSTGRES_PASSWORD=paste-the-output-of-openssl-rand-hex-24
+   ```
+
+   Dokploy writes them to a `.env` file that fills the `${…}` placeholders; it doesn't pass them to containers by
+   itself, so add [other settings](/self-hosting/configuration/) under `environment:` in the Compose file. Don't change
+   `POSTGRES_PASSWORD` after the first deploy: PostgreSQL applies it only when it creates an empty data volume.
+
+5. On the **Domains** tab, click **Add Domain**. Set **Service Name** to `reputecast`, **Host** to the host of your
+   public URL (`news.example.com`), leave **Path** empty, set **Container Port** to `8080`, turn on **HTTPS**, choose
+   **Let's Encrypt** as **Certificate Provider** and click **Create**.
+
+6. On the **General** tab, click **Deploy**, then **Confirm**. Dokploy opens **Deployments**; the log ends with
+   `Docker Compose Deployed: ✅`. Once PostgreSQL is healthy, ReputeCast applies the migrations and creates the Owner.
+
+7. On the **Logs** tab, select the container whose name ends in `reputecast-1`, choose **1000 lines** and search for
+   `Password`. The line reads `Password    XXXX-XXXX-XXXX-XXXX   (temporary: you'll replace it at first sign-in)`.
+   Open your public URL and sign in: the [first sign-in](/self-hosting/first-run/) asks you to replace the password,
+   add a passkey or an authenticator app, save recovery codes, confirm the public URL and create a workspace.
+
+</Steps>
+
+## Check that it works
+
+- The **Containers** tab shows both containers as `running`, and the `reputecast-db` status ends in `(healthy)`.
+- From your computer, `https://news.example.com/readyz` answers `ready` (`503 database unavailable` without PostgreSQL)
+  and `/healthz` answers `ok`. Point uptime monitoring at `/readyz` from outside the server.
+- On the **Domains** tab, **Validate DNS** on your domain turns to **DNS Valid**.
+
+## Upgrade
+
+Read the [upgrade notes](/self-hosting/upgrades/) and [back up](/self-hosting/backups/) first; the **Volume Backups**
+tab can copy the `pgdata` and `appdata` named volumes to S3. On the **General** tab, change the image tag in the
+Compose file (such as `v1.0.1` to the new release), click **Save**, then **Deploy** and **Confirm**. Compose pulls the
+new image and recreates the container; ReputeCast applies new migrations at start. Never use **Fresh Volumes**: it
+deletes all of the service's volumes, including the database.
+
+## Troubleshooting
+
+- **The deployment log shows `required variable … is missing a value`**: add that variable on the **Environment** tab,
+  click **Save** and deploy again.
+- **The domain returns 404 or has no valid certificate**: domain changes on a Compose service apply only after a
+  redeploy. If the `A` record pointed elsewhere when you added the domain, fix it, check **Validate DNS**, delete and
+  add the domain again, then deploy.
+- **The domain never answers after you added a `healthcheck:`**: a failing health check keeps the domain from working,
+  and the image has no shell or `curl` to run one. Remove it from the `reputecast` service.
+- **The password line isn't in the logs**: choose **5000 lines**. Still missing? The database already had users; over
+  SSH, run `docker exec <container-name> /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([recover access](/self-hosting/account-recovery/)).
+
+Platform docs (checked October 2026): [Docker Compose](https://docs.dokploy.com/docs/core/docker-compose), [Compose domains](https://docs.dokploy.com/docs/core/docker-compose/domains), [Domains](https://docs.dokploy.com/docs/core/domains),
+[Domains & Traefik troubleshooting](https://docs.dokploy.com/docs/core/troubleshooting/domains), [Volume Backups](https://docs.dokploy.com/docs/core/volume-backups), [Installation](https://docs.dokploy.com/docs/core/installation).

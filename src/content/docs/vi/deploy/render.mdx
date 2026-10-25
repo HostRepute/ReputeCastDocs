@@ -1,0 +1,150 @@
+---
+title: Triển khai ReputeCast trên Render
+description: Triển khai ReputeCast trên Render với Render Postgres, Docker image chạy dạng web service, disk tùy chọn, tên miền riêng qua HTTPS và kiểm tra /readyz.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên Render
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/cli/install.go
+  - internal/db/db.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast trên Render bằng hai tài nguyên tạo trong Render Dashboard: một cơ sở dữ liệu Render
+Postgres và một web service kéo Docker image của ReputeCast, phục vụ qua HTTPS trên tên miền riêng của bạn.
+
+## Trước khi bắt đầu
+
+- Một tài khoản Render. Hãy dùng các gói tính toán trả phí: web service Free tạm ngừng sau 15 phút không có lưu lượng
+  và không gắn được disk, còn cơ sở dữ liệu Render Postgres Free hết hạn 30 ngày sau khi được tạo.
+- OpenSSL hoặc Docker trên máy tính của bạn, để tạo khóa bí mật. Xem thêm
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/).
+- Một tên miền cho ReputeCast, ví dụ `news.example.com`, tại một nhà cung cấp DNS cho phép bạn thêm bản ghi `CNAME`.
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Tạo khóa bí mật và lưu nó vào trình quản lý mật khẩu. Hai lệnh sau in ra khóa cùng định dạng (44 ký tự, kết thúc
+   bằng `=`): `openssl rand -base64 32` hoặc
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.0.1 secrets generate-key`.
+
+2. Trong Render Dashboard, nhấn **+ New** → **Postgres**. Nhập **Name**, ví dụ `reputecast-db`, chọn **Region**, giữ
+   **PostgreSQL Version** là 18, chọn một gói tính toán khác **Free** rồi nhấn **Create Database**. Để trống
+   **Database** và **User**: Render tự tạo hai giá trị này.
+
+3. Khi trạng thái của cơ sở dữ liệu là **Available**, nhấn **Connect** ở đầu trang của nó và sao chép
+   **Internal Database URL** trong tab **Internal**. URL này chỉ dùng được cho các dịch vụ cùng region. Hãy giữ nguyên
+   (ReputeCast dùng TLS khi cơ sở dữ liệu hỗ trợ), hoặc thêm `?sslmode=require` để từ chối kết nối không mã hóa.
+
+4. Nhấn **+ New** → **Web Service**. Trong **Source Code**, nhấn **Existing Image**, nhập **Image URL**
+   `ghcr.io/hostrepute/reputecast:v1.0.1` rồi nhấn **Connect**. Image này công khai nên không cần thông tin xác thực.
+
+5. Nhập **Name**, ví dụ `reputecast` (tên này trở thành một phần của địa chỉ `onrender.com` của dịch vụ), chọn đúng
+   **Region** của cơ sở dữ liệu và một **Compute Plan** khác **Free**.
+
+6. Trong **Environment Variables**, thêm từng dòng dưới đây thành một cặp **Key** và **Value**, với giá trị của bạn:
+
+   ```sh title="Environment Variables"
+   PORT=8080
+   REPUTECAST_DATABASE__URL=paste-the-internal-database-url
+   REPUTECAST_HTTP__PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-1
+   ```
+
+   - `PORT=8080` cho Render biết ReputeCast lắng nghe ở cổng nào; mặc định của Render là 10000. Bản thân ReputeCast
+     không đọc `PORT`.
+   - `REPUTECAST_HTTP__PUBLIC_URL` là URL tên miền của bạn, không có dấu gạch chéo ở cuối. Nếu muốn dùng địa chỉ
+     `onrender.com`, hãy sao chép địa chỉ đó ở đầu trang của dịch vụ sau khi dịch vụ được tạo rồi đổi biến này.
+   - `REPUTECAST_ADMIN_EMAIL` là email của Chủ sở hữu đầu tiên, chỉ được dùng khi cơ sở dữ liệu chưa có người dùng nào.
+     Khi đã đặt `REPUTECAST_SECRETS__KEY`, ReputeCast không bao giờ đọc hay ghi tệp `secret.key`.
+   - Render không công bố dải địa chỉ mà bộ cân bằng tải của Render dùng để kết nối, nên hãy để trống
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)). Các thiết lập khác:
+     [cấu hình](/vi/self-hosting/configuration/).
+
+7. Mở **Advanced** ở cuối biểu mẫu và đặt **Health Check Path** là `/readyz`. Nếu cần, nhấn **Add disk**, đặt
+   **Mount path** là `/var/lib/reputecast` và **Size** là 1 GB. Disk giữ các tệp bạn tải lên cho sản phẩm số và quà
+   tặng đăng ký; không có disk, các tệp này mất sau mỗi lần triển khai và khởi động lại. Khi có disk, Render dừng
+   instance đang chạy trước khi khởi động instance mới (không còn triển khai không gián đoạn) và dịch vụ không mở rộng
+   ra nhiều instance được.
+
+8. Nhấn **Deploy Web Service**. Render kéo image và khởi động ReputeCast; ReputeCast áp dụng các migration cơ sở dữ liệu
+   và tạo Chủ sở hữu đầu tiên. Render chỉ chuyển lưu lượng đến instance mới khi `/readyz` trả về `200`.
+
+9. Mở trang **Logs** của dịch vụ và tìm `temporary`. Dòng tìm thấy chứa mật khẩu tạm thời của Chủ sở hữu đầu tiên,
+   thuộc thông báo này:
+
+   ```txt title="Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+10. Trên trang **Settings** của dịch vụ, trong **Custom Domains**, nhấn **+ Add Custom Domain**, nhập
+    `news.example.com` rồi nhấn **Save**. Tại nhà cung cấp DNS, tạo bản ghi `CNAME` mà Render hiển thị (trỏ đến tên
+    máy chủ `onrender.com` của dịch vụ) và xóa mọi bản ghi `AAAA` của tên đó. Nhấn **Verify**: Render cấp chứng chỉ TLS
+    và chuyển hướng HTTP sang HTTPS.
+
+11. Mở URL công khai và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu,
+    thêm khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo không
+    gian làm việc.
+
+</Steps>
+
+<Aside type="caution">
+  Hãy giữ một bản sao của `REPUTECAST_SECRETS__KEY` bên ngoài Render: thiếu nó, thông tin xác thực của nhà cung cấp
+  lưu trong cơ sở dữ liệu không thể giải mã được.
+</Aside>
+
+## Kiểm tra kết quả
+
+- Trang **Deploys** của dịch vụ đánh dấu lần triển khai là **Live**: kiểm tra tình trạng `/readyz` đã đạt.
+- `https://news.example.com/readyz` trả về `ready`, hoặc `database unavailable` (mã 503) khi ReputeCast không kết nối
+  được PostgreSQL. `/healthz` trả về `ok`.
+- Render tiếp tục gọi `/readyz` vài giây một lần. Sau 15 giây lỗi liên tục, Render ngừng chuyển lưu lượng đến instance;
+  sau 60 giây, Render khởi động lại instance đó ([giám sát](/vi/self-hosting/monitoring/)).
+
+## Nâng cấp
+
+1. Đọc ghi chú phát hành và [sao lưu](/vi/self-hosting/backups/). Cơ sở dữ liệu Render Postgres trả phí còn có khôi
+   phục theo thời điểm (point-in-time recovery).
+2. Trên trang **Settings** của dịch vụ, trong phần **Deploy**, đổi tag trong URL của image, ví dụ thành
+   `ghcr.io/hostrepute/reputecast:v1.0.2`, rồi lưu.
+3. Nếu không có lần triển khai nào bắt đầu, nhấn **Manual Deploy** → **Deploy latest reference**: Render kéo image của
+   tag vừa đặt. ReputeCast áp dụng các migration mới khi khởi động. Khi có disk, dịch vụ gián đoạn vài giây.
+
+Xem [nâng cấp ReputeCast](/vi/self-hosting/upgrades/).
+
+## Khắc phục sự cố
+
+- **Lần triển khai thất bại vì Render không phát hiện cổng nào đang mở**: `PORT` khác `8080`. Hãy sửa nó trên trang
+  **Environment** của dịch vụ và chọn **Save and deploy**.
+- **Lần triển khai không bao giờ chuyển sang Live và `/readyz` trả về `database unavailable`**: cơ sở dữ liệu nằm ở
+  region khác, mà URL nội bộ chỉ dùng được trong chính region của nó. Region không đổi được: hãy tạo lại web service
+  trong region của cơ sở dữ liệu.
+- **Log không có dòng `temporary`**: trình xem log mặc định chỉ hiện **Last hour**; hãy chọn khoảng thời gian dài hơn.
+  Workspace Render ở gói Hobby giữ log trong 7 ngày. ReputeCast chỉ in thông báo này ở lần khởi động đầu tiên, khi cơ
+  sở dữ liệu chưa có người dùng.
+- **Nhà cung cấp gửi thư qua SMTP không kết nối được**: Render chặn cổng 25 đi ra trên mọi dịch vụ, và chặn cả cổng
+  465 và 587 trên web service Free. Hãy dùng cổng 587 hoặc 465 với gói trả phí, hoặc một nhà cung cấp có API HTTPS.
+  Render chỉ chuyển tiếp một cổng HTTP cho mỗi web service, nên [SMTP relay](/vi/transactional/smtp-relay/) không nhận
+  được kết nối trên Render.
+
+Tài liệu của nền tảng (kiểm tra tháng 10/2026):
+[Render Postgres](https://render.com/docs/postgresql-creating-connecting),
+[Web services](https://render.com/docs/web-services), [Prebuilt images](https://render.com/docs/deploying-an-image),
+[Environment variables](https://render.com/docs/configure-environment-variables),
+[Persistent disks](https://render.com/docs/disks), [Health checks](https://render.com/docs/health-checks),
+[Custom domains](https://render.com/docs/custom-domains), [Logs](https://render.com/docs/logging),
+[Deploys](https://render.com/docs/deploys), [Free instances](https://render.com/docs/free),
+[Deploy n8n](https://render.com/docs/deploy-n8n).
