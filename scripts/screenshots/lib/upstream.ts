@@ -57,7 +57,7 @@ export async function reputecast(u: Upstream, args: string[]): Promise<string> {
         ...process.env,
         REPUTECAST_ENV: 'development',
         REPUTECAST_DATABASE__URL: databaseURL(u, 'reputecast'),
-        REPUTECAST_HTTP__PUBLIC_URL: u.publicUrl,
+        REPUTECAST_PUBLIC_URL: u.publicUrl,
       },
     })
     return stdout

@@ -1,6 +1,6 @@
 ---
 title: Warm up a new provider or IP
-description: Run an IP warm-up schedule in ReputeCast with a daily ramp to your largest audience, engaged contacts first and an automatic slowdown when bounces rise.
+description: Run an IP warm-up schedule in ReputeCast with a daily cap enforced as mail goes out, engaged contacts first and an automatic slowdown when bounces rise.
 type: how-to
 audience: [admin]
 permissions: ['providers:manage']
@@ -8,11 +8,15 @@ uiPath: 'nav.providers > providers.tabWarmup'
 primaryKeyword: IP warm-up schedule
 sources:
   - internal/warmup
+  - internal/sending/engine/warmup_send.go
   - internal/sending/engine/audience.go
-  - internal/sending/engine/engine.go
+  - internal/sending/engine/automation.go
+  - internal/sending/engine/transactional.go
   - internal/routing/routing.go
   - web/src/features/providers/WarmupPage.tsx
+  - web/src/features/providers/warmup-model.ts
   - web/src/features/providers/warmup.messages.ts
+  - web/src/features/live/States.tsx
 sidebar:
   order: 16
 ---
@@ -24,15 +28,16 @@ import LimitsTable from '~/components/LimitsTable.astro'
 
 A new [dedicated IP](/reference/glossary/#dedicated-ip), a new sending provider or your own Postal server has no sending
 history, so mailbox providers treat a sudden flood of mail from it with suspicion. A
-[warm-up](/reference/glossary/#warm-up) plan gives it an IP warm-up schedule: a daily cap that rises over a few weeks,
-mail to your most engaged contacts first, and an automatic slowdown when bounces or complaints rise.
+[warm-up](/reference/glossary/#warm-up) plan gives it an IP warm-up schedule: a daily cap that rises over a few weeks and
+is enforced as mail goes out, mail to your most engaged contacts first, and an automatic slowdown when bounces or
+complaints rise.
 
 ## Before you begin
 
 - Connect the provider. Read [Connect a sending provider](/providers/connect/).
 - For its share of Broadcasts to rise on schedule, put it in a weighted split on the Broadcasts route next to a provider
   that is already warm, for example 90% Amazon SES and 10% Postal. You set this up on the connect wizard's Streams step
-  (role Weighted split). Read [Route mail across providers](/providers/routing/).
+  (role Weighted split) or on the routing page. Read [Route mail across providers](/providers/routing/).
 - You need the `providers:manage` permission. With `providers:view` you can follow a plan.
 - Engagement tiers come from [list health](/audience/list-health/): Active, Cooling, At risk and Sunset.
 
@@ -42,68 +47,93 @@ mail to your most engaged contacts first, and an automatic slowdown when bounces
 
 1. Open <UiPath path="nav.providers > providers.tabWarmup" /> and choose <UiPath path="providers.warmup.newPlan" />.
 
-2. Pick the <UiPath path="providers.warmup.provider" />. Enter its <UiPath path="providers.warmup.dedicatedIp" /> if it
-   has one; leave it empty to warm the provider's shared pool for your domain.
+2. Pick the <UiPath path="providers.warmup.provider" /> and the <UiPath path="providers.warmup.length" />. Enter its
+   <UiPath path="providers.warmup.dedicatedIp" /> if it has one; leave it empty to warm the provider's shared pool for
+   your domain.
 
 3. Choose <UiPath path="providers.warmup.startWarmup" />. The provider's status changes to Warming up · day 1 of N, its
-   first day's cap is 200 emails, and its Broadcasts share starts at 10%. Each provider can have one plan at a time.
+   first day's cap is 200 emails, and its Broadcasts share starts at 10%. A new plan sends engaged contacts first, caps
+   each mailbox provider separately and sends what's over the cap through a warm provider. Each provider can have one
+   plan at a time.
 
 4. Adjust the <UiPath path="providers.warmup.settingsTitle" /> if you need to, then choose
-   <UiPath path="providers.warmup.savePlan" />. Changes apply from tomorrow's cap.
-   - <UiPath path="providers.warmup.length" />: 14 days (fast), 21 days (recommended for a new dedicated IP) or 30 days
-     (cautious). A new length rebuilds the schedule between the same first and last volumes; days already sent keep
-     their results.
+   <UiPath path="providers.warmup.savePlan" />. Today's cap stays where it is; the changes apply to the days ahead.
+   - <UiPath path="providers.warmup.length" />: 14 counted days (fast), 21 (recommended for a new dedicated IP) or 30
+     (cautious). A new length rebuilds the days ahead from today's cap to the same last volume, so today's cap never
+     jumps. A plan can't be shorter than the days it already counted.
    - <UiPath path="providers.warmup.ordering" />: <UiPath path="providers.warmup.orderEngaged" />, or
      <UiPath path="providers.warmup.orderRandom" />, which mails every engagement tier from the first day.
-   - <UiPath path="providers.warmup.slowIfBounces" /> a bounce rate, or complaints exceed a complaint rate.
-   - <UiPath path="providers.warmup.whenTrips" />: <UiPath path="providers.warmup.actionHold" />,
+   - <UiPath path="providers.warmup.slowIfBounces" /> a bounce rate,
+     <UiPath path="providers.warmup.orComplaints" /> a complaint rate.
+   - <UiPath path="providers.warmup.whenTrips" />: hold the cap until 2 healthy days in a row (the default),
      <UiPath path="providers.warmup.actionStepBack" /> or <UiPath path="providers.warmup.actionPause" />.
+   - <UiPath path="providers.warmup.spread" />.
 
 </Steps>
 
 <Screenshot
   id="providers-warmup"
-  alt="A Postal dedicated IP on day 9 of 21: today's cap of 6,000, 14,298 sent so far, bounce and complaint rates under their guards and one slowdown, with the daily volume ramp and the plan settings."
+  alt="A Postal dedicated IP on day 9 of 21 with 8 of 21 days counted: the box that explains how the plan moves, today's cap of 6,000 with nothing sent on a Friday without broadcasts, so day 9 repeats tomorrow, the 7-day bounce and complaint rates under their guards, one slowdown, the daily volume ramp and today's caps by mailbox provider."
 />
 
 ## How the schedule works
 
 1. **The ramp.** Day 1 is 200 emails. The cap grows by the same factor each day until the last day reaches the target:
    your largest campaign audience so far, or 48,000 when the workspace hasn't sent a campaign yet. The day's rate limit
-   spreads the cap over about an hour (the cap divided by 3,000, per second), never goes below 1 email per second and
-   never exceeds the provider's own maximum rate.
-2. **Who gets mail first.** With engaged-first ordering, the first quarter of the days mails only Active contacts,
+   spreads the cap over about an hour and never exceeds the provider's own maximum rate.
+2. **The cap is enforced as mail goes out.** Every stream sent through the provider counts toward the day's cap, in the
+   workspace's time zone. With caps per mailbox provider, each one gets its part of the cap, so strict mailbox providers
+   get lower caps; Gmail includes Google Workspace and Outlook includes Microsoft 365 recipients, found from MX records.
+3. **Who gets mail first.** With engaged-first ordering, the first quarter of the days mails only Active contacts,
    Cooling contacts join until the halfway point, At risk contacts join after that, and the last day mails every tier.
-3. **What happens to the rest.** For Broadcasts, a contact the plan doesn't allow today (the wrong tier, over today's
-   cap, or the plan is paused) goes through the largest other share of the same route that isn't warming up, or else the
-   route's fallback. Nobody is skipped because of the warm-up: if the route has no other provider, the mail still goes
-   through the warming provider.
-4. **The Broadcast share.** If the provider is in a Broadcasts weighted split with another provider, its share rises from
-   10% to 15%, 25% and finally 40% over the plan; the share comes from the largest other provider in the split.
-5. **The daily check.** ReputeCast checks every running plan each hour. When a day ends (in the workspace's time zone),
-   it records what was sent, the bounce rate (bounces per message sent) and the complaint rate (complaints per message
-   delivered). If either is over its guard, it holds the next day's cap, steps back one day or pauses the plan, as you
-   chose, and writes it to the <UiPath path="providers.warmup.logTitle" />.
-6. **The end.** After the last day, the plan is done, the provider's status returns to Healthy and it can take Broadcasts
-   failover under the warmed-up-only policy.
-
-<Aside type="note">
-The plan settings also offer to spread each day's cap evenly across mailbox providers. This release saves that choice
-with the plan, but sending doesn't apply it yet.
-</Aside>
+   A Broadcast recipient outside the day's tiers goes through the largest warm share of the same route, or else the
+   route's fallback.
+4. **What's over the cap.** It depends on the stream:
+   - **Broadcasts** go through a warm provider of the route when the plan sends what's over the cap there (overflow).
+     Without overflow, or without a warm provider, the provider's share of the send is held at the cap: a
+     [held route](/reference/glossary/#held-route) that goes on by itself with the next day's cap. The plan's page and
+     the [live monitor](/campaigns/live-monitor/) show the campaign waiting, with three choices:
+     <UiPath path="providers.warmup.holdWait" /> for the next cap, move the held recipients to a provider that passes
+     the failover checks, or <UiPath path="providers.warmup.holdCancel" /> of this share. Waiting and moving need
+     `campaigns:send`; cancelling needs `campaigns:pause`.
+   - **Automations** wait at the cap and while the plan is paused, or go through the stream's warm fallback when the
+     plan allows overflow. Nothing is dropped.
+   - **Transactional** mail never waits: it goes through a warm provider of its route, or it is sent and counted over
+     the cap for the day. The caps card shows how many went over.
+5. **The Broadcast share.** If the provider is in a Broadcasts weighted split with another provider, its share rises from
+   10% to 15%, 25% and finally 40% over the plan; the share comes from the largest other provider in the split. The
+   split is sticky, so recipients who already moved to the warming provider stay there.
+6. **Counted days.** A plan has counted days, not calendar days. ReputeCast checks every running plan each hour. When a
+   day ends, it counts if at least 80% of its cap went out and the guards held; otherwise the same day repeats the next
+   day. The guards judge a day only once it sent 500 messages, so one complaint out of 200 never holds the ramp. The
+   bounce rate is bounces per message sent; the complaint rate counts only mailbox providers that report complaints,
+   because Gmail and iCloud don't.
+7. **Slowdowns.** When a judged day's bounce or complaint rate is over its guard, the day doesn't count and the plan
+   does what you chose. With hold, the cap holds until 2 healthy days in a row while the plan stays on its day; then the
+   ramp resumes one step up from the held cap. With step back, the cap first steps back a day, holds the same way, and
+   the ramp then resumes on the day that tripped. With pause, the plan waits until someone resumes it. Each step goes in the <UiPath path="providers.warmup.logTitle" />.
+8. **The end.** After the last counted day, the plan is done, the provider's status returns to Healthy and it can take
+   Broadcasts failover under the warmed-up-only policy.
 
 ### Read the plan
 
-The headline shows the day ("day 9 of 21"), when the plan finishes, today's cap and what was sent today, everything sent
-during the warm-up against what was planned, the 7-day bounce and complaint rates beside their guards, the slowdowns so
-far and today's rate limit. The <UiPath path="providers.warmup.rampTitle" /> chart and the table under it show each day's
-cap, what was sent, its bounce and complaint rates, the tiers it mailed and its status: Done, Slowdown, Today or
-Planned.
+The headline shows the day ("day 9 of 21"), the days counted so far and when the plan finishes at the earliest. Under
+<UiPath path="providers.warmup.howTitle" />, it says what makes today count, for example "Today counts once 4,800 are
+sent; 1,200 so far", or that the day repeats tomorrow because too little went out. Then come today's cap and what was
+sent today, everything sent during the warm-up, the 7-day bounce and complaint rates beside their guards, the slowdowns
+so far and today's rate limit.
 
-To stop the ramp for a while, choose <UiPath path="providers.warmup.pause" />. While the plan is paused, its Broadcast
-share goes to the other providers of the route, and its cap stays where it is until you choose
-<UiPath path="providers.warmup.resume" />. The days keep counting while it's paused, so the ramp continues from the day
-you resume on.
+The <UiPath path="providers.warmup.rampTitle" /> chart and the table under it show each day's cap (held caps say so),
+what was sent, its bounce and complaint rates, the tiers it mailed and whether it counted:
+<UiPath path="providers.warmup.badgeCounted" />, <UiPath path="providers.warmup.badgeNotCounted" /> with the reason,
+<UiPath path="providers.warmup.badgeHeld" /> (a healthy day under a slowdown's hold), Today, Planned or Paused.
+<UiPath path="providers.warmup.capsTitle" /> lists today's cap and what was sent per mailbox provider, with the switch
+<UiPath path="providers.warmup.overflowLabelNone" /> and the transactional mail sent over the cap today.
+
+To stop the ramp for a while, choose <UiPath path="providers.warmup.pause" />. Pausing freezes the plan: the provider
+sends nothing, Broadcasts go through a warm provider of the route or wait, Automations wait, Transactional mail goes to a warm
+provider or counts over the cap, and the paused days don't count. <UiPath path="providers.warmup.resume" /> picks the
+plan up on the day it stopped.
 
 ## Defaults and limits
 
@@ -113,13 +143,20 @@ you resume on.
 
 - <UiPath path="nav.providers > providers.tabProviders" /> shows the provider as Warming up · day N of M, with today's
   warm-up cap.
-- <UiPath path="nav.providers > providers.tabRouting" /> shows the planned share increases under the weighted split.
-- After the first full day, the warm-up log has a "Day 1 complete" entry with what was sent and the bounce rate.
+- <UiPath path="nav.providers > providers.tabRouting" /> shows the planned share increases under the weighted split, and
+  the route tester's Campaign tab shows what the next broadcast sends through the warming provider, over its cap and held.
+- After the first full day, the warm-up log has a "Day 1 counted" entry with what was sent and the bounce rate, or says
+  why the day repeated.
 
 ## Troubleshooting
 
 - **"Every connected provider already has a warm-up plan"**: each provider has one plan at a time. Change the running
   plan's settings instead.
+- **The plan stays on the same day**: less than 80% of the day's cap went out, for example on a day without broadcasts.
+  The day repeats until enough mail goes out; the table and the log name the days that didn't count.
+- **A campaign waits at the warm-up cap**: no warm provider shares the Broadcasts route, or overflow is off. Choose wait,
+  move or cancel the rest on the plan's page or the live monitor, or turn on overflow and add a warm provider to the
+  split.
 - **The Broadcast share doesn't rise**: the provider must be in the Broadcasts weighted split with at least one other
   provider whose share can give up the difference. A share you raised by hand above the planned one stays as it is.
 - **A slowdown on the first days**: bounces on a new IP usually mean old or unverified addresses. Check
@@ -134,5 +171,5 @@ you resume on.
   <LinkCard title="Route mail across providers" href="/providers/routing/" />
   <LinkCard title="Keep your list healthy" href="/audience/list-health/" />
   <LinkCard title="Send with your own Postal server" href="/providers/postal/" />
-  <LinkCard title="Test inbox placement with seed mailboxes" href="/deliverability/placement-tests/" />
+  <LinkCard title="Monitor a send and auto-pause" href="/campaigns/live-monitor/" />
 </CardGrid>

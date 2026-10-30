@@ -17,7 +17,12 @@ sources:
   - internal/connect/connection.go
   - internal/deliverability/providers.go
   - internal/sending/engine/loop.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/watch.go
+  - internal/mailbox/mailbox.go
+  - internal/counters/counters.go
   - web/src/features/reports/messages.ts
+  - web/src/features/traffic/traffic.messages.ts
 sidebar:
   order: 8
 ---
@@ -43,7 +48,7 @@ chỉ nào bị chặn gửi ngay lập tức, và các giới hạn đó nằm 
   nào cuối cùng vẫn không gửi được sẽ được báo là trả thư tạm thời.
 - [Hoãn nhận](/vi/reference/glossary/#deferral) (deferral) là một lần gửi bị trì hoãn mà nhà cung cấp gửi thư sẽ thử
   lại. Nhiều lần hoãn nhận tại cùng một nhà cung cấp hộp thư thường có nghĩa là nhà cung cấp đó đang giới hạn tốc độ
-  nhận thư của bạn.
+  nhận thư của bạn. Một thư chỉ được tính là hoãn nhận một lần, dù có bao nhiêu lần gửi bị hoãn.
 - Khiếu nại đến với bạn qua [vòng phản hồi](/vi/reference/glossary/#feedback-loop) (feedback loop):
   [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider) báo một lượt nhấp "Report spam" (Báo cáo spam) cho
   [nhà cung cấp gửi thư](/vi/reference/glossary/#sending-provider) của bạn, và nhà cung cấp này chuyển tiếp báo cáo đó.
@@ -68,12 +73,15 @@ với loại sự kiện gốc và mã lỗi của nhà cung cấp.
    chuyển thành đã trả thư (bounced) hoặc đã khiếu nại (complained).
    [Đồng bộ danh sách chặn gửi](/vi/reference/glossary/#suppression-sync) sau đó đẩy địa chỉ sang mọi nhà cung cấp gửi
    thư đã kết nối có nhận danh sách chặn gửi, nên chỉ một lần trả thư là thư ngừng gửi đến địa chỉ đó ở mọi nơi.
-5. Một lần trả thư tạm thời hoặc hoãn nhận không tự khiến địa chỉ bị chặn gửi. Chúng được tính trong báo cáo và trong
+5. Thư bị chặn vì uy tín hoặc chính sách của người gửi (`policy_block`, `spam_block`, `reputation`) không bao giờ khiến
+   địa chỉ bị chặn gửi, kể cả khi nhà cung cấp gửi thư coi là vĩnh viễn: địa chỉ vẫn hợp lệ, và sẽ nhận thư trở lại khi
+   vấn đề chặn được khắc phục.
+6. Một lần trả thư tạm thời hoặc hoãn nhận không tự khiến địa chỉ bị chặn gửi. Chúng được tính trong báo cáo và trong
    [theo dõi trực tiếp](/vi/campaigns/live-monitor/). Thư Giao dịch có thêm một quy tắc: khi một thư Giao dịch bị trả
    tạm thời và địa chỉ đã bị trả tạm thời 3 lần trong 7 ngày, địa chỉ bị chặn gửi.
-6. Tỷ lệ trả thư và tỷ lệ khiếu nại là dữ liệu đầu vào của [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending):
-   khi tỷ lệ của một chiến dịch vượt [ngưỡng tự động tạm dừng](#ngưỡng-tự-động-tạm-dừng), ReputeCast tạm giữ phần bị
-   ảnh hưởng.
+7. Thư trả lại theo loại, hoãn nhận và khiếu nại là dữ liệu đầu vào của
+   [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending): khi tỷ lệ của một chiến dịch vượt
+   [ngưỡng tự động tạm dừng](#ngưỡng-tự-động-tạm-dừng), ReputeCast giảm tốc hoặc tạm giữ phần bị ảnh hưởng.
 
 Ngoại lệ duy nhất là các bản gửi của một [kiểm tra vị trí thư](/vi/deliverability/placement-tests/) đến hộp thư thử của
 chính bạn: thư trả lại và khiếu nại từ các bản gửi đó không bao giờ khiến hộp thư thử bị chặn gửi.
@@ -99,24 +107,32 @@ biết điều gì đã xảy ra với các địa chỉ.
 | `domain_invalid`  | Tên miền không tồn tại hoặc không có máy chủ thư                 | Vĩnh viễn · không tìm thấy tên miền  | Tự động chặn gửi                                     |
 | `mailbox_full`    | Hộp thư đã vượt hạn mức (`4.2.2`, `5.2.2`)                       | Tạm thời · hộp thư đầy               | Thử lại ở lần gửi sau                                |
 | `temporary`       | Một lỗi tạm thời mãi không hết                                   | Tạm thời · hoãn nhận đã hết hạn      | Thử lại ở lần gửi sau                                |
-| `policy_block`    | Bị từ chối theo chính sách, thường do xác thực (`5.7.1`, `5.7.26`) | Bị chặn · chính sách hoặc uy tín     | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
-| `spam_block`      | Bị từ chối vì bị coi là spam, hoặc vì bị liệt kê trong danh sách chặn | Bị chặn · chính sách hoặc uy tín     | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
-| `reputation`      | Bị từ chối hoặc bị giới hạn tốc độ vì uy tín người gửi           | Bị chặn · chính sách hoặc uy tín     | Bạn quyết định; báo cáo đề nghị chặn gửi các địa chỉ này |
+| `policy_block`    | Bị từ chối theo chính sách, thường do xác thực (`5.7.1`, `5.7.26`) | Bị chặn · chính sách hoặc uy tín     | Không bao giờ chặn gửi; tìm hiểu và khắc phục nguyên nhân |
+| `spam_block`      | Bị từ chối vì bị coi là spam, hoặc vì bị liệt kê trong danh sách chặn | Bị chặn · chính sách hoặc uy tín     | Không bao giờ chặn gửi; tìm hiểu và khắc phục nguyên nhân |
+| `reputation`      | Bị từ chối hoặc bị giới hạn tốc độ vì uy tín người gửi           | Bị chặn · chính sách hoặc uy tín     | Không bao giờ chặn gửi; tìm hiểu và khắc phục nguyên nhân |
 | `other`           | Không có mã nào ReputeCast phân loại được                        | Khác                                 | Bạn tự xem xét                                       |
 
 </TableScroll>
 
-Một thư trả lại thuộc dòng Bị chặn mà nhà cung cấp gửi thư báo là vĩnh viễn vẫn là trả thư vĩnh viễn, nên địa chỉ bị chặn gửi
-ngay như mọi trường hợp khác. Báo cáo cho biết địa chỉ nào của mỗi dòng đã nằm trong danh sách và đề nghị thêm những
-địa chỉ còn lại. Thư trả lại thuộc dòng Bị chặn thường chỉ ra vấn đề ở thiết lập gửi thư của bạn hơn là ở địa chỉ: hãy kiểm
-tra [SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/) và
+Thư trả lại thuộc dòng Bị chặn chỉ ra vấn đề ở thiết lập gửi thư của bạn, không phải ở địa chỉ, nên ReputeCast không bao
+giờ chặn gửi các địa chỉ đó, kể cả khi nhà cung cấp gửi thư báo là vĩnh viễn. Trong bảng thư trả lại của báo cáo, dòng Bị
+chặn có <UiPath path="reports.investigate" /> để xem từng nhà cung cấp gửi thư đã nói gì, và
+<UiPath path="reports.retryTitle" /> soạn lại số bản tin đó cho các địa chỉ bị chặn vẫn còn trong danh sách của bạn,
+mỗi địa chỉ một lần, để gửi từ Kiểm tra và gửi sau khi bạn khắc phục nguyên nhân. Hãy kiểm tra [SPF, DKIM và DMARC](/vi/deliverability/spf-dkim-dmarc/) và
 [việc bị liệt kê trong danh sách chặn](/vi/deliverability/blocklists/), rồi tra mã lỗi trong
 [Mã lỗi SMTP](/vi/smtp-errors/).
 
-### Khiếu nại và vòng phản hồi của Gmail
+### Khiếu nại: nơi có báo cáo
 
 Hầu hết nhà cung cấp hộp thư gửi một báo cáo cho mỗi khiếu nại đến nhà cung cấp gửi thư của bạn, và ReputeCast nhận báo
-cáo đó dưới dạng sự kiện `complaint`. Gmail làm khác: vòng phản hồi của Gmail báo tỷ lệ spam tổng hợp theo từng mã định
+cáo đó dưới dạng sự kiện `complaint`: Outlook, Yahoo và nhiều nhà cung cấp trong nhóm Khác. Gmail và iCloud không bao giờ
+báo từng khiếu nại. Vì vậy ReputeCast chỉ tính tỷ lệ khiếu nại trên thư gửi thành công tới các nhà cung cấp hộp thư có báo
+cáo, và hiển thị tỷ lệ khiếu nại riêng của Gmail và iCloud là "n/a" kèm lý do, không bao giờ là 0%. Chưa biết không có
+nghĩa là bằng không: một chiến dịch chỉ gửi tới Gmail không có tỷ lệ khiếu nại, chứ không phải có tỷ lệ hoàn hảo. Nhà cung
+cấp hộp thư của người nhận được xác định từ bản ghi MX của tên miền, nên địa chỉ Google Workspace được tính là Gmail và
+địa chỉ Microsoft 365 được tính là Outlook.
+
+Gmail làm khác: vòng phản hồi của Gmail báo tỷ lệ spam tổng hợp theo từng mã định
 danh trong Google Postmaster Tools, dựa trên header `Feedback-ID` trong thư
 ([Gmail Help, "Feedback Loop"](https://support.google.com/mail/answer/6254652), kiểm tra tháng 10/2026). ReputeCast
 thêm header đó vào thư của các luồng Gửi hàng loạt, Tự động hóa và Giao dịch:
@@ -127,7 +143,12 @@ Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
 
 Các mã định danh này nhóm dữ liệu của Gmail theo từng chiến dịch, từng không gian làm việc và từng luồng. Khi đã kết nối
 [HostRepute](/vi/deliverability/hostrepute/), số liệu Postmaster Tools, gồm cả các chiến dịch bị gắn cờ, hiện trong mục
-Khả năng vào hộp thư.
+Khả năng vào hộp thư, và việc theo dõi khiếu nại sau khi gửi có thể đọc tỷ lệ thư rác hằng ngày của Gmail (xem
+[đặt quy tắc lưu lượng](/vi/providers/traffic-rules/)).
+
+Khiếu nại vẫn tiếp tục đến nhiều ngày sau khi giao thư. Mỗi khiếu nại vẫn đưa địa chỉ vào danh sách chặn gửi và được tính
+trong báo cáo của chiến dịch, và trong 72 giờ sau một lần gửi (theo mặc định), ReputeCast cảnh báo những người có thể tiếp
+tục gửi khi một nhà cung cấp hộp thư vượt giới hạn khiếu nại của nó.
 
 ## Giới hạn tài khoản của nhà cung cấp gửi thư
 
@@ -148,7 +169,8 @@ cố định. AWS khuyên giữ tỷ lệ trả thư dưới 2% và tỷ lệ kh
 ReputeCast lưu hai mức của Amazon SES cùng mỗi kết nối SES và hiển thị tỷ lệ trả thư và tỷ lệ khiếu nại trong 7 ngày gần
 nhất của từng nhà cung cấp gửi thư trong
 [Giám sát tình trạng tên miền và nhà cung cấp](/vi/deliverability/health/), cạnh giới hạn áp dụng cho nhà cung cấp đó.
-Thanh tỷ lệ bắt đầu cảnh báo khi chạm một nửa giới hạn thứ nhất. Máy chủ tự triển khai như Postal hay một máy chủ SMTP
+Tỷ lệ khiếu nại chỉ tính thư gửi thành công ở nơi có báo cáo khiếu nại. Thanh tỷ lệ bắt đầu cảnh báo khi chạm một nửa
+giới hạn thứ nhất, sau khi ReputeCast đã đếm được 500 thư trong 7 ngày. Máy chủ tự triển khai như Postal hay một máy chủ SMTP
 không có giới hạn tài khoản; đường hiển thị ở đó là ngưỡng bảo vệ do ReputeCast đặt, hoặc ngưỡng bảo vệ khởi động khi
 máy chủ đang [khởi động](/vi/providers/warm-up/).
 
@@ -156,7 +178,11 @@ máy chủ đang [khởi động](/vi/providers/warm-up/).
 
 Các ngưỡng riêng của ReputeCast áp dụng trong từng chiến dịch, theo từng nhà cung cấp hộp thư và nhà cung cấp gửi thư.
 Chúng bằng hoặc thấp hơn các mức khiến một tài khoản Amazon SES bị xem xét, nên một lần gửi có vấn đề sẽ dừng lại trước
-khi gây hại cho tài khoản.
+khi gây hại cho tài khoản. Mỗi loại thư trả lại có ngưỡng riêng: trả lại do chặn hoặc chính sách theo từng nhà cung cấp
+hộp thư, người nhận không tồn tại trên cả lần gửi ở hai mức (cảnh báo, rồi tạm dừng), và trả lại tạm thời cùng hoãn nhận
+theo từng nhà cung cấp hộp thư trong 10 phút ở hai mức (giảm tốc, rồi tạm dừng). Khiếu nại và thư trả lại do chặn hoặc
+chính sách rõ ràng vượt giới hạn sẽ vượt ngưỡng với lần gửi ở mọi quy mô. Đặt các ngưỡng này trong
+[quy tắc lưu lượng](/vi/providers/traffic-rules/).
 
 <LimitsTable area="auto-pause" />
 

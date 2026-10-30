@@ -1,19 +1,36 @@
 ---
 title: Theo dõi lần gửi và tự động tạm dừng
-description: 'Cách ReputeCast bảo vệ lần gửi: tự động tạm dừng chiến dịch email khi tỷ lệ bounce hoặc khiếu nại vượt ngưỡng, tạm giữ khi có sự cố và lựa chọn của bạn sau đó.'
+description: 'Cách ReputeCast bảo vệ lần gửi: tự động tạm dừng chiến dịch email khi vượt ngưỡng trả thư hoặc khiếu nại, gửi thử (canary), sự cố và lựa chọn của bạn.'
 type: explanation
 audience: [publisher]
-permissions: ['campaigns:pause', 'campaigns:send']
+permissions: ['campaigns:pause', 'campaigns:send', 'campaigns:approve']
 uiPath: 'nav.campaigns > campaigns.liveMonitor'
 primaryKeyword: tự động tạm dừng chiến dịch email
 sources:
   - internal/sending/engine/engine.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/thresholds_live.go
+  - internal/sending/engine/rearm.go
   - internal/sending/engine/actions.go
   - internal/sending/engine/analysis.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/routeerrors.go
+  - internal/sending/engine/doubt.go
+  - internal/sending/engine/canary.go
+  - internal/sending/engine/canary_live.go
+  - internal/sending/engine/replies.go
+  - internal/sending/engine/rates.go
+  - internal/sending/engine/estimate.go
+  - internal/sending/engine/watch.go
+  - internal/sending/engine/warmup_send.go
   - internal/sending/engine/live.go
   - internal/sending/engine/api.go
-  - internal/providers/manage/health.go
+  - internal/sending/engine/messages/en.json
+  - internal/sending/rules
+  - internal/providers/state/vet.go
+  - internal/providers/{brevo,sparkpost}/idempotency.go
+  - internal/mailbox/mailbox.go
   - web/src/features/live
 sidebar:
   order: 14
@@ -24,108 +41,348 @@ import UiPath from '~/components/UiPath.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 import TableScroll from '~/components/TableScroll.astro'
 
-Khi một chiến dịch bắt đầu, màn hình <UiPath path="live.title" /> hiển thị lần gửi theo thời gian thực, và cơ chế [gửi có bảo vệ](/vi/reference/glossary/#guarded-sending) theo dõi các tỷ lệ. Khi tỷ lệ trả thư (bounce) hoặc tỷ lệ khiếu nại của một chiến dịch email vượt ngưỡng, ReputeCast tự động tạm dừng chỉ phần của lần gửi gây ra vấn đề, chẳng hạn những người nhận dùng Outlook, còn phần còn lại vẫn tiếp tục. Khi một nhà cung cấp gửi thư ngừng phản hồi, phần của nó bị tạm giữ hoặc được chuyển đi. Trong cả hai trường hợp, một người sẽ quyết định bước tiếp theo.
+Khi một chiến dịch bắt đầu, màn hình <UiPath path="live.title" /> hiển thị lần gửi theo thời gian thực, và cơ chế
+[gửi có bảo vệ](/vi/reference/glossary/#guarded-sending) bảo vệ nó. Khi tỷ lệ trả thư, tỷ lệ khiếu nại hoặc một ngưỡng
+khác của chiến dịch email vượt giới hạn, ReputeCast tự động tạm dừng chiến dịch email hoặc giảm tốc chỉ ở phần gây ra vấn
+đề, chẳng hạn những người nhận dùng Outlook, còn phần còn lại vẫn tiếp tục. Một lần gửi có thể bắt đầu bằng một nhóm
+[gửi thử (canary)](/vi/reference/glossary/#canary) nhỏ, một sự cố chỉ tạm giữ phần của nhà cung cấp gửi thư đang lỗi, và
+không thư nào bị gửi hai lần. Mỗi khi có phần bị tạm giữ, một người sẽ quyết định bước tiếp theo.
 
 <Screenshot
   id="live-monitor"
-  alt="Màn hình theo dõi trực tiếp sau 20 phút gửi Weekly Digest #142: tỷ lệ đã gửi kèm thời điểm dự kiến xong, các ô thư gửi thành công, trả lại, khiếu nại, lượt mở và lượt nhấp, mọi nhà cung cấp hộp thư đều ổn, và mọi thanh ngưỡng đều dưới giới hạn."
+  alt="Màn hình theo dõi trực tiếp sau 20 phút gửi Weekly Digest #142, đã gửi 68%: thẻ tiến độ với thời điểm xong của từng tuyến và dòng tóm tắt cho biết đang gửi tới mọi người và mọi ngưỡng đều trong giới hạn, các ô thư gửi thành công, trả lại, khiếu nại, lượt mở và lượt nhấp, và các ngưỡng tự động tạm dừng, ngưỡng nào cũng ở trạng thái Đang theo dõi trong giới hạn, từ thư trả lại và trả lại do chặn hoặc chính sách đến phản hồi của nhà cung cấp hộp thư và lỗi API của nhà cung cấp gửi thư."
 />
 
-Trang cho biết tiến độ và thời điểm dự kiến hoàn tất, năm ô số liệu (gửi thành công, trả lại, khiếu nại, đã mở với lượt mở bởi người đọc và lượt mở tự động được tách riêng, đã nhấp), một bảng <UiPath path="live.perMailbox" /> và một bảng <UiPath path="live.perProvider" />, phần <UiPath path="live.thresholds" /> với một thanh cho mỗi tỷ lệ, và danh sách <UiPath path="live.liveEvents" />. Số liệu đến từ webhook báo trạng thái gửi của các nhà cung cấp gửi thư (xem [sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)) và cập nhật khoảng mỗi giây qua một luồng server-sent events.
+## Màn hình theo dõi hiển thị gì
 
-## Cách tự động tạm dừng ra quyết định
+- **Đầu trang** cho biết ai đã bắt đầu, lên lịch và phê duyệt lần gửi, số liệu mới đến đâu ("Trực tiếp · cập nhật 1
+  giây trước") và ai có thể thao tác. Thay vì một khóa quyền, màn hình nêu tên những người có thể tiếp tục gửi hoặc ra
+  quyết định.
+- **Thẻ tiến độ** cho biết tỷ lệ đã gửi, một thanh cho mỗi nhà cung cấp gửi thư (kèm phần bị tạm giữ, đang chờ hoặc chưa
+  rõ trạng thái) và, theo tốc độ hiện tại, thời điểm mỗi tuyến gửi xong. Dòng tóm tắt duy nhất của thẻ nói điều quan
+  trọng lúc này, chẳng hạn "Đang gửi tới mọi người; mọi ngưỡng đều trong giới hạn." Trình đọc màn hình đọc dòng này khi
+  nó thay đổi, không đọc mỗi lần số liệu nhảy.
+- **Năm ô số liệu:** gửi thành công, trả lại (tách thành người nhận không tồn tại, trả lại do chặn hoặc chính sách và trả
+  lại tạm thời), khiếu nại, đã mở và đã nhấp. Ô đã mở đặt [lượt mở bởi người đọc](/vi/reference/glossary/#human-opens) lên trước; mọi
+  lượt mở không do người thật thực hiện, gồm cả [lượt mở được bảo vệ quyền riêng tư](/vi/reference/glossary/#privacy-protected-open)
+  lẫn lượt mở của trình quét, đều được tính là "tự động" ở đây. [Báo cáo chiến dịch](/vi/campaigns/reports/) tách riêng
+  hai loại này.
+- <UiPath path="live.perMailbox" />: đã gửi, còn lại, gửi thành công, hoãn nhận trong 10 phút gần nhất, tỷ lệ trả thư và
+  khiếu nại, tốc độ hiện tại và thời điểm mỗi [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider) nhận xong.
+  Nhà cung cấp hộp thư được xác định từ bản ghi MX của từng tên miền, nên Gmail gồm cả người nhận dùng Google Workspace và
+  Outlook gồm cả người nhận dùng Microsoft 365.
+- <UiPath path="live.perProvider" />: phần của từng nhà cung cấp gửi thư, tốc độ, tỷ lệ gửi thành công, lỗi API trong 3
+  phút và thời điểm xong. Nhà cung cấp đang [khởi động](/vi/providers/warm-up/) hiển thị ngày khởi động và giới hạn của
+  hôm nay.
+- <UiPath path="live.thresholds" />: một thanh cho mỗi ngưỡng kèm bằng chứng phía sau, được mô tả bên dưới.
+- <UiPath path="live.liveEvents" /> và <UiPath path="live.sendDetails" />: người gửi, nhóm người nhận, tuyến, chi phí đến
+  lúc này, người lên lịch, gửi thử và việc theo dõi khiếu nại sau khi gửi.
 
-1. **Tỷ lệ được tính theo từng thư.** Tỷ lệ trả thư là số thư trả lại vĩnh viễn cộng tạm thời trên mỗi thư đã gửi. Tỷ lệ khiếu nại là số khiếu nại trên mỗi thư gửi thành công. Tỷ lệ hoãn nhận là số thư bị hoãn nhận trên mỗi thư đã gửi.
-2. **Cứ mỗi 2 giây** ReputeCast kiểm tra các tỷ lệ theo thứ tự sau: với từng nhà cung cấp hộp thư (Gmail, Outlook, Yahoo, iCloud, khác) là tỷ lệ khiếu nại, tỷ lệ trả thư và tỷ lệ hoãn nhận; với từng nhà cung cấp gửi thư là tỷ lệ trả thư; sau đó là tỷ lệ trả thư và tỷ lệ khiếu nại của cả chiến dịch. Tỷ lệ đầu tiên vượt ngưỡng sẽ quyết định.
-3. **Một tỷ lệ chỉ vượt ngưỡng khi có đủ bằng chứng.** Một nhà cung cấp hộp thư hoặc nhà cung cấp gửi thư cần 500 thư trước khi các tỷ lệ của nó được tính; cả chiến dịch cần 1.000 thư. Phải có ít nhất 5 thư trả lại, khiếu nại hoặc hoãn nhận, tỷ lệ phải vượt giới hạn, và ReputeCast phải tin chắc khoảng 90% rằng tỷ lệ thật vượt giới hạn, để một khiếu nại không may lúc đầu lần gửi không làm dừng cả lần gửi.
-4. **Phạm vi quyết định phần nào tạm dừng.** Với phạm vi mặc định, chỉ người nhận của nhà cung cấp hộp thư bị ảnh hưởng (hoặc phần của nhà cung cấp gửi thư bị ảnh hưởng) bị tạm giữ, mọi phần khác vẫn tiếp tục gửi. Với phạm vi chiến dịch, cả chiến dịch tạm dừng.
-5. **Các ngưỡng được cố định khi lần gửi bắt đầu.** Chúng lấy từ mặc định của không gian làm việc, cộng với những thay đổi bạn đã làm cho chiến dịch này trong Kiểm tra và gửi, nếu có.
+Số liệu đến từ webhook báo trạng thái gửi của các nhà cung cấp gửi thư (xem
+[sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/)) và được cập nhật qua một kết nối trực
+tiếp khoảng mỗi giây. Một máy chủ SMTP thông thường không báo thư đã gửi thành công, nên thư gửi qua nó được tính là gửi
+thành công khi máy chủ chấp nhận, kèm nhãn "suy ra".
 
-Ngưỡng hoãn nhận (5,0% theo nhà cung cấp hộp thư) là cố định và không có ô cài đặt trong ứng dụng.
+### Khiếu nại chỉ được tính ở nơi có báo cáo
+
+Gmail và iCloud không bao giờ báo cho người gửi về từng khiếu nại. Tỷ lệ khiếu nại của chúng hiển thị
+<UiPath path="live.model.notAvailable" /> kèm lý do, và thư gửi thành công tới chúng không được tính vào bất kỳ tỷ lệ
+khiếu nại nào, để không làm loãng tỷ lệ đó. Tỷ lệ khiếu nại chỉ tính thư gửi thành công tới các nhà cung cấp hộp thư có
+báo cáo khiếu nại: Outlook, Yahoo và nhiều nhà cung cấp trong nhóm Khác. Tỷ lệ thư rác riêng của Gmail đến mỗi ngày một
+lần từ Google Postmaster Tools; [việc theo dõi khiếu nại](#sau-khi-gửi-theo-dõi-khiếu-nại) có thể đọc tỷ lệ này.
+
+## Cách gửi có bảo vệ ra quyết định
+
+1. **Quy tắc phản hồi hành động trước.** [Quy tắc phản hồi](/vi/reference/glossary/#reply-rule) đếm các phản hồi SMTP
+   của một nhà cung cấp hộp thư, chẳng hạn `TSS04` của Yahoo, và hành động ngay khi đạt số lần đã đặt, trước mọi ngưỡng tỷ
+   lệ. Mọi không gian làm việc đều bắt đầu với các quy tắc mặc định; xem
+   [đặt quy tắc lưu lượng](/vi/providers/traffic-rules/).
+2. **Sau đó là các ngưỡng, mỗi 2 giây.** Trước hết là ngưỡng theo loại thư trả lại: trả lại do chặn hoặc chính sách và
+   hoãn nhận theo từng nhà cung cấp hộp thư, rồi người nhận không tồn tại trên cả lần gửi. Tiếp theo là khiếu nại và trả
+   thư theo từng nhà cung cấp hộp thư, trả thư theo từng nhà cung cấp gửi thư, và trả thư cùng khiếu nại của cả lần gửi.
+   Ngưỡng đầu tiên bị vượt sẽ hành động.
+3. **Mỗi loại thư trả lại có ngưỡng riêng.** Thư trả lại do chặn hoặc chính sách (bị từ chối vì danh tiếng, chính sách
+   hoặc nội dung) được xét theo từng nhà cung cấp hộp thư. Người nhận không tồn tại (địa chỉ không có thật) được xét trên
+   cả lần gửi ở hai mức: mức thứ nhất cảnh báo, mức thứ hai tạm dừng lần gửi. Trả lại tạm thời và hoãn nhận được xét theo
+   từng nhà cung cấp hộp thư trong 10 phút gần nhất, mỗi thư tính một lần, ở hai mức: mức thứ nhất giảm tốc độ gửi tới
+   nhà cung cấp hộp thư đó còn một nửa, mức thứ hai tạm dừng nó.
+4. **Một tỷ lệ chỉ vượt ngưỡng khi có đủ bằng chứng.** Cần ít nhất 5 sự kiện, ít nhất 500 thư tới nhà cung cấp hộp thư
+   hoặc nhà cung cấp gửi thư đó (1.000 thư với cả lần gửi), và độ tin cậy khoảng 90% rằng tỷ lệ thật vượt giới hạn, để vài
+   khiếu nại lúc đầu lần gửi không làm dừng cả lần gửi. Tỷ lệ khiếu nại tính trên thư gửi thành công ở nơi có báo cáo
+   khiếu nại; các tỷ lệ khác tính trên thư đã gửi.
+5. **Một số tỷ lệ không cần chờ nhiều bằng chứng như vậy.** Khiếu nại và thư trả lại do chặn hoặc chính sách là phán
+   quyết của nhà cung cấp hộp thư về người gửi, nên chúng cũng vượt ngưỡng với lần gửi ở mọi quy mô khi đã rõ ràng vượt
+   giới hạn: ít nhất 3 sự kiện, và cận dưới của khoảng tin cậy 95% (Wilson) của tỷ lệ cao hơn giới hạn. Thư trả lại do
+   chặn hoặc chính sách còn vượt ngưỡng khi tăng đột biến: từ 3 thư trở lên tại Gmail, Outlook, Yahoo hoặc iCloud trong
+   10 phút, rõ ràng vượt giới hạn so với lượng thư gửi tới đó trong khoảng thời gian ấy. Nhờ vậy, một nhà cung cấp hộp thư
+   bắt đầu chặn muộn trong một lần gửi lớn cũng bị phát hiện.
+6. **Hành động quyết định điều gì xảy ra.** Mặc định, một ngưỡng bị vượt chỉ tạm dừng nhà cung cấp hộp thư đó (hoặc phần
+   của nhà cung cấp gửi thư đó), mọi phần khác vẫn tiếp tục gửi. Quy tắc lưu lượng có thể cho một ngưỡng giảm tốc độ của
+   phạm vi đó còn một nửa, tạm dừng cả lần gửi hoặc chỉ cảnh báo. Khi <UiPath path="senders.providers.pauseScope" /> là
+   toàn bộ chiến dịch, mọi lần tạm dừng đều giữ lại tất cả.
+
+Mỗi thanh trên thẻ ngưỡng hiển thị một trong bốn trạng thái:
+
+- <UiPath path="traffic.legendCollecting" />: ít hơn 5 sự kiện hoặc chưa đủ thư, và chưa rõ ràng vượt giới hạn. Thanh
+  màu xám; chưa thể vượt ngưỡng.
+- <UiPath path="traffic.legendWatching" />: đủ bằng chứng và trong giới hạn.
+- <UiPath path="traffic.legendNear" />: từ 90% giới hạn trở lên.
+- <UiPath path="traffic.legendTripped" />: đủ bằng chứng rằng tỷ lệ cao hơn giới hạn; hành động đã chạy.
+
+Thẻ liệt kê thư trả lại (cả lần gửi), <UiPath path="live.model.thresholdBlock" /> và hoãn nhận (nhà cung cấp hộp thư gần
+giới hạn nhất), khiếu nại (cả lần gửi, ở nơi có báo cáo) và khiếu nại của nhà cung cấp hộp thư cao nhất,
+<UiPath path="live.model.thresholdReplies" /> và <UiPath path="live.model.thresholdErrors" />.
+
+Các ngưỡng lấy từ mặc định của không gian làm việc và [quy tắc lưu lượng](/vi/reference/glossary/#traffic-rules), cộng
+với những thay đổi bạn đã làm cho chiến dịch này trong <UiPath path="composer.reviewSend" />, nếu có. Trong khi lần gửi
+đang chạy hoặc đang chờ, <UiPath path="live.editThresholdsLive" /> mở <UiPath path="live.thresholdsEditTitle" />: giới
+hạn mới áp dụng cho phần còn lại của lần gửi này trong vài giây, mặc định của không gian làm việc giữ nguyên, và thay đổi
+được ghi vào [nhật ký kiểm tra](/vi/team/audit-log/) kèm tên bạn.
 
 ## Điều gì xảy ra khi tạm dừng
 
 - Người nhận bị tạm giữ chờ trong hàng đợi. Không thư nào bị bỏ.
-- Mọi người trong không gian làm việc có quyền `campaigns:send` nhận thông báo khẩn trong ứng dụng và qua email, ví dụ "Tỷ lệ khiếu nại ở Outlook đạt 0,18% (giới hạn 0,10%). Đã tạm giữ 2.522 người nhận, phần còn lại vẫn đang gửi."
-- [Webhook](/vi/reference/webhook-events/) `campaign.paused` được gửi với `paused_by: auto_pause`, chỉ số, giá trị và giới hạn của chỉ số, phạm vi và số người nhận bị tạm giữ.
-- Màn hình theo dõi trực tiếp mở một bảng quyết định: <UiPath path="live.whatTripped" />, các nguyên nhân có thể, một đề xuất và <UiPath path="live.chooseTitle" />.
+- Mọi người trong không gian làm việc có thể gửi chiến dịch nhận thông báo khẩn trong ứng dụng và qua email, ví dụ "Tỷ lệ
+  khiếu nại ở Outlook đạt 0,18% (giới hạn 0,10%). Đã tạm giữ 2.522 người nhận, phần còn lại vẫn đang gửi."
+- [Webhook](/vi/reference/webhook-events/) `campaign.paused` được gửi với `paused_by: auto_pause`, chỉ số, giá trị và giới
+  hạn của chỉ số, phạm vi và số người nhận bị tạm giữ.
+- Màn hình theo dõi trực tiếp mở một bảng quyết định: <UiPath path="live.whatTripped" /> kèm bằng chứng, các nguyên nhân
+  có thể, một đề xuất và <UiPath path="live.chooseTitle" />.
 
 <Screenshot
   id="live-monitor-paused"
-  alt="Weekly Digest #142 tự tạm dừng với Outlook: tỷ lệ khiếu nại ở Outlook vượt giới hạn 0,10%, nên ReputeCast tạm giữ những người nhận còn lại ở Outlook trong khi Gmail, Yahoo, iCloud và Khác vẫn tiếp tục. Bên dưới biểu ngữ: điều gì vượt ngưỡng, nguyên nhân có thể và các đề xuất."
+  alt="Weekly Digest #142 tự tạm dừng khi đã gửi 6%: 3 khiếu nại trên 641 thư gửi thành công đưa tỷ lệ khiếu nại lên 0,47% so với giới hạn 0,10%, rõ ràng vượt giới hạn, nên ReputeCast tạm dừng chiến dịch mà không chờ đủ 5 khiếu nại và 1.000 thư gửi thành công. Bảng cho thấy điều gì vượt ngưỡng, nguyên nhân có thể, đề xuất và các lựa chọn Tiếp tục như cũ, Tiếp tục với thay đổi (khuyên dùng) và Hủy chiến dịch."
 />
 
 ### Quyết định sau khi tạm dừng vì vượt ngưỡng
 
-- **Tiếp tục như cũ** gửi cho mọi người còn đang bị tạm giữ. Ngưỡng vẫn được kích hoạt và sẽ tạm dừng lại ngay ở lần khiếu nại (hoặc trả thư) tiếp theo cùng loại.
-- **Tiếp tục với thay đổi** được đề xuất cho lần tạm dừng theo nhà cung cấp hộp thư khi ReputeCast tìm ra nguyên nhân. Lựa chọn này có thể loại nhóm gây ra phần lớn khiếu nại (chẳng hạn liên hệ được nhập vào nhưng chưa từng tương tác, hoặc liên hệ thuộc nhóm Có nguy cơ và Ngừng gửi dần), giảm một nửa tốc độ gửi tới nhà cung cấp hộp thư đó trong phần còn lại của lần gửi, và, khi có một tự động hóa xin phép lại hoặc tái tương tác phù hợp đang chạy, thêm các liên hệ bị loại vào đó. Lựa chọn này liệt kê chính xác những gì nó sẽ làm trước khi bạn chọn. Với lần tạm dừng theo nhà cung cấp gửi thư, nó tiếp tục mà không thay đổi gì.
-- **Hủy phần này** bỏ qua những người nhận bị tạm giữ; phần còn lại của chiến dịch hoàn tất bình thường.
-- **Hủy cả chiến dịch** bằng <UiPath path="live.cancelWhole" /> dừng mọi thứ chưa được gửi.
+- <UiPath path="sending.opt.resumeAction" /> gửi cho mọi người còn đang bị tạm giữ. Hộp thoại
+  <UiPath path="live.resumeSending" /> hỏi cách tiếp tục: tiếp tục và tạm dừng lại nếu tỷ lệ lại vượt giới hạn (ở tốc độ
+  thấp hơn được đề xuất, nếu có), hoặc tiếp tục với ngưỡng được nâng lên chỉ cho chiến dịch này, được ghi vào nhật ký kiểm
+  tra kèm tên bạn. Cách nào thì ngưỡng cũng được kích hoạt lại từ số liệu hiện tại: chỉ sự kiện mới được tính, nên những
+  sự kiện đã làm vượt ngưỡng không bao giờ làm nó tạm dừng lại. <UiPath path="live.keepPaused" /> giữ nguyên trạng thái
+  tạm giữ.
+- <UiPath path="sending.opt.changesAction" /> được đề xuất khi ReputeCast tìm ra nguyên nhân. Lựa chọn này có thể loại
+  nhóm gây ra phần lớn khiếu nại (liên hệ được nhập vào nhưng chưa từng tương tác, hoặc liên hệ đã ngừng mở thư), gửi phần
+  còn lại của một nhà cung cấp hộp thư hoặc nhà cung cấp gửi thư ở tốc độ thấp hơn, và, khi có một tự động hóa xin phép
+  lại hoặc tái tương tác phù hợp đang chạy, thêm các liên hệ bị loại vào đó. Lựa chọn này liệt kê chính xác những gì nó sẽ
+  làm trước khi bạn chọn.
+- **Hủy phần này** bỏ qua những người nhận bị tạm giữ; phần còn lại của chiến dịch hoàn tất bình thường. Sau khi cả chiến
+  dịch bị tạm dừng, <UiPath path="sending.opt.cancelCampaign" /> bỏ qua mọi người còn lại.
+- <UiPath path="live.cancelWhole" /> dừng mọi thứ chưa được gửi.
 
-Với phạm vi chiến dịch, các lựa chọn là Tiếp tục như cũ và hủy chiến dịch.
+### Giảm tốc, cảnh báo và quy tắc phản hồi
+
+Một ngưỡng được đặt để giảm tốc hoặc cảnh báo không giữ ai lại. Nó để lại một thông báo trên màn hình theo dõi kèm nút
+<UiPath path="live.acknowledge" />: nhà cung cấp hộp thư bị giảm tốc giữ một nửa tốc độ cho phần còn lại của lần gửi (đổi
+trong <UiPath path="live.adjustRates" />), còn một cảnh báo cũng được gửi tới những người có thể gửi chiến dịch.
+
+Một quy tắc phản hồi tạm dừng một nhà cung cấp hộp thư trong một khoảng thời gian sẽ đưa ra ba lựa chọn: gửi tới nhà cung
+cấp đó ngay bây giờ (khi đó quy tắc chỉ đếm phản hồi mới), <UiPath path="sending.opt.replyWaitAction" /> cho đến hết thời
+gian của quy tắc (nó tự tiếp tục), hoặc hủy phần của nhà cung cấp đó.
 
 ## Sự cố của nhà cung cấp gửi thư
 
-Thanh <UiPath path="live.model.thresholdErrors" /> cho biết tỷ lệ lệnh gọi thất bại cao nhất trong 3 phút gần nhất giữa các nhà cung cấp gửi thư trên tuyến (thanh này tính mọi lệnh gọi tới nhà cung cấp đó, không chỉ của lần gửi này). Thanh chỉ để theo dõi; nó không bao giờ tạm dừng lần gửi, kể cả khi chuyển sang màu đỏ. Phần của một nhà cung cấp bị tách khỏi lần gửi khi:
+Dù sự cố do chính lần gửi hay do kiểm tra tình trạng nhà cung cấp phát hiện, phần bị ảnh hưởng đều đi qua cùng một quy
+trình. Phần của một nhà cung cấp gửi thư bị tạm giữ khi:
 
-- mọi lệnh gọi của lần gửi này tới nhà cung cấp đều thất bại trong 3 phút, với ít nhất 5 lệnh gọi thất bại (phản hồi giới hạn tốc độ không được tính, và chỉ cần một lệnh gọi thành công là việc đếm giờ bắt đầu lại),
-- kiểm tra tình trạng nhà cung cấp đánh dấu nhà cung cấp là gián đoạn, hoặc
-- nhà cung cấp từ chối thông tin xác thực, khi đó phần của nó bị tách ra ngay lập tức.
+- mọi lệnh gọi của lần gửi này tới nhà cung cấp đều thất bại trong 3 phút, với ít nhất 5 lệnh gọi thất bại;
+- nhà cung cấp liên tục giới hạn tốc độ tài khoản trong 3 phút, kể cả khi đã gửi chậm hơn;
+- lỗi API của nhà cung cấp vượt giới hạn <UiPath path="live.model.thresholdErrors" /> trong 3 phút (mặc định 5,0%, xét
+  sau 20 lệnh gọi và 3 lần thất bại);
+- kiểm tra tình trạng đánh dấu nhà cung cấp là gián đoạn, hoặc nhà cung cấp từ chối thông tin xác thực;
+- nhà cung cấp từ chối người gửi vì người gửi chưa được xác minh ở đó, hoặc báo hạn mức của tài khoản đã hết. Không thư
+  nào bị đánh dấu thất bại: các thư chờ tuyến gửi.
 
-Điều xảy ra sau đó phụ thuộc vào [chính sách chuyển dự phòng](/vi/providers/routing/) của luồng Gửi hàng loạt. Với chính sách tự động, ReputeCast chuyển phần còn lại sang một nhà cung cấp đang hoạt động, cho phép thư hàng loạt và không trong giai đoạn khởi động (ưu tiên nhà cung cấp dự phòng của luồng, sau đó là nhà cung cấp có tỷ trọng lớn nhất trong phân bổ), và ghi lại việc chuyển. Với chính sách "tạm dừng và hỏi", khi thông tin xác thực bị từ chối, hoặc khi không có nhà cung cấp nào đủ điều kiện, phần đó bị tạm giữ và mọi người có quyền `campaigns:send` được yêu cầu quyết định.
+Điều xảy ra sau đó phụ thuộc vào [chính sách chuyển dự phòng](/vi/providers/routing/) của luồng Gửi hàng loạt. Với chính
+sách tự động, ReputeCast chuyển phần đó sang nhà cung cấp khác, nhưng chỉ sang nhà cung cấp vượt qua mọi bước kiểm tra:
+đang hoạt động, điều khoản cho phép thư hàng loạt, không ở chế độ sandbox, tên miền của người gửi đã được xác minh ở đó,
+còn đủ hạn mức, và không đang khởi động. ReputeCast thử nhà cung cấp dự phòng của luồng trước, sau đó là nhà cung cấp có
+tỷ trọng lớn nhất trong phân bổ. Với chính sách "tạm dừng và hỏi", khi thông tin xác thực bị từ chối, hoặc khi không có
+nhà cung cấp nào đủ điều kiện, phần đó bị tạm giữ và những người có thể gửi chiến dịch được yêu cầu quyết định.
+
+Trong khi chưa có ai quyết định, phần bị tạm giữ tự kiểm tra nhà cung cấp của nó: mỗi 60 giây gửi 1 thư kiểm tra, tới
+một hộp thư thử nếu không gian làm việc có, nếu không thì là một thư trong chính phần đó. Khi 3 lần kiểm tra liên tiếp
+thành công, phần đó tự tiếp tục.
 
 <Screenshot
   id="live-monitor-outage"
-  alt="Postal trả về lỗi kết nối trong 3 phút, nên phần của Postal đang bị tạm giữ trong khi Amazon SES vẫn tiếp tục gửi. Bảng cho thấy Postal đã trả về gì, các nguyên nhân có thể, cùng chi phí thêm, thời gian thêm và rủi ro uy tín thấp nếu chuyển những người nhận đang bị giữ sang SES."
+  alt="Postal trả về lỗi kết nối trong 3 phút, nên phần của Postal trong Weekly Digest #142 đang bị tạm giữ trong khi Amazon SES vẫn tiếp tục gửi, và ReputeCast kiểm tra Postal bằng 1 thư tới một hộp thư thử mỗi 60 giây. Bảng cho thấy Postal đã trả về gì, các nguyên nhân có thể, việc chuyển những người nhận đang bị giữ sang SES sẽ tốn gì (chi phí thêm, thời gian thêm, hạn mức sau khi chuyển, rủi ro uy tín Thấp vì SES đã khởi động xong) và các bước kiểm tra ReputeCast đã chạy trên SES, với lựa chọn chuyển được đề xuất."
 />
 
 ### Quyết định sau khi tạm giữ vì sự cố
 
-- **Thử lại** giữ người nhận ở nhà cung cấp cũ và thử lại. Nếu sau thêm 15 phút vẫn thất bại, bạn sẽ được hỏi lại.
-- **Chuyển phần còn lại** gửi những người nhận bị tạm giữ qua một nhà cung cấp khác. Bảng cho biết chi phí tăng thêm, thời gian tăng thêm theo tốc độ của nhà cung cấp đó, hạn mức của nó sau khi chuyển và rủi ro uy tín ("Thấp · SES đã khởi động xong"). Thư đã gửi vẫn giữ nguyên dữ liệu theo dõi.
-- **Hủy phần này** bỏ qua những người nhận bị tạm giữ. Họ được đánh dấu là "chưa gửi" trong báo cáo và có thể được gửi sau.
+- **Thử lại** giữ người nhận ở nhà cung cấp cũ và tiếp tục gửi thư kiểm tra. Nếu sau thêm 15 phút nhà cung cấp vẫn lỗi,
+  bạn sẽ được hỏi lại.
+- **Chuyển** gửi những người nhận bị tạm giữ tới nhà cung cấp mà ReputeCast đề xuất. Bảng cho biết chi phí tăng thêm,
+  thời gian tăng thêm theo tốc độ của nhà cung cấp đó, hạn mức của nó sau khi chuyển, rủi ro uy tín ("Thấp · SES đã khởi
+  động xong") và các bước kiểm tra nó đã vượt qua: tên miền của người gửi đã được xác minh ở đó, hạn mức còn trống sau khi
+  chuyển, đã khởi động xong. Người nhận đang được giữ cho một [thử nghiệm A/B](/vi/campaigns/ab-testing/) hoặc cho gửi thử
+  vẫn bị giữ cho đến khi có biến thể thắng hoặc gửi thử có kết quả. Thư đã gửi vẫn giữ nguyên dữ liệu theo dõi.
+- **Hủy phần này** bỏ qua những người nhận bị tạm giữ. Họ được đánh dấu là "chưa gửi" trong báo cáo và có thể được gửi
+  sau.
 
-Thư thất bại tạm thời được thử lại tối đa 10 lần, sau 5, 10, 20 và 40 giây rồi mỗi 60 giây. Mỗi lần thử mang một khóa idempotency, nên không thư nào bị gửi hai lần.
+Quyết định về một phần không bao giờ hủy thao tác <UiPath path="live.pause" /> của một người: nếu có người đã tạm dừng cả
+lần gửi, nó vẫn tạm dừng.
+
+## Không thư nào bị gửi hai lần
+
+Thư thất bại tạm thời được thử lại tối đa 10 lần, sau 5, 10, 20 và 40 giây rồi mỗi 60 giây. Mỗi lần thử mang một khóa
+idempotency, và một lệnh gọi tới nhà cung cấp có tối đa 30 giây để hoàn tất kể cả khi máy chủ đang dừng, để phản hồi của
+nó được ghi lại.
+
+Khi một lệnh gọi vẫn kết thúc mà không ghi nhận được phản hồi (máy chủ gặp sự cố, phản hồi đến quá muộn), không ai biết
+nhà cung cấp đã nhận các thư đó hay chưa. Sau 5 phút, ReputeCast xử lý chúng:
+
+- nhà cung cấp nhận ra được thư mà nó đã nhận sẽ nhận lại các thư đó với cùng khóa, trong khoảng thời gian của nó trừ đi 5
+  phút. SparkPost giữ một khóa trong 24 giờ và Brevo trong 30 phút;
+- mọi thư khác trở thành [thư chưa rõ trạng thái](/vi/reference/glossary/#messages-in-doubt). Chúng không bao giờ được
+  gửi lại theo phỏng đoán.
+
+Màn hình theo dõi hiển thị chúng trong một bảng riêng, với <UiPath path="live.model.inDoubtWho" />: từng nhà cung cấp, số
+thư, thời điểm chuyển giao, và nhà cung cấp đó có nhận ra thư gửi lại hay không và đến khi nào. Huy hiệu ghi
+<UiPath path="live.model.inDoubtSafeBadge" /> hoặc <UiPath path="live.model.inDoubtTwiceBadge" />. Hãy chọn
+<UiPath path="sending.opt.resendTitle" /> hoặc <UiPath path="sending.opt.leaveOutTitle" />; đề xuất đi theo huy hiệu.
+Thư bị bỏ qua hiển thị "chưa gửi, chưa rõ trạng thái" trong báo cáo. Nếu nhà cung cấp báo một sự kiện cho một thư (gửi
+thành công, trả lại hoặc khiếu nại), thư đó được tính là đã gửi và tự rời khỏi danh sách. Phần còn lại của lần gửi vẫn
+tiếp tục trong lúc đó; khi không còn gì khác, lần gửi chờ quyết định này.
+
+## Giai đoạn gửi thử (canary)
+
+Một lần gửi có thể bắt đầu bằng gửi thử: những người nhận tương tác nhiều nhất, mặc định 5%, cùng các
+[hộp thư thử](/vi/reference/glossary/#seed-mailbox) của không gian làm việc nhận email trước, còn mọi người khác chờ. Gửi
+thử tự chạy, với nhóm người nhận từ 1.000 trở lên, khi:
+
+- tên miền gửi còn mới (30 ngày đầu tiên), hoặc một IP gửi riêng chưa từng gửi cho không gian làm việc này;
+- một số người nhận chưa từng nhận thư từ tên miền gửi;
+- số người nhận lớn hơn hai lần mức thông thường (trung vị của 8 lần gửi gần nhất).
+
+Bạn cũng có thể chọn <UiPath path="review.canaryOn" /> hoặc <UiPath path="review.canaryOff" /> trong
+<UiPath path="composer.reviewSend" />. Các lý do và quy mô được đặt trong
+[quy tắc lưu lượng](/vi/providers/traffic-rules/).
+
+<Screenshot
+  id="live-monitor-canary"
+  alt="Weekly Digest #142 trong giai đoạn gửi thử: 5% người nhận tương tác nhiều nhất cùng 10 hộp thư thử nhận email trước và được theo dõi 20 phút trong khi mọi người khác đang chờ. Hai trong năm điều kiện đạt và chưa điều kiện nào không đạt; trả lại do chặn hoặc chính sách, khiếu nại và vị trí ở hộp thư thử vẫn đang thu thập bằng chứng. Bên phải: Tiếp tục gửi tới mọi người ngay, Theo dõi thêm 10 phút và Dừng lần gửi."
+/>
+
+Màn hình gửi thử hiển thị <UiPath path="live.canary.why" />, tiến độ cùng số người nhận đang chờ,
+<UiPath path="live.canary.gates" /> và <UiPath path="live.canary.seedsTitle" />. Sau thư gửi thử cuối cùng, gửi thử được
+theo dõi trong 20 phút theo mặc định. Sau đó, mỗi điều kiện có đủ bằng chứng phải đạt: thư trả lại, trả lại do chặn hoặc
+chính sách, hoãn nhận, khiếu nại theo từng nhà cung cấp hộp thư (mỗi nhà cung cấp cần 500 thư gửi thành công trước khi
+điều kiện có thể không đạt) và hộp thư thử vào thư rác. Nếu đạt, lần gửi tự tiếp tục tới mọi người. Nếu một điều kiện
+không đạt, lần gửi bị giữ lại và những người có thể gửi chiến dịch được hỏi nên tiếp tục hay dừng. Các điều kiện còn đang
+thu thập bằng chứng không giữ lần gửi; chúng trở thành ngưỡng của lần gửi.
+
+Trong khi gửi thử đang chạy:
+
+- <UiPath path="live.canary.continueNow" /> bắt đầu lần gửi chính trước khi hết thời gian theo dõi, và
+  <UiPath path="sending.opt.canaryContinueTitle" /> cho một lần gửi đang bị giữ vì một điều kiện không đạt tiếp tục. Cả
+  hai đều cần người có thể phê duyệt lần gửi, và chỉ một người mới làm được, không bao giờ là khóa API hay tác tử.
+- <UiPath path="live.canary.watchMore" /> giữ những người nhận đang chờ lâu hơn.
+- <UiPath path="live.canary.stop" /> loại những người nhận đang chờ khỏi lần gửi. Kết quả gửi thử vẫn nằm trong báo cáo.
+
+Gửi thử đến những người đọc tương tác nhiều nhất, nên nó kiểm tra việc bị chặn, hoãn nhận và vị trí vào hộp thư, không cho
+biết các liên hệ mới nhập sẽ phản ứng thế nào. Khiếu nại của họ được theo dõi trong lần gửi chính và trong 72 giờ sau đó.
+
+## Tạm giữ do khởi động
+
+Khi một nhà cung cấp đang [khởi động](/vi/providers/warm-up/) đạt giới hạn của hôm nay, phần của nó chờ giới hạn của ngày
+mai (<UiPath path="live.model.providerWarmupHeld" />) và phần còn lại của lần gửi vẫn tiếp tục. Biểu ngữ đưa ra
+<UiPath path="providers.warmup.holdWait" />, chuyển sang một nhà cung cấp đã khởi động xong và vượt qua các bước kiểm tra,
+hoặc <UiPath path="providers.warmup.holdCancel" />. Chờ và chuyển cần quyền gửi chiến dịch; hủy phần còn lại cần quyền tạm
+dừng lần gửi. Một lần tạm giữ do khởi động không bao giờ bị coi là sự cố.
+
+## Đổi tốc độ trong khi gửi
+
+<UiPath path="live.adjustRates" /> mở <UiPath path="live.ratesTitle" />. Hạ tốc độ để gửi chậm lại tới một nhà cung cấp
+hộp thư cho phần còn lại của lần gửi, trên mọi tuyến, trong khi các nhà cung cấp khác giữ nhịp; bảng cho thấy thời điểm
+xong mới trước khi bạn áp dụng. Tốc độ bắt đầu từ [giới hạn tốc độ](/vi/reference/glossary/#throttle) của không gian làm
+việc, và các giới hạn này được chia sẻ giữa mọi lần gửi đang chạy cùng lúc của không gian làm việc, nên hai chiến dịch
+không bao giờ cùng vượt tốc độ dành cho một nhà cung cấp hộp thư. Tốc độ mới của một nhà cung cấp hộp thư đang bị tạm giữ
+áp dụng khi nó tiếp tục. Trong lúc gửi thử, đó là tốc độ của lần gửi chính.
+
+## Sau khi gửi: theo dõi khiếu nại
+
+Khiếu nại vẫn tiếp tục đến nhiều ngày sau khi giao thư, nên khi lần gửi kết thúc ReputeCast vẫn theo dõi chúng, mặc định
+trong 72 giờ. Màn hình lần gửi đã xong liệt kê từng nhà cung cấp hộp thư được theo dõi đến khi nào, hoặc "Không báo cáo"
+với Gmail và iCloud. Khi một nhà cung cấp hộp thư, hoặc cả lần gửi, vượt giới hạn khiếu nại với đủ bằng chứng, những người
+có thể tiếp tục gửi nhận cảnh báo trong ứng dụng và qua email, và <UiPath path="live.acknowledge" /> đánh dấu cảnh báo là
+đã xem. Không có gì bị tạm dừng: lần gửi đã xong, và cảnh báo cho biết cần kiểm tra gì trước lần gửi tiếp theo.
+
+Với dữ liệu Postmaster Tools từ [HostRepute](/vi/deliverability/hostrepute/), việc theo dõi còn đọc tỷ lệ thư rác hằng
+ngày của Gmail cho tên miền gửi và cảnh báo khi tỷ lệ này vượt giới hạn khiếu nại theo nhà cung cấp hộp thư. Gmail không
+cho biết ai đã đánh dấu thư là thư rác, nên không ai bị đưa vào danh sách chặn gửi vì tỷ lệ này. Khiếu nại đến muộn được
+báo từng cái sẽ đưa liên hệ vào danh sách chặn gửi và được tính trong báo cáo của chiến dịch.
 
 ## Tạm dừng và tiếp tục thủ công
 
-<TableScroll label="Các thao tác trên màn hình theo dõi trực tiếp và quyền mỗi thao tác cần">
+<TableScroll label="Các thao tác trên màn hình theo dõi trực tiếp và ai có thể thực hiện">
 
-| Thao tác                                            | Cần quyền         | Ghi chú                                                                                 |
-| --------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------- |
-| <UiPath path="live.pause" />                        | `campaigns:pause` | Hiện khi chiến dịch đang gửi. Mọi thứ dừng lại cho đến khi có người tiếp tục.           |
-| <UiPath path="live.resumeSending" />                | `campaigns:send`  | Áp dụng cho cả mọi quyết định tiếp tục, chuyển và thử lại.                              |
-| <UiPath path="live.cancelSend" />                   | `campaigns:send`  | Hộp thoại đề xuất <UiPath path="live.pauseInstead" /> nếu bạn có quyền `campaigns:pause`. |
-| Xem màn hình theo dõi                               | `campaigns:view`  |                                                                                         |
+| Thao tác                                                  | Ai có thể                             | Ghi chú                                                                                       |
+| --------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                              | Người có thể tạm dừng lần gửi         | Mọi thứ dừng lại cho đến khi có người tiếp tục. Hiện khi chiến dịch đang gửi.                 |
+| <UiPath path="live.resumeSending" />, quyết định về phần bị giữ | Người có thể gửi chiến dịch     | Cả việc chuyển, thử lại, thư chưa rõ trạng thái, tốc độ và ngưỡng cho lần gửi này.            |
+| <UiPath path="live.cancelSend" />                         | Người có thể gửi chiến dịch           | Hộp thoại đề xuất <UiPath path="live.pauseInstead" /> nếu bạn có thể tạm dừng lần gửi.        |
+| Tiếp tục gửi thử sớm                                      | Người có thể phê duyệt lần gửi        | Chỉ người thật, không bao giờ là khóa API hay tác tử.                                         |
+| Xem màn hình theo dõi                                     | Mọi người có thể xem chiến dịch       |                                                                                               |
 
 </TableScroll>
 
-Tạm dừng được cố ý đặt là quyền thấp hơn: người phát hiện vấn đề có thể dừng lần gửi, còn người được phép gửi quyết định cách tiếp tục. Chủ sở hữu, Quản trị viên và Biên tập viên có cả hai quyền; Người xem không có quyền nào. Xem [vai trò và quyền](/vi/team/roles-and-permissions/).
+Tạm dừng được cố ý đặt là quyền thấp hơn (`campaigns:pause`): người phát hiện vấn đề có thể dừng lần gửi, còn người được
+phép gửi (`campaigns:send`) quyết định cách tiếp tục. Khi bạn không thể thực hiện một thao tác, màn hình theo dõi nêu tên
+những người có thể. Chủ sở hữu, Quản trị viên và Biên tập viên có thể tạm dừng và gửi; Người xem không làm được việc nào.
+Xem [vai trò và quyền](/vi/team/roles-and-permissions/).
 
 ## Trên điện thoại
 
 <Screenshot
   id="live-monitor-mobile"
-  alt="Màn hình theo dõi trực tiếp trên điện thoại: đầu trang riêng với trạng thái kết nối, tỷ lệ đã gửi kèm thời gian dự kiến hoàn tất và tốc độ, năm ô số liệu xếp hai cột với lượt mở bởi người đọc hiện trước, và các thanh ngưỡng."
+  alt="Màn hình theo dõi trực tiếp trên điện thoại: đầu trang ngắn với độ mới của dữ liệu, tỷ lệ đã gửi kèm thời điểm xong của từng tuyến, các ô số liệu xếp hai cột với lượt mở bởi người đọc đứng trước, các ngưỡng, và nút Tạm dừng cùng một menu thao tác khác ở cuối màn hình."
 />
 
-Dưới 768 px, màn hình trực tiếp có bố cục riêng: đầu trang ngắn gọn với trạng thái kết nối ("Trực tiếp · sự kiện 1 giây trước"), các ô số liệu xếp hai cột, các dòng ngưỡng và nhà cung cấp thu gọn, và nút Tạm dừng (hoặc Tiếp tục) cùng nút Hủy ở cuối màn hình. Bảng quyết định dùng bố cục như trên máy tính.
+Dưới 768 px, màn hình trực tiếp có bố cục riêng: đầu trang ngắn gọn với độ mới của dữ liệu, các ô số liệu xếp hai cột,
+các dòng ngưỡng, nhà cung cấp hộp thư và nhà cung cấp gửi thư thu gọn, và nút Tạm dừng (hoặc Tiếp tục) ở cuối màn hình
+cùng một menu chứa <UiPath path="live.adjustRates" /> và <UiPath path="live.cancelSend" />. Gửi thử và các bảng quyết định
+có bố cục riêng cho điện thoại.
 
-Nếu luồng sự kiện bị ngắt, màn hình theo dõi tự kết nối lại (tối đa 10 lần thử) và đề xuất <UiPath path="live.reconnectNow" />. Màn hình theo dõi không bao giờ cập nhật khi chạy sau reverse proxy thường là do proxy đệm luồng dữ liệu; xem [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
+### Khi số liệu không còn mới
+
+Máy chủ gửi tín hiệu ít nhất mỗi 15 giây. Nếu màn hình theo dõi không nhận được gì trong 90 giây, có thể một proxy đang
+đệm kết nối trực tiếp: màn hình báo "Không có cập nhật trong 90 giây" và chuyển sang hỏi lại mỗi 10 giây. Nếu kết nối bị
+ngắt, màn hình tự kết nối lại (tối đa 10 lần thử) và đề xuất <UiPath path="live.reconnectNow" />. Dù thế nào, việc gửi vẫn
+tiếp tục trên máy chủ. Màn hình theo dõi không bao giờ cập nhật khi chạy sau reverse proxy thường là do proxy đệm luồng dữ
+liệu; xem [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
 
 ## Mặc định và giới hạn
 
 <LimitsTable area="auto-pause" />
 
+### Gửi thử
+
+<LimitsTable area="canary" />
+
 ## Khi nào nên thay đổi
 
-- **Mặc định của không gian làm việc** trong [mặc định gửi thư của không gian làm việc](/vi/providers/workspace-defaults/) (<UiPath path="nav.settings > settings.providers" />) đặt ngưỡng trả thư, ngưỡng khiếu nại và <UiPath path="senders.providers.pauseScope" /> cho mọi lần gửi mới.
-- **Một chiến dịch** có thể dùng ngưỡng khác hoặc phạm vi chiến dịch trong <UiPath path="composer.reviewSend" />, cho đến khi bắt đầu gửi. Hãy hạ ngưỡng với danh sách đã lâu bạn không gửi hoặc với nhà cung cấp mới; chọn phạm vi chiến dịch khi việc chỉ gửi một phần sẽ khiến người đọc bối rối, chẳng hạn với một ưu đãi có thời hạn.
-- Nâng ngưỡng cao hơn mức nhà cung cấp gửi thư của bạn chấp nhận nghĩa là đổi một lần gửi bị tạm dừng lấy một tài khoản bị đình chỉ. Hãy so sánh với giới hạn riêng của nhà cung cấp trong [thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/).
+- **Mặc định của không gian làm việc** trong [mặc định gửi thư của không gian làm việc](/vi/providers/workspace-defaults/)
+  đặt ngưỡng trả thư và khiếu nại, giới hạn lỗi API và <UiPath path="senders.providers.pauseScope" />.
+  [Quy tắc lưu lượng](/vi/providers/traffic-rules/) đặt ngưỡng theo loại thư trả lại, hành động của chúng, quy tắc phản
+  hồi, gửi thử và việc theo dõi khiếu nại.
+- **Một chiến dịch** có thể dùng ngưỡng khác hoặc phạm vi chiến dịch trong <UiPath path="composer.reviewSend" />, và
+  <UiPath path="live.editThresholdsLive" /> trong khi đang gửi. Hãy hạ ngưỡng với danh sách đã lâu bạn không gửi hoặc với
+  nhà cung cấp mới; chọn phạm vi chiến dịch khi việc chỉ gửi một phần sẽ khiến người đọc bối rối, chẳng hạn với một ưu đãi
+  có thời hạn.
+- Nâng ngưỡng cao hơn mức nhà cung cấp gửi thư của bạn chấp nhận nghĩa là đổi một lần gửi bị tạm dừng lấy một tài khoản
+  bị đình chỉ. Hãy so sánh với giới hạn riêng của nhà cung cấp trong
+  [thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/).
 
 ## Liên quan
 
-- [Lên lịch và gửi chiến dịch](/vi/campaigns/schedule-and-send/) là nơi đặt ngưỡng cho từng chiến dịch.
-- [Tình trạng nhà cung cấp và sự cố gián đoạn](/vi/providers/health-and-outages/) nói về phần Gửi hàng loạt bị tạm giữ trên màn hình Nhà cung cấp gửi thư.
-- [Đọc báo cáo chiến dịch](/vi/campaigns/reports/) cho biết số liệu cuối cùng theo nhà cung cấp hộp thư và nhà cung cấp gửi thư.
+- [Lên lịch và gửi chiến dịch](/vi/campaigns/schedule-and-send/) là nơi đặt ngưỡng và lựa chọn gửi thử cho từng chiến
+  dịch.
+- [Đặt quy tắc lưu lượng](/vi/providers/traffic-rules/) cho ngưỡng theo loại thư trả lại, quy tắc phản hồi và gửi thử.
+- [Tình trạng nhà cung cấp và sự cố gián đoạn](/vi/providers/health-and-outages/) nói về phần Gửi hàng loạt bị tạm giữ
+  trên màn hình Nhà cung cấp gửi thư.
+- [Đọc báo cáo chiến dịch](/vi/campaigns/reports/) cho biết số liệu cuối cùng theo nhà cung cấp hộp thư và nhà cung cấp
+  gửi thư.
 - [Giới hạn và mặc định](/vi/reference/limits-and-defaults/) liệt kê mọi con số cố định.

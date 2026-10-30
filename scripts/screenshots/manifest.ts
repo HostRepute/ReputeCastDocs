@@ -33,7 +33,13 @@ export type Shot = {
   // side the number goes on (default: the first side with room, see badgeSide in lib/markers.ts).
   markers?: { n: number; selector: string; badge?: BadgeSide }[]
   locales?: ('en' | 'vi')[] // default both
-  demoSend?: { campaign: string; scenario: 'normal' | 'outlook-complaints' | 'postal-outage'; elapsed: string }
+  // `reputecast demo send`; `canary` defaults to the CLI's (on in the normal scenario, off in the others)
+  demoSend?: {
+    campaign: string
+    scenario: 'normal' | 'steady' | 'outlook-complaints' | 'postal-outage'
+    elapsed: string
+    canary?: 'on' | 'off'
+  }
 }
 
 /** Features whose shots are English only: public pages, which show the newsletter's languages (see above). */
@@ -90,6 +96,21 @@ export const shots: Shot[] = [
   { id: 'providers-routing', path: `${ws}/providers/routing`, feature: 'providers' },
   { id: 'providers-routing-mobile', path: `${ws}/providers/routing`, feature: 'providers', viewport: 'mobile' },
   { id: 'providers-warmup', path: `${ws}/providers/warmup`, feature: 'providers' },
+  // qa-map: ProvidersTrafficRules
+  { id: 'traffic-rules', path: `${ws}/providers/traffic-rules`, feature: 'traffic' },
+  // The same page's second and third cards: mailbox provider responses (reply rules) and canary defaults.
+  {
+    id: 'traffic-rules-replies',
+    path: `${ws}/providers/traffic-rules`,
+    feature: 'traffic',
+    clip: 'main section >> nth=1',
+  },
+  {
+    id: 'traffic-rules-canary',
+    path: `${ws}/providers/traffic-rules`,
+    feature: 'traffic',
+    clip: 'main section >> nth=2',
+  },
   { id: 'providers-events', path: `${ws}/providers/events`, feature: 'providers' },
   { id: 'providers-adapters', path: `${ws}/providers/adapters`, feature: 'providers' },
   { id: 'settings-senders', path: `${ws}/settings/senders`, feature: 'senders' },
@@ -103,17 +124,27 @@ export const shots: Shot[] = [
     id: 'composer',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?select=2`,
     feature: 'composer',
-    // Blocks panel, canvas, inspector, top bar actions.
+    // Blocks panel, canvas, inspector, the Write / Design / Code switch, Review & send.
     markers: [
       // Above the panel the number would cover the subject; inside the canvas's top-left it sits on the grey margin.
       { n: 1, selector: 'aside:has([id$="-trigger-blocks"])', badge: 'right-end' },
       { n: 2, selector: '#main [role="region"]', badge: 'inside' },
       { n: 3, selector: 'aside:has([id$="-trigger-style"])' },
-      { n: 4, selector: 'header > :last-child' },
+      { n: 4, selector: 'header [role="tablist"]', badge: 'bottom' },
+      { n: 5, selector: 'header > :last-child', badge: 'bottom' },
     ],
   },
   { id: 'composer-empty', path: `${ws}/campaigns/{campaign:Untitled campaign}/edit`, feature: 'composer' },
   { id: 'composer-code', path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?view=mjml`, feature: 'composer' },
+  // qa-map: ComposerWrite
+  { id: 'composer-write', path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?view=write`, feature: 'composer' },
+  {
+    id: 'composer-comments',
+    path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?select=2&panel=comments`,
+    feature: 'composer',
+  },
+  // qa-map: BrandKit
+  { id: 'brand-kit', path: `${ws}/settings/brand-kit`, feature: 'brandkit' },
   {
     id: 'composer-preview',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?view=preview`,
@@ -177,10 +208,10 @@ export const shots: Shot[] = [
     id: 'review-send',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/review`,
     feature: 'review',
-    // Verdict, check groups, audience estimate, schedule and send actions.
+    // Verdict, the issues that need attention (passed checks collapse below), audience estimate, schedule actions.
     markers: [
       { n: 1, selector: 'main [role="status"]' },
-      { n: 2, selector: 'main section[aria-label]' },
+      { n: 2, selector: 'section[aria-labelledby="rv-attn"]' },
       // Left of these, the numbers would cover the Web card's Edit button and the banner's text.
       { n: 3, selector: 'section[aria-labelledby="rv-audience"]', badge: 'left-end' },
       { n: 4, selector: 'main [role="status"] .rv-vacts', badge: 'bottom' },
@@ -190,6 +221,8 @@ export const shots: Shot[] = [
     id: 'review-send-blocked',
     path: `${ws}/campaigns/{campaign:Flash sale: 48 hours only}/review`,
     feature: 'review',
+    // Opening the draft re-runs its checks in the background; the verdict banner is a <section> once they finish.
+    waitFor: 'main section.rv-verdict',
   },
   {
     id: 'review-send-mobile',
@@ -199,18 +232,28 @@ export const shots: Shot[] = [
   },
   { id: 'approval-policy', path: `${ws}/settings/approvals`, feature: 'approvals' },
   { id: 'approval-inbox', path: `${ws}/approvals`, feature: 'approvals' },
+  // qa-map: SettingsSendingRules
+  { id: 'sending-rules', path: `${ws}/settings/sending-rules`, feature: 'sending-rules' },
   {
+    // The steady scenario is the normal one without the simulated provider's chance throttling (and without a canary).
     id: 'live-monitor',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/live`,
     feature: 'live',
-    demoSend: { campaign: 'Weekly Digest #142', scenario: 'normal', elapsed: '20m' },
+    demoSend: { campaign: 'Weekly Digest #142', scenario: 'steady', elapsed: '20m' },
+  },
+  {
+    // qa-map: LiveMonitorCanary (the normal scenario starts with a canary; at 8 minutes it is still watching).
+    id: 'live-monitor-canary',
+    path: `${ws}/campaigns/{campaign:Weekly Digest #142}/live`,
+    feature: 'live',
+    demoSend: { campaign: 'Weekly Digest #142', scenario: 'normal', elapsed: '8m' },
   },
   {
     id: 'live-monitor-mobile',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/live`,
     feature: 'live',
     viewport: 'mobile',
-    demoSend: { campaign: 'Weekly Digest #142', scenario: 'normal', elapsed: '20m' },
+    demoSend: { campaign: 'Weekly Digest #142', scenario: 'steady', elapsed: '20m' },
   },
   {
     id: 'live-monitor-paused',
@@ -229,13 +272,13 @@ export const shots: Shot[] = [
     path: `${ws}/campaigns/{campaign:October Product Update}/report`,
     feature: 'reports',
     fullPage: true,
-    // Human vs machine opens, click map, per mailbox provider and per sending provider tables.
+    // Headline tiles (each compared with the last issues), insights, click map, per mailbox provider, share links.
     markers: [
-      { n: 1, selector: 'section[aria-labelledby="rep-eng-h"]' },
-      // Left of 2 and 4, the numbers would cover the chart's legend and the mailbox table's caption.
-      { n: 2, selector: 'section[aria-labelledby="rep-map-h"]', badge: 'left-end' },
-      { n: 3, selector: 'section[aria-labelledby="rep-mb-h"]' },
-      { n: 4, selector: 'section[aria-labelledby="rep-sp-h"]', badge: 'top' },
+      { n: 1, selector: 'main section[aria-label]' },
+      { n: 2, selector: 'section[aria-labelledby="rep-ins-h"]' },
+      { n: 3, selector: 'section[aria-labelledby="rep-map-h"]' },
+      { n: 4, selector: 'section[aria-labelledby="rep-mb-h"]' },
+      { n: 5, selector: 'section[aria-labelledby="rep-share-h"]' },
     ],
   },
   {
@@ -419,6 +462,7 @@ export const shots: Shot[] = [
   { id: 'instance-users', path: `${ws}/admin/users`, feature: 'admin' },
   { id: 'instance-auth', path: `${ws}/admin/authentication`, feature: 'admin' },
   { id: 'instance-settings', path: `${ws}/admin/instance`, feature: 'admin' },
+  { id: 'bot-filter', path: `${ws}/admin/bot-filter`, feature: 'admin' },
   { id: 'sso-setup', path: `${ws}/admin/sso/{sso:Microsoft Entra ID}`, feature: 'admin' },
 
   // Agency accounts (the Northwind Studio sample)

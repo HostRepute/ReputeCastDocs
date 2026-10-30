@@ -10,6 +10,10 @@ sources:
   - internal/providers/bounce/bounce.go
   - internal/ingest/normalize.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
   - internal/sending/engine/analysis.go
   - internal/readiness/assemble.go
   - internal/reports/bounces.go
@@ -65,16 +69,22 @@ Gmail giới hạn tốc độ khi lượng thư của bạn, hoặc tỷ lệ t
 - Trong khi nhà cung cấp gửi thư thử lại, mỗi lần bị từ chối được ghi là một lần [hoãn nhận](/vi/reference/glossary/#deferral):
   một sự kiện <UiPath path="providers.events.optionDeferred" /> trong nhật ký sự kiện. Các lần hoãn nhận không xuất hiện
   trong bảng thư trả lại của báo cáo chiến dịch.
-- Các lần hoãn nhận được tính vào tỷ lệ hoãn nhận của nhà cung cấp hộp thư Gmail trong lúc gửi. Khi vượt 5,0% (cố định;
-  chỉ bắt đầu tính sau 500 thư đến Gmail và ít nhất 5 lần hoãn nhận, với độ tin cậy khoảng 90%), ReputeCast
+- Mọi không gian làm việc đều bắt đầu với một [quy tắc phản hồi](/vi/reference/glossary/#reply-rule) cho mã này: khi 5
+  phản hồi của Gmail chứa `421-4.7.28` trong vòng 10 phút, ReputeCast giảm tốc độ gửi tới Gmail còn một nửa trong 30
+  phút, trước mọi ngưỡng tỷ lệ. Các nhà cung cấp hộp thư khác vẫn giữ nhịp. Quy tắc khớp với đoạn văn bản đó ở bất kỳ đâu
+  trong phản hồi; nếu nhật ký sự kiện của bạn ghi mã theo cách khác, chẳng hạn `421 4.7.28`, hãy thêm một quy tắc cho
+  `4.7.28` trong [quy tắc lưu lượng](/vi/providers/traffic-rules/).
+- Các lần hoãn nhận và trả thư tạm thời còn được tính vào các ngưỡng hoãn nhận của Gmail, mỗi thư một lần, trong 10 phút
+  gần nhất. Ở mức 15% số thư gửi tới Gmail, ReputeCast giảm tốc độ gửi tới Gmail còn một nửa; ở mức 40%, ReputeCast
   [tự động tạm dừng](/vi/reference/glossary/#auto-pause) phần gửi tới Gmail của chiến dịch, hoặc toàn bộ chiến dịch khi
-  phạm vi tạm dừng được đặt là chiến dịch.
+  phạm vi tạm dừng được đặt là chiến dịch. Mỗi mức chờ đủ 500 thư tới Gmail trong khoảng thời gian đó và ít nhất 5 lần
+  hoãn nhận.
 - Nếu nhà cung cấp gửi thư ngừng thử lại, nó báo về một thư trả lại. Văn bản của Gmail có chữ "spam", nên
   [loại thư trả lại](/vi/reference/glossary/#bounce-class) là `spam_block` và hàng trong báo cáo là
-  <UiPath path="reports.bounceType.blocked" />. Một thư trả lại có phản hồi 4xx được ghi nhận là trả thư tạm thời và
-  không khiến địa chỉ bị chặn gửi, trừ khi chính nhà cung cấp gửi thư coi đó là vĩnh viễn (Amazon SES và Resend làm theo
-  loại thư trả lại của riêng họ; xem
-  [khi nào ReputeCast chặn gửi một địa chỉ](/vi/smtp-errors/#khi-nào-reputecast-chặn-gửi-một-địa-chỉ)).
+  <UiPath path="reports.bounceType.blocked" />. Thư bị chặn vì uy tín của người gửi không bao giờ khiến địa chỉ bị chặn
+  gửi, kể cả khi nhà cung cấp gửi thư coi là vĩnh viễn (xem
+  [khi nào ReputeCast chặn gửi một địa chỉ](/vi/smtp-errors/#khi-nào-reputecast-chặn-gửi-một-địa-chỉ)). Một thư bị chặn
+  vĩnh viễn được tính vào ngưỡng thư trả lại do chặn hoặc chính sách của Gmail.
 - Biến thể Message-ID, hoặc mã đứng một mình không kèm văn bản của Gmail, là `temporary`
   (<UiPath path="reports.bounceType.deferralExpired" />).
 
@@ -83,8 +93,9 @@ Gmail giới hạn tốc độ khi lượng thư của bạn, hoặc tỷ lệ t
 ## Trước khi bắt đầu
 
 - `providers:view` để đọc nhật ký sự kiện.
-- `providers:manage` để thay đổi giới hạn tốc độ trong <UiPath path="nav.settings > settings.providers" />.
-- `campaigns:send` để tiếp tục một lần gửi đã tự tạm dừng.
+- `providers:manage` để thay đổi giới hạn tốc độ trong <UiPath path="nav.settings > settings.providers" /> và các quy tắc
+  phản hồi trong <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` để tiếp tục một lần gửi đã tự tạm dừng hoặc đổi tốc độ của nó.
 
 ## Khôi phục sau khi bị giới hạn tốc độ
 
@@ -96,8 +107,9 @@ Gmail giới hạn tốc độ khi lượng thư của bạn, hoặc tỷ lệ t
    hạn một địa chỉ IP, một tên miền hay một liên kết.
 2. Gửi chậm lại cho Gmail. Theo mặc định, Gmail không có giới hạn tốc độ. Trong
    <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />, hãy đặt tốc độ cho Gmail theo
-   số thư mỗi giây. Nếu một lần gửi đã tự tạm dừng, [theo dõi trực tiếp](/vi/campaigns/live-monitor/) sẽ đề xuất tốc độ
-   thấp hơn cho phần gửi tới Gmail; hãy tiếp tục gửi với thay đổi đó.
+   số thư mỗi giây. Trong lúc gửi, hạ tốc độ gửi tới Gmail bằng <UiPath path="live.adjustRates" /> trên
+   [màn hình theo dõi trực tiếp](/vi/campaigns/live-monitor/). Nếu một lần gửi đã tự tạm dừng, màn hình theo dõi trực
+   tiếp sẽ đề xuất tốc độ thấp hơn cho phần gửi tới Gmail; hãy tiếp tục gửi với thay đổi đó.
 3. Gửi cho người đọc tương tác trước. Những liên hệ đã thôi mở thư làm tăng tỷ lệ thư không mong muốn. Hãy dùng
    [các nhóm tương tác của sức khỏe danh sách](/vi/audience/list-health/) và để Độ sẵn sàng gửi loại các liên hệ ít tương
    tác khi nó cảnh báo về họ.
@@ -114,7 +126,8 @@ Gmail giới hạn tốc độ khi lượng thư của bạn, hoặc tỷ lệ t
 
 ## Kiểm tra kết quả
 
-- Ở lần gửi tiếp theo, tỷ lệ hoãn nhận của Gmail trong theo dõi trực tiếp vẫn thấp và lần gửi không bị tự tạm dừng.
+- Ở lần gửi tiếp theo, tỷ lệ hoãn nhận của Gmail trong theo dõi trực tiếp vẫn thấp, lần gửi không bị giảm tốc hay tự tạm
+  dừng, và dòng <UiPath path="live.model.thresholdReplies" /> cho thấy quy tắc `421-4.7.28` còn cách xa số lần đã đặt.
 - Nhật ký sự kiện hiển thị sự kiện gửi thành công cho người nhận dùng Gmail thay vì các lần hoãn nhận 421 4.7.28 mới.
 
 ## Khắc phục sự cố

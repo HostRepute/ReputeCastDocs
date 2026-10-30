@@ -1,6 +1,6 @@
 ---
 title: Khởi động nhà cung cấp hoặc IP mới
-description: Chạy lịch warm up IP trong ReputeCast với giới hạn tăng mỗi ngày đến tệp người nhận lớn nhất, gửi liên hệ tương tác trước và tự giảm tốc khi trả thư tăng.
+description: Chạy lịch warm up IP trong ReputeCast với giới hạn mỗi ngày được áp dụng ngay khi gửi, gửi liên hệ tương tác trước và tự giảm tốc khi trả thư tăng.
 type: how-to
 audience: [admin]
 permissions: ['providers:manage']
@@ -8,11 +8,15 @@ uiPath: 'nav.providers > providers.tabWarmup'
 primaryKeyword: lịch warm up IP
 sources:
   - internal/warmup
+  - internal/sending/engine/warmup_send.go
   - internal/sending/engine/audience.go
-  - internal/sending/engine/engine.go
+  - internal/sending/engine/automation.go
+  - internal/sending/engine/transactional.go
   - internal/routing/routing.go
   - web/src/features/providers/WarmupPage.tsx
+  - web/src/features/providers/warmup-model.ts
   - web/src/features/providers/warmup.messages.ts
+  - web/src/features/live/States.tsx
 sidebar:
   order: 16
 ---
@@ -24,15 +28,17 @@ import LimitsTable from '~/components/LimitsTable.astro'
 
 Một [IP riêng](/vi/reference/glossary/#dedicated-ip) mới, một nhà cung cấp gửi thư mới hay máy chủ Postal của riêng bạn
 chưa có lịch sử gửi thư, nên các nhà cung cấp hộp thư sẽ nghi ngờ khi đột ngột nhận rất nhiều thư từ đó. Một kế hoạch
-[khởi động](/vi/reference/glossary/#warm-up) cho nó một lịch warm up IP: giới hạn mỗi ngày tăng dần trong vài tuần, gửi
-cho những liên hệ tương tác nhiều nhất trước, và tự động giảm tốc khi thư trả lại hoặc khiếu nại tăng.
+[khởi động](/vi/reference/glossary/#warm-up) cho nó một lịch warm up IP: giới hạn mỗi ngày tăng dần trong vài tuần và được
+áp dụng ngay khi thư được gửi đi, gửi cho những liên hệ tương tác nhiều nhất trước, và tự động giảm tốc khi thư trả lại
+hoặc khiếu nại tăng.
 
 ## Trước khi bắt đầu
 
 - Kết nối nhà cung cấp. Hãy đọc [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
 - Để tỷ trọng Gửi hàng loạt của nó tăng theo lịch, hãy đặt nó vào phần chia theo tỷ trọng trên tuyến Gửi hàng loạt, cạnh
   một nhà cung cấp đã khởi động xong, ví dụ 90% Amazon SES và 10% Postal. Bạn thiết lập việc này ở bước Luồng của trình
-  hướng dẫn kết nối (vai trò Chia theo tỷ trọng). Hãy đọc [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
+  hướng dẫn kết nối (vai trò Chia theo tỷ trọng) hoặc trên trang định tuyến. Hãy đọc
+  [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
 - Bạn cần quyền `providers:manage`. Với `providers:view`, bạn có thể theo dõi một kế hoạch.
 - Các nhóm tương tác lấy từ [sức khỏe danh sách](/vi/audience/list-health/): Tích cực, Nguội dần, Có nguy cơ và Ngừng
   gửi dần.
@@ -43,71 +49,97 @@ cho những liên hệ tương tác nhiều nhất trước, và tự động gi
 
 1. Mở <UiPath path="nav.providers > providers.tabWarmup" /> và chọn <UiPath path="providers.warmup.newPlan" />.
 
-2. Chọn <UiPath path="providers.warmup.provider" />. Nhập <UiPath path="providers.warmup.dedicatedIp" /> nếu nhà cung cấp
-   có IP riêng; để trống để khởi động nhóm IP dùng chung của nhà cung cấp cho tên miền của bạn.
+2. Chọn <UiPath path="providers.warmup.provider" /> và <UiPath path="providers.warmup.length" />. Nhập
+   <UiPath path="providers.warmup.dedicatedIp" /> nếu nhà cung cấp có IP riêng; để trống để khởi động nhóm IP dùng chung
+   của nhà cung cấp cho tên miền của bạn.
 
 3. Chọn <UiPath path="providers.warmup.startWarmup" />. Trạng thái của nhà cung cấp chuyển thành Đang khởi động · ngày
-   1/N, giới hạn của ngày đầu tiên là 200 email, và tỷ trọng Gửi hàng loạt của nó bắt đầu từ 10%. Mỗi nhà cung cấp chỉ có
-   một kế hoạch tại một thời điểm.
+   1/N, giới hạn của ngày đầu tiên là 200 email, và tỷ trọng Gửi hàng loạt của nó bắt đầu từ 10%. Một kế hoạch mới gửi
+   cho liên hệ tương tác nhiều nhất trước, chia giới hạn riêng cho từng nhà cung cấp hộp thư và gửi phần vượt giới hạn qua
+   một nhà cung cấp đã khởi động xong. Mỗi nhà cung cấp chỉ có một kế hoạch tại một thời điểm.
 
 4. Điều chỉnh <UiPath path="providers.warmup.settingsTitle" /> nếu cần, rồi chọn
-   <UiPath path="providers.warmup.savePlan" />. Thay đổi áp dụng từ giới hạn của ngày mai.
-   - <UiPath path="providers.warmup.length" />: 14 ngày (nhanh), 21 ngày (nên dùng cho IP riêng mới) hoặc 30 ngày (thận
-     trọng). Khi đổi thời gian, lịch được dựng lại giữa cùng mức gửi ngày đầu và ngày cuối; những ngày đã gửi giữ nguyên
-     kết quả.
+   <UiPath path="providers.warmup.savePlan" />. Giới hạn hôm nay giữ nguyên; thay đổi áp dụng cho các ngày tiếp theo.
+   - <UiPath path="providers.warmup.length" />: 14 ngày được tính (nhanh), 21 (nên dùng cho IP riêng mới) hoặc 30 (thận
+     trọng). Khi đổi thời gian, các ngày tiếp theo được dựng lại từ giới hạn hôm nay đến cùng mức gửi ngày cuối, nên giới
+     hạn hôm nay không bao giờ nhảy vọt. Một kế hoạch không thể ngắn hơn số ngày nó đã tính.
    - <UiPath path="providers.warmup.ordering" />: <UiPath path="providers.warmup.orderEngaged" />, hoặc
      <UiPath path="providers.warmup.orderRandom" />, gửi cho mọi nhóm tương tác ngay từ ngày đầu.
-   - <UiPath path="providers.warmup.slowIfBounces" /> một tỷ lệ trả thư, hoặc khi khiếu nại vượt một tỷ lệ khiếu nại.
-   - <UiPath path="providers.warmup.whenTrips" />: <UiPath path="providers.warmup.actionHold" />,
+   - <UiPath path="providers.warmup.slowIfBounces" /> một tỷ lệ trả thư,
+     <UiPath path="providers.warmup.orComplaints" /> một tỷ lệ khiếu nại.
+   - <UiPath path="providers.warmup.whenTrips" />: giữ giới hạn cho đến khi có 2 ngày ổn định liên tiếp (mặc định),
      <UiPath path="providers.warmup.actionStepBack" /> hoặc <UiPath path="providers.warmup.actionPause" />.
+   - <UiPath path="providers.warmup.spread" />.
 
 </Steps>
 
 <Screenshot
   id="providers-warmup"
-  alt="Một IP riêng của Postal ở ngày 9/21: giới hạn hôm nay là 6.000, đã gửi 14.298 đến nay, tỷ lệ trả thư và khiếu nại dưới ngưỡng bảo vệ và một lần giảm tốc, cùng biểu đồ mức tăng lượng gửi mỗi ngày và cài đặt kế hoạch."
+  alt="Một IP riêng của Postal ở ngày 9/21, đã tính 8/21 ngày: khung giải thích kế hoạch tiến lên như thế nào, giới hạn hôm nay là 6.000 và chưa gửi gì vào một thứ Sáu không có lần gửi hàng loạt nào nên ngày 9 lặp lại vào ngày mai, tỷ lệ trả thư và khiếu nại 7 ngày dưới ngưỡng bảo vệ, một lần giảm tốc, biểu đồ mức tăng lượng gửi mỗi ngày và giới hạn hôm nay theo nhà cung cấp hộp thư."
 />
 
 ## Lịch hoạt động như thế nào
 
 1. **Mức tăng.** Ngày 1 là 200 email. Giới hạn tăng theo cùng một hệ số mỗi ngày cho đến khi ngày cuối đạt mục tiêu: tệp
    người nhận chiến dịch lớn nhất của bạn đến nay, hoặc 48.000 nếu không gian làm việc chưa gửi chiến dịch nào. Giới hạn
-   tốc độ của ngày trải giới hạn ra trong khoảng một giờ (giới hạn chia cho 3.000, tính theo giây), không bao giờ thấp hơn
-   1 email mỗi giây và không bao giờ vượt tốc độ tối đa của chính nhà cung cấp.
-2. **Ai nhận thư trước.** Với thứ tự tương tác nhiều nhất trước, một phần tư số ngày đầu chỉ gửi cho liên hệ Tích cực,
+   tốc độ của ngày trải giới hạn ra trong khoảng một giờ và không bao giờ vượt tốc độ tối đa của chính nhà cung cấp.
+2. **Giới hạn được áp dụng ngay khi gửi.** Mọi luồng gửi qua nhà cung cấp đều được tính vào giới hạn của ngày, theo múi
+   giờ của không gian làm việc. Khi chia giới hạn theo nhà cung cấp hộp thư, mỗi nhà cung cấp hộp thư nhận phần giới hạn
+   của mình, nên các nhà cung cấp hộp thư khắt khe có giới hạn thấp hơn; Gmail bao gồm người nhận Google Workspace và
+   Outlook bao gồm người nhận Microsoft 365, xác định từ bản ghi MX.
+3. **Ai nhận thư trước.** Với thứ tự tương tác nhiều nhất trước, một phần tư số ngày đầu chỉ gửi cho liên hệ Tích cực,
    liên hệ Nguội dần được thêm vào cho đến nửa chặng, liên hệ Có nguy cơ được thêm sau đó, và ngày cuối gửi cho mọi nhóm.
-3. **Phần còn lại đi đâu.** Với Gửi hàng loạt, một liên hệ mà kế hoạch không cho phép gửi hôm nay (sai nhóm, vượt giới
-   hạn hôm nay, hoặc kế hoạch đang tạm dừng) đi qua phần lớn nhất khác của cùng tuyến mà không đang khởi động, hoặc nếu
-   không có thì qua nhà cung cấp dự phòng của tuyến. Không ai bị bỏ qua vì quá trình khởi động: nếu tuyến không có nhà
-   cung cấp nào khác, thư vẫn đi qua nhà cung cấp đang khởi động.
-4. **Tỷ trọng Gửi hàng loạt.** Nếu nhà cung cấp nằm trong phần chia theo tỷ trọng của Gửi hàng loạt cùng một nhà cung cấp
-   khác, tỷ trọng của nó tăng từ 10% lên 15%, 25% và cuối cùng là 40% trong suốt kế hoạch; phần tăng thêm được lấy từ nhà
-   cung cấp lớn nhất còn lại trong phần chia.
-5. **Kiểm tra hằng ngày.** ReputeCast kiểm tra mọi kế hoạch đang chạy mỗi giờ. Khi một ngày kết thúc (theo múi giờ của
-   không gian làm việc), nó ghi lại lượng đã gửi, tỷ lệ trả thư (số thư trả lại trên số thư đã gửi) và tỷ lệ khiếu nại
-   (số khiếu nại trên số thư gửi thành công). Nếu một trong hai tỷ lệ vượt ngưỡng bảo vệ, nó giữ nguyên giới hạn của ngày
-   tiếp theo, lùi lại một ngày hoặc tạm dừng kế hoạch, theo lựa chọn của bạn, và ghi vào
-   <UiPath path="providers.warmup.logTitle" />.
-6. **Kết thúc.** Sau ngày cuối, kế hoạch hoàn tất, trạng thái của nhà cung cấp trở về Ổn định và nó có thể nhận chuyển
-   dự phòng cho Gửi hàng loạt theo chính sách chỉ chuyển sang nhà cung cấp đã khởi động xong.
-
-<Aside type="note">
-Cài đặt kế hoạch còn có tùy chọn chia đều giới hạn mỗi ngày cho các nhà cung cấp hộp thư. Bản phát hành này lưu lựa chọn
-đó cùng kế hoạch, nhưng việc gửi chưa áp dụng nó.
-</Aside>
+   Một người nhận Gửi hàng loạt nằm ngoài các nhóm của ngày đi qua phần lớn nhất đã khởi động xong của cùng tuyến, hoặc
+   nếu không có thì qua nhà cung cấp dự phòng của tuyến.
+4. **Phần vượt giới hạn.** Tùy theo luồng:
+   - **Gửi hàng loạt** đi qua một nhà cung cấp đã khởi động xong của tuyến khi kế hoạch cho phép gửi phần vượt giới hạn
+     qua đó. Nếu không cho phép, hoặc không có nhà cung cấp đã khởi động xong, phần của nhà cung cấp trong lần gửi bị giữ
+     ở giới hạn: một [tuyến bị giữ](/vi/reference/glossary/#held-route) tự tiếp tục với giới hạn của ngày hôm sau. Trang
+     kế hoạch và màn hình [theo dõi trực tiếp](/vi/campaigns/live-monitor/) hiển thị chiến dịch đang chờ, với ba lựa chọn:
+     <UiPath path="providers.warmup.holdWait" /> giới hạn tiếp theo, chuyển những người nhận bị giữ sang một nhà cung cấp
+     vượt qua các bước kiểm tra chuyển dự phòng, hoặc <UiPath path="providers.warmup.holdCancel" /> (chỉ trong phần này). Chờ và
+     chuyển cần quyền `campaigns:send`; hủy cần quyền `campaigns:pause`.
+   - **Tự động hóa** chờ ở giới hạn và trong lúc kế hoạch tạm dừng, hoặc đi qua nhà cung cấp dự phòng đã khởi động xong
+     của luồng khi kế hoạch cho phép. Không thư nào bị bỏ.
+   - Thư **Giao dịch** không bao giờ phải chờ: thư đi qua một nhà cung cấp đã khởi động xong của tuyến, hoặc được gửi và
+     tính là vượt giới hạn của ngày. Thẻ giới hạn cho biết có bao nhiêu thư đã vượt.
+5. **Tỷ trọng Gửi hàng loạt.** Nếu nhà cung cấp nằm trong phần chia theo tỷ trọng của Gửi hàng loạt cùng một nhà cung cấp
+   khác, tỷ trọng của nó tăng từ 10% lên 15%, 25% và cuối cùng 40% trong suốt kế hoạch; phần tăng lấy từ nhà cung cấp lớn
+   nhất còn lại trong phần chia. Phần chia là cố định, nên những người nhận đã chuyển sang nhà cung cấp đang khởi động sẽ
+   ở lại đó.
+6. **Ngày được tính.** Một kế hoạch có các ngày được tính, không phải ngày lịch. ReputeCast kiểm tra mọi kế hoạch đang
+   chạy mỗi giờ. Khi một ngày kết thúc, ngày đó được tính nếu đã gửi ít nhất 80% giới hạn và ngưỡng bảo vệ không bị vượt;
+   nếu không, ngày đó lặp lại vào ngày hôm sau. Ngưỡng bảo vệ chỉ đánh giá một ngày khi ngày đó đã gửi 500 thư, nên một
+   khiếu nại trên 200 thư không bao giờ giữ mức tăng lại. Tỷ lệ trả thư là số thư trả lại trên mỗi thư đã gửi; tỷ lệ khiếu
+   nại chỉ tính các nhà cung cấp hộp thư có báo khiếu nại, vì Gmail và iCloud không báo.
+7. **Giảm tốc.** Khi tỷ lệ trả thư hoặc khiếu nại của một ngày đã được đánh giá vượt ngưỡng bảo vệ, ngày đó không được
+   tính và kế hoạch làm theo lựa chọn của bạn. Với giữ nguyên, giới hạn được giữ cho đến khi có 2 ngày ổn định liên tiếp
+   trong khi kế hoạch ở nguyên ngày của nó; sau đó mức tăng tiếp tục lên một bậc từ giới hạn đang giữ. Với lùi lại, giới
+   hạn lùi một ngày trước, được giữ theo cùng cách, rồi mức tăng tiếp tục từ ngày đã vượt ngưỡng. Với tạm dừng, kế hoạch
+   chờ đến khi có người cho tiếp tục. Mỗi bước được ghi vào <UiPath path="providers.warmup.logTitle" />.
+8. **Kết thúc.** Sau ngày được tính cuối cùng, kế hoạch hoàn tất, trạng thái của nhà cung cấp trở về Ổn định và nó có thể
+   nhận chuyển dự phòng cho Gửi hàng loạt theo chính sách chỉ chuyển sang nhà cung cấp đã khởi động xong.
 
 ### Đọc kế hoạch
 
-Phần đầu cho biết ngày hiện tại ("ngày 9/21"), thời điểm kế hoạch kết thúc, giới hạn hôm nay và lượng đã gửi hôm nay, tổng
-lượng đã gửi trong quá trình khởi động so với kế hoạch, tỷ lệ trả thư và khiếu nại 7 ngày bên cạnh ngưỡng bảo vệ của
-chúng, số lần giảm tốc đến nay và giới hạn tốc độ hôm nay. Biểu đồ <UiPath path="providers.warmup.rampTitle" /> và bảng
-bên dưới hiển thị giới hạn của từng ngày, lượng đã gửi, tỷ lệ trả thư và khiếu nại, các nhóm đã được gửi và trạng thái
-của ngày: Xong, Giảm tốc, Hôm nay hoặc Theo kế hoạch.
+Phần đầu cho biết ngày hiện tại ("ngày 9/21"), số ngày đã tính và ngày sớm nhất kế hoạch kết thúc. Dưới
+<UiPath path="providers.warmup.howTitle" />, trang cho biết điều gì làm hôm nay được tính, ví dụ hôm nay được tính khi đã
+gửi 4.800 thư và hiện đã gửi 1.200, hoặc ngày này lặp lại vào ngày mai vì gửi quá ít. Tiếp theo là giới hạn hôm nay và
+số đã gửi hôm nay, tổng số đã gửi trong thời gian khởi động, tỷ lệ trả thư và khiếu nại 7 ngày bên cạnh ngưỡng bảo vệ,
+số lần giảm tốc đến nay và giới hạn tốc độ hôm nay.
 
-Để tạm ngừng mức tăng một thời gian, chọn <UiPath path="providers.warmup.pause" />. Trong lúc kế hoạch tạm dừng, tỷ trọng
-Gửi hàng loạt của nó chuyển sang các nhà cung cấp khác của tuyến, và giới hạn giữ nguyên cho đến khi bạn chọn
-<UiPath path="providers.warmup.resume" />. Số ngày vẫn tiếp tục được đếm trong lúc tạm dừng, nên mức tăng tiếp tục từ
-ngày bạn chọn tiếp tục.
+Biểu đồ <UiPath path="providers.warmup.rampTitle" /> và bảng bên dưới cho biết giới hạn của từng ngày (giới hạn đang giữ
+được ghi rõ), số đã gửi, tỷ lệ trả thư và khiếu nại, các nhóm được gửi và ngày đó có được tính hay không:
+<UiPath path="providers.warmup.badgeCounted" />, <UiPath path="providers.warmup.badgeNotCounted" /> kèm lý do,
+<UiPath path="providers.warmup.badgeHeld" /> (một ngày ổn định trong lúc giảm tốc đang giữ giới hạn), Hôm nay, Đã lên kế
+hoạch hoặc Tạm dừng. <UiPath path="providers.warmup.capsTitle" /> liệt kê giới hạn hôm nay và số đã gửi theo từng nhà
+cung cấp hộp thư, cùng công tắc <UiPath path="providers.warmup.overflowLabelNone" /> và số thư giao dịch đã gửi vượt giới
+hạn hôm nay.
+
+Để tạm ngừng mức tăng một thời gian, chọn <UiPath path="providers.warmup.pause" />. Tạm dừng sẽ đóng băng kế hoạch: nhà
+cung cấp không gửi gì, Gửi hàng loạt đi qua một nhà cung cấp đã khởi động xong của tuyến hoặc phải chờ, Tự động hóa chờ,
+thư Giao dịch đi qua một nhà cung cấp đã khởi động xong hoặc được tính là vượt giới hạn, và những ngày tạm dừng không
+được tính. <UiPath path="providers.warmup.resume" /> cho kế hoạch chạy tiếp từ ngày đã dừng.
 
 ## Mặc định và giới hạn
 
@@ -115,24 +147,30 @@ ngày bạn chọn tiếp tục.
 
 ## Kiểm tra kết quả
 
-- <UiPath path="nav.providers > providers.tabProviders" /> hiển thị nhà cung cấp ở trạng thái Đang khởi động · ngày N/M,
-  kèm giới hạn khởi động hôm nay.
-- <UiPath path="nav.providers > providers.tabRouting" /> hiển thị các lần tăng tỷ trọng theo kế hoạch dưới phần chia theo
-  tỷ trọng.
-- Sau ngày đầu tiên trọn vẹn, nhật ký khởi động có một mục "Ngày 1 xong" ghi lượng đã gửi và tỷ lệ trả thư.
+- <UiPath path="nav.providers > providers.tabProviders" /> hiển thị nhà cung cấp là Đang khởi động · ngày N/M, kèm giới
+  hạn khởi động hôm nay.
+- <UiPath path="nav.providers > providers.tabRouting" /> hiển thị các lần tăng tỷ trọng đã lên kế hoạch dưới phần chia theo
+  tỷ trọng, và tab Chiến dịch của công cụ thử tuyến cho biết lần gửi hàng loạt kế tiếp gửi gì qua nhà cung cấp đang khởi
+  động, phần nào vượt giới hạn và phần nào bị giữ.
+- Sau ngày đầy đủ đầu tiên, nhật ký khởi động có mục "Ngày 1 được tính" với số đã gửi và tỷ lệ trả thư, hoặc cho biết vì
+  sao ngày đó lặp lại.
 
 ## Khắc phục sự cố
 
-- **"Mọi nhà cung cấp đã kết nối đều đã có kế hoạch khởi động"**: mỗi nhà cung cấp chỉ có một kế hoạch tại một thời
-  điểm. Thay vào đó, hãy đổi cài đặt của kế hoạch đang chạy.
-- **Tỷ trọng Gửi hàng loạt không tăng**: nhà cung cấp phải nằm trong phần chia theo tỷ trọng của Gửi hàng loạt cùng ít nhất
-  một nhà cung cấp khác có tỷ trọng đủ để nhường phần chênh lệch. Tỷ trọng mà bạn đã tự tăng cao hơn mức theo kế hoạch sẽ
-  được giữ nguyên.
-- **Giảm tốc ngay những ngày đầu**: thư trả lại trên IP mới thường là dấu hiệu của địa chỉ cũ hoặc chưa được xác minh.
-  Hãy kiểm tra [sức khỏe danh sách](/vi/audience/list-health/) và mã thư trả lại trong
-  [nhật ký sự kiện](/vi/providers/events-and-sync/).
-- **Kế hoạch tự tạm dừng**: ngưỡng bảo vệ đã bị vượt và kế hoạch được đặt để tạm dừng cho đến khi bạn tiếp tục. Đọc nhật
-  ký khởi động để biết ngày đó và nhà cung cấp hộp thư có nhiều thư trả lại nhất, khắc phục nguyên nhân, rồi chọn
+- **"Mọi nhà cung cấp đã kết nối đều đã có kế hoạch khởi động"**: mỗi nhà cung cấp chỉ có một kế hoạch tại một thời điểm.
+  Hãy đổi cài đặt của kế hoạch đang chạy.
+- **Kế hoạch đứng yên ở một ngày**: đã gửi chưa đến 80% giới hạn của ngày, ví dụ vào một ngày không có lần gửi hàng loạt.
+  Ngày đó lặp lại cho đến khi gửi đủ; bảng và nhật ký nêu những ngày không được tính.
+- **Một chiến dịch chờ ở giới hạn khởi động**: không có nhà cung cấp đã khởi động xong nào cùng tuyến Gửi hàng loạt, hoặc
+  tùy chọn gửi phần vượt giới hạn đang tắt. Chọn chờ, chuyển hoặc hủy phần còn lại trên trang kế hoạch hoặc màn hình theo
+  dõi trực tiếp, hoặc bật tùy chọn đó và thêm một nhà cung cấp đã khởi động xong vào phần chia.
+- **Tỷ trọng Gửi hàng loạt không tăng**: nhà cung cấp phải nằm trong phần chia theo tỷ trọng của Gửi hàng loạt cùng ít
+  nhất một nhà cung cấp khác có thể nhường phần chênh lệch. Tỷ trọng bạn tự nâng cao hơn mức đã lên kế hoạch sẽ được giữ
+  nguyên.
+- **Giảm tốc ngay những ngày đầu**: thư trả lại trên một IP mới thường là do địa chỉ cũ hoặc chưa được xác minh. Hãy kiểm
+  tra [sức khỏe danh sách](/vi/audience/list-health/) và mã trả thư trong [nhật ký sự kiện](/vi/providers/events-and-sync/).
+- **Kế hoạch tự tạm dừng**: ngưỡng bảo vệ bị vượt và kế hoạch được đặt là tạm dừng cho đến khi bạn tiếp tục. Đọc nhật ký
+  khởi động để biết ngày đó và nhà cung cấp hộp thư có nhiều thư trả lại nhất, khắc phục nguyên nhân rồi chọn
   <UiPath path="providers.warmup.resume" />.
 
 ## Liên quan
@@ -141,5 +179,5 @@ ngày bạn chọn tiếp tục.
   <LinkCard title="Định tuyến thư qua nhiều nhà cung cấp" href="/vi/providers/routing/" />
   <LinkCard title="Giữ danh sách luôn khỏe mạnh" href="/vi/audience/list-health/" />
   <LinkCard title="Gửi bằng máy chủ Postal của riêng bạn" href="/vi/providers/postal/" />
-  <LinkCard title="Kiểm tra vị trí thư bằng hộp thư thử" href="/vi/deliverability/placement-tests/" />
+  <LinkCard title="Theo dõi lần gửi và tự động tạm dừng" href="/vi/campaigns/live-monitor/" />
 </CardGrid>

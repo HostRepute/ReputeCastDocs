@@ -8,15 +8,17 @@ uiPath: 'nav.campaigns > campaigns.edit'
 primaryKeyword: Liquid email personalization
 sources:
   - internal/liquid
-  - internal/campaigns/compose.go
+  - internal/campaigns/{compose,personalize}.go
   - internal/contentcheck/contentcheck.go
-  - internal/sending/engine/{render,loop}.go
+  - internal/readiness/personalization.go
+  - internal/sending/engine/{render,loop,render_errors}.go
   - internal/earn/tokens.go
   - internal/referrals/blocks.go
   - internal/recommendations/blocks.go
   - internal/digests/tokens.go
   - internal/audience/lists.go
-  - web/src/features/composer/{CanvasArea,CodeView,PreviewView}.tsx
+  - web/src/features/composer/{CanvasArea,CodeView,PreviewView,LiquidChips,Personalization}.tsx
+  - web/src/features/composer/editor/{liquid,fields}.ts
 sidebar:
   order: 3
 ---
@@ -39,7 +41,21 @@ ReputeCast renders Liquid with the [osteele/liquid](https://github.com/osteele/l
 | Tag                                     | `{% if plan == "pro" %}…{% endif %}`            | The block between the tags when the condition holds.            |
 | Whitespace control                      | `{{- first_name -}}`                            | The value, with the spaces and line breaks around it removed.   |
 
-Variables, filter names and tags are lowercase. Insert a token from the text toolbar with <UiPath path="composer.canvas.insertToken" />; it adds the suggested fallback for you (`there` for `first_name`, `free` for a custom field called `plan`). In the MJML view, the <UiPath path="composer.code.tabTokens" /> tab lists the same tokens; select one to copy it.
+Variables, filter names and tags are lowercase. Insert a token from the text toolbar with <UiPath path="composer.canvas.insertToken" />, or with <UiPath path="composer.write.personalize" /> in Write mode; it adds the suggested fallback for you (`there` for `first_name`, `free` for a custom field called `plan`). In the MJML view, the <UiPath path="composer.code.tabTokens" /> tab lists the same tokens; select one to copy it.
+
+## Tokens on the canvas
+
+In the [composer](/campaigns/composer/), a token shows as a chip with the field's name and its fallback, such as "First name · fallback “there”". The email keeps the Liquid: a chip saves exactly its token. Select a chip to open its <UiPath path="composer.canvas.liquidTitle" /> editor:
+
+- <UiPath path="composer.canvas.liquidField" /> and <UiPath path="composer.canvas.liquidFallback" />, the text shown when the field is empty.
+- How many recipients on the campaign's lists have no value for the field and see the fallback.
+- The sentence as the previewed contact reads it, and as someone without the field reads it.
+- The Liquid it saves as.
+- For a variable that isn't a contact field, a warning with "Did you mean …?" and a button that uses the suggestion.
+
+<UiPath path="composer.canvas.liquidDone" /> applies your changes; <UiPath path="composer.canvas.liquidRemove" /> takes the token out of the text.
+
+Other filters on a token, such as `capitalize`, stay as you wrote them.
 
 ## Variables
 
@@ -152,18 +168,20 @@ Values are inserted as they are stored, without HTML escaping. Add `| escape` to
 
 | Situation                                              | What happens                                                                                                                                                                                                 |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| The contact has no value                               | The token prints nothing, or its fallback. The composer's preview notes how many recipients have no first name and see the fallback.                                                                       |
-| A token isn't a known field and has no fallback        | The composer warns "`{{ key }}` isn't a contact field; it prints nothing". Check the spelling, or add a fallback.                                                                                             |
-| A syntax error (an unclosed tag, `include`, a typo in a tag) | The composer shows a Block naming the part (Subject, Preheader or Body) and the line. A send can't start while the personalization doesn't render. See [fix content warnings](/campaigns/content-checks/). |
-| A filter name that doesn't exist                       | The syntax check doesn't catch it. The preview shows the failing part as raw text with the error, and at send time each message that uses it fails. Check filter names against the table above.          |
-| The rendered email is larger than 4 MB                 | The message fails with "the rendered email is larger than 4 MB".                                                                                                                                            |
+| The contact has no value                               | The token prints nothing, or its fallback. The chip's editor and the preview's <UiPath path="composer.preview.personalization" /> card say, for each field, how many recipients on the campaign's lists have no value (recipients who come only from segments aren't counted). [Send Readiness](/campaigns/send-readiness/) warns, with the count, about a first-name token without a fallback. |
+| A token isn't a contact field                          | The composer flags it, for example "frist_name isn't a contact field (did you mean first_name?)", with a button that replaces it everywhere in the subject, preheader and email. It is flagged even with a fallback, because everyone would see the fallback. Send Readiness warns. |
+| A syntax error (an unclosed tag, `include`, a typo in a tag) | The composer shows a Block naming the part (Subject, Preheader or Body) and the line, and Send Readiness blocks: a send can't start while the personalization doesn't render. A Block can't be dismissed. See [fix content warnings](/campaigns/content-checks/). |
+| A filter name that doesn't exist                       | The syntax check doesn't catch it. The preview shows the failing part as raw text with the error, and at send time each message that uses it fails as described in the next row. Check filter names against the table above. |
+| A recipient's own data breaks the render (a value of an unexpected type for a filter, an output too large) | That recipient's message fails with the error and everyone else keeps getting the email. The send raises one notice, on the [live monitor](/campaigns/live-monitor/) and to the members who can send, that counts the failed recipients and shows a few of them, with their addresses masked. It notifies once; later failures are added to the same notice. |
+| The rendered email is larger than 4 MB                 | The message fails with "the rendered email is larger than 4 MB", as in the row above.                                                                                                                       |
 | A `for` loop over a literal range of more than 1,000 items | A syntax error: loops over a range are limited to 1,000 items.                                                                                                                                            |
 
 ## Notes
 
 - <UiPath path="composer.preview.previewAs" /> in the preview fills every token for a real contact, a contact without a first name, or a random Active contact; the <UiPath path="composer.preview.personalization" /> card lists each token with its value. Real contacts need `subscribers:view`. See [design emails in the composer](/campaigns/composer/#preview-the-email).
+- A test sent from the preview is personalized as the <UiPath path="composer.preview.previewAs" /> contact; a test sent from the editor, as the audience's first contact.
 - Tokens work in link addresses too, for example `https://example.com/welcome?ref={{ email | url_encode }}`. The content checks skip links that contain `{{` or `{%`.
-- A preview takes a contact's first name up to the first space; the send uses the first name as stored.
+- Previews and test sends fill `first_name` and `last_name` from the contact's own fields, as the send does.
 
 <Aside type="note">
   Liquid in the email runs on your server for every recipient. Keep loops short: ReputeCast caps the output at 4 MB per
