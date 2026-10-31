@@ -9,7 +9,12 @@ primaryKeyword: Yahoo TSS04
 sources:
   - internal/providers/bounce/bounce.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
   - internal/sending/engine/analysis.go
+  - internal/ingest/normalize.go
   - internal/readiness/assemble.go
   - internal/reports/bounces.go
   - web/src/features/senders/providers.messages.ts
@@ -58,22 +63,27 @@ Source: [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yaho
 - While the sending provider retries, each refused attempt is a [deferral](/reference/glossary/#deferral): a
   <UiPath path="providers.events.optionDeferred" /> event in the event log. Deferrals don't appear in the campaign
   report's bounces table.
-- Deferrals count toward the Yahoo mailbox provider's deferral rate during a send. Above 5.0% (fixed; it counts after
-  500 messages to Yahoo and at least 5 deferrals, with about 90% confidence), ReputeCast
+- Every workspace starts with a [reply rule](/reference/glossary/#reply-rule) for this code: when 10 Yahoo replies
+  contain `TSS04` within 10 minutes, ReputeCast pauses Yahoo for 2 hours on every route, before any rate threshold. A
+  second default rule does the same for the older `TS04`. The rest of the send keeps going, and Yahoo resumes by itself
+  after the 2 hours. Change or turn off the rules in [traffic rules](/providers/traffic-rules/).
+- Deferrals and soft bounces also count toward Yahoo's deferral thresholds, each message once, over the last 10 minutes.
+  At 15% of the mail sent to Yahoo, ReputeCast slows Yahoo to half rate; at 40% it
   [auto-pauses](/reference/glossary/#auto-pause) the Yahoo share of the campaign, or the whole campaign when the pause
-  scope is set to the campaign.
+  scope is set to the campaign. Each level waits for 500 messages to Yahoo in that time and at least 5 deferrals.
 - If the sending provider stops retrying, the [bounce class](/reference/glossary/#bounce-class) is `reputation`, from
-  the `TSS04` tag, and the report row is <UiPath path="reports.bounceType.blocked" />. A bounce with a 4xx reply is
-  recorded as a soft bounce and doesn't suppress the address, unless the sending provider itself calls it permanent
-  (see [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address)).
+  the `TSS04` tag, and the report row is <UiPath path="reports.bounceType.blocked" />. A block for the sender's
+  reputation never suppresses the address, even when the sending provider calls it permanent (see
+  [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address)).
 - When a sending provider passes only `421 4.7.0` without the tag, the class is `temporary`
   (<UiPath path="reports.bounceType.deferralExpired" />).
 
 ## Before you begin
 
 - `providers:view` to read the event log.
-- `providers:manage` to change the throttles in <UiPath path="nav.settings > settings.providers" />.
-- `campaigns:send` to resume an auto-paused send.
+- `providers:manage` to change the throttles in <UiPath path="nav.settings > settings.providers" /> and the reply rules
+  in <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` to resume an auto-paused send or change its rates.
 
 ## Bring the deferrals down
 
@@ -84,8 +94,9 @@ Source: [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yaho
    Yahoo recipient. <UiPath path="providers.events.colCode" /> shows the `[TSS04]` tag and the IP address Yahoo
    deferred.
 2. Slow down to Yahoo. By default ReputeCast throttles Yahoo to 4 messages per second on every route; lower it in
-   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />. During an auto-paused send,
-   the [live monitor](/campaigns/live-monitor/) recommends a lower rate for the Yahoo share; resume with that change.
+   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />. During a send, lower the Yahoo
+   rate with <UiPath path="live.adjustRates" /> on the [live monitor](/campaigns/live-monitor/). After an auto-pause,
+   the live monitor recommends a lower rate for the Yahoo share; resume with that change.
 3. Bring complaints down. Send only to contacts who asked for your mail, exclude those who stopped opening
    ([keep your list healthy](/audience/list-health/)), and keep
    [one-click unsubscribe](/deliverability/one-click-unsubscribe/) working so readers leave instead of reporting spam.
@@ -98,15 +109,16 @@ Source: [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yaho
 
 ## Check that it worked
 
-- The live monitor's Yahoo deferral rate stays low during the next send.
+- The live monitor's Yahoo deferral rate stays low during the next send, and its
+  <UiPath path="live.model.thresholdReplies" /> row shows the `TSS04` rule well under its count.
 - The event log shows delivered events for Yahoo recipients instead of new `[TSS04]` deferrals.
 
 ## Troubleshooting
 
-- **The send keeps pausing on Yahoo.** Resume the Yahoo share at the lower rate the live monitor recommends, and lower
-  the Yahoo throttle for future sends.
+- **The send keeps pausing on Yahoo.** When the `TSS04` rule paused it, let Yahoo resume by itself after 2 hours, or
+  resume it at a lower rate with <UiPath path="live.adjustRates" />. Lower the Yahoo throttle for future sends.
 - **Yahoo complaints are high.** Read [bounces, complaints and provider limits](/deliverability/bounces-and-complaints/);
-  by default a running send auto-pauses when a mailbox provider's complaint rate passes 0.10%.
+  by default a running send auto-pauses Yahoo when its complaint rate passes 0.10%.
 - **You send from a shared IP address.** Yahoo's Sender Hub notes that on a shared IP address, mail from other domains
   can hurt your IP reputation, and suggests asking your provider for dedicated IP addresses. A new dedicated IP address
   needs a warm-up plan.

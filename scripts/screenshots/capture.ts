@@ -355,8 +355,10 @@ async function main(): Promise<void> {
     const groups = Map.groupBy(demo, (s) => JSON.stringify(s.demoSend))
     for (const [key, list] of groups) {
       const d = JSON.parse(key) as NonNullable<Shot['demoSend']>
-      console.log(`Demo send "${d.campaign}" (${d.scenario}, ${d.elapsed}) …`)
-      await reputecast(u, ['demo', 'send', d.campaign, '--scenario', d.scenario, '--elapsed', d.elapsed, '--reset'])
+      console.log(`Demo send "${d.campaign}" (${d.scenario}, ${d.elapsed}${d.canary ? `, canary ${d.canary}` : ''}) …`)
+      const args = ['demo', 'send', d.campaign, '--scenario', d.scenario, '--elapsed', d.elapsed]
+      if (d.canary) args.push('--canary', d.canary)
+      await reputecast(u, [...args, '--reset'])
       database = 'changed'
       await sleep(5_000)
       await captureAll(list)

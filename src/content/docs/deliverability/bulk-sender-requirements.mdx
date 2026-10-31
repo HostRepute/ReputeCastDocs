@@ -7,6 +7,8 @@ primaryKeyword: Gmail Yahoo bulk sender requirements
 sources:
   - internal/readiness/assemble.go
   - internal/readiness/gather.go
+  - internal/readiness/infra.go
+  - internal/providers/manage/usage.go
   - internal/sending/engine/loop.go
   - internal/contentcheck/contentcheck.go
   - internal/dnscheck/rdns.go
@@ -55,13 +57,13 @@ email campaign, whatever its size, so the rules it covers are already in place w
 | ------------------------------------------ | ------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | SPF and DKIM                               | Both; SPF or DKIM for smaller senders       | Both; SPF or DKIM for smaller senders                      | SPF must pass, DKIM must pass                  | [Send Readiness](/campaigns/send-readiness/), Authentication: blocks when SPF doesn't authorize the sending provider or DKIM isn't verified ([set them up](/deliverability/spf-dkim-dmarc/)) |
 | DKIM key of 1024 bits or more              | Required                                    | Recommended                                                | —                                              | Authentication: warns when a key is shorter than 1024 bits                                                                                                                                    |
-| DMARC record, at least `p=none`            | Required                                    | Required, and DMARC must pass                              | Required                                       | Authentication: blocks without a valid DMARC record. Compliance, bulk-sender row: warns as well                                                                                              |
+| DMARC record, at least `p=none`            | Required                                    | Required, and DMARC must pass                              | Required                                       | Authentication: blocks without a valid DMARC record, and when mail through a sending provider can't pass DMARC. Compliance, bulk-sender row: warns as well                                  |
 | From domain aligned with SPF or DKIM       | Required                                    | Required; relaxed alignment is enough                      | Required; both preferred                       | Authentication: warns when under 90% of mail aligned in the last 7 days of [DMARC reports](/deliverability/dmarc-reports/), and when the return path keeps SPF from aligning           |
-| One-click unsubscribe (RFC 8058)           | Required for marketing mail                 | Required for marketing mail; POST recommended, mailto accepted | Not required; a working unsubscribe link is recommended | Added to every Broadcast and Automation message. Compliance: passes with the headers, warns when the public URL isn't HTTPS ([how it works](/deliverability/one-click-unsubscribe/)) |
+| One-click unsubscribe (RFC 8058)           | Required for marketing mail                 | Required for marketing mail; POST recommended, mailto accepted | Not required; a working unsubscribe link is recommended | Added to every Broadcast and Automation message. Compliance: passes with the headers, warns when the public URL isn't HTTPS or a sending provider doesn't sign the headers with DKIM ([how it works](/deliverability/one-click-unsubscribe/)) |
 | Visible unsubscribe link in the body       | Required                                    | Required; it may lead to a preference page                 | Recommended                                    | Compliance, footer: blocks when the body has no unsubscribe link or postal address                                                                                                          |
 | Unsubscribes honored quickly               | Within 48 hours                             | Within 2 days                                              | —                                              | Not a check: a one-click unsubscribe takes effect in the same request                                                                                                                         |
-| Spam rate                                  | Below 0.3% in Postmaster Tools; aim below 0.1% | Below 0.3%                                              | No number published                            | Compliance, bulk-sender row: warns at 0.1%, blocks at 0.3%. While sending, [auto-pause](/campaigns/live-monitor/) at 0.10%                                                                   |
-| Forward and reverse DNS (PTR) for sending IPs | Required                                 | Required                                                   | —                                              | Not in Send Readiness. [Deliverability health](/deliverability/health/) shows reverse DNS for dedicated IPs                                                                                  |
+| Spam rate                                  | Below 0.3% in Postmaster Tools; aim below 0.1% | Below 0.3%                                              | No number published                            | Compliance, bulk-sender row: the route's complaint rate and Gmail's spam rate from Postmaster Tools each warn at 0.1% and block at 0.3%; Google's Compliant or Needs work status shows there too. While sending, [auto-pause](/campaigns/live-monitor/) at 0.10% |
+| Forward and reverse DNS (PTR) for sending IPs | Required                                 | Required                                                   | —                                              | Sender reputation: blocks when a dedicated IP on the route has no reverse DNS, or one that doesn't resolve back to it. [Deliverability health](/deliverability/health/) shows it too. Shared IPs are the sending provider's |
 | TLS for the connection                     | Required                                    | —                                                          | —                                              | Not checked. The sending provider, or your SMTP server, makes the connection                                                                                                                 |
 | Message format (RFC 5322)                  | Required                                    | RFC 5321 and RFC 5322                                      | —                                              | Not a separate check: ReputeCast and the sending provider build the message                                                                                                                  |
 | Valid From and Reply-To that accept replies | —                                          | —                                                          | Recommended                                    | Not checked beyond Authentication blocking a campaign without a sender                                                                                                                        |
@@ -76,22 +78,33 @@ its [FAQ](https://support.google.com/a/answer/14229414),
 ### How the Send Readiness checks decide
 
 - **Authentication** checks the stored DNS records of the campaign's sending domain against what each sending
-  provider in the route needs. A missing SPF authorization, unverified DKIM or a missing or invalid DMARC record is a
-  Block: the send can't start.
+  provider in the route needs. A missing SPF authorization, unverified DKIM, a missing or invalid DMARC record, or a
+  provider whose mail can't align with DMARC is a Block: the send can't start. A DNS lookup that fails is Unknown, not a
+  Block.
 - **Compliance** has three rows. "One-click unsubscribe headers present" passes when the instance's public URL uses
-  HTTPS. The footer row looks for an unsubscribe link and a postal address in the compiled email. The bulk-sender row
-  passes as "Bulk-sender requirements met" when DMARC is valid and the complaint rate is under 0.1%.
-- **The complaint rate** in the bulk-sender row is the 7-day complaint rate that the sending providers of the route
-  report, weighted by recipients. It isn't Gmail's spam rate from Postmaster Tools, which ReputeCast shows on the
-  Health page when [HostRepute](/deliverability/hostrepute/) is connected.
+  HTTPS and every sending provider of the route signs the headers with DKIM. The footer row looks for an unsubscribe
+  link and a postal address in the compiled email of every version. The bulk-sender row passes as "Bulk-sender
+  requirements met" when DMARC passes and the complaint rate is under 0.1%.
+- **The complaint rate** in the bulk-sender row is the 7-day complaint rate of the route's sending providers, weighted
+  by recipients, and counts only mail delivered to mailbox providers that report complaints. Gmail and iCloud never
+  report them, so their mail is left out of the rate; with no reporting mail the row says the rate isn't measured yet.
+- **Gmail's spam rate** comes from Google Postmaster Tools, a day late, when [HostRepute](/deliverability/hostrepute/)
+  brings Postmaster data for the sending domain (or its parent). It warns and blocks at the same levels.
+- **Gmail Postmaster's compliance status** shows on the bulk-sender row when Postmaster has data for the domain:
+  "Gmail Postmaster: Compliant (yesterday)", or "Needs work", which warns, when Google measured SPF, DKIM, DMARC or TLS
+  under 98% of mail or a spam rate of 0.3% or more. Yahoo has no such report, so the row also lists the same rules
+  ReputeCast checks itself: DMARC aligned, one-click unsubscribe and the complaint rate. Without Postmaster data the row
+  says Gmail Postmaster isn't connected, with <UiPath path="readiness.fix.connectPostmaster" />, or that it has no data for the domain yet; Google
+  reports only domains with enough Gmail volume.
 
 <Screenshot
   id="review-send"
-  alt="Review and send for Weekly Digest #142: scheduled for 31,604 recipients through SES and Postal, with Sender reputation and Authentication checks listed and the audience after exclusions on the right."
+  alt="Review & send for Weekly Digest #142, scheduled for Sunday 1 Nov at 09:00 New York time to 31,192 recipients via SES and Postal, with tiles for the time left, the A/B test, auto-pause and who scheduled it. Needs attention · 2 lists a workspace rule about UTM tags and a Postal IP listed on UCEPROTECT, each with its fixes and what they change; on the right, the audience leaves out 412 unengaged contacts, with Include them, and the route breakdown follows."
 >
-  1. The verdict. This campaign is scheduled, and the checks run again before it starts.
-  2. The check groups, starting with sender reputation and authentication; compliance follows further down.
-  3. The audience after the suppression list, role addresses and duplicates are removed.
+  1. The status banner. This campaign is scheduled, and the checks run again before it starts.
+  2. Needs attention: the warnings and blocks, such as a bulk-sender rule, each with its fix and
+     <UiPath path="review.technicalDetails" />. Passed checks, compliance included, fold into a card below.
+  3. The audience after the suppression list, role addresses, duplicates and unengaged contacts are removed.
   4. The actions for the scheduled send.
 </Screenshot>
 

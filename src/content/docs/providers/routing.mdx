@@ -8,11 +8,14 @@ uiPath: 'nav.providers > providers.tabRouting'
 primaryKeyword: email failover multiple providers
 sources:
   - internal/routing
+  - internal/mailbox
+  - internal/providers/state/vet.go
   - internal/sending/engine/audience.go
   - internal/providers/manage/health.go
   - internal/connect/streams.go
   - web/src/features/providers/RoutingPage.tsx
   - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing-model.ts
   - web/src/features/providers/routing.messages.ts
 sidebar:
   order: 15
@@ -21,6 +24,7 @@ sidebar:
 import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
 import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
 
 Routing decides which [sending provider](/reference/glossary/#sending-provider) delivers each email: per stream, by list,
 sender domain or the recipient's mailbox provider, with weighted splits and a fallback. This page sets up routes and
@@ -39,61 +43,88 @@ Each email belongs to one of four [streams](/reference/glossary/#stream): Broadc
 recipient, ReputeCast:
 
 1. Takes the stream's rules.
-2. Checks the stream's conditions in order. The first one that matches decides the provider.
+2. Checks the stream's conditions in order. The first one that matches decides: it sends to one provider, or through a
+   weighted split of its own.
 3. If no condition matches, uses the stream's default route: the primary provider, or a
-   [weighted split](/reference/glossary/#weighted-split). A split puts each address in one of 100 buckets from a hash of
-   the address, so the same recipient always lands on the same provider.
+   [sticky split](/reference/glossary/#sticky-split). Each provider of the split scores the address with a hash of the
+   address and the provider, scaled by its weight, and the highest score wins. So the same recipient keeps the same
+   provider from send to send, the order of the split changes nothing, and raising one provider's weight moves only
+   about the difference to it; nobody else changes provider.
 4. Checks the shared suppression list. A suppressed address gets nothing, whichever provider it was routed to.
-5. If the chosen provider can't take mail, applies the stream's failover policy.
+5. If the provider is [warming up](/providers/warm-up/), applies its plan: the day's engagement tiers and cap, with
+   what's over going through a warm provider of the route or waiting for the next day's cap.
+6. If the chosen provider can't take mail, applies the stream's failover policy. Mail only moves to a fallback that
+   passes its checks: available, terms that allow the stream's mail, a verified sending domain, enough quota and out of
+   the sandbox. A fallback that is still warming up only takes mail when the policy accepts it.
 
-The mailbox provider (Gmail, Outlook, Yahoo, iCloud or Other) comes from the contact's mail server records when the
-contact exists, and from the address's domain otherwise.
+The [mailbox provider](/reference/glossary/#mailbox-provider) (Gmail, Outlook, Yahoo, iCloud or Other) comes from the
+address's domain. Consumer domains such as `gmail.com` are known by name; a company's own domain is classified from its
+MX records: Google Workspace counts as Gmail, Microsoft 365 as Outlook, Yahoo-hosted domains as Yahoo and iCloud custom
+domains as iCloud, and the hosting is kept as a detail. A background sweep looks up new contacts' domains, and a send
+looks up what's still waiting before it builds its audience. An address whose domain hasn't been looked up yet counts
+as Other.
 
 ## Set up the routes
 
 <Steps>
 
-1. Open <UiPath path="nav.providers > providers.tabRouting" />. There is one card per stream.
+1. Open <UiPath path="nav.providers > providers.tabRouting" />. There is one card per stream, with the route tester and
+   the settings shared across providers beside them.
 
    <Screenshot
      id="providers-routing"
-     alt="Routing and failover for Broadcasts: Amazon SES as primary with a 90/10 weighted split to Postal, two conditions, the failover policy set to pause and ask, and the route tester answering Amazon SES for an Outlook address."
+     alt="Routing and failover for Broadcasts: a sticky 90/10 weighted split between Amazon SES and Postal, which is warming up on day 9 of 21, two conditions (one sends to Amazon SES only, the other to a 70/30 split), and the route tester answering Amazon SES for an Outlook address step by step."
    />
 
-2. For each stream, pick the <UiPath path="providers.routing.primary" /> and, if you have a second provider, the
-   <UiPath path="providers.routing.fallback" />. The fallback takes over when the primary is down; it can't also be part
-   of the split.
+2. For Automations, System and Transactional, pick the <UiPath path="providers.routing.primary" /> and, if you have a
+   second provider, the <UiPath path="providers.routing.fallback" />. The fallback takes over when the primary can't
+   take mail.
 
-3. Adjust a <UiPath path="providers.routing.weightedSplit" /> if the stream has one. Splits are created when you connect a
-   provider and give it the Weighted split role on the Streams step (Broadcasts only). Here you change each provider's
-   share; the primary gets the rest. Set a share to 0 to take the provider out of the split. While a provider in the
-   split [warms up](/providers/warm-up/), the warm-up planner raises its share on schedule and the card says when.
+3. For Broadcasts, set the <UiPath path="providers.routing.weightedSplit" />. Each row is a provider with its share in
+   percent; the shares must add up to 100% before you can save. <UiPath path="providers.routing.addToSplit" /> adds a
+   connected provider; a provider set to 0% can leave the split. Drag a row, or use its up and down arrows from the
+   keyboard, to reorder it: the order only changes how the bar reads, and nobody changes provider. While a provider in
+   the split [warms up](/providers/warm-up/), the warm-up planner raises its share on schedule and the card lists the
+   planned steps.
 
-4. Add conditions where one kind of mail should always use one provider: <UiPath path="providers.routing.addCondition" />.
-   Broadcasts and Automations can match on the list, the sender domain or the recipient's mailbox provider;
-   Transactional matches on the transactional category or the mailbox provider. System mail has no conditions. Each
-   condition sends to exactly one provider, and what you type under <UiPath path="providers.routing.why" /> is shown next
-   to it, for example "Outlook and iCloud are strict with new IPs".
+4. Add conditions where one kind of mail should always use certain providers:
+   <UiPath path="providers.routing.addCondition" />. Broadcasts and Automations can match on the list, the sender domain
+   or the recipient's mailbox provider; Transactional matches on the transactional category or the mailbox provider.
+   System mail has no conditions. Under the condition's provider, choose <UiPath path="providers.routing.thenOne" />, or
+   <UiPath path="providers.routing.thenSplit" /> with a share per provider (a sticky split too). What you type under
+   <UiPath path="providers.routing.why" /> is shown next to the condition, for example "Outlook is strict with new IPs".
 
-5. Choose the Broadcasts <UiPath path="providers.routing.failoverPolicy" />:
-   - **Pause and ask** (the default): if the primary fails during a send, the remaining recipients are held and you are
-     notified. Moving a bulk send to a cold provider can hurt its reputation.
-   - <UiPath path="providers.routing.warmOnly" />: moves the send to the fallback automatically once the fallback has
-     finished its warm-up; until then, it behaves like pause and ask.
+5. Set the Broadcasts <UiPath path="providers.routing.failoverPolicy" />. The card states the trigger the health check
+   really uses: at least half of the calls to the provider fail over 3 minutes (5 calls or more), or 2 health checks in a
+   row fail. Silent webhooks alone raise an alarm, not a failover. Pick the
+   <UiPath path="providers.routing.fallback" />, then what happens when the trigger fires
+   (<UiPath path="providers.routing.whenTriggerFires" />):
+   - <UiPath path="providers.routing.pauseAndAsk" />: the remaining recipients are held and you are asked. Moving a bulk
+     send to a cold provider can hurt its reputation.
+   - <UiPath path="providers.routing.warmOnly" />: the send moves on its own once the fallback has finished its warm-up;
+     until then, it behaves like pause and ask.
    - <UiPath path="providers.routing.automatic" />.
 
-   Automations, System and Transactional mail fail over to their fallback automatically, because it must keep going
-   out. Without a fallback, it waits until the provider recovers.
+   Under the policy, the card lists the checks the fallback must pass before any failover, each with a mark: available,
+   terms that allow Broadcasts, sending domain verified, quota or today's warm-up cap left, warm, and not in the
+   sandbox. If any check fails, Broadcasts pause and ask instead.
 
-6. For Transactional mail, <UiPath path="providers.routing.firstInLine" /> makes transactional messages go first on a
+6. Automations, System and Transactional mail fail over to their fallback automatically, because it must keep going
+   out; each card names its trigger, and traffic returns to the primary after 10 healthy minutes. Before the fallback
+   takes over, it passes the same checks. If a check fails, ReputeCast keeps retrying the primary and alerts you instead
+   of switching. Without a fallback, the mail waits until the provider recovers.
+
+7. For Transactional mail, <UiPath path="providers.routing.firstInLine" /> makes transactional messages go first on a
    provider that also sends a campaign, within the provider's rate.
 
-7. Try a few addresses in the <UiPath path="providers.routing.testerTitle" />: pick the stream, a list, a sender domain
-   (or a transactional template) and type a recipient. It answers with the provider, the mailbox provider, the DKIM
-   selector, the cost of one message, each step of the decision and what happens if the provider fails. It tests your
-   unsaved changes.
+8. Check your changes before saving. As soon as you change something, a bar stays at the bottom of the page under
+   <UiPath path="providers.routing.unsavedTitle" />. It says what saving changes for each stream, for example "Broadcasts
+   split 90/10 → 85/15 · about 1,600 Broadcast recipients move from SES to Postal; nobody else changes provider", and for
+   the other streams the share of their addresses (from the last 30 days) that would move. Every changed stream card carries an Unsaved change
+   badge.
 
-8. Choose <UiPath path="providers.routing.saveRouting" />. New sends use the routing right away; sends already in
+9. Choose <UiPath path="providers.routing.saveRouting" />, or <UiPath path="providers.routing.discard" /> to go back to
+   the saved routing. Only the streams you changed are saved. New sends use the routing right away; sends already in
    progress keep their route.
 
 </Steps>
@@ -102,38 +133,73 @@ On a phone, the stream cards stack and the route tester follows them:
 
 <Screenshot
   id="providers-routing-mobile"
-  alt="The routing page on a phone: the Broadcasts card with its primary, fallback, weighted split and the first condition, above the bottom tab bar."
+  alt="The routing page on a phone: the Broadcasts card with its sticky weighted split, each provider's share with up and down arrows, the planned warm-up steps for Postal and the first condition."
 />
 
 <Aside type="caution">
-Before it saves, ReputeCast checks that every Broadcasts provider's terms allow bulk marketing. If one doesn't, it offers
-a fix (create a Postmark Broadcast stream, use another provider or save without a fallback). Keeping it anyway is
-recorded in the audit log, and [Send Readiness](/campaigns/send-readiness/) blocks every broadcast until the route
-changes. Read [Choose a sending provider](/providers/choose/#bulk-marketing-terms).
+Before it saves, ReputeCast checks that every Broadcasts provider's terms allow bulk marketing. If one doesn't, it shows
+the change and its warning and offers a fix (create a Postmark Broadcast stream, use another provider or save without a
+fallback); your other edits stay while you fix it. Keeping it anyway is recorded in the audit log, and
+[Send Readiness](/campaigns/send-readiness/) blocks every broadcast until the route changes. Read
+[Choose a sending provider](/providers/choose/#bulk-marketing-terms).
 </Aside>
+
+## Test a route
+
+The <UiPath path="providers.routing.testerTitle" /> tests the saved routing and, while you have unsaved changes, says
+what they would change.
+
+- **<UiPath path="providers.routing.tabRecipient" />**: pick the stream, a list and a sender domain (or a transactional
+  template) and type an address. It answers with the provider, the mailbox provider and the MX host it was found from,
+  the DKIM selector, the cost of one message, each step of the decision (the condition that matched, or the bucket the
+  address hashes to in a split of two) and what happens if the provider fails. With an unsaved split, it adds whether
+  this address stays on its provider or moves.
+- **<UiPath path="providers.routing.tabCampaign" />**: runs the audience of the next broadcast (the next scheduled one, or
+  the draft edited last) through the routing on its send day. It shows the recipients per provider, the conditions that matched, the
+  sunset contacts left out, and what the send would do: recipients outside a warming provider's engagement tiers or over
+  its cap going through a warm provider, recipients held by the cap until the next day's cap or while the plan is
+  paused, and where a provider that can't send now would put its share. With unsaved changes, it says how many
+  recipients move. A large audience is estimated from its first recipients and scaled.
+
+## Defaults and limits
+
+<LimitsTable area="routing" />
 
 ## Check that it worked
 
 - The page header shows when routing was saved and by whom.
 - <UiPath path="nav.providers > providers.tabProviders" /> shows the routing per stream as a bar with each provider's
   share, the fallback and the failover policy.
-- The route tester gives the provider you expect for an address on each list and mailbox provider that has a condition.
+- The route tester gives the provider you expect for an address on each list and mailbox provider that has a condition,
+  and its Campaign tab shows the split you planned.
 - During a send, the [live monitor](/campaigns/live-monitor/) shows each provider's share of the campaign.
 
 ## Troubleshooting
 
-- **"The Broadcasts split adds up to 95%; it must add up to 100%"**: change a share so the total is 100.
-- **"A provider appears twice in the split"** or **"The fallback is already part of the split"**: pick another provider,
-  or none, as the fallback.
+- **"Weights add up to 95%. Make them 100% to save."**: change a share so the total is 100. The same rule applies to a
+  condition's split.
+- **"Broadcasts changed while you were editing"**: someone saved the routing, or the warm-up planner raised a share,
+  since you opened the page. Nothing was saved and your edits are still there. Choose
+  <UiPath path="providers.routing.conflictShowLatest" /> to start again from the latest routing, or
+  <UiPath path="providers.routing.conflictKeepMine" />. A change to another stream never blocks your save. Through the
+  [save-routing API operation](/api/operations/save-routing/), each stream is saved with the version it was read at, and a stale one is refused with `409` and the code
+  `routing_changed`.
+- **"Couldn't refresh the routing"**: a background refresh failed. Your edits stay on the page, and mail keeps going out
+  on the saved routing.
 - **"Broadcasts has no primary provider"**: every stream except Transactional needs a primary. Transactional can stay
   without a route while your product sends no mail.
-- **A warning that the fallback is warming up**: moving a broadcast to a provider that is still warming up can hurt its
-  reputation. With the warmed-up-only policy, Broadcasts don't fail over to it until its warm-up ends; with Automatic,
-  they do. The warning doesn't stop the save.
-- **The route tester says the email would wait**: the provider is down or its webhooks are silent, so its share waits
-  for it or for the fallback. Read [Provider health and outages](/providers/health-and-outages/).
+- **A stream card says a provider "can't take mail right now"**: a provider the route uses is down, paused or its
+  webhooks are silent. Its mail fails over or waits as the policy says; when it is the fallback, the stream has no
+  working fallback until it's back. Read [Provider health and outages](/providers/health-and-outages/).
+- **A warning that the fallback is warming up**: the warm-up guard blocks failover to it until the day the warning
+  names. With the
+  warmed-up-only policy, Broadcasts pause and ask meanwhile.
+- **The tester says the email would wait**: the provider is down or its webhooks are silent, so its share waits for it
+  or for the fallback.
 - **The tester says the address is suppressed**: nothing is sent to it on any provider. Read
   [The suppression list](/audience/suppressions/).
+- **A Google Workspace or Microsoft 365 address shows as Other**: its domain hasn't been looked up yet, or the server
+  can't reach DNS. Read [System requirements](/self-hosting/requirements/).
 
 ## Related
 

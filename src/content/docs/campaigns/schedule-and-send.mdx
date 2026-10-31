@@ -1,6 +1,6 @@
 ---
 title: Schedule and send a campaign
-description: "Schedule email campaign sends in ReputeCast for now, a time in any time zone or each contact's best time, then confirm warnings and the recipient count."
+description: 'Schedule email campaign sends in ReputeCast for now, a time in any time zone or each contact''s best time, then confirm warnings, the canary and the count.'
 type: how-to
 audience: [publisher]
 permissions: ['campaigns:send']
@@ -8,10 +8,14 @@ uiPath: 'nav.campaigns > composer.reviewSend'
 primaryKeyword: schedule email campaign
 sources:
   - internal/approvals/send.go
+  - internal/approvals/jobs.go
   - internal/approvals/policy.go
   - internal/approvals/review.go
+  - internal/readiness/confirm.go
+  - internal/readiness/sendtime.go
   - internal/readiness/settings.go
   - internal/sending/engine/audience.go
+  - internal/sending/engine/canary.go
   - internal/store/queries/sending.sql
   - web/src/features/review
 sidebar:
@@ -22,46 +26,56 @@ import { Aside, Steps } from '@astrojs/starlight/components'
 import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
 
-To schedule an email campaign, or send it at once, you open its <UiPath path="composer.reviewSend" /> page, pick when it goes out and confirm what [Send Readiness](/campaigns/send-readiness/) found. ReputeCast checks the campaign again before it starts and guards it with [auto-pause](/reference/glossary/#auto-pause) while it sends.
+To schedule an email campaign, or send it at once, you open its <UiPath path="composer.reviewSend" /> page, pick when it goes out and confirm what [Send Readiness](/campaigns/send-readiness/) found. ReputeCast checks the campaign again at the send time, holds it if something changed that you didn't confirm, and guards it with [auto-pause](/reference/glossary/#auto-pause) while it sends.
 
 ## Before you begin
 
-- Sending or scheduling needs `campaigns:send`. Without it, the send button is disabled and names who can help; when the workspace's approval policy has the "author lacks the send permission" rule on (it is on by default), you can [request approval](/campaigns/approvals/) instead.
+- Sending or scheduling needs `campaigns:send`. Without it, the send button is disabled and names who can send it; when the workspace's approval policy has the "author lacks the send permission" rule on (it is on by default), you can [request approval](/campaigns/approvals/) instead.
 - The campaign has a sender, an audience and content, and Send Readiness isn't Blocked.
 
 ## Send or schedule
 
 <Steps>
 
-1. Open the campaign and select <UiPath path="composer.reviewSend" />. Send Readiness runs if its last result is out of date.
+1. Open the campaign and select <UiPath path="composer.reviewSend" />. Send Readiness runs if its last result is out of date; sending stays locked until it finishes.
 
-2. Fix every blocking issue. The verdict must be Ready or Ready with warnings.
+2. Fix every blocking issue. The verdict must be Ready or Ready with warnings. If some checks couldn't run, retry them or continue without them (see [when checks can't run](/campaigns/send-readiness/#when-checks-cant-run)).
 
-3. Check the <UiPath path="review.thresholdsTitle" /> card. It starts with the workspace defaults; change them for this campaign only if you need to:
+3. Check the <UiPath path="review.audience" /> card. Unengaged contacts are left out by default; select <UiPath path="review.includeThem" /> on their line only if this send should reach them, which adds a warning.
+
+4. Check the <UiPath path="review.thresholdsTitle" /> card. It shows the thresholds this send pauses at, the workspace defaults unless the campaign has its own, and what pauses when one trips. To change them for this campaign only, open <UiPath path="review.changeForThisSend" />:
    - Rates: <UiPath path="review.thresholdBounce" /> (0.1–20%), <UiPath path="review.thresholdComplaint" /> (0.01–5%) and <UiPath path="review.thresholdMailbox" /> (0.01–5%, at most 5 times the complaint rate).
-   - Scope, under <UiPath path="review.whenTrips" />: pause only the affected route or mailbox provider (the default), or pause the whole campaign.
+   - <UiPath path="review.thresholdErrors" />: a route whose failed calls pass this share over three minutes is handled as an outage.
+   - Scope, under <UiPath path="review.whenTrips" />: <UiPath path="review.pauseRoute" /> (the default) or <UiPath path="review.pauseCampaign" />.
 
-   Changes save as you leave a field, and the thresholds are fixed once the send starts. The card's <UiPath path="review.thresholdErrors" /> field doesn't pause anything; a failing sending provider is handled as an outage. See [monitor a send and auto-pause](/campaigns/live-monitor/) for how thresholds are applied.
+   Changes save as you leave a field and are recorded in the campaign's history; the thresholds are fixed once the send starts. See [monitor a send and auto-pause](/campaigns/live-monitor/) for how they are applied.
 
-4. Under <UiPath path="review.scheduling" />, choose when it goes out:
+5. Under <UiPath path="review.scheduling" />, choose when it goes out:
    - Select <UiPath path="review.modeNow" /> to start within a minute of confirming.
    - Select <UiPath path="review.modeAt" /> to pick a date and a time in the <UiPath path="review.timezone" /> you choose. The time zone starts as the workspace's. The earliest time is one minute from now.
    - Select <UiPath path="review.modeBest" /> to send each contact the email at the hour they open email most often, within 24 hours after the time you set. See [how best time works](#how-best-time-works).
 
-5. Select the send button. It names the audience size, for example "Send to 31,604 recipients" or "Schedule send to 31,604 recipients".
+6. Select the main action. It states what it will do, for example "Send now to 31,192", "Schedule for Sun 1 Nov, 09:00 ET" or "Schedule best time from Sun 1 Nov, 09:00 ET". On a phone it sits in a bar at the bottom of the screen.
 
-6. Read the confirmation. It shows the sender, reply-to address, subject, A/B test, route, cost and duration, the auto-pause thresholds and who is excluded (suppressed, role addresses and duplicates).
+7. Read the confirmation. It shows when the send starts and when the checks run again, the sender, reply-to address, subject, A/B test, route, cost and duration (with the time the A/B winner is picked), the auto-pause thresholds and who is excluded (suppressed, role addresses, duplicates and unengaged contacts).
 
-7. Tick each warning to confirm it, for example "I understand 412 unengaged contacts are included." For unengaged contacts you can choose <UiPath path="review.excludeInstead" />.
+8. Choose the <UiPath path="review.canaryLabel" />:
+   - <UiPath path="review.canaryAuto" /> lets the sending engine decide: a new sending domain or IP, contacts never mailed from the domain, or an audience over twice the usual one start with a canary. The hint under the field says what it will do for this send.
+   - <UiPath path="review.canaryOn" /> sends to your most engaged contacts and your [seed mailboxes](/reference/glossary/#seed-mailbox) first, and goes on when their results look healthy.
+   - <UiPath path="review.canaryOff" /> sends to everyone at the route's pace.
 
-8. If the campaign goes to 1,000 recipients or more, type the recipient count under <UiPath path="review.typeToConfirm" />. Large sends can't be recalled once they leave the queue, so this step is deliberate and can't be turned off.
+   See [canary](/reference/glossary/#canary) and the [live monitor](/campaigns/live-monitor/) for how a canary is watched.
 
-9. Select <UiPath path="review.sendNowButton" /> or <UiPath path="review.actionSchedule" />.
+9. Tick each warning to confirm it, for example "I understand 412 unengaged contacts are included." A warning with a one-click fix offers it as a link, such as "Send via SES only instead". Warnings someone dismissed in the composer are listed as already confirmed.
+
+10. If the send is unusual, type the recipient count under <UiPath path="review.typeToConfirm" />. The dialog says why it asks: an audience much larger than usual, a first send to a list, from a sending domain or through a sending provider, or a blocklist listing above low impact. A routine send doesn't ask. The workspace sets "much larger" in [sending rules](/campaigns/sending-rules/#set-the-audience-defaults).
+
+11. Select <UiPath path="review.sendNowButton" /> or <UiPath path="review.actionSchedule" />.
 
 </Steps>
 
 <Aside type="note">
-The "Confirmation for sends over 5,000" setting in workspace sending defaults is saved but not used. The typed confirmation always applies from 1,000 recipients.
+The <UiPath path="senders.providers.confirmOver" /> field in the workspace sending defaults is saved but not used. When a send asks for the typed count follows <UiPath path="nav.settings > settings.sendingRules" />.
 </Aside>
 
 ## How best time works
@@ -74,26 +88,32 @@ ReputeCast looks at each contact's human opens in the last 180 days (machine ope
 
 ## After you confirm
 
-- **Send now:** the send starts and the [live monitor](/campaigns/live-monitor/) opens.
-- **Scheduled:** the banner shows the time, the audience, the route and when the checks run again (15 minutes before the send). If a check turns to Block, the send is held and you are notified. To change the time, select <UiPath path="review.unschedule" />: the campaign goes back to draft (or stays approved), and the checks, settings and approval stay as they are.
+- **Send now:** the send starts and the [live monitor](/campaigns/live-monitor/) opens. A send that starts now relies on checks run in the last 15 minutes; if the run is older, the checks run again first and you send when they finish.
+- **Scheduled:** the banner shows the time, the audience, the route and when the checks run again (15 minutes before the send). To change the time, select <UiPath path="review.unschedule" />: the campaign goes back to draft (or stays approved), and the checks, settings and approval stay as they are.
 
 <Screenshot
   id="review-send"
-  alt="Weekly Digest #142 scheduled for 09:00 New York time to 31,604 recipients via SES and Postal. The banner says checks run again at 08:45."
+  alt="Review & send for Weekly Digest #142, scheduled for Sunday 1 Nov at 09:00 New York time to 31,192 recipients via SES and Postal, with tiles for the time left, the A/B test, auto-pause and who scheduled it. Needs attention · 2 lists a workspace rule about UTM tags and a Postal IP listed on UCEPROTECT, each with its fixes and what they change; on the right, the audience leaves out 412 unengaged contacts, with Include them, and the route breakdown follows."
 >
 
 1. The scheduled banner: time, time zone, audience, route and the next recheck.
-2. The check groups, as they were when you scheduled.
-3. The audience estimate, down to the final recipients.
+2. Needs attention: the warnings you confirmed, with their fixes and <UiPath path="review.technicalDetails" />.
+3. The <UiPath path="review.audience" /> card, down to the final recipients, with <UiPath path="review.includeThem" /> on the unengaged contacts left out.
 4. <UiPath path="review.unschedule" /> to change the time, and <UiPath path="review.openLive" />.
 
 </Screenshot>
 
+### When the send-time recheck holds the send
+
+At the send time, the checks run again and are compared with what you confirmed. The send is held, and nothing goes out, when a check now blocks, a new warning or Unknown appears that nobody confirmed, the audience changed by more than 10%, or the content, audience, sender or route changed after you scheduled it. Review & send then shows <UiPath path="review.heldRecheckTitle" /> with the reason, and you and the approvers are notified.
+
+Select <UiPath path="review.reviewAgain" /> to confirm the send on the fresh checks; a changed audience asks you to type the new count. A held send nobody reviews goes back to Draft 3 hours after its time, with its schedule and A/B test kept. See [held sends](/campaigns/send-readiness/#held-sends).
+
 ## When an approval is needed
 
-If a rule in the workspace's [approval policy](/campaigns/approvals/) matches, the scheduling card shows <UiPath path="review.requiredTitle" /> and the rules that matched. Select <UiPath path="review.requestApproval" /> instead of sending. Once an approver approves, the author schedules it with <UiPath path="review.actionApproved" />; that needs `campaigns:edit`, not `campaigns:send`. Changing the time of an approved campaign invalidates the approval.
+If a rule in the workspace's [approval policy](/campaigns/approvals/) matches, Review & send shows <UiPath path="review.requiredTitle" /> and the rules that matched, named in people's words ("Your role, Content Writer, needs an approval to send: Marcus Chen or Linh Nguyen can approve"). Select <UiPath path="review.requestApproval" /> instead of sending. Once an approver approves, the author schedules it with <UiPath path="review.actionApproved" />; that needs `campaigns:edit`, not `campaigns:send`. Changing the time of an approved campaign invalidates the approval.
 
-Owners can use <UiPath path="review.sendWithoutApproval" /> in an emergency when the policy allows it. They give a reason and, if their account has a password, confirm it. Every approver is notified, and Send Readiness still runs.
+Owners can use <UiPath path="review.moreActions" /> › <UiPath path="review.sendWithoutApproval" /> in an emergency when the policy allows it. They give a reason and, if their account has a password, confirm it, then select <UiPath path="review.sendNowWithout" /> or <UiPath path="review.scheduleWithout" />. Every approver is notified, and Send Readiness still runs.
 
 ## Check that it worked
 
@@ -103,12 +123,15 @@ Owners can use <UiPath path="review.sendWithoutApproval" /> in an emergency when
 
 ## Troubleshooting
 
-- **The send button is disabled with "Sending needs the campaigns:send permission".** Ask one of the people it names, or request approval.
+- **The send button is disabled and says who can send it.** Your role can't send campaigns. Ask one of the people it names, or request approval.
 - **"Pick a time in the future, or send now."** The time you chose is less than a minute away or in the past. Choose a later time.
-- **"The campaign is scheduled. Unschedule it to change when it goes out."** Select Unschedule first, change the time, then schedule again.
-- **"Type 31,604 to confirm the send."** The typed number must match the recipient count. Separators are ignored.
+- **"The campaign is scheduled. Unschedule it to change when it goes out."** Select <UiPath path="review.unschedule" /> first, change the time, then schedule again.
+- **"The checks ran 22 minutes ago, so they run again before a send that starts now."** Wait for the checks to finish, then send.
+- **"Send Readiness ran again since you looked."** The results changed while the confirmation was open. Review the new results and confirm again.
+- **"Type 31192 to confirm the send."** The typed number must match the recipient count. Separators are ignored.
 - **"Confirm each warning before sending."** Tick every warning in the confirmation, or fix them on Review & send.
-- **The scheduled send didn't start.** The recheck before the send turned Blocked and held it. Review & send shows "Send-time recheck turned Blocked"; fix the block and the send starts at the next passing recheck (every 15 minutes), or select Cancel send.
+- **Sending is locked.** The checks are running again, or a fix is being saved. The button says which; it unlocks when they finish.
+- **The scheduled send didn't start.** The send-time recheck held it. Open Review & send, read why, and select <UiPath path="review.reviewAgain" />, or <UiPath path="review.unschedule" />.
 
 ## Related
 

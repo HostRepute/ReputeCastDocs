@@ -1,6 +1,6 @@
 ---
 title: Provider health and outages
-description: What ReputeCast does during an email provider outage, from health checks and Down or Degraded states to automatic failover, held Broadcasts and the switch back.
+description: What ReputeCast does during an email provider outage, from health checks and Down or Degraded states to vetted failover, held Broadcasts and the switch back.
 type: explanation
 audience: [admin]
 permissions: ['providers:view']
@@ -8,10 +8,16 @@ uiPath: 'nav.providers > providers.tabProviders'
 primaryKeyword: email provider outage
 sources:
   - internal/providers/manage/health.go
+  - internal/providers/manage/review_health.go
   - internal/providers/manage/actions.go
+  - internal/providers/manage/usage.go
   - internal/providers/state/state.go
+  - internal/providers/state/vet.go
+  - internal/providers/state/messages/en.json
   - internal/routing/routing.go
+  - internal/sending/engine/outages.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/routeerrors.go
   - web/src/features/providers/messages.ts
   - web/src/features/providers/overview.messages.ts
   - web/src/features/providers/incidents.messages.ts
@@ -26,29 +32,33 @@ import TableScroll from '~/components/TableScroll.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
 ReputeCast checks every connected sending provider in the background and gives it a status. When an email provider
-outage starts, mail that must keep going out moves to its fallback on its own, a campaign's share on the failing
-provider waits for your decision, and traffic switches back once the provider has been healthy for 10 minutes.
+outage starts, mail that must keep going out moves to a fallback that passes its checks, a campaign's share on the
+failing provider waits for your decision, and traffic switches back once the provider has been healthy for 10 minutes.
 
 ## What the statuses mean
 
 <UiPath path="nav.providers > providers.tabProviders" /> shows a card per provider with its status, the streams it
-carries, its webhook freshness, its API error rate, quota and send rate, its cost this month and its capabilities.
+carries, its sending IPs, its webhook freshness, its API error rate, quota and send rate, its cost this month and its
+capabilities.
 
 <Screenshot
   id="providers-list"
-  alt="The providers page: Amazon SES and Postmark are Healthy, each card with the streams it carries, bounce and complaint rates against their limits, quota, send rate and capability chips, and Postal below them is Warming up on day 9 of 21."
+  alt="The providers page: 3 providers connected, 2 Healthy and 1 Warming up. The Amazon SES and Postmark cards are Healthy, each with the streams it carries, its sending IPs, webhooks, API error rate over 7 days, bounce and complaint rates against their limits, quota, send rate, cost and capability chips."
 />
 
 <TableScroll label="Provider statuses">
 
-| Status                                                   | Meaning                                                                                 | Takes new mail          |
-| -------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------- |
-| <UiPath path="providers.statusHealthy" />                | The last checks passed.                                                                 | Yes                     |
-| <UiPath path="providers.statusWarmingUp" /> · day N of M | A [warm-up plan](/providers/warm-up/) is running; its daily cap applies to Broadcasts.  | Yes, up to today's cap  |
-| <UiPath path="providers.statusSandbox" />                | The account can only send to verified addresses, such as the Amazon SES sandbox.        | Only to those addresses |
-| <UiPath path="providers.statusDegraded" /> · webhooks silent | The provider accepts mail but has reported no events for 6 hours.                    | No, until events resume |
-| <UiPath path="providers.statusDown" />                   | Calls are failing, or the provider rejected the credentials ("Down · auth failed").     | No                      |
-| <UiPath path="providers.statusPaused" />                 | The provider is paused.                                                                 | No                      |
+| Status                                                                                       | Meaning                                                                                                                                                                   | Takes new mail                                               |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| <UiPath path="providers.statusHealthy" />                                                    | The last checks passed.                                                                                                                                                   | Yes                                                          |
+| <UiPath path="providers.statusWarmingUp" /> · day N of M                                     | A [warm-up plan](/providers/warm-up/) is running; its daily cap applies to Broadcasts.                                                                                    | Yes, up to today's cap                                       |
+| <UiPath path="providers.statusSandbox" />                                                    | The account can only send to verified addresses, such as the Amazon SES sandbox.                                                                                          | Only to those addresses                                      |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.webhooksSilent" /> | The provider accepts mail but reports no delivery, bounce or complaint events. See [silent webhooks](#silent-webhooks).                                                 | No: Broadcasts wait, other streams use their fallback        |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.rejecting" />    | The provider refuses an unusual share of the messages handed to it, for example for an unverified sender or a suspended account. See [rejecting messages](#rejecting-messages).      | Yes; the refused messages weren't sent                       |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.mailboxFailing" /> | An SMTP server's [bounce mailbox](/reference/glossary/#bounce-mailbox) can't be read, so its bounces don't reach the suppression list.                                 | Yes                                                          |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.queueFailing" /> | Amazon SES's event queue can't be read; its events wait there.                                                                                                            | Yes                                                          |
+| <UiPath path="providers.statusDown" />                                                       | Calls are failing, or the provider rejected the credentials (<UiPath path="providers.health.downAuth" />).                                                                | No                                                           |
+| <UiPath path="providers.statusPaused" />                                                     | The provider is paused.                                                                                                                                                   | No                                                           |
 
 </TableScroll>
 
@@ -56,7 +66,15 @@ The bounce and complaint rates on a card cover the last 7 days (or are the provi
 them). They are shown against the provider account's limits, such as the Amazon SES review and pause levels, so you can
 see how close your account is to them. You can change the limits shown in the provider's
 <UiPath path="providers.overview.settings" />. They are for reference only: the thresholds that pause a send are the
-[workspace sending defaults](/providers/workspace-defaults/).
+[workspace sending defaults](/providers/workspace-defaults/) and the [traffic rules](/providers/traffic-rules/).
+
+A rate without data is never shown as 0%:
+
+- The complaint rate counts only mail delivered to [mailbox providers](/reference/glossary/#mailbox-provider) that
+  report complaints. Gmail and iCloud never do, so a provider whose mail went only there reads "n/a" with the reason,
+  "Gmail and iCloud don't report complaints".
+- With nothing delivered in the last 7 days, the rates read "n/a" too.
+- The API error rate of a provider that had no calls reads <UiPath path="providers.overview.errorRateNoCalls" />.
 
 ## How health is checked
 
@@ -66,8 +84,9 @@ see how close your account is to them. You can change the limits shown in the pr
 2. Real sends count too: every API call during a send is recorded.
 3. A provider is marked **Down** after 2 failed checks in a row, or when at least half of at least 5 calls in the last 3
    minutes failed. A `401` or similar "credentials rejected" answer marks it Down at once.
-4. A provider is marked **Degraded** when it has accepted mail but reported no delivery, bounce or complaint event for 6
-   hours. SMTP servers are exempt because their bounces come from a mailbox.
+4. A provider is marked **Degraded** when its webhooks go silent, when it starts rejecting messages, or when ReputeCast
+   can't read its bounce mailbox or event queue. Each of these opens an incident and notifies the people who manage
+   sending providers.
 5. A Down provider counts as recovered once calls succeed again (fewer than 1 in 10 failing) for 10 minutes. After you
    replace rejected credentials, it recovers at the next successful check.
 
@@ -76,29 +95,36 @@ The outage banner has a button to re-check the provider now instead of waiting f
 ## What happens during an outage
 
 When a provider goes down, ReputeCast handles each stream that routes mail through it, following the stream's
-[failover policy](/providers/routing/):
+[failover policy](/providers/routing/). Mail only moves to a fallback that passes every check first: available, its
+terms allow bulk mail (for Broadcasts), out of sandbox, the sender's domain verified there, enough quota for the mail
+that would move, and warm. A provider that is warming up takes failover mail only under the automatic policy and
+within today's cap.
 
-- **Automations, System and Transactional** switch to the stream's fallback automatically, if the fallback is available.
-  The banner says how many emails were rerouted. Without an available fallback, new mail for the stream waits until the
-  provider recovers.
-- **Broadcasts** follow the Broadcasts policy. With the default, pause and ask, each campaign that is sending through
-  the provider has that provider's share held, while the other shares keep sending. Members who can send campaigns get
-  a notification that the campaign is waiting for a decision. With warmed-up-only or automatic failover, the share moves
-  to the fallback when the policy allows it.
+- **Automations, System and Transactional** switch to the stream's fallback automatically when it passes its checks.
+  The banner says how many emails were rerouted. When the fallback fails a check, ReputeCast keeps retrying the
+  provider instead of switching, and new mail for the stream waits until the provider recovers.
+- **Broadcasts** follow the Broadcasts policy. With the default, pause and ask, each campaign sending through the
+  provider has that provider's share held while the other shares keep sending, and the people who can send campaigns
+  are asked to decide. With warmed-up-only or automatic failover, the share moves to the fallback when the policy
+  allows it and the fallback passes its checks.
 
-For a held Broadcast share, the outage banner on the providers page offers three choices:
+A held share goes through the sending engine's one outage path, whether the health check found the outage or the send
+found it first: its calls failed for 3 minutes, it kept throttling the account, its API errors passed the send's limit,
+or it refused the sender or ran out of quota. Until someone decides, the share tests the provider with one message a
+minute and resumes by itself after 3 go through in a row. The [live monitor](/campaigns/live-monitor/) shows the same
+hold with the engine's analysis and its choices.
 
-- **Wait** for the provider: the share resumes on its own after the provider has been healthy for 10 minutes.
-- **Move** the held recipients to another provider you pick. If that provider is still warming up, ReputeCast warns you
-  when the move would exceed its cap for today.
-- <UiPath path="providers.incidents.cancelSend" />: the held recipients don't get the campaign. What was already sent
-  stays sent. This can't be undone.
+For a held Broadcast share, the outage banner on the providers page offers three choices. Above them,
+<UiPath path="providers.incidents.checksFirst" />, and each target lists the checks it passed.
+
+- **Wait** for the provider: the share resumes on its own after the provider has been healthy for 10 minutes. It is
+  recommended when no target passed every check.
+- **Move** the held recipients to another provider. A target that failed a check can't be chosen. If it is still
+  warming up and the move would exceed today's cap, the button says it isn't recommended.
+- <UiPath path="providers.incidents.cancelSend" />: the held recipients don't get the campaign, the rest of the send
+  stops, and what was already sent stays sent. This can't be undone.
 
 Waiting and moving resume the send and need `campaigns:send`; cancelling needs `campaigns:pause`.
-
-A provider can also fail while a campaign is sending, before the next health check: the send holds that provider's share
-after its calls have failed for 3 minutes (at least 5 calls), and the live monitor asks what to do with it. Read
-[Monitor a send and auto-pause](/campaigns/live-monitor/).
 
 Members with `providers:manage` are notified when a provider goes down. Every step (down, failover, waiting, switched
 back, recovered) is written to the <UiPath path="providers.incidents.timelineTitle" />, and the outage is recorded in the
@@ -111,13 +137,31 @@ where they stopped.
 
 ### Silent webhooks
 
-While a provider is Degraded, sending works but the status of new messages is unknown, so bounce protection for that
-route is blind. Until events arrive again, new mail is routed as if the provider were down: its share of Broadcasts is
-held, and other streams use their fallback when they have one. The banner shows what ReputeCast checked (the
-API, whether the webhook is still registered at the provider, whether ReputeCast's endpoint is reachable from the
-internet), the likely causes and the messages still waiting for a status. From there you can choose
-<UiPath path="providers.incidents.sendTestEvent" />, <UiPath path="providers.incidents.reregister" /> or, where the
-provider's API keeps past events, backfill their status. The banner clears as soon as events arrive.
+A provider's webhooks are silent when it keeps accepting mail but no delivery, bounce or complaint event comes back:
+the messages it took are overdue past a grace period, as the "Webhooks silent" row under
+[defaults and limits](#defaults-and-limits) sets out. A provider that has never reported an event is flagged as soon as
+mail to it is overdue, so a webhook that never worked doesn't read "no events yet" forever. SMTP servers are exempt
+because their bounces come from a mailbox.
+
+While webhooks are silent, sending works but the status of new messages is unknown, so bounce protection for that route
+is blind. The provider is marked Degraded. ReputeCast doesn't fail over on silence alone: Broadcasts on the provider wait
+until events arrive or you decide, and other streams use their fallback when they have one. The banner shows what
+ReputeCast checked (the API, whether the webhook is still registered at the provider, whether its webhook address is
+public and when the provider last reached it), the likely causes and the impact: messages overdue and still inside the
+30-minute grace, the campaigns affected and the bounces not yet suppressed. From there you can choose
+<UiPath path="providers.incidents.sendTestEvent" /> (the provider sends one to the webhook, and its arrival proves the
+address works), <UiPath path="providers.incidents.reregister" /> or, where the provider's API keeps past messages,
+<UiPath path="providers.incidents.checkNow" /> to read the status of the overdue messages. The banner clears as soon as
+events arrive. How events reach ReputeCast is in [delivery events and suppression sync](/providers/events-and-sync/).
+
+### Rejecting messages
+
+A provider that refuses messages it was handed, for example because the sender isn't verified there or the account is
+suspended, is marked <UiPath path="providers.health.rejecting" /> once the refusals pass the "Rejecting messages" row
+under [defaults and limits](#defaults-and-limits). The refused messages weren't sent. The incident shows
+how many it refused and its last answer; check the sender's domain and the account at the provider. The status clears
+once it accepts messages again. During a campaign, a provider that refuses the sender holds its share instead of failing
+every message: nothing is marked failed, and the messages wait for you to fix the sender, move them or cancel them.
 
 ### Rejected credentials
 
@@ -131,8 +175,9 @@ provider, it is marked Down at once and its streams fail over as above. Replace 
 
 ## When to change them
 
-- **Give every stream a fallback.** A second provider turns an outage into a short failover for Automations, System and
-  Transactional mail. Read [Route mail across providers](/providers/routing/).
+- **Give every stream a fallback that can take its mail.** A second provider with the sender's domain verified and
+  enough quota turns an outage into a short failover for Automations, System and Transactional mail. Read
+  [Route mail across providers](/providers/routing/).
 - **Choose the Broadcasts policy deliberately.** Pause and ask is the safe default. Fail over automatically, only to a
   warmed-up provider, if you'd rather keep campaigns moving and your fallback has a sending history.
 - **Make sure the webhooks can reach you.** Silent webhooks are usually a reverse proxy, a firewall or a public URL

@@ -7,6 +7,8 @@ primaryKeyword: cấu hình reverse proxy cho ReputeCast
 sources:
   - internal/app/app.go
   - internal/server/middleware.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
   - internal/sending/engine/api.go
   - internal/mcpserver/server.go
   - internal/publicpages/publicpages.go
@@ -37,8 +39,8 @@ ReputeCast vào tháng 10/2026.
   gọi đến.
 - **Giữ nguyên header `Host`.** ReputeCast nhận diện tên miền tùy chỉnh dựa vào header này.
 - **Gửi `X-Forwarded-For`.** ReputeCast chỉ đọc header này từ
-  [proxy tin cậy](#đặt-url-công-khai-và-proxy-tin-cậy). ReputeCast không cần `X-Forwarded-Proto`: nó biết mình chạy
-  trên HTTPS nhờ `http.public_url`.
+  [proxy tin cậy](#đặt-url-công-khai-và-proxy-tin-cậy), dù proxy nối thêm vào dòng của client hay thêm một dòng header
+  riêng. ReputeCast không cần `X-Forwarded-Proto`: nó biết mình chạy trên HTTPS nhờ `http.public_url`.
 - **Truyền không đệm** hai loại phản hồi:
   - theo dõi trực tiếp, dùng Server-Sent Events tại
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (heartbeat mỗi 15 giây,
@@ -223,8 +225,9 @@ volumes:
 <Steps>
 
 1. Đặt `http.public_url` thành địa chỉ HTTPS, không có dấu gạch chéo ở cuối:
-   `REPUTECAST_PUBLIC_URL=https://news.example.com` trong `.env` của Compose, hoặc `REPUTECAST_HTTP__PUBLIC_URL` với tệp
-   nhị phân. Khi URL công khai bắt đầu bằng `https://`, ReputeCast gửi HSTS và đánh dấu cookie phiên là Secure.
+   `REPUTECAST_PUBLIC_URL=https://news.example.com`, trong `.env` của Compose hoặc biến môi trường của tệp nhị phân. Tên
+   cũ `REPUTECAST_HTTP__PUBLIC_URL` vẫn dùng được khi `REPUTECAST_PUBLIC_URL` chưa được đặt. Khi URL công khai bắt đầu
+   bằng `https://`, ReputeCast gửi HSTS và đánh dấu cookie phiên là Secure.
 
 2. Đặt `http.trusted_proxies` thành các địa chỉ mà proxy kết nối từ đó: `127.0.0.1` cho proxy trên cùng máy chủ với tệp
    nhị phân, hoặc subnet của network Compose:
@@ -237,10 +240,29 @@ volumes:
 
 </Steps>
 
-ReputeCast đọc `X-Forwarded-For` từ phải sang trái và lấy địa chỉ đầu tiên không phải proxy tin cậy, nếu không có thì
-dùng `X-Real-IP`. Khi đứng sau một chuỗi proxy (một CDN, rồi đến nginx), hãy tin cậy mọi chặng. Nếu không có thiết lập
-này, phiên, giới hạn tốc độ và nhật ký kiểm tra sẽ hiện địa chỉ của proxy cho mọi người: khi kiểm thử, một phiên mở qua
-nginx hiện địa chỉ `172.19.0.6` của container proxy cho đến khi subnet được tin cậy.
+ReputeCast nối mọi dòng header `X-Forwarded-For` theo thứ tự, đọc các địa chỉ từ phải sang trái và lấy địa chỉ đầu tiên
+không phải proxy tin cậy, nếu không có thì dùng `X-Real-IP`. Một proxy thêm chặng của nó thành một dòng header riêng
+(`option forwardfor` của HAProxy) hoạt động giống như proxy nối thêm vào dòng của client, và các dòng do client gửi
+không bao giờ thắng các chặng mà proxy của bạn thêm vào. Khi đứng sau một chuỗi proxy (một CDN, rồi đến nginx), hãy tin
+cậy mọi chặng.
+
+Nếu không có thiết lập này, phiên, giới hạn tốc độ và nhật ký kiểm tra sẽ hiện địa chỉ của proxy cho mọi người: khi kiểm
+thử, một phiên mở qua nginx hiện địa chỉ `172.19.0.6` của container proxy cho đến khi subnet được tin cậy. Mọi lượt mở và
+lượt nhấp cũng mang địa chỉ đó, nên [bộ lọc bot](/vi/reference/glossary/#bot-filter) không phân biệt được mạng của trình
+quét hay proxy bảo vệ quyền riêng tư của Apple với người đọc.
+
+### Thông báo về proxy không tin cậy
+
+ReputeCast theo dõi các yêu cầu mang `X-Forwarded-For`, `X-Real-IP` hoặc `Forwarded` từ một địa chỉ mà
+`http.trusted_proxies` không liệt kê. Khi một địa chỉ riêng liên tục hoạt động như một proxy, phút này qua phút khác, mọi
+quản trị viên hệ thống nhận thông báo "Yêu cầu đi qua một proxy mà ReputeCast không tin cậy", nêu địa chỉ, header và
+thiết lập cần đổi. Hãy thêm địa chỉ đó vào `http.trusted_proxies` rồi khởi động lại.
+
+Một địa chỉ công khai chuyển tiếp phần lớn lưu lượng trong thời gian dài sẽ nhận một thông báo khác: nếu đó là CDN hoặc
+bộ cân bằng tải của bạn, hãy tin cậy các dải địa chỉ mà nhà cung cấp của nó công bố; nếu bạn không nhận ra địa chỉ đó,
+hãy bỏ qua, vì ai cũng có thể gửi header chuyển tiếp. Một loạt yêu cầu ngắn không nêu tên ai. Xem
+[xử lý yêu cầu đi qua proxy không tin cậy](/vi/self-hosting/instance-admin/#xử-lý-yêu-cầu-đi-qua-proxy-không-tin-cậy) để
+biết cả hai thông báo và thời điểm chúng xuất hiện.
 
 ## Tên miền tùy chỉnh
 
@@ -298,6 +320,7 @@ riêng, nên proxy HTTP không chuyển tiếp được:
 
   Bạn thấy `retry: 3000` và `: connected` ngay lập tức, rồi `: heartbeat …` mỗi 15 giây.
 - Danh sách phiên đang hoạt động trong tài khoản của bạn hiện địa chỉ IP của chính bạn, không phải của proxy.
+- Quản trị viên hệ thống không nhận thông báo "Yêu cầu đi qua một proxy mà ReputeCast không tin cậy".
 
 ## Khắc phục sự cố
 
@@ -305,6 +328,9 @@ riêng, nên proxy HTTP không chuyển tiếp được:
   `location` của live stream với `proxy_buffering off`.
 - **`413 Request Entity Too Large` khi nhập dữ liệu hoặc tải tệp lên**: hãy tăng `client_max_body_size` của nginx.
 - **Mọi người đều hiện địa chỉ của proxy**: `http.trusted_proxies` không chứa địa chỉ mà proxy kết nối từ đó.
+- **Quản trị viên hệ thống nhận thông báo "Yêu cầu đi qua một proxy mà ReputeCast không tin cậy"**: hãy thêm địa chỉ được
+  nêu vào `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) rồi khởi động lại. Thông báo dừng khi địa chỉ đó
+  được tin cậy.
 - **Tên miền tùy chỉnh mở ứng dụng ReputeCast thay vì trang công khai**: proxy thay header `Host`, hoặc tên miền chưa
   được xác minh.
 - **Caddy từ chối TLS cho tên miền tùy chỉnh** (`tlsv1 alert internal error`): `/p/_/tls-check` trả về `404` vì tên

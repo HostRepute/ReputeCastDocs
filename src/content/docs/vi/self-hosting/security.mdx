@@ -17,6 +17,10 @@ sources:
   - internal/authn/breached.go
   - internal/accounts/service.go
   - migrations/00002_workspaces.sql
+  - internal/media/decode.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
+  - web/src/features/composer/inert.ts
 sidebar:
   order: 12
 ---
@@ -48,13 +52,16 @@ bạn phải tự lên kế hoạch: giữ và xoay vòng khóa bí mật.
    `http.public_url` bắt đầu bằng `https://` (hoặc, ngoài môi trường phát triển, khi `auth.cookie_secure` là `true`, giá
    trị mặc định).
 5. **Mọi thao tác đều qua cùng một bước kiểm tra quyền.** Người dùng, khóa API và tác tử MCP đều đi qua cùng một bước
-   kiểm tra; khóa và tác tử không bao giờ có nhiều quyền hơn người đã tạo ra chúng. Xem
+   kiểm tra; khóa và tác tử không bao giờ có nhiều quyền hơn người đã tạo ra chúng, và hành động với danh nghĩa của chính
+   chúng, không bao giờ thay cho người đó. Một thao tác bị từ chối cho người dùng biết ai có thể giúp thay vì nêu khóa
+   quyền; ứng dụng gọi API đọc khóa quyền trong trường `permission` của lỗi. Xem
    [vai trò và quyền](/vi/team/roles-and-permissions/).
 6. **Không thể sửa nhật ký kiểm tra.** Mọi thay đổi và mọi lần thử bị từ chối đều được ghi lại cùng người thực hiện, địa
    chỉ IP, user agent và mã yêu cầu. Một trigger của cơ sở dữ liệu từ chối mọi cập nhật lên các mục nhật ký; chỉ tác vụ dọn
    dẹp theo thời hạn lưu giữ mới xóa các mục cũ.
 7. **Yêu cầu gửi ra ngoài không thể chạm tới mạng nội bộ của bạn.** Các địa chỉ người dùng nhập vào ứng dụng (URL nhà
-   cung cấp, endpoint webhook, trình nhập dữ liệu, nguồn cấp, máy chủ mô hình AI, hộp thư thử và các loại khác) được
+   cung cấp, endpoint webhook, trình nhập dữ liệu, nguồn cấp, máy chủ mô hình AI, hộp thư thử, việc nhập bộ nhận diện
+   thương hiệu từ một trang web và các loại khác) được
    kiểm tra trước khi ReputeCast kết nối, rồi được kiểm tra lại lúc kết nối, sau khi phân giải DNS. ReputeCast không đi
    theo chuyển hướng.
 8. **Trình duyệt nhận header nghiêm ngặt.** Mọi phản hồi đều mang Content Security Policy, `X-Frame-Options: DENY`,
@@ -65,6 +72,14 @@ bạn phải tự lên kế hoạch: giữ và xoay vòng khóa bí mật.
    theo cách khác. Các route `/api` không gửi header CORS.
 9. **Phân khúc SQL chỉ đọc được.** SQL do người dùng viết chạy trong một transaction chỉ đọc có statement timeout,
    dưới một role chỉ đọc được liên hệ của một không gian làm việc. Xem [PostgreSQL](/vi/self-hosting/postgres/#phân-khúc-sql).
+10. **Ảnh được giải mã trong một hạn mức bộ nhớ.** Vài trăm byte phần đầu của một tệp ảnh có thể đòi hàng gigabyte bộ
+    nhớ. Trước khi giải mã một ảnh tải lên, một ảnh do AI tạo, một ảnh của bản tin định kỳ hoặc một ảnh đại diện,
+    ReputeCast tính từ phần đầu tệp lượng bộ nhớ cần để giải mã, kể cả với JPEG progressive, và chỉ giải mã một ảnh mỗi
+    lúc trên toàn hệ thống. Ảnh đại diện, ảnh AI hoặc ảnh bản tin định kỳ vượt hạn mức bị từ chối; ảnh tải lên vượt hạn
+    mức được lưu nguyên trạng, chỉ bị loại bỏ siêu dữ liệu.
+11. **HTML không do trình soạn thảo viết ra không thể chạy.** HTML được dán vào và HTML sửa trong chế độ Viết được đọc
+    trong một tài liệu trơ, và script, frame, trình xử lý sự kiện cùng liên kết `javascript:` bị gỡ bỏ trước khi HTML
+    hiển thị trong ứng dụng. Máy chủ tự biên dịch MJML và giữ HTML của chính nó khi HTML được gửi lên không khớp.
 
 Content Security Policy của ứng dụng:
 
@@ -166,7 +181,12 @@ phiên và khóa đăng nhập) nằm ở <UiPath path="shell.userMenuInstanceAd
   Tính năng này mặc định tắt. Khi bật, ReputeCast gửi 5 ký tự đầu của giá trị băm SHA-1 của mật khẩu mới đến
   `api.pwnedpasswords.com` (k-anonymity); nếu dịch vụ đó không trả lời, mật khẩu vẫn được chấp nhận.
 - **Đặt `http.trusted_proxies`** thành địa chỉ của reverse proxy. Nếu không, ReputeCast bỏ qua `X-Forwarded-For`, và
-  mọi client phía sau proxy dùng chung một địa chỉ IP trong giới hạn tốc độ và nhật ký kiểm tra.
+  mọi client phía sau proxy dùng chung một địa chỉ IP trong giới hạn tốc độ, nhật ký kiểm tra và bộ lọc bot, nên không
+  phân biệt được các lượt mở và nhấp. ReputeCast nhận ra một địa chỉ nội bộ chuyển tiếp gần như mọi yêu cầu của nó kèm
+  header chuyển tiếp trong 10 khoảng một phút, và báo cho quản trị viên hệ thống thêm địa chỉ đó. Một địa chỉ công khai
+  gửi phần lớn lưu lượng trong một giờ cũng được báo, nhưng không bao giờ được đề xuất thêm nguyên trạng: nếu đó là CDN
+  hoặc bộ cân bằng tải của bạn, hãy thêm các dải địa chỉ mà nhà cung cấp của nó công bố. Mọi dòng `X-Forwarded-For` đều
+  được tính, theo thứ tự.
 - **Dùng URL công khai `https://`** trong môi trường production, để cookie có `Secure` và HSTS được gửi. Xem
   [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
 - **Không công khai `/metrics`**: endpoint này không yêu cầu xác thực. Xem

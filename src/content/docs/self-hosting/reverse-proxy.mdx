@@ -7,6 +7,8 @@ primaryKeyword: ReputeCast reverse proxy
 sources:
   - internal/app/app.go
   - internal/server/middleware.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
   - internal/sending/engine/api.go
   - internal/mcpserver/server.go
   - internal/publicpages/publicpages.go
@@ -34,8 +36,9 @@ October 2026.
 - **Forward every path** to ReputeCast: the app and API, `/hooks/…` (sending providers' webhooks), `/p/…` (public
   pages), `/t/…` (open and click tracking), `/mcp` and `/healthz`, which the public URL check fetches.
 - **Keep the `Host` header.** ReputeCast recognizes custom domains by it.
-- **Send `X-Forwarded-For`.** ReputeCast reads it only from [trusted proxies](#set-the-public-url-and-trusted-proxies).
-  It doesn't need `X-Forwarded-Proto`: it knows it is on HTTPS from `http.public_url`.
+- **Send `X-Forwarded-For`.** ReputeCast reads it only from [trusted proxies](#set-the-public-url-and-trusted-proxies),
+  whether the proxy extends the client's line or adds its own header line. It doesn't need `X-Forwarded-Proto`: it
+  knows it is on HTTPS from `http.public_url`.
 - **Stream without buffering** two kinds of response:
   - the live monitor, Server-Sent Events at
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (a heartbeat every 15 seconds,
@@ -220,9 +223,10 @@ volumes:
 
 <Steps>
 
-1. Set `http.public_url` to the HTTPS address, without a trailing slash: `REPUTECAST_PUBLIC_URL=https://news.example.com`
-   in Compose's `.env`, or `REPUTECAST_HTTP__PUBLIC_URL` for the binary. With an `https://` public URL, ReputeCast
-   sends HSTS and marks its session cookie Secure.
+1. Set `http.public_url` to the HTTPS address, without a trailing slash:
+   `REPUTECAST_PUBLIC_URL=https://news.example.com`, in Compose's `.env` or the binary's environment. The earlier name
+   `REPUTECAST_HTTP__PUBLIC_URL` still works when `REPUTECAST_PUBLIC_URL` isn't set. With an `https://` public URL,
+   ReputeCast sends HSTS and marks its session cookie Secure.
 
 2. Set `http.trusted_proxies` to the addresses the proxy connects from: `127.0.0.1` for a proxy on the same server
    as the binary, or the Compose network's subnet:
@@ -235,10 +239,28 @@ volumes:
 
 </Steps>
 
-ReputeCast reads `X-Forwarded-For` from right to left and takes the first address that is not a trusted proxy, then
-falls back to `X-Real-IP`. Behind a chain of proxies (a CDN, then nginx), trust every hop. Without this setting,
-sessions, rate limits and the audit log show the proxy's address for everyone: in testing, a session opened through
-nginx showed the proxy container's `172.19.0.6` until the subnet was trusted.
+ReputeCast joins every `X-Forwarded-For` header line in order, reads the addresses from right to left and takes the
+first one that is not a trusted proxy, then falls back to `X-Real-IP`. A proxy that adds its hop as a header line of
+its own (HAProxy's `option forwardfor`) works the same as one that extends the client's line, and the lines a client
+sent never win over the hops your proxies added. Behind a chain of proxies (a CDN, then nginx), trust every hop.
+
+Without this setting, sessions, rate limits and the audit log show the proxy's address for everyone: in testing, a
+session opened through nginx showed the proxy container's `172.19.0.6` until the subnet was trusted. Every open and
+click carries that address too, so the [bot filter](/reference/glossary/#bot-filter) can't tell scanner networks or
+Apple's privacy proxy from readers.
+
+### The untrusted proxy notice
+
+ReputeCast watches for requests that carry `X-Forwarded-For`, `X-Real-IP` or `Forwarded` from an address
+`http.trusted_proxies` doesn't list. When a private address keeps behaving like a proxy, minute after minute, every
+instance admin gets the notification "Requests come through a proxy ReputeCast doesn't trust", naming the address,
+the header and the setting to change. Add that address to `http.trusted_proxies` and restart.
+
+A public address that forwards most of the traffic for a long time gets a different notice: if it is your CDN or load
+balancer, trust the address ranges its provider publishes; if you don't recognize it, leave it out, because anyone can
+send forwarding headers. A short burst names nobody. See
+[fix requests through an untrusted proxy](/self-hosting/instance-admin/#fix-requests-through-an-untrusted-proxy) for
+both notices and when they come.
 
 ## Custom domains
 
@@ -296,6 +318,7 @@ certificate, so HTTP proxies don't carry it:
 
   You see `retry: 3000` and `: connected` immediately, then `: heartbeat …` every 15 seconds.
 - Your account's active sessions show your own IP address, not the proxy's.
+- Instance admins get no "Requests come through a proxy ReputeCast doesn't trust" notification.
 
 ## Troubleshooting
 
@@ -304,6 +327,8 @@ certificate, so HTTP proxies don't carry it:
 - **`413 Request Entity Too Large` on imports or uploads**: raise nginx's `client_max_body_size`.
 - **Everyone appears with the proxy's address**: `http.trusted_proxies` doesn't include the address the proxy
   connects from.
+- **Instance admins get "Requests come through a proxy ReputeCast doesn't trust"**: add the address it names to
+  `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) and restart. The notice stops once the address is trusted.
 - **A custom domain opens the ReputeCast app instead of the public pages**: the proxy replaces the `Host` header, or
   the domain isn't verified yet.
 - **Caddy refuses TLS for a custom domain** (`tlsv1 alert internal error`): `/p/_/tls-check` answered `404` because the

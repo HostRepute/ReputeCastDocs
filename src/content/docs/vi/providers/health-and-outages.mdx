@@ -1,6 +1,6 @@
 ---
 title: Tình trạng và sự cố của nhà cung cấp
-description: 'ReputeCast làm gì khi có sự cố nhà cung cấp email: kiểm tra tình trạng, trạng thái Gián đoạn hay Suy giảm, tự chuyển dự phòng, tạm giữ thư và chuyển lại.'
+description: 'ReputeCast làm gì khi có sự cố nhà cung cấp email: kiểm tra tình trạng, trạng thái Gián đoạn hay Suy giảm, chuyển dự phòng có kiểm tra, tạm giữ và chuyển lại.'
 type: explanation
 audience: [admin]
 permissions: ['providers:view']
@@ -8,10 +8,16 @@ uiPath: 'nav.providers > providers.tabProviders'
 primaryKeyword: sự cố nhà cung cấp email
 sources:
   - internal/providers/manage/health.go
+  - internal/providers/manage/review_health.go
   - internal/providers/manage/actions.go
+  - internal/providers/manage/usage.go
   - internal/providers/state/state.go
+  - internal/providers/state/vet.go
+  - internal/providers/state/messages/en.json
   - internal/routing/routing.go
+  - internal/sending/engine/outages.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/routeerrors.go
   - web/src/features/providers/messages.ts
   - web/src/features/providers/overview.messages.ts
   - web/src/features/providers/incidents.messages.ts
@@ -26,29 +32,33 @@ import TableScroll from '~/components/TableScroll.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
 ReputeCast kiểm tra mọi nhà cung cấp gửi thư đã kết nối ở chế độ nền và gán cho mỗi nhà cung cấp một trạng thái. Khi một
-sự cố nhà cung cấp email bắt đầu, thư phải tiếp tục được gửi sẽ tự chuyển sang nhà cung cấp dự phòng, phần của chiến dịch
-trên nhà cung cấp đang lỗi chờ bạn quyết định, và lưu lượng chuyển lại khi nhà cung cấp đã ổn định được 10 phút.
+sự cố nhà cung cấp email bắt đầu, thư phải tiếp tục được gửi sẽ chuyển sang một nhà cung cấp dự phòng đã vượt qua các bước
+kiểm tra, phần của chiến dịch trên nhà cung cấp đang lỗi chờ bạn quyết định, và lưu lượng chuyển lại khi nhà cung cấp đã
+ổn định được 10 phút.
 
 ## Ý nghĩa của các trạng thái
 
 <UiPath path="nav.providers > providers.tabProviders" /> hiển thị mỗi nhà cung cấp một thẻ, với trạng thái, các luồng nó
-phục vụ, độ mới của webhook, tỷ lệ lỗi API, hạn mức và tốc độ gửi, chi phí tháng này và các khả năng của nó.
+phục vụ, các IP gửi, độ mới của webhook, tỷ lệ lỗi API, hạn mức và tốc độ gửi, chi phí tháng này và các khả năng của nó.
 
 <Screenshot
   id="providers-list"
-  alt="Trang nhà cung cấp: phần tóm tắt cho biết 3 nhà cung cấp đã kết nối, 2 Ổn định và 1 Đang khởi động, rồi các thẻ Amazon SES và Postmark ở trạng thái Ổn định, mỗi thẻ có các luồng nó phục vụ, tỷ lệ trả thư và khiếu nại so với giới hạn, hạn mức, tốc độ gửi và các nhãn khả năng."
+  alt="Trang nhà cung cấp: 3 nhà cung cấp đã kết nối, 2 Ổn định và 1 Đang khởi động. Thẻ Amazon SES và Postmark ở trạng thái Ổn định, mỗi thẻ có các luồng nó phục vụ, các IP gửi, webhook, tỷ lệ lỗi API trong 7 ngày, tỷ lệ trả thư và khiếu nại so với giới hạn, hạn mức, tốc độ gửi, chi phí và các nhãn khả năng."
 />
 
 <TableScroll label="Trạng thái nhà cung cấp">
 
-| Trạng thái                                                   | Ý nghĩa                                                                                      | Nhận thư mới                    |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ------------------------------- |
-| <UiPath path="providers.statusHealthy" />                    | Các lần kiểm tra gần nhất đều đạt.                                                           | Có                              |
-| <UiPath path="providers.statusWarmingUp" /> · ngày N/M       | Một [kế hoạch khởi động](/vi/providers/warm-up/) đang chạy; giới hạn mỗi ngày của nó áp dụng cho Gửi hàng loạt. | Có, đến giới hạn hôm nay |
-| <UiPath path="providers.statusSandbox" />                    | Tài khoản chỉ gửi được đến địa chỉ đã xác minh, như sandbox của Amazon SES.                  | Chỉ đến các địa chỉ đó          |
-| <UiPath path="providers.statusDegraded" /> · webhook im lặng | Nhà cung cấp vẫn nhận thư nhưng không báo sự kiện nào trong 6 giờ.                           | Không, cho đến khi có sự kiện trở lại |
-| <UiPath path="providers.statusDown" />                       | Lệnh gọi đang thất bại, hoặc nhà cung cấp từ chối thông tin xác thực ("Gián đoạn · xác thực thất bại"). | Không |
-| <UiPath path="providers.statusPaused" />                     | Nhà cung cấp đang tạm dừng.                                                                  | Không                           |
+| Trạng thái                                                                                   | Ý nghĩa                                                                                                                                                                                     | Nhận thư mới                                                       |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| <UiPath path="providers.statusHealthy" />                                                    | Các lần kiểm tra gần nhất đều đạt.                                                                                                                                                          | Có                                                                 |
+| <UiPath path="providers.statusWarmingUp" /> · ngày N/M                                       | Một [kế hoạch khởi động](/vi/providers/warm-up/) đang chạy; giới hạn mỗi ngày của nó áp dụng cho Gửi hàng loạt.                                                                             | Có, đến giới hạn hôm nay                                           |
+| <UiPath path="providers.statusSandbox" />                                                    | Tài khoản chỉ gửi được đến địa chỉ đã xác minh, như sandbox của Amazon SES.                                                                                                                 | Chỉ đến các địa chỉ đó                                             |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.webhooksSilent" /> | Nhà cung cấp vẫn nhận thư nhưng không báo sự kiện gửi thành công, trả thư hay khiếu nại. Xem [webhook im lặng](#webhook-im-lặng).                                                          | Không: Gửi hàng loạt chờ, các luồng khác dùng nhà cung cấp dự phòng |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.rejecting" />    | Nhà cung cấp từ chối một tỷ lệ bất thường trong số thư được giao cho nó, ví dụ vì người gửi chưa được xác minh hoặc tài khoản bị đình chỉ. Xem [đang từ chối thư](#đang-từ-chối-thư).              | Có; các thư bị từ chối chưa được gửi                               |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.mailboxFailing" /> | Không đọc được [hộp thư nhận thư trả lại](/vi/reference/glossary/#bounce-mailbox) của một máy chủ SMTP, nên thư trả lại của nó không vào được danh sách chặn gửi.                          | Có                                                                 |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.queueFailing" /> | Không đọc được hàng đợi sự kiện của Amazon SES; các sự kiện chờ ở đó.                                                                                                                       | Có                                                                 |
+| <UiPath path="providers.statusDown" />                                                       | Lệnh gọi đang thất bại, hoặc nhà cung cấp từ chối thông tin xác thực (<UiPath path="providers.health.downAuth" />).                                                                         | Không                                                              |
+| <UiPath path="providers.statusPaused" />                                                     | Nhà cung cấp đang tạm dừng.                                                                                                                                                                 | Không                                                              |
 
 </TableScroll>
 
@@ -56,7 +66,16 @@ Tỷ lệ trả thư và khiếu nại trên một thẻ tính trong 7 ngày g�
 cấp có báo). Các tỷ lệ này được hiển thị so với giới hạn của tài khoản ở nhà cung cấp, như mức xem xét và mức tạm dừng của
 Amazon SES, để bạn thấy tài khoản của mình đang gần các mức đó đến đâu. Bạn có thể đổi các giới hạn hiển thị trong
 <UiPath path="providers.overview.settings" /> của nhà cung cấp. Chúng chỉ để tham khảo: ngưỡng làm tạm dừng một lần gửi là
-[cài đặt gửi mặc định của không gian làm việc](/vi/providers/workspace-defaults/).
+[cài đặt gửi mặc định của không gian làm việc](/vi/providers/workspace-defaults/) và
+[quy tắc lưu lượng](/vi/providers/traffic-rules/).
+
+Một tỷ lệ không có dữ liệu không bao giờ hiển thị là 0%:
+
+- Tỷ lệ khiếu nại chỉ tính thư gửi thành công tới các [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider)
+  có báo cáo khiếu nại. Gmail và iCloud không bao giờ báo, nên một nhà cung cấp chỉ gửi thư tới đó sẽ hiển thị "n/a" kèm
+  lý do, "Gmail và iCloud không báo khiếu nại".
+- Khi không có thư nào được giao trong 7 ngày qua, các tỷ lệ cũng hiển thị "n/a".
+- Tỷ lệ lỗi API của một nhà cung cấp không có lệnh gọi nào hiển thị <UiPath path="providers.overview.errorRateNoCalls" />.
 
 ## Tình trạng được kiểm tra như thế nào
 
@@ -67,8 +86,9 @@ Amazon SES, để bạn thấy tài khoản của mình đang gần các mức �
 3. Một nhà cung cấp bị đánh dấu **Gián đoạn** sau 2 lần kiểm tra thất bại liên tiếp, hoặc khi ít nhất một nửa trong số
    ít nhất 5 lệnh gọi trong 3 phút gần nhất thất bại. Một phản hồi `401` hoặc phản hồi tương tự kiểu "thông tin xác thực
    bị từ chối" đánh dấu nhà cung cấp Gián đoạn ngay lập tức.
-4. Một nhà cung cấp bị đánh dấu **Suy giảm** khi nó đã nhận thư nhưng không báo sự kiện gửi thành công, trả thư hay khiếu
-   nại nào trong 6 giờ. Máy chủ SMTP được miễn vì thư trả lại của chúng đến từ một hộp thư.
+4. Một nhà cung cấp bị đánh dấu **Suy giảm** khi webhook của nó im lặng, khi nó bắt đầu từ chối thư, hoặc khi ReputeCast
+   không đọc được hộp thư nhận thư trả lại hay hàng đợi sự kiện của nó. Mỗi trường hợp mở một sự cố và thông báo cho những
+   người quản lý nhà cung cấp gửi thư.
 5. Một nhà cung cấp đang Gián đoạn được coi là đã hồi phục khi các lệnh gọi thành công trở lại (dưới 1 trên 10 lệnh
    gọi thất bại) trong 10 phút. Sau khi bạn thay thông tin xác thực bị từ chối, nó hồi phục ở lần kiểm tra thành công tiếp
    theo.
@@ -78,29 +98,40 @@ Thanh thông báo sự cố có nút kiểm tra lại nhà cung cấp ngay, thay
 ## Điều gì xảy ra khi có sự cố
 
 Khi một nhà cung cấp bị gián đoạn, ReputeCast xử lý từng luồng định tuyến thư qua nhà cung cấp đó, theo
-[chính sách chuyển dự phòng](/vi/providers/routing/) của luồng:
+[chính sách chuyển dự phòng](/vi/providers/routing/) của luồng. Thư chỉ chuyển sang một nhà cung cấp dự phòng đã vượt qua
+mọi bước kiểm tra trước: đang hoạt động, điều khoản cho phép thư hàng loạt (với Gửi hàng loạt), không ở chế độ sandbox,
+tên miền của người gửi đã được xác minh ở đó, đủ hạn mức cho lượng thư sẽ chuyển, và đã khởi động xong. Một nhà cung cấp
+đang khởi động chỉ nhận thư chuyển dự phòng theo chính sách tự động và trong giới hạn của hôm nay.
 
-- **Tự động hóa, Hệ thống và Giao dịch** tự động chuyển sang nhà cung cấp dự phòng của luồng, nếu nhà cung cấp dự phòng
-  khả dụng. Thanh thông báo cho biết đã định tuyến lại bao nhiêu email. Nếu không có nhà cung cấp dự phòng khả dụng, thư
-  mới của luồng chờ đến khi nhà cung cấp hồi phục.
+- **Tự động hóa, Hệ thống và Giao dịch** tự động chuyển sang nhà cung cấp dự phòng của luồng khi nhà cung cấp đó vượt qua
+  các bước kiểm tra. Thanh thông báo cho biết đã định tuyến lại bao nhiêu email. Khi nhà cung cấp dự phòng không đạt một
+  bước kiểm tra, ReputeCast tiếp tục thử lại nhà cung cấp chính thay vì chuyển, và thư mới của luồng chờ đến khi nhà cung
+  cấp hồi phục.
 - **Gửi hàng loạt** theo chính sách của Gửi hàng loạt. Với mặc định là tạm dừng và hỏi, mỗi chiến dịch đang gửi qua nhà
-  cung cấp này bị tạm giữ phần của nhà cung cấp đó, trong khi các phần khác vẫn tiếp tục gửi. Thành viên có quyền gửi
-  chiến dịch nhận thông báo rằng chiến dịch đang chờ quyết định. Với chính sách chỉ chuyển sang nhà cung cấp đã khởi động
-  xong hoặc chuyển dự phòng tự động, phần đó chuyển sang nhà cung cấp dự phòng khi chính sách cho phép.
+  cung cấp này bị tạm giữ phần của nhà cung cấp đó trong khi các phần khác vẫn tiếp tục gửi, và những người có thể gửi
+  chiến dịch được yêu cầu quyết định. Với chính sách chỉ chuyển sang nhà cung cấp đã khởi động xong hoặc chuyển dự phòng
+  tự động, phần đó chuyển sang nhà cung cấp dự phòng khi chính sách cho phép và nhà cung cấp dự phòng vượt qua các bước
+  kiểm tra.
 
-Với một phần Gửi hàng loạt đang bị tạm giữ, thanh thông báo sự cố trên trang nhà cung cấp đưa ra ba lựa chọn:
+Một phần bị tạm giữ đi qua cùng một quy trình xử lý sự cố của bộ máy gửi thư, dù sự cố do kiểm tra tình trạng hay do
+chính lần gửi phát hiện trước: các lệnh gọi thất bại trong 3 phút, nhà cung cấp liên tục giới hạn tốc độ tài khoản, lỗi
+API vượt giới hạn của lần gửi, hoặc nhà cung cấp từ chối người gửi hay hết hạn mức. Trong khi chưa có ai quyết định, phần
+đó kiểm tra nhà cung cấp bằng một thư mỗi phút và tự tiếp tục khi 3 thư liên tiếp thành công.
+[Màn hình theo dõi trực tiếp](/vi/campaigns/live-monitor/) hiển thị cùng lần tạm giữ đó kèm phân tích và các lựa chọn.
 
-- **Chờ** nhà cung cấp: phần đó tự tiếp tục sau khi nhà cung cấp đã ổn định được 10 phút.
-- **Chuyển** những người nhận đang tạm giữ sang một nhà cung cấp khác do bạn chọn. Nếu nhà cung cấp đó vẫn đang khởi động,
-  ReputeCast cảnh báo khi việc chuyển sẽ vượt giới hạn hôm nay của nó.
-- <UiPath path="providers.incidents.cancelSend" />: những người nhận đang tạm giữ không nhận được chiến dịch. Thư đã gửi
-  vẫn giữ nguyên là đã gửi. Không thể hoàn tác thao tác này.
+Với một phần Gửi hàng loạt đang bị tạm giữ, thanh thông báo sự cố trên trang nhà cung cấp đưa ra ba lựa chọn. Phía trên
+chúng là dòng <UiPath path="providers.incidents.checksFirst" />, và mỗi nhà cung cấp đích liệt kê các bước kiểm tra nó đã
+vượt qua.
+
+- **Chờ** nhà cung cấp: phần đó tự tiếp tục sau khi nhà cung cấp đã ổn định được 10 phút. Lựa chọn này được đề xuất khi
+  không có nhà cung cấp đích nào vượt qua mọi bước kiểm tra.
+- **Chuyển** những người nhận đang tạm giữ sang một nhà cung cấp khác. Không thể chọn một nhà cung cấp đích không đạt một
+  bước kiểm tra. Nếu nhà cung cấp đó vẫn đang khởi động và việc chuyển sẽ vượt giới hạn hôm nay của nó, nút ghi rằng lựa
+  chọn này không được khuyến nghị.
+- <UiPath path="providers.incidents.cancelSend" />: những người nhận đang tạm giữ không nhận được chiến dịch, phần còn lại
+  của lần gửi dừng lại, và thư đã gửi vẫn giữ nguyên là đã gửi. Không thể hoàn tác thao tác này.
 
 Chờ và chuyển sẽ tiếp tục lần gửi và cần quyền `campaigns:send`; hủy cần quyền `campaigns:pause`.
-
-Một nhà cung cấp cũng có thể gặp lỗi trong lúc chiến dịch đang gửi, trước lần kiểm tra tình trạng tiếp theo: lần gửi tạm
-giữ phần của nhà cung cấp đó sau khi các lệnh gọi của nó thất bại trong 3 phút (ít nhất 5 lệnh gọi), và màn hình theo dõi
-trực tiếp hỏi bạn xử lý phần đó thế nào. Hãy đọc [Theo dõi lần gửi và tự động tạm dừng](/vi/campaigns/live-monitor/).
 
 Thành viên có quyền `providers:manage` nhận thông báo khi một nhà cung cấp bị gián đoạn. Mọi bước (gián đoạn,
 chuyển dự phòng, đang chờ, đã chuyển lại, đã hồi phục) đều được ghi vào <UiPath path="providers.incidents.timelineTitle" />,
@@ -113,14 +144,33 @@ tiếp tục từ chỗ đã dừng.
 
 ### Webhook im lặng
 
-Trong lúc một nhà cung cấp ở trạng thái Suy giảm, việc gửi vẫn hoạt động nhưng trạng thái của thư mới chưa rõ, nên cơ chế
-bảo vệ trước thư trả lại cho tuyến đó không còn tác dụng. Cho đến khi sự kiện về trở lại, thư mới được định tuyến như thể
-nhà cung cấp đang gián đoạn: phần Gửi hàng loạt của nó bị tạm giữ, và các luồng khác dùng nhà cung cấp dự phòng nếu
-có. Thanh thông báo cho biết ReputeCast đã kiểm tra những gì (API, webhook còn được đăng ký ở nhà cung cấp hay không,
-endpoint của ReputeCast có truy cập được từ internet hay không), các nguyên nhân có thể và những thư vẫn đang chờ trạng
-thái. Từ đó, bạn có thể chọn <UiPath path="providers.incidents.sendTestEvent" />,
-<UiPath path="providers.incidents.reregister" /> hoặc, nếu API của nhà cung cấp còn giữ các sự kiện đã qua, lấy bù trạng
-thái của chúng. Thanh thông báo biến mất ngay khi có sự kiện về đến.
+Webhook của một nhà cung cấp im lặng khi nhà cung cấp vẫn nhận thư nhưng không có sự kiện gửi thành công, trả thư hay
+khiếu nại nào quay về: các thư nó đã nhận quá hạn sau một khoảng thời gian chờ, theo dòng "Webhook im lặng" trong
+[mặc định và giới hạn](#mặc-định-và-giới-hạn). Một nhà cung cấp chưa từng báo sự kiện nào bị đánh dấu ngay khi thư gửi
+tới nó quá hạn, để một webhook chưa bao giờ hoạt động không mãi hiển thị "chưa có sự kiện". Máy chủ SMTP được miễn vì thư
+trả lại của chúng đến từ một hộp thư.
+
+Trong lúc webhook im lặng, việc gửi vẫn hoạt động nhưng trạng thái của thư mới chưa rõ, nên cơ chế bảo vệ trước thư trả
+lại cho tuyến đó không còn tác dụng. Nhà cung cấp bị đánh dấu Suy giảm. ReputeCast không chuyển dự phòng chỉ vì webhook im
+lặng: Gửi hàng loạt trên nhà cung cấp đó chờ đến khi có sự kiện hoặc bạn quyết định, và các luồng khác dùng nhà cung cấp
+dự phòng nếu có. Thanh thông báo cho biết ReputeCast đã kiểm tra những gì (API, webhook còn được đăng ký ở nhà cung cấp hay
+không, địa chỉ webhook có phải địa chỉ công khai không và lần gần nhất nhà cung cấp gọi tới nó), các nguyên nhân có thể và
+ảnh hưởng: số thư đã quá hạn và còn trong 30 phút chờ, các chiến dịch bị ảnh hưởng và các thư trả lại chưa được đưa vào
+danh sách chặn gửi. Từ đó, bạn có thể chọn <UiPath path="providers.incidents.sendTestEvent" /> (nhà cung cấp gửi một sự
+kiện thử tới webhook, và việc nó đến nơi chứng tỏ địa chỉ hoạt động), <UiPath path="providers.incidents.reregister" />
+hoặc, nếu API của nhà cung cấp còn giữ các thư đã qua, <UiPath path="providers.incidents.checkNow" /> để đọc trạng thái
+của các thư quá hạn. Thanh thông báo biến mất ngay khi có sự kiện về đến. Cách sự kiện đến với ReputeCast được mô tả trong
+[sự kiện gửi thư và đồng bộ danh sách chặn gửi](/vi/providers/events-and-sync/).
+
+### Đang từ chối thư
+
+Một nhà cung cấp từ chối các thư được giao cho nó, ví dụ vì người gửi chưa được xác minh ở đó hoặc tài khoản bị đình chỉ,
+bị đánh dấu <UiPath path="providers.health.rejecting" /> khi số thư bị từ chối vượt dòng "Đang từ chối thư" trong
+[mặc định và giới hạn](#mặc-định-và-giới-hạn). Các thư bị từ chối chưa được gửi. Sự cố cho biết nó đã từ chối
+bao nhiêu thư và phản hồi gần nhất; hãy kiểm tra tên miền của người gửi và tài khoản ở nhà cung cấp. Trạng thái này hết
+khi nhà cung cấp nhận thư trở lại. Trong một chiến dịch, nhà cung cấp từ chối người gửi sẽ khiến phần của nó bị tạm giữ
+thay vì làm mọi thư thất bại: không thư nào bị đánh dấu thất bại, và các thư chờ bạn sửa người gửi, chuyển chúng hoặc hủy
+chúng.
 
 ### Thông tin xác thực bị từ chối
 
@@ -135,8 +185,9 @@ trước khi lưu.
 
 ## Khi nào nên thay đổi
 
-- **Cho mỗi luồng một nhà cung cấp dự phòng.** Nhà cung cấp thứ hai biến một sự cố thành một lần chuyển dự phòng ngắn cho
-  thư Tự động hóa, Hệ thống và Giao dịch. Hãy đọc [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
+- **Cho mỗi luồng một nhà cung cấp dự phòng nhận được thư của nó.** Nhà cung cấp thứ hai đã xác minh tên miền của người
+  gửi và còn đủ hạn mức biến một sự cố thành một lần chuyển dự phòng ngắn cho thư Tự động hóa, Hệ thống và Giao dịch. Hãy
+  đọc [Định tuyến thư qua nhiều nhà cung cấp](/vi/providers/routing/).
 - **Chọn chính sách cho Gửi hàng loạt có cân nhắc.** Tạm dừng và hỏi là mặc định an toàn. Hãy chọn tự động chuyển dự
   phòng, chỉ sang nhà cung cấp đã khởi động xong, nếu bạn muốn chiến dịch tiếp tục chạy và nhà cung cấp dự phòng của bạn
   đã có lịch sử gửi thư.

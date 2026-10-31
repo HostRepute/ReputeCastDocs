@@ -17,6 +17,10 @@ sources:
   - internal/authn/breached.go
   - internal/accounts/service.go
   - migrations/00002_workspaces.sql
+  - internal/media/decode.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
+  - web/src/features/composer/inert.ts
 sidebar:
   order: 12
 ---
@@ -46,13 +50,15 @@ must plan yourself: keeping and rotating the secret key.
 4. **Session cookies stay in the browser.** The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` when
    `http.public_url` starts with `https://` (or, outside development, while `auth.cookie_secure` is `true`, the default).
 5. **Every action passes one permission check.** People, API keys and MCP agents go through the same check; keys and
-   agents never hold more than the person who created them. See [roles and permissions](/team/roles-and-permissions/).
+   agents never hold more than the person who created them, and act as themselves, never as that person. A refused
+   action tells people who can help instead of naming a permission key; API clients read the key in the error's
+   `permission` field. See [roles and permissions](/team/roles-and-permissions/).
 6. **The audit log can't be edited.** Every change and every denied attempt is recorded with actor, IP address, user
    agent and request ID. A database trigger rejects updates to audit entries; only the retention cleanup removes old
    ones.
 7. **Outbound requests can't reach your network.** Addresses people type into the app (provider URLs, webhook
-   endpoints, importers, feeds, AI model servers, seed mailboxes and others) are checked before ReputeCast connects, and
-   again at connect time, after DNS. Redirects are not followed.
+   endpoints, importers, feeds, AI model servers, seed mailboxes, the brand kit's import from a website and others) are
+   checked before ReputeCast connects, and again at connect time, after DNS. Redirects are not followed.
 8. **Browsers get strict headers.** Every response carries a Content Security Policy, `X-Frame-Options: DENY`,
    `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
    `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
@@ -61,6 +67,14 @@ must plan yourself: keeping and rotating the secret key.
    The `/api` routes send no CORS headers.
 9. **SQL segments can only read.** User-written SQL runs in a read-only transaction with a statement timeout, as a role
    that can read only one workspace's contacts. See [PostgreSQL](/self-hosting/postgres/#sql-segments).
+10. **Images are decoded within a memory budget.** A few hundred bytes of image header can claim gigabytes of memory.
+    Before ReputeCast decodes an upload, an AI-generated image, a digest's image or an avatar, it works out from the
+    header what decoding takes, a progressive JPEG's included, and decodes one image at a time across the instance. An
+    avatar, AI or digest image over the budget is refused; an upload over it is stored as it is, only stripped of its
+    metadata.
+11. **HTML the composer didn't write can't run.** Pasted HTML and HTML edited in Write mode are read in an inert
+    document, and scripts, frames, event handlers and `javascript:` links are removed before the HTML is shown in the
+    app. The server compiles the MJML itself and keeps its own HTML when the HTML it is sent doesn't match.
 
 The Content Security Policy of the app:
 
@@ -161,7 +175,11 @@ lives in <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; s
   is off by default. When on, ReputeCast sends the first 5 characters of a new password's SHA-1 hash to
   `api.pwnedpasswords.com` (k-anonymity); if that service doesn't answer, the password is accepted.
 - **Set `http.trusted_proxies`** to your reverse proxy's address. Without it, ReputeCast ignores `X-Forwarded-For`,
-  and every client behind the proxy shares one IP address in rate limits and the audit log.
+  and every client behind the proxy shares one IP address in rate limits, the audit log and the bot filter, so opens
+  and clicks can't be told apart. ReputeCast notices a private address that forwards nearly all of its requests with
+  forwarding headers for 10 one-minute windows, and tells instance admins to add it. A public address that sends most
+  of the traffic for an hour is reported too, but never as one to add as it is: if it is your CDN or load balancer, add
+  the address ranges its provider publishes. Every `X-Forwarded-For` line counts, in order.
 - **Use an `https://` public URL** in production, so cookies are `Secure` and HSTS is sent. See
   [reverse proxy and TLS](/self-hosting/reverse-proxy/).
 - **Keep `/metrics` private**: it needs no authentication. See [health checks, metrics and logs](/self-hosting/monitoring/).

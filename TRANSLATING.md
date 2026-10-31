@@ -68,4 +68,4 @@ The Vietnamese edition is reviewed by a native speaker (the project owner) befor
 
 | Reviewer                 | Date | Scope                                                           |
 | ------------------------ | ---- | --------------------------------------------------------------- |
-| _pending: project owner_ | —    | all 170 Vietnamese pages and the `vi` text in `src/data/*.yaml` |
+| _pending: project owner_ | —    | all 182 Vietnamese pages and the `vi` text in `src/data/*.yaml` |

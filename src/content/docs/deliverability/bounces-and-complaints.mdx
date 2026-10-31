@@ -17,7 +17,12 @@ sources:
   - internal/connect/connection.go
   - internal/deliverability/providers.go
   - internal/sending/engine/loop.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/watch.go
+  - internal/mailbox/mailbox.go
+  - internal/counters/counters.go
   - web/src/features/reports/messages.ts
+  - web/src/features/traffic/traffic.messages.ts
 sidebar:
   order: 8
 ---
@@ -42,7 +47,8 @@ suppressed at once, and where those limits sit.
   asks to try again later. Replies start with 4 (for example `452 4.2.2`). The sending provider retries; a message it
   can't deliver in the end is reported as a soft bounce.
 - A [deferral](/reference/glossary/#deferral) is one delayed attempt the sending provider will retry. Many deferrals
-  at one mailbox provider usually mean it is throttling your mail.
+  at one mailbox provider usually mean it is throttling your mail. A message counts as deferred once, however many
+  attempts were deferred.
 - A complaint reaches you through a [feedback loop](/reference/glossary/#feedback-loop): the
   [mailbox provider](/reference/glossary/#mailbox-provider) reports a "Report spam" click to your
   [sending provider](/reference/glossary/#sending-provider), which passes it on.
@@ -65,11 +71,15 @@ provider's original event type and code.
    [shared suppression list](/reference/glossary/#suppression-list) at once, and the contact's status changes to bounced
    or complained. [Suppression sync](/reference/glossary/#suppression-sync) then pushes the address to every connected
    sending provider that accepts suppressions, so one bounce stops mail everywhere.
-5. A soft bounce or a deferral doesn't suppress an address on its own. They count in reports and in the
+5. A block for the sender's reputation or policy (`policy_block`, `spam_block`, `reputation`) never suppresses the
+   address, even when the sending provider calls it permanent: the address is valid, and it gets mail again once the
+   block is fixed.
+6. A soft bounce or a deferral doesn't suppress an address on its own. They count in reports and in the
    [live monitor](/campaigns/live-monitor/). Transactional mail adds one rule: when a Transactional message soft-bounces
    and the address has soft-bounced 3 times within 7 days, the address is suppressed.
-6. Bounce and complaint rates feed [guarded sending](/reference/glossary/#guarded-sending): when a campaign's rates
-   cross the [auto-pause thresholds](#auto-pause-thresholds), ReputeCast holds the affected share.
+7. Bounces by type, deferrals and complaints feed [guarded sending](/reference/glossary/#guarded-sending): when a
+   campaign's rates cross the [auto-pause thresholds](#auto-pause-thresholds), ReputeCast slows down or holds the
+   affected share.
 
 Copies sent by a [placement test](/deliverability/placement-tests/) to your own seed mailboxes are the one exception:
 their bounces and complaints never suppress the seed.
@@ -95,23 +105,30 @@ what happened to the addresses.
 | `domain_invalid`  | The domain doesn't exist or has no mail server            | Hard · domain not found         | Suppressed automatically                       |
 | `mailbox_full`    | The mailbox is over quota (`4.2.2`, `5.2.2`)              | Soft · mailbox full             | Retried with the next send                     |
 | `temporary`       | A temporary failure that never cleared                    | Soft · deferral expired         | Retried with the next send                     |
-| `policy_block`    | Refused by policy, often authentication (`5.7.1`, `5.7.26`) | Blocked · policy or reputation | You decide; the report offers to suppress them |
-| `spam_block`      | Refused as spam, or because of a blocklist listing        | Blocked · policy or reputation  | You decide; the report offers to suppress them |
-| `reputation`      | Refused or throttled because of sender reputation         | Blocked · policy or reputation  | You decide; the report offers to suppress them |
+| `policy_block`    | Refused by policy, often authentication (`5.7.1`, `5.7.26`) | Blocked · policy or reputation | Never suppressed; investigate and fix the cause |
+| `spam_block`      | Refused as spam, or because of a blocklist listing        | Blocked · policy or reputation  | Never suppressed; investigate and fix the cause |
+| `reputation`      | Refused or throttled because of sender reputation         | Blocked · policy or reputation  | Never suppressed; investigate and fix the cause |
 | `other`           | No code ReputeCast can classify                           | Other                           | You review it                                  |
 
 </TableScroll>
 
-A blocked bounce that the sending provider reported as permanent is still a hard bounce, so it is suppressed at once
-like any other. The report shows which addresses of each row are already on the list and offers to add the rest.
-Blocked bounces usually point at your sending setup rather than at the address: check
-[SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/) and [blocklist listings](/deliverability/blocklists/), and look
-the code up in [SMTP error codes](/smtp-errors/).
+Blocked bounces point at your sending setup, not at the address, so ReputeCast never suppresses them, even when the
+sending provider reported them as permanent. In the report's bounces table the blocked row offers
+<UiPath path="reports.investigate" />, which shows what each sending provider said, and
+<UiPath path="reports.retryTitle" /> drafts the issue again for the blocked addresses still on your list, each once,
+to send from Review & send after you fix the cause. Check [SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/) and
+[blocklist listings](/deliverability/blocklists/), and look the code up in [SMTP error codes](/smtp-errors/).
 
-### Complaints and Gmail's feedback loop
+### Complaints: where they are reported
 
 Most mailbox providers send one report per complaint to your sending provider, which ReputeCast receives as a
-`complaint` event. Gmail works differently: its feedback loop reports aggregate spam rates per identifier in Google
+`complaint` event: Outlook, Yahoo and many of the providers in Other. Gmail and iCloud never report single complaints.
+So ReputeCast counts complaint rates only over mail delivered to mailbox providers that report them, and shows Gmail's
+and iCloud's own complaint rates as "n/a" with the reason, never as 0%. Unknown is not zero: a campaign that went only to
+Gmail has no complaint rate, not a perfect one. Which mailbox provider a recipient uses comes from the domain's MX
+records, so Google Workspace addresses count as Gmail and Microsoft 365 addresses as Outlook.
+
+Gmail works differently: its feedback loop reports aggregate spam rates per identifier in Google
 Postmaster Tools, keyed by a `Feedback-ID` header in the message
 ([Gmail Help, "Feedback Loop"](https://support.google.com/mail/answer/6254652), checked October 2026). ReputeCast adds
 that header to Broadcasts, Automations and Transactional mail:
@@ -122,7 +139,12 @@ Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
 
 The identifiers group Gmail's data per campaign, per workspace and per stream. With
 [HostRepute](/deliverability/hostrepute/) connected, the Postmaster Tools figures, including flagged campaigns, appear
-under Deliverability.
+under Deliverability, and the complaint watch after a send can read Gmail's daily spam rate (see
+[set the traffic rules](/providers/traffic-rules/)).
+
+Complaints keep arriving for days after delivery. Each one still suppresses the address and counts in the campaign's
+report, and for 72 hours after a send (by default) ReputeCast alerts the people who can resume sends when a mailbox provider passes
+its complaint limit.
 
 ## Sending provider account limits
 
@@ -142,14 +164,19 @@ below 2% bounces and below 0.1% complaints.
 
 ReputeCast stores Amazon SES's two levels with every SES connection and shows each sending provider's bounce and
 complaint rate for the last 7 days under [Monitor domain and provider health](/deliverability/health/), next to the
-limit it applies to that provider. The bar warns from half of the first limit on. Self-hosted servers
+limit it applies to that provider. The complaint rate counts only mail delivered where complaints are reported. The bar
+warns from half of the first limit on, once ReputeCast has counted 500 messages in the 7 days. Self-hosted servers
 such as Postal or an SMTP server have no account limits; the line shown there is the guard ReputeCast sets, or the
 warm-up guard while the server is [warming up](/providers/warm-up/).
 
 ## Auto-pause thresholds
 
 ReputeCast's own thresholds apply during each campaign, per mailbox provider and sending provider. They sit at or
-below the levels that get an Amazon SES account reviewed, so a bad send stops before it harms the account.
+below the levels that get an Amazon SES account reviewed, so a bad send stops before it harms the account. Each bounce
+type has its own threshold: block/policy bounces per mailbox provider, unknown users over the whole send at two levels
+(warn, then pause), and soft bounces and deferrals per mailbox provider over 10 minutes at two levels (slow down, then
+pause). Complaints and block/policy bounces clearly over the limit trip a send of any size. Set them in
+[traffic rules](/providers/traffic-rules/).
 
 <LimitsTable area="auto-pause" />
 

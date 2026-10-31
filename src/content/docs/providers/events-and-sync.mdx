@@ -9,6 +9,10 @@ primaryKeyword: email bounce webhook events
 sources:
   - internal/ingest
   - internal/suppressions/sync.go
+  - internal/providers/eventqueue
+  - internal/providers/ses/queue.go
+  - internal/providers/smtp
+  - internal/providers/manage/review_health.go
   - internal/providers/provider.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
@@ -24,8 +28,9 @@ import UiPath from '~/components/UiPath.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
-Every sending provider reports what happened to your mail in its own format: Amazon SES through SNS notifications,
-Postmark and Mailgun through webhooks, an SMTP server through bounce messages in a mailbox. ReputeCast turns these email
+Every sending provider reports what happened to your mail in its own format: Amazon SES through SNS notifications
+(delivered to a webhook or to an SQS queue), Postmark and Mailgun through webhooks, an SMTP server through bounce messages
+in a mailbox. ReputeCast turns these email
 bounce webhook events, deliveries and complaints into one [normalized event](/reference/glossary/#normalized-event)
 model, keeps the provider's original code next to it, and shares every bounce and complaint through one
 [suppression list](/reference/glossary/#suppression-list).
@@ -34,7 +39,8 @@ model, keeps the provider's original code next to it, and shares every bounce an
 
 1. **The provider calls ReputeCast.** Each connected provider has its own webhook address,
    `https://<public URL>/hooks/<adapter>/<token>`. The connect wizard registers it at the provider for you, or shows it to
-   paste in. Read [Connect a sending provider](/providers/connect/).
+   paste in, and proves from outside that the provider can reach it. Read
+   [Connect a sending provider](/providers/connect/).
 2. **ReputeCast checks the signature.** Each adapter verifies the request the way its provider signs it (an SNS
    signature for Amazon SES, an HMAC for Mailgun, an ECDSA signature for SendGrid, a shared secret for providers that
    don't sign). A request that fails is answered `401` and never processed; the first 2 KB of it are kept for diagnosis.
@@ -47,9 +53,21 @@ model, keeps the provider's original code next to it, and shares every bounce an
    provider, and the provider's daily statistics. Hard bounces, complaints and unsubscribes reported by the provider add
    the address to the shared suppression list, and the contact is marked bounced or complained.
 
-Providers without webhooks take the same path from step 4: ReputeCast reads bounces from an SMTP server's
-[bounce mailbox](/reference/glossary/#bounce-mailbox) every minute, and polls the events API of Mailgun or SparkPost
-every minute when you chose polling in the connect wizard.
+Events that don't come through a webhook take the same path from step 4:
+
+- **Amazon SES with the queue option**: SNS delivers the events to an SQS queue in your AWS account, and ReputeCast
+  long-polls it with the connection's own access. Nothing has to reach ReputeCast from the internet. Read
+  [Send with Amazon SES](/providers/amazon-ses/).
+- **SMTP servers**: ReputeCast reads bounces and spam reports from the server's
+  [bounce mailbox](/reference/glossary/#bounce-mailbox) every minute. If the mailbox can't be read for 15 minutes, the
+  provider turns Degraded ("Bounce mailbox unreachable") and the team is notified, because bounces from that server don't
+  reach the suppression list until it can be read again.
+- **Polling**: ReputeCast polls the events API of Mailgun or SparkPost every minute when you chose polling in the
+  connect wizard.
+
+A provider whose events stop arriving while mail goes out is flagged as having silent webhooks, and one that never
+reported an event is flagged once mail is 30 minutes overdue; [Provider health and outages](/providers/health-and-outages/)
+explains when and what happens to sending.
 
 ## Normalized events
 
@@ -76,8 +94,15 @@ original code (such as `550 5.1.1`) and the diagnostic text. Bounces also get a
 words it; read [Bounces, complaints and provider limits](/deliverability/bounces-and-complaints/) and the
 [SMTP error codes](/smtp-errors/).
 
+SMTP servers report no deliveries. ReputeCast counts a message as delivered (inferred) once the server accepts it with
+its `250` reply, and asks for delivery status notifications (success, failure and delay, headers only) where the server
+announces DSN support; bounces and complaints still arrive as reports in the bounce mailbox. Read
+[Send through any SMTP server](/providers/smtp/).
+
 ReputeCast tracks opens and clicks itself. A provider's own `open` and `click` events only count when you chose to keep
-that provider's tracking (see [Provider-side tracking check](#provider-side-tracking-check)).
+that provider's tracking (see [Provider-side tracking check](#provider-side-tracking-check)). Then they are counted like
+ReputeCast's own: each open is classified as a person's, a privacy proxy's (such as Apple Mail's prefetch) or a
+scanner's, and a click settles before it counts and is matched to the email's link.
 
 ## The event log
 
@@ -96,19 +121,30 @@ ID.
 
 ## Suppression sync
 
-A bounce or complaint at one provider stops mail to that address on every provider. The
-<UiPath path="providers.events.syncTitle" /> card shows how each provider takes part:
+A hard bounce or complaint at one provider stops mail to that address on every provider. The
+<UiPath path="providers.events.syncTitle" /> card says what goes where:
 
-- **Two-way**: ReputeCast pulls the provider's own suppressions into the shared list and pushes new shared suppressions
-  to the provider's suppression list.
+- **Pushed to providers**: only hard bounces and complaints that apply to all mail. They go entry by entry, in the order
+  they joined the shared list, late bounces and imported history included.
+- **Kept in ReputeCast**: unsubscribes and other marketing-only suppressions, so password resets and receipts still
+  arrive, because a provider's list stops every message. Manual entries and other suppressions that apply to all mail
+  stay in ReputeCast too, and ReputeCast still blocks them for all mail before it hands a message over.
+- **Removals sync too**: an address that leaves the shared list leaves the provider's list.
+
+Each provider's row names the list it syncs with and how it takes part:
+
+- **Two-way**: ReputeCast pulls the provider's own suppressions into the shared list and pushes the hard bounces and
+  complaints back out. Amazon SES syncs with the workspace's own tenant list, never your whole AWS account; without a
+  tenant, SES's account-level list is shared by every app on the AWS account, so ReputeCast only reads it. Postmark
+  keeps a list per message stream, Mailgun per sending domain.
 - **Pull only**: the provider lists its suppressions but its API can't take new ones (Brevo). ReputeCast pulls them.
 - **Local only** (shown as Enforced locally): the provider has no suppression API (Postal, SMTP, Azure Communication
   Services, the generic HTTP adapter). ReputeCast checks the shared list before every send.
 
 Sync runs every 15 minutes for every provider, and soon after an event adds new suppressions. To run it now, choose
 <UiPath path="providers.events.syncAll" /> (needs `providers:manage`). The card shows what each provider pulled in and
-pushed out, the last sync and any error. Read [The suppression list](/audience/suppressions/) to add, upload or remove
-addresses by hand.
+pushed out, how many entries are still pending, the last sync and any error. Read
+[The suppression list](/audience/suppressions/) to add, upload or remove addresses by hand.
 
 ## Provider-side tracking check
 
@@ -129,7 +165,8 @@ Brevo adds its own tracking by default; read [Send with Brevo](/providers/brevo/
 ## When to change them
 
 - **Events stop arriving**: ReputeCast marks a provider Degraded when its webhooks stay silent while it accepts mail.
-  Read [Provider health and outages](/providers/health-and-outages/).
+  Silent webhooks alone raise an alarm, not a failover. Read [Provider health and outages](/providers/health-and-outages/).
+- **Your server can't take webhooks from the internet**: for Amazon SES, switch the connection to the SQS queue.
 - **You rotated webhook secrets**: providers whose webhook you set up by hand need the new secret, or their events are
   refused. Read [Workspace sending defaults](/providers/workspace-defaults/).
 - **You moved from another platform**: pull your old provider's suppressions before your first send. Read

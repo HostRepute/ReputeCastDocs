@@ -10,6 +10,10 @@ sources:
   - internal/providers/bounce/bounce.go
   - internal/ingest/normalize.go
   - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
   - internal/sending/engine/analysis.go
   - internal/readiness/assemble.go
   - internal/reports/bounces.go
@@ -63,15 +67,21 @@ Gmail rate limits when your volume, or the share of your mail its users don't wa
 - While the sending provider retries, each refused attempt arrives as a [deferral](/reference/glossary/#deferral): a
   <UiPath path="providers.events.optionDeferred" /> event in the event log. Deferrals don't appear in the campaign
   report's bounces table.
-- Deferrals count toward the deferral rate of the Gmail mailbox provider during a send. Above 5.0% (fixed; it counts
-  after 500 messages to Gmail and at least 5 deferrals, with about 90% confidence), ReputeCast
+- Every workspace starts with a [reply rule](/reference/glossary/#reply-rule) for this code: when 5 Gmail replies
+  contain `421-4.7.28` within 10 minutes, ReputeCast slows Gmail to half rate for 30 minutes, before any rate threshold.
+  The other mailbox providers keep their pace. The rule matches that text anywhere in the reply; if your event log shows
+  the code written another way, such as `421 4.7.28`, add a rule for `4.7.28` in
+  [traffic rules](/providers/traffic-rules/).
+- Deferrals and soft bounces also count toward Gmail's deferral thresholds, each message once, over the last 10
+  minutes. At 15% of the mail sent to Gmail, ReputeCast slows Gmail to half rate; at 40% it
   [auto-pauses](/reference/glossary/#auto-pause) the Gmail share of the campaign, or the whole campaign when the pause
-  scope is set to the campaign.
+  scope is set to the campaign. Each level waits for 500 messages to Gmail in that time and at least 5 deferrals.
 - If the sending provider stops retrying, it reports a bounce. Gmail's text contains the word "spam", so the
   [bounce class](/reference/glossary/#bounce-class) is `spam_block` and the report row is
-  <UiPath path="reports.bounceType.blocked" />. A bounce with a 4xx reply is recorded as a soft bounce and doesn't
-  suppress the address, unless the sending provider itself calls it permanent (Amazon SES and Resend follow their own
-  bounce type; see [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address)).
+  <UiPath path="reports.bounceType.blocked" />. A block for the sender's reputation never suppresses the address, even
+  when the sending provider calls it permanent (see
+  [when ReputeCast suppresses an address](/smtp-errors/#when-reputecast-suppresses-an-address)). A permanent one counts
+  toward Gmail's block/policy bounce threshold.
 - The Message-ID variant, or the bare code without Gmail's text, is `temporary`
   (<UiPath path="reports.bounceType.deferralExpired" />).
 
@@ -80,8 +90,9 @@ Gmail rate limits when your volume, or the share of your mail its users don't wa
 ## Before you begin
 
 - `providers:view` to read the event log.
-- `providers:manage` to change the throttles in <UiPath path="nav.settings > settings.providers" />.
-- `campaigns:send` to resume an auto-paused send.
+- `providers:manage` to change the throttles in <UiPath path="nav.settings > settings.providers" /> and the reply rules
+  in <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` to resume an auto-paused send or change its rates.
 
 ## Recover from the rate limit
 
@@ -93,7 +104,8 @@ Gmail rate limits when your volume, or the share of your mail its users don't wa
    address, a domain or a link.
 2. Slow down to Gmail. Gmail has no throttle by default. In
    <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />, set a Gmail rate in messages
-   per second. If a send is already auto-paused, the [live monitor](/campaigns/live-monitor/) recommends a lower rate
+   per second. During a send, lower the Gmail rate with <UiPath path="live.adjustRates" /> on the
+   [live monitor](/campaigns/live-monitor/). If a send is already auto-paused, the live monitor recommends a lower rate
    for the Gmail share; resume with that change.
 3. Send to engaged readers first. Contacts who stopped opening raise the share of unwanted mail. Use the
    [list health tiers](/audience/list-health/) and let Send Readiness exclude unengaged contacts when it warns about
@@ -110,7 +122,8 @@ Gmail rate limits when your volume, or the share of your mail its users don't wa
 
 ## Check that it worked
 
-- On the next send, the live monitor's Gmail deferral rate stays low and the send isn't auto-paused.
+- On the next send, the live monitor's Gmail deferral rate stays low, the send isn't slowed down or auto-paused, and its
+  <UiPath path="live.model.thresholdReplies" /> row shows the `421-4.7.28` rule well under its count.
 - The event log shows delivered events for Gmail recipients instead of new 421 4.7.28 deferrals.
 
 ## Troubleshooting

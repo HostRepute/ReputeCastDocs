@@ -9,6 +9,10 @@ primaryKeyword: webhook bounce email
 sources:
   - internal/ingest
   - internal/suppressions/sync.go
+  - internal/providers/eventqueue
+  - internal/providers/ses/queue.go
+  - internal/providers/smtp
+  - internal/providers/manage/review_health.go
   - internal/providers/provider.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
@@ -24,8 +28,9 @@ import UiPath from '~/components/UiPath.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
-Mỗi nhà cung cấp gửi thư báo lại chuyện gì đã xảy ra với thư của bạn theo định dạng riêng: Amazon SES qua thông báo SNS,
-Postmark và Mailgun qua webhook, máy chủ SMTP qua thư trả lại trong một hộp thư. ReputeCast chuyển các sự kiện webhook
+Mỗi nhà cung cấp gửi thư báo lại chuyện gì đã xảy ra với thư của bạn theo định dạng riêng: Amazon SES qua thông báo SNS
+(gửi tới webhook hoặc tới một hàng đợi SQS), Postmark và Mailgun qua webhook, máy chủ SMTP qua thư trả lại trong một hộp
+thư. ReputeCast chuyển các sự kiện webhook
 bounce email, gửi thành công và khiếu nại này thành một mô hình
 [sự kiện chuẩn hóa](/vi/reference/glossary/#normalized-event) duy nhất, giữ mã gốc của nhà cung cấp bên cạnh, và chia sẻ
 mọi thư trả lại và khiếu nại qua một [danh sách chặn gửi](/vi/reference/glossary/#suppression-list) dùng chung.
@@ -34,7 +39,8 @@ mọi thư trả lại và khiếu nại qua một [danh sách chặn gửi](/vi
 
 1. **Nhà cung cấp gọi ReputeCast.** Mỗi nhà cung cấp đã kết nối có địa chỉ webhook riêng,
    `https://<public URL>/hooks/<adapter>/<token>`. Trình hướng dẫn kết nối đăng ký địa chỉ này ở nhà cung cấp giúp bạn,
-   hoặc hiển thị nó để bạn tự dán vào. Hãy đọc [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
+   hoặc hiển thị nó để bạn tự dán vào, và chứng minh từ bên ngoài rằng nhà cung cấp gọi được đến địa chỉ đó. Hãy đọc
+   [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/).
 2. **ReputeCast kiểm tra chữ ký.** Mỗi adapter xác minh yêu cầu theo đúng cách nhà cung cấp của nó ký (chữ ký SNS với
    Amazon SES, HMAC với Mailgun, chữ ký ECDSA với SendGrid, khóa bí mật dùng chung với các nhà cung cấp không ký). Yêu cầu
    không hợp lệ nhận phản hồi `401` và không bao giờ được xử lý; 2 KB đầu tiên của nó được giữ lại để chẩn đoán.
@@ -47,9 +53,22 @@ mọi thư trả lại và khiếu nại qua một [danh sách chặn gửi](/vi
    cung cấp gửi thư, và số liệu hằng ngày của nhà cung cấp. Trả thư vĩnh viễn, khiếu nại và hủy đăng ký do nhà cung cấp
    báo về sẽ đưa địa chỉ vào danh sách chặn gửi dùng chung, và liên hệ được đánh dấu là bị trả thư hoặc đã khiếu nại.
 
-Các nhà cung cấp không có webhook đi cùng con đường đó từ bước 4: ReputeCast đọc thư trả lại từ
-[hộp thư nhận thư trả lại](/vi/reference/glossary/#bounce-mailbox) của máy chủ SMTP mỗi phút, và hỏi định kỳ API sự kiện
-của Mailgun hoặc SparkPost mỗi phút khi bạn chọn hỏi định kỳ trong trình hướng dẫn kết nối.
+Những sự kiện không đến qua webhook đi cùng con đường đó từ bước 4:
+
+- **Amazon SES với tùy chọn hàng đợi**: SNS gửi sự kiện vào một hàng đợi SQS trong tài khoản AWS của bạn, và ReputeCast
+  hỏi định kỳ (long poll) hàng đợi đó bằng chính quyền truy cập của kết nối. Không có gì phải đi từ internet vào
+  ReputeCast. Hãy đọc [Gửi thư bằng Amazon SES](/vi/providers/amazon-ses/).
+- **Máy chủ SMTP**: ReputeCast đọc thư trả lại và báo cáo spam từ
+  [hộp thư nhận thư trả lại](/vi/reference/glossary/#bounce-mailbox) của máy chủ mỗi phút. Nếu không đọc được hộp thư
+  trong 15 phút, nhà cung cấp chuyển sang Suy giảm ("Không đọc được hộp thư trả lại") và nhóm được thông
+  báo, vì thư trả lại từ máy chủ đó không vào được danh sách chặn gửi cho đến khi đọc lại được hộp thư.
+- **Hỏi định kỳ**: ReputeCast hỏi định kỳ API sự kiện của Mailgun hoặc SparkPost mỗi phút khi bạn chọn hỏi định kỳ trong
+  trình hướng dẫn kết nối.
+
+Một nhà cung cấp ngừng gửi sự kiện trong khi thư vẫn được gửi đi sẽ bị đánh dấu là webhook im lặng, và một nhà cung cấp
+chưa từng báo sự kiện nào sẽ bị đánh dấu khi thư đã quá hạn 30 phút;
+[Tình trạng và sự cố của nhà cung cấp](/vi/providers/health-and-outages/) giải thích khi nào và điều gì xảy ra với việc
+gửi.
 
 ## Sự kiện chuẩn hóa
 
@@ -77,9 +96,16 @@ từng nhà cung cấp diễn đạt thế nào; hãy đọc
 [Thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/) và
 [Mã lỗi SMTP](/vi/smtp-errors/).
 
+Máy chủ SMTP không báo thư gửi thành công. ReputeCast tính một thư là đã gửi thành công (suy ra) khi máy chủ nhận thư
+bằng phản hồi `250`, và yêu cầu thông báo trạng thái gửi (DSN: thành công, thất bại và trì hoãn, chỉ phần header) ở những
+máy chủ có hỗ trợ DSN; thư trả lại và khiếu nại vẫn đến dưới dạng báo cáo trong hộp thư nhận thư trả lại. Hãy đọc
+[Gửi thư qua bất kỳ máy chủ SMTP nào](/vi/providers/smtp/).
+
 ReputeCast tự theo dõi lượt mở và lượt nhấp. Sự kiện `open` và `click` của nhà cung cấp chỉ được tính khi bạn chọn giữ
 theo dõi của nhà cung cấp đó (xem
-[Kiểm tra theo dõi phía nhà cung cấp](#kiểm-tra-theo-dõi-phía-nhà-cung-cấp)).
+[Kiểm tra theo dõi phía nhà cung cấp](#kiểm-tra-theo-dõi-phía-nhà-cung-cấp)). Khi đó chúng được tính như sự kiện của chính
+ReputeCast: mỗi lượt mở được phân loại là của người đọc, của proxy bảo mật (như tính năng tải trước của Apple Mail) hay
+của trình quét, và một lượt nhấp phải ổn định rồi mới được tính và được ghép với liên kết trong email.
 
 ## Nhật ký sự kiện
 
@@ -98,11 +124,22 @@ tìm theo người nhận hay mã thư.
 
 ## Đồng bộ danh sách chặn gửi
 
-Một thư trả lại hay khiếu nại ở một nhà cung cấp sẽ dừng việc gửi đến địa chỉ đó trên mọi nhà cung cấp. Thẻ
-<UiPath path="providers.events.syncTitle" /> cho biết từng nhà cung cấp tham gia như thế nào:
+Một thư trả lại vĩnh viễn hay khiếu nại ở một nhà cung cấp sẽ dừng việc gửi đến địa chỉ đó trên mọi nhà cung cấp. Thẻ
+<UiPath path="providers.events.syncTitle" /> cho biết cái gì đi đâu:
 
-- **Hai chiều**: ReputeCast kéo các địa chỉ bị chặn của chính nhà cung cấp về danh sách dùng chung và đẩy các địa chỉ chặn
-  gửi mới của danh sách dùng chung ra danh sách chặn của nhà cung cấp.
+- **Đẩy ra nhà cung cấp**: chỉ các thư trả lại vĩnh viễn và khiếu nại áp dụng cho mọi thư. Chúng được đẩy từng mục một,
+  theo thứ tự đã vào danh sách dùng chung, kể cả thư trả lại đến muộn và lịch sử đã nhập.
+- **Giữ trong ReputeCast**: hủy đăng ký và các địa chỉ chặn gửi khác chỉ dành cho thư tiếp thị, để thư đặt lại mật khẩu và
+  biên nhận vẫn đến, vì danh sách của nhà cung cấp chặn mọi thư. Các mục thêm thủ công và các địa chỉ chặn gửi khác áp
+  dụng cho mọi thư cũng ở lại ReputeCast, và ReputeCast vẫn chặn chúng cho mọi thư trước khi giao thư đi.
+- **Việc gỡ cũng được đồng bộ**: một địa chỉ rời khỏi danh sách dùng chung sẽ rời khỏi danh sách của nhà cung cấp.
+
+Hàng của mỗi nhà cung cấp nêu danh sách mà nó đồng bộ và cách nó tham gia:
+
+- **Hai chiều**: ReputeCast kéo các địa chỉ bị chặn của chính nhà cung cấp về danh sách dùng chung và đẩy các thư trả lại
+  vĩnh viễn và khiếu nại ngược ra. Amazon SES đồng bộ với danh sách riêng của tenant thuộc không gian làm việc, không bao
+  giờ với cả tài khoản AWS của bạn; khi không có tenant, danh sách cấp tài khoản của SES được mọi ứng dụng trên tài khoản
+  AWS dùng chung, nên ReputeCast chỉ đọc nó. Postmark có một danh sách cho mỗi luồng thư, Mailgun cho mỗi tên miền gửi.
 - **Chỉ kéo về**: nhà cung cấp liệt kê được các địa chỉ bị chặn nhưng API của nó không nhận địa chỉ mới (Brevo).
   ReputeCast kéo các địa chỉ đó về.
 - **Chỉ cục bộ** (hiển thị là Áp dụng cục bộ): nhà cung cấp không có API danh sách chặn (Postal, SMTP, Azure Communication
@@ -110,7 +147,7 @@ Một thư trả lại hay khiếu nại ở một nhà cung cấp sẽ dừng v
 
 Việc đồng bộ chạy mỗi 15 phút cho mọi nhà cung cấp, và chạy sớm ngay sau khi một sự kiện thêm địa chỉ chặn gửi mới. Để
 chạy ngay, chọn <UiPath path="providers.events.syncAll" /> (cần quyền `providers:manage`). Thẻ cho biết mỗi nhà cung cấp
-đã kéo về và đẩy đi những gì, lần đồng bộ gần nhất và lỗi nếu có. Hãy đọc [Danh sách chặn gửi](/vi/audience/suppressions/)
+đã kéo về và đẩy đi những gì, còn bao nhiêu mục đang chờ, lần đồng bộ gần nhất và lỗi nếu có. Hãy đọc [Danh sách chặn gửi](/vi/audience/suppressions/)
 để thêm, tải lên hoặc gỡ địa chỉ thủ công.
 
 ## Kiểm tra theo dõi phía nhà cung cấp
@@ -133,7 +170,9 @@ Brevo tự thêm theo dõi riêng theo mặc định; hãy đọc [Gửi bằng 
 ## Khi nào nên thay đổi
 
 - **Sự kiện ngừng về**: ReputeCast đánh dấu một nhà cung cấp là Suy giảm khi webhook của nó im lặng trong lúc nó vẫn nhận
-  thư. Hãy đọc [Tình trạng và sự cố của nhà cung cấp](/vi/providers/health-and-outages/).
+  thư. Chỉ riêng webhook im lặng thì báo động, không chuyển dự phòng. Hãy đọc
+  [Tình trạng và sự cố của nhà cung cấp](/vi/providers/health-and-outages/).
+- **Máy chủ của bạn không nhận được webhook từ internet**: với Amazon SES, hãy chuyển kết nối sang hàng đợi SQS.
 - **Bạn đã xoay vòng khóa bí mật webhook**: những nhà cung cấp có webhook do bạn thiết lập thủ công cần khóa bí mật mới,
   nếu không sự kiện của chúng sẽ bị từ chối. Hãy đọc
   [Cài đặt gửi mặc định của không gian làm việc](/vi/providers/workspace-defaults/).

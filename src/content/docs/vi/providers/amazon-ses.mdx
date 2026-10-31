@@ -1,6 +1,6 @@
 ---
 title: Gửi thư bằng Amazon SES
-description: 'Gửi newsletter bằng Amazon SES qua ReputeCast: kết nối bằng role CloudFormation hoặc khóa IAM; SNS topic và configuration set được tạo sẵn cho bạn.'
+description: 'Gửi newsletter bằng Amazon SES qua ReputeCast: kết nối bằng khóa IAM hoặc role CloudFormation; sự kiện, tenant và configuration set được tạo sẵn.'
 type: how-to
 audience: [admin]
 permissions: ['providers:manage', 'domains:manage']
@@ -8,9 +8,11 @@ uiPath: 'nav.providers > providers.tabProviders'
 primaryKeyword: gửi newsletter bằng Amazon SES
 sources:
   - internal/providers/ses
+  - internal/providers/eventqueue
   - internal/connect
   - internal/domains/attach.go
   - internal/providers/manage
+  - internal/suppressions/sync.go
   - web/src/features/connect
 sidebar:
   order: 3
@@ -22,9 +24,11 @@ import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
 
 Để gửi newsletter bằng Amazon SES từ ReputeCast, bạn kết nối tài khoản AWS của chính mình trong trình hướng dẫn kết
-nối. ReputeCast tạo Amazon SNS topic và mỗi [luồng](/vi/reference/glossary/#stream) một configuration set để đưa thư
-trả lại, khiếu nại và thông báo gửi thành công về ReputeCast, phát hiện sandbox SES ở mọi khu vực, và đọc hạn mức cũng
-như tốc độ gửi của bạn.
+nối. ReputeCast tạo một SES tenant cho không gian làm việc, đường đi của sự kiện để đưa thư trả lại, khiếu nại và thông
+báo gửi thành công về ReputeCast (một Amazon SNS topic gọi đến ReputeCast, hoặc một topic đẩy vào hàng đợi SQS do
+ReputeCast hỏi định kỳ) và mỗi [luồng](/vi/reference/glossary/#stream) một configuration set. ReputeCast phát hiện sandbox
+SES ở mọi khu vực, đọc hạn mức cũng như tốc độ gửi của bạn, và chỉ hoàn tất thiết lập khi một sự kiện gửi thành công thật
+đã quay về.
 
 <ProviderMatrix family="email" id="ses" />
 
@@ -37,16 +41,20 @@ như tốc độ gửi của bạn.
   [quyền gửi chính thức](/vi/reference/glossary/#production-access) ngay từ trình hướng dẫn.
 - **Quyền.** Kết nối cần quyền `providers:manage`. Thêm tên miền gửi mới trong trình hướng dẫn cần thêm quyền
   `domains:manage`.
-- **Một địa chỉ HTTPS công khai.** SNS gửi sự kiện tới `<public URL>/hooks/ses/<token>`, nên URL công khai của
-  ReputeCast phải truy cập được từ internet. Trên máy tính cá nhân, hãy dùng tunnel trong lúc thử nghiệm (xem
-  [Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
-- **Một cách cấp quyền truy cập.** Chọn một trong hai:
-  - **Stack CloudFormation (khuyên dùng).** Stack tạo một IAM role tên `ReputeCastSES` mà ReputeCast đảm nhận
-    (assume) bằng một external ID. Không có khóa dài hạn nào được lưu. Bản thân máy chủ ReputeCast cần một danh tính
-    AWS để đảm nhận role đó (một instance role, hoặc `AWS_ACCESS_KEY_ID` và `AWS_SECRET_ACCESS_KEY` trong biến môi
-    trường của nó).
-  - **Khóa truy cập IAM.** Access key ID và secret access key của một IAM user có chính sách bên dưới. Hãy dùng khóa
-    dài hạn (bắt đầu bằng `AKIA`); biểu mẫu không có ô cho session token.
+- **Một cách để sự kiện quay về.** Chọn một cách trong trình hướng dẫn:
+  - **Webhook**: SNS gửi sự kiện tới `<public URL>/hooks/ses/<token>`, nên URL công khai của ReputeCast phải truy cập
+    được từ internet qua HTTPS (xem [Reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+  - **Hàng đợi**: SNS gửi sự kiện vào một hàng đợi SQS mà ReputeCast hỏi định kỳ (long poll) bằng chính quyền truy cập
+    AWS đó. Không có gì phải đi từ internet vào ReputeCast, nên cách này hoạt động sau NAT và tường lửa. AWS tính phí
+    hàng đợi, khoảng 0,40 USD cho mỗi triệu sự kiện.
+- **Một cách cấp quyền truy cập.** Trình hướng dẫn kiểm tra ReputeCast đang chạy ở đâu và khuyên dùng một cách:
+  - **Khóa truy cập IAM** (khuyên dùng khi ReputeCast không chạy trên AWS). Access key ID và secret access key của một
+    IAM user có chính sách bên dưới. Hãy dùng khóa dài hạn (bắt đầu bằng `AKIA`); biểu mẫu không có ô cho session token.
+  - **Stack CloudFormation** (khuyên dùng khi ReputeCast chạy trên AWS: EC2, ECS, EKS hoặc Lambda). Stack tạo một IAM
+    role tên `ReputeCastSES` mà ReputeCast đảm nhận (assume) bằng một external ID, nên không có khóa dài hạn nào được
+    lưu. Ngoài AWS, máy chủ cần thông tin xác thực AWS của riêng nó để đảm nhận role (`AWS_ACCESS_KEY_ID` và
+    `AWS_SECRET_ACCESS_KEY`, hoặc một tệp credentials dùng chung); nếu không có, trình hướng dẫn yêu cầu khóa truy cập
+    IAM thay thế.
 
 Đây là chính sách đặc quyền tối thiểu mà stack gắn vào role, cũng là chính sách một IAM user cần có:
 
@@ -63,15 +71,36 @@ như tốc độ gửi của bạn.
         "ses:GetSendQuota",
         "ses:*ConfigurationSet*",
         "ses:*EmailIdentity*",
+        "ses:ListEmailIdentities",
+        "ses:*Tenant*",
+        "ses:GetReputationEntity",
         "ses:*SuppressedDestination*",
-        "ses:PutAccountDetails"
+        "ses:PutAccountDetails",
+        "ses:GetDedicatedIps"
       ],
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["sns:CreateTopic", "sns:Subscribe", "sns:SetTopicAttributes", "sns:GetSubscriptionAttributes"],
+      "Action": [
+        "sns:CreateTopic",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
+        "sns:SetTopicAttributes",
+        "sns:GetSubscriptionAttributes"
+      ],
       "Resource": "arn:aws:sns:*:*:reputecast-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage"
+      ],
+      "Resource": "arn:aws:sqs:*:*:reputecast-*"
     }
   ]
 }
@@ -85,23 +114,24 @@ như tốc độ gửi của bạn.
    danh mục. Trình hướng dẫn có sáu bước; [Kết nối nhà cung cấp gửi thư](/vi/providers/connect/) mô tả các bước chung
    của mọi nhà cung cấp.
 
-2. Trong <UiPath path="connect.connection.ses.grantTitle" />, chọn cách ReputeCast truy cập vào tài khoản AWS của bạn.
-   - <UiPath path="connect.connection.ses.stackTitle" />: chọn
-     <UiPath path="connect.connection.ses.launchStack" />. AWS CloudFormation console mở một stack tạo nhanh
-     (quick-create) tên `ReputeCastSES` với external ID đã điền sẵn. Hãy tạo stack, rồi sao chép đầu ra `RoleArn` của
-     nó (có dạng `arn:aws:iam::123456789012:role/ReputeCastSES`) vào
+2. Trong <UiPath path="connect.connection.ses.grantTitle" />, một ghi chú cho biết ReputeCast có chạy trên AWS hay không,
+   và lựa chọn phù hợp mang nhãn <UiPath path="connect.connection.ses.recommendedHere" />. Chọn cách ReputeCast truy cập
+   vào tài khoản AWS của bạn.
+   - <UiPath path="connect.connection.ses.keysTitle" />: tạo một IAM user có chính sách ở trên rồi dán
+     <UiPath path="connect.connection.ses.keyIdLabel" /> và <UiPath path="connect.connection.ses.secretLabel" /> của nó.
+   - <UiPath path="connect.connection.ses.stackTitle" />: chọn <UiPath path="connect.connection.ses.launchStack" />. AWS
+     CloudFormation console mở một stack tạo nhanh (quick-create) tên `ReputeCastSES` với external ID đã điền sẵn. Hãy
+     tạo stack, rồi sao chép đầu ra `RoleArn` của nó (có dạng `arn:aws:iam::123456789012:role/ReputeCastSES`) vào
      <UiPath path="connect.connection.ses.roleArnLabel" />.
-   - <UiPath path="connect.connection.ses.keysTitle" />: dán
-     <UiPath path="connect.connection.ses.keyIdLabel" /> và
-     <UiPath path="connect.connection.ses.secretLabel" />.
 
    <UiPath path="connect.connection.ses.policyToggle" /> hiển thị chính sách ở trên. Chọn
    <UiPath path="connect.connection.ses.checkAccess" />: ReputeCast kiểm tra quyền truy cập bằng các lệnh gọi chỉ đọc
-   (`GetAccount`) trước khi lưu bất cứ thứ gì, ở dạng mã hóa.
+   (`GetAccount`) trước khi lưu bất cứ thứ gì, ở dạng mã hóa. Khi đã kết nối, dòng trạng thái nêu access key đã che bớt
+   và IAM user của nó, hoặc role đã đảm nhận, cùng tài khoản AWS.
 
    <Screenshot
      id="connect-ses-connection"
-     alt="Bước kết nối Amazon SES: đã chọn stack CloudFormation, role đã được đảm nhận, khu vực us-east-1 có quyền gửi chính thức, và mọi dòng khởi tạo đều đã hoàn tất."
+     alt="Bước kết nối Amazon SES: một ghi chú cho biết ReputeCast không chạy trên AWS nên khóa truy cập IAM được khuyên dùng; stack CloudFormation đang được chọn và role đã được đảm nhận cho tài khoản 123456789012; khu vực us-east-1 có quyền gửi chính thức với hạn mức 50.000 thư mỗi ngày; thẻ sự kiện cho chọn Webhook hoặc Hàng đợi."
    />
 
 3. Trong <UiPath path="connect.connection.ses.regionTitle" />, chọn
@@ -109,18 +139,31 @@ như tốc độ gửi của bạn.
    chọn đều cho biết khu vực đó đã có quyền gửi chính thức cùng hạn mức hằng ngày, hay đang ở sandbox. Hãy chọn khu vực
    bạn đã có quyền gửi chính thức, hoặc khu vực gần người nhận nhất.
 
-4. Chờ danh sách khởi tạo hoàn tất. ReputeCast tạo (có thử lại khi lỗi):
-   - SNS topic `reputecast-events`, đăng ký (subscribe) vào URL webhook của bạn, và xác nhận đăng ký khi SNS gửi bước
-     bắt tay (handshake);
+4. Trong <UiPath path="connect.connection.ses.eventsTitle" />, chọn
+   <UiPath path="connect.connection.ses.eventsWebhook" /> (SNS gọi URL công khai của bạn) hoặc
+   <UiPath path="connect.connection.ses.eventsQueue" /> (SNS đẩy vào một hàng đợi SQS do ReputeCast hỏi định kỳ). Đổi lựa
+   chọn này về sau sẽ thiết lập lại topic và kiểm tra lại sự kiện.
+
+5. Chờ bước khởi tạo và kiểm tra sự kiện hoàn tất. ReputeCast tạo, mỗi bước tự thử lại khi lỗi:
+   - tenant mang tên không gian làm việc của bạn, với danh sách chặn gửi riêng cho thư trả lại và khiếu nại và uy tín
+     riêng: chính sách uy tín của SES chỉ tạm dừng tenant này, không bao giờ tạm dừng cả tài khoản AWS;
+   - SNS topic `reputecast-events`, đăng ký (subscribe) vào URL webhook của bạn (và xác nhận đăng ký khi SNS gửi bước
+     bắt tay), hoặc topic đó cùng một hàng đợi SQS `reputecast-events` đăng ký vào nó, chỉ nhận từ topic đó;
    - các configuration set `rc-broadcasts`, `rc-automations`, `rc-system` và `rc-transactional`, mỗi set có một event
-     destination phát các sự kiện gửi, gửi thành công, thư trả lại, khiếu nại, từ chối, trì hoãn và sự kiện đăng ký
-     tới topic. Sự kiện mở và nhấp vẫn tắt: ReputeCast tự theo dõi các sự kiện đó.
+     destination phát các sự kiện gửi, gửi thành công, thư trả lại, khiếu nại, từ chối, trì hoãn và sự kiện đăng ký tới
+     topic, và đều được gắn với tenant. Sự kiện mở và nhấp vẫn tắt: ReputeCast tự theo dõi các sự kiện đó.
+
+   Sau đó ReputeCast gửi một thư thử tới mailbox simulator của SES, `success@simulator.amazonses.com` (không ảnh hưởng tỷ
+   lệ trả thư hay khiếu nại của bạn), và chờ sự kiện Delivery của thư đó.
+   <UiPath path="connect.connection.continueDomain" /> bị tắt cho đến khi sự kiện gửi thành công thật đó đến được
+   ReputeCast. SES chỉ gửi từ một identity đã xác minh: nếu bạn chưa có, thư thử được gửi khi bước tiếp theo xác minh tên
+   miền của bạn, và việc thiết lập hoàn tất sau khi sự kiện đến.
 
    Nếu một kết nối khác trên hệ thống này đã dùng cùng tài khoản AWS và khu vực, các tên sẽ có thêm hậu tố là slug của
    không gian làm việc. Dòng thất bại hiển thị mã lỗi của AWS và hành động bị từ chối; hãy sửa chính sách
    (<UiPath path="connect.connection.ses.fixPolicy" /> mở role hoặc trang IAM users trong AWS), rồi thử lại.
 
-5. Nếu khu vực đang ở sandbox, một huy hiệu sandbox xuất hiện cùng biểu mẫu nộp yêu cầu quyền gửi chính thức tới AWS
+6. Nếu khu vực đang ở sandbox, một huy hiệu sandbox xuất hiện cùng biểu mẫu nộp yêu cầu quyền gửi chính thức tới AWS
    thay bạn: <UiPath path="connect.connection.ses.website" />,
    <UiPath path="connect.connection.ses.mailType" />, <UiPath path="connect.connection.ses.useCase" />,
    <UiPath path="connect.connection.ses.dailyVolume" /> và <UiPath path="connect.connection.ses.contactLanguage" />.
@@ -129,8 +172,9 @@ như tốc độ gửi của bạn.
    [Đưa Amazon SES ra khỏi sandbox](/vi/deliverability/amazon-ses-production-access/) giải thích AWS xem xét những gì.
    Bạn có thể tiếp tục trong lúc chờ.
 
-6. Chọn <UiPath path="connect.connection.continueDomain" /> và nhập tên miền gửi. ReputeCast tạo SES identity với khóa
-   DKIM 2048 bit, đặt tên miền MAIL FROM là `bounce.<your domain>`, và liệt kê chính xác các bản ghi cần công bố. Các
+7. Chọn <UiPath path="connect.connection.continueDomain" /> và nhập tên miền gửi. ReputeCast tạo SES identity với khóa
+   DKIM 2048 bit, đặt tên miền MAIL FROM là `bounce.<your domain>`, gắn identity với tenant, và liệt kê chính xác các
+   bản ghi cần công bố. Các
    bản ghi chuyển sang <UiPath path="connect.domain.statusVerified" /> khi DNS lan truyền.
 
    <Screenshot
@@ -144,16 +188,17 @@ như tốc độ gửi của bạn.
      5. Trạng thái xác minh và thời điểm kiểm tra gần nhất.
    </Screenshot>
 
-7. Trong <UiPath path="connect.stepTest" />, gửi một thư thử. Dòng thời gian gửi cho thấy thư được SES chấp nhận (kèm
+8. Trong <UiPath path="connect.stepTest" />, gửi một thư thử. Dòng thời gian gửi cho thấy thư được SES chấp nhận (kèm
    MessageId và configuration set), rồi các sự kiện Send và Delivery trả về qua SNS.
 
-8. Trong <UiPath path="connect.stepStreams" />, chọn các luồng mà SES đảm nhận. Mỗi luồng dùng configuration set riêng,
+9. Trong <UiPath path="connect.stepStreams" />, chọn các luồng mà SES đảm nhận. Mỗi luồng dùng configuration set riêng,
    nên sự cố ở luồng Gửi hàng loạt không bao giờ ảnh hưởng đến thư đặt lại mật khẩu.
 
-9. Trong <UiPath path="connect.stepContacts" />, giữ tùy chọn kéo các địa chỉ chặn gửi hiện có từ SES (khuyên dùng và
-   được chọn sẵn) để nhập các địa chỉ trong danh sách chặn gửi cấp tài khoản của SES. Khi chọn, việc
-   [đồng bộ danh sách chặn gửi](/vi/reference/glossary/#suppression-sync) diễn ra hai chiều; khi bỏ chọn, ReputeCast
-   chỉ đẩy danh sách của mình lên SES.
+10. Trong <UiPath path="connect.stepContacts" />, giữ tùy chọn kéo các địa chỉ chặn gửi hiện có từ SES (khuyên dùng và
+    được chọn sẵn) để nhập các địa chỉ trong danh sách chặn gửi cấp tài khoản của SES. Từ đó trở đi, thư trả lại vĩnh
+    viễn và khiếu nại được đưa vào danh sách riêng của tenant, và việc
+    [đồng bộ danh sách chặn gửi](/vi/reference/glossary/#suppression-sync) giữ danh sách đó khớp với ReputeCast theo cả
+    hai chiều.
 
 </Steps>
 
@@ -165,23 +210,28 @@ như tốc độ gửi của bạn.
 
 ## Kiểm tra kết quả
 
+- Bản tóm tắt thiết lập đánh dấu Sự kiện là <UiPath path="connect.stateVerified" />, kèm thời điểm của sự kiện gửi thành
+  công đầu tiên từ mailbox simulator của SES, và liệt kê tenant.
 - Trên <UiPath path="nav.providers > providers.tabProviders" />, thẻ Amazon SES hiển thị
   <UiPath path="providers.statusHealthy" /> (hoặc <UiPath path="providers.statusSandbox" />), trạng thái tài khoản,
-  hạn mức 24 giờ và tốc độ gửi mà ReputeCast đọc từ SES.
+  hạn mức 24 giờ và tốc độ gửi mà ReputeCast đọc từ SES, các [IP gửi thư](/vi/reference/glossary/#sending-ip) của nó và
+  tenant cùng chính sách uy tín.
 
   <Screenshot
     id="providers-list"
-    alt="Trang Nhà cung cấp gửi thư liệt kê Amazon SES ở trạng thái Ổn định cùng hạn mức, tốc độ, trạng thái tài khoản, tỷ lệ trả thư và tỷ lệ khiếu nại so với ngưỡng xem xét của SES."
+    alt="Trang Nhà cung cấp gửi thư liệt kê Amazon SES ở trạng thái Ổn định tại us-east-1: Gửi hàng loạt 90%, IP gửi thư đọc từ Amazon SES mỗi ngày (nhóm IP dùng chung), webhook SNS, tenant acme-newsletter với danh sách chặn gửi riêng và chính sách uy tín, cùng tỷ lệ trả thư và khiếu nại so với ngưỡng xem xét của SES."
   />
 
-- Trong AWS console, ở khu vực bạn đã chọn: SNS topic `reputecast-events` có một HTTPS subscription đã xác nhận, bốn
-  configuration set `rc-` đều có event destination tên `reputecast`, và identity tên miền của bạn đã được xác minh.
+- Trong AWS console, ở khu vực bạn đã chọn: tenant đã tồn tại, SNS topic `reputecast-events` có một HTTPS subscription
+  đã xác nhận (hoặc một SQS subscription tới hàng đợi `reputecast-events`), bốn configuration set `rc-` đều có event
+  destination tên `reputecast`, và identity tên miền của bạn đã được xác minh.
 - Các lượt gửi thành công và thư trả lại mới xuất hiện trong <UiPath path="nav.providers > providers.tabEvents" />.
 
-ReputeCast gửi từng thư bằng SES `SendEmail` với configuration set của luồng. Mỗi lô tối đa 50 thư, gửi bằng các lệnh
-gọi song song, ở tốc độ gửi tối đa mà SES báo cho tài khoản của bạn. Khi chiến dịch lớn hơn phần hạn mức 24 giờ còn
-lại, [Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) sẽ cảnh báo bạn: việc gửi tạm dừng khi chạm hạn mức và
-tiếp tục khi hạn mức được giải phóng. Thẻ hiển thị tỷ lệ trả thư và tỷ lệ khiếu nại so với giới hạn 5% và 0,1%, bên
+ReputeCast gửi từng thư bằng SES `SendEmail` với configuration set của luồng và tenant của không gian làm việc. Mỗi lô
+tối đa 50 thư, gửi bằng các lệnh gọi song song, ở tốc độ gửi tối đa mà SES báo cho tài khoản của bạn. Khi chiến dịch lớn
+hơn phần hạn mức 24 giờ còn lại, [Độ sẵn sàng gửi](/vi/reference/glossary/#send-readiness) sẽ cảnh báo bạn: việc gửi tạm
+dừng khi chạm hạn mức và tiếp tục khi hạn mức được giải phóng. ReputeCast đọc các IP riêng của tài khoản
+(`GetDedicatedIps`) khi bạn kết nối và mỗi ngày. Thẻ hiển thị tỷ lệ trả thư và tỷ lệ khiếu nại so với giới hạn 5% và 0,1%, bên
 cạnh các mức mà SES bắt đầu xem xét và tạm dừng tài khoản;
 [Thư trả lại, khiếu nại và giới hạn của nhà cung cấp](/vi/deliverability/bounces-and-complaints/) giải thích các mức
 này.
@@ -191,23 +241,31 @@ này.
 - **"AWS không cho ReputeCast nhận vai trò này."** Hãy kiểm tra stack đã tạo xong, bạn đã dán đúng đầu ra `RoleArn`
   của nó, và external ID trong stack không bị thay đổi. Thông báo này cũng xuất hiện khi role thiếu một quyền hoặc AWS
   không phản hồi, nên hãy kiểm tra cả chính sách của role.
-- **"ReputeCast không nhận được vai trò: máy chủ này không có thông tin xác thực AWS của riêng nó để nhận vai trò."**
-  Máy chủ không có danh tính AWS để đảm nhận role. Hãy chạy ReputeCast với một instance role hoặc các biến môi trường
-  `AWS_*`, hoặc dùng khóa truy cập IAM.
+- **"ReputeCast không chạy trên AWS và máy chủ này không có thông tin xác thực AWS để đảm nhận vai trò."** Hãy dùng
+  khóa truy cập IAM, hoặc cấp thông tin xác thực AWS cho máy chủ trước (`AWS_ACCESS_KEY_ID` và `AWS_SECRET_ACCESS_KEY`,
+  hoặc một tệp credentials).
 - **"Amazon SES đã từ chối khóa này"** kèm một mã như `UnrecognizedClientException`. Key ID hoặc secret bị sai, hoặc
   khóa đã bị xóa. Hãy tạo access key mới cho IAM user và dán lại cả hai giá trị.
-- **Một dòng khởi tạo thất bại với `AccessDenied`** và một hành động như `ses:CreateConfigurationSet`. Chính sách của
+- **Một dòng khởi tạo thất bại với `AccessDenied`** và một hành động như `ses:CreateConfigurationSet` hoặc
+  `ses:CreateTenant`. Chính sách của
   role hoặc user không cho phép hành động đó (hoặc đã bị sửa sau khi stack chạy). Hãy khôi phục chính sách ở trên, rồi
   thử lại.
 - **"Không có xác nhận sau 5 phút"** trên dòng SNS subscription. SNS không truy cập được URL webhook của bạn. Hãy
-  đảm bảo URL công khai truy cập được từ internet qua HTTPS và proxy của bạn chuyển `/hooks/` tới ReputeCast, rồi thử
-  lại.
+  đảm bảo URL công khai truy cập được từ internet qua HTTPS và proxy của bạn chuyển `/hooks/` tới ReputeCast, hoặc
+  chuyển sang hàng đợi, rồi thử lại.
+- **"Không có sự kiện giao thư nào sau … phút kể từ khi gửi"** ở bước kiểm tra sự kiện. Với webhook, SNS không gửi được
+  sự kiện đến URL của bạn: hãy kiểm tra địa chỉ truy cập được từ internet, hoặc cho sự kiện SES đi qua hàng đợi. Với hàng
+  đợi, hãy kiểm tra hàng đợi vẫn nhận từ SNS topic và chính sách IAM cho phép `sqs:ReceiveMessage`. Sau đó thử lại.
+- **"Không kiểm tra được với Amazon SES" ở phần IP gửi thư**: role hoặc khóa không được phép liệt kê các IP riêng của tài
+  khoản. Hãy cho phép `ses:GetDedicatedIps` (mẫu CloudFormation đã cho phép), rồi chọn
+  <UiPath path="providers.overview.checkIpsAgain" /> trên thẻ.
 - **Thư thử thất bại với `MessageRejected`** vì một địa chỉ chưa được xác minh. Khu vực đang ở sandbox: hãy xác minh
   người nhận trong SES, gửi tới một địa chỉ bạn đã xác minh, hoặc yêu cầu quyền gửi chính thức.
 - **Bạn đã đổi URL công khai.** ReputeCast không tự cập nhật SNS. Hãy đăng ký topic `reputecast-events` với URL webhook
-  mới trong AWS.
+  mới trong AWS, hoặc chuyển kết nối sang hàng đợi.
 - **Bạn đã ngắt kết nối SES.** ReputeCast xóa thông tin xác thực đã lưu nhưng không gỡ bỏ gì trong AWS. Nếu không còn
-  cần, hãy tự xóa SNS topic và subscription, các configuration set `rc-`, identity và stack hoặc IAM user.
+  cần, hãy tự xóa tenant, SNS topic và subscription, hàng đợi, các configuration set `rc-`, identity và stack hoặc IAM
+  user.
 
 ## Liên quan
 

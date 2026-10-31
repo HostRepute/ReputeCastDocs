@@ -1,6 +1,6 @@
 ---
 title: Instance admin
-description: Instance administration in ReputeCast covers users, workspaces, the sign-in policy, the public URL, updates and the instance audit log.
+description: Instance administration in ReputeCast covers users, workspaces, the sign-in policy, the public URL, updates, the bot filter and the audit log.
 type: how-to
 audience: [operator, admin]
 primaryKeyword: instance administration
@@ -9,6 +9,11 @@ sources:
   - internal/instance
   - internal/auditlog/instance.go
   - internal/accounts/setup.go
+  - internal/tracking/{agents,networks,classify}.go
+  - internal/useragent
+  - internal/proxycheck
+  - migrations/03201_r05_bot_clicks.sql
+  - migrations/03340_m40_tracking_user_agents.sql
   - web/src/features/admin
   - web/src/features/settings/messages.ts
   - web/src/features/settings/SettingsTabs.ts
@@ -23,7 +28,8 @@ import TableScroll from '~/components/TableScroll.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
 Instance administration is everything that applies to the whole server rather than to one workspace: who has an
-account, which workspaces exist, how people sign in, the public URL, and updates. It lives in
+account, which workspaces exist, how people sign in, the public URL, updates, and the bot filter that keeps machines'
+opens and clicks out of every workspace's numbers. It lives in
 <UiPath path="shell.userMenuInstanceAdmin" />, which only [instance admins](/reference/glossary/#instance-admin) can
 open.
 
@@ -35,9 +41,10 @@ open.
 - The flag is separate from workspace roles: making someone an instance admin doesn't change their workspace roles or
   add them to any workspace. Anyone without the flag who opens the page sees "Only instance admins can open Instance
   admin".
-- Open it from the account menu at the top right: <UiPath path="shell.userMenuInstanceAdmin" />. It has six tabs:
+- Open it from the account menu at the top right: <UiPath path="shell.userMenuInstanceAdmin" />. It has seven tabs:
   <UiPath path="admin.users" />, <UiPath path="admin.workspaces" />, <UiPath path="admin.authentication" />,
-  <UiPath path="admin.sso" />, <UiPath path="admin.instance" /> and <UiPath path="admin.audit" />.
+  <UiPath path="admin.sso" />, <UiPath path="admin.instance" />, <UiPath path="admin.botFilter" /> and
+  <UiPath path="admin.audit" />.
 
 ## Manage users
 
@@ -139,7 +146,7 @@ In <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, the <UiPath p
 
 <Aside type="caution" title="Changing the public URL">
   Saving a new address re-registers the webhook at every sending provider that supports it and lists the providers
-  where you paste the new address yourself. Also set `REPUTECAST_HTTP__PUBLIC_URL` to the same address and restart:
+  where you paste the new address yourself. Also set `REPUTECAST_PUBLIC_URL` to the same address and restart:
   HTTPS-only cookies and HSTS follow the server setting, not the saved one.
 </Aside>
 
@@ -153,6 +160,82 @@ The other cards on this tab:
   [run client workspaces as an agency](/team/agencies/).
 
 <LimitsTable area="instance" />
+
+## Edit the bot filter
+
+<Screenshot
+  id="bot-filter"
+  alt="The Bot filter tab of Instance admin: only people's opens and clicks count; Networks · 12 with Add network, no network added yet and 12 built-in ones; User agents · 28 with Add user agent and 28 built-in ones, CUBOT phones listed as people's; and How the filter decides for opens, clicks, rules and changes."
+/>
+
+The [bot filter](/reference/glossary/#bot-filter) decides which opens and clicks are machines' (mail scanners, scripts,
+link previews) or privacy-protected (a privacy proxy such as Apple Mail Privacy Protection). Reports, segments,
+automations and scores in every workspace leave them out. Built-in entries come with ReputeCast releases and can't be
+removed; in <UiPath path="shell.userMenuInstanceAdmin > admin.botFilter" /> you add the ones your recipients' mail goes
+through, such as a company's mail gateway or a new link checker.
+
+To add a network:
+
+<Steps>
+
+1. In <UiPath path="admin.botfilter.networksTitle" />, select <UiPath path="admin.botfilter.addNetwork" />.
+
+2. Enter the <UiPath path="admin.botfilter.cidrLabel" />: an address or a network such as `203.0.113.0/24` or
+   `2001:db8::/48`.
+
+3. Say <UiPath path="admin.botfilter.runByLabel" />, for example "Our mail gateway".
+
+4. Under <UiPath path="admin.botfilter.kindLegend" />, choose <UiPath path="admin.botfilter.netScanner" /> (its opens
+   and clicks when mail arrives are a machine's; later ones can be people behind the gateway and count) or
+   <UiPath path="admin.botfilter.netPrivacy" /> (it fetches images when mail arrives whether or not anyone reads, so its
+   opens are privacy-protected), then select <UiPath path="admin.botfilter.addNetwork" />.
+
+</Steps>
+
+To add a user agent:
+
+<Steps>
+
+1. In <UiPath path="admin.botfilter.agentsTitle" />, select <UiPath path="admin.botfilter.addAgent" />.
+
+2. Under <UiPath path="admin.botfilter.itIsLegend" />, choose <UiPath path="admin.botfilter.aMachine" /> (a scanner,
+   link checker or script: its opens and clicks are left out wherever the text is in the user agent) or
+   <UiPath path="admin.botfilter.aPerson" /> (a device or app whose user agent has a word the rules take for a
+   machine's, such as one ending in "bot": its opens and clicks count as people's).
+
+3. Enter the <UiPath path="admin.botfilter.patternLabel" />. It isn't case-sensitive; a person's device is one word of
+   letters and digits. ReputeCast refuses text found in the user agents of browsers and mail clients people read email
+   with.
+
+4. Fill in <UiPath path="admin.botfilter.whoLabel" /> and select <UiPath path="admin.botfilter.addAgent" />.
+
+</Steps>
+
+To take off an entry an admin added, select <UiPath path="admin.botfilter.remove" /> on its row and confirm. A change
+applies to new opens and clicks in every workspace within minutes; the ones counted already stay as they are. Every
+change is in the instance audit log. <UiPath path="admin.botfilter.rulesTitle" /> at the bottom of the tab sums up the
+rules; [read campaign reports](/campaigns/reports/#how-clicks-are-counted) explains them with the report's numbers.
+
+<LimitsTable area="tracking" />
+
+## Fix requests through an untrusted proxy
+
+Behind a reverse proxy or load balancer that `http.trusted_proxies` doesn't list, every open and click carries the
+proxy's address instead of the reader's, so the bot filter can't tell a scanner network or Apple's privacy proxy from a
+person, and rate limits treat every reader as one. ReputeCast notices requests that carry forwarding headers
+(`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) from an address it doesn't trust, and tells every instance admin with a
+notification that links to <UiPath path="admin.instance" />:
+
+- "Requests come through a proxy ReputeCast doesn't trust" names a private address that behaved like your proxy. Add
+  it to `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) and restart ReputeCast.
+- "Most requests carry forwarding headers from a public address" names a public address. If it belongs to your CDN or
+  load balancer, add the address ranges its provider publishes, not the address itself. If you don't recognize it,
+  change nothing: anyone can send these headers, and a trusted address can make up readers' addresses.
+
+A burst of forwarded requests never triggers a notice. The notice comes back while the proxy keeps forwarding, and a
+proxy that becomes trusted or goes quiet is forgotten. See
+[reverse proxy and TLS](/self-hosting/reverse-proxy/#set-the-public-url-and-trusted-proxies) for the setting; the
+timing is in the instance table above.
 
 ## Review the instance audit log
 
@@ -181,6 +264,15 @@ See [audit log](/team/audit-log/) for what each entry records.
   workspace is gone.
 - **The public URL check reports a problem next to Reachable**: the address doesn't answer from outside. Check DNS,
   the firewall and your [reverse proxy](/self-hosting/reverse-proxy/).
+- **"A network this wide would take ordinary readers for machines."**: add a narrower network, within the limit in the
+  bot filter table.
+- **"… is in the user agents of browsers and mail clients people read email with"**: enter a word only the machine's
+  user agent has.
+- **A built-in network or user agent has no** <UiPath path="admin.botfilter.remove" /> **button**: built-in entries
+  come with ReputeCast releases and stay. <UiPath path="admin.botfilter.aPerson" /> overrides the rules (a word ending
+  in "bot", "crawler" and the like), not a machine's user agent on the list.
+- **Every open and click in the live monitor comes from one address**: ReputeCast doesn't trust your proxy. See
+  [fix requests through an untrusted proxy](#fix-requests-through-an-untrusted-proxy).
 
 ## Related
 

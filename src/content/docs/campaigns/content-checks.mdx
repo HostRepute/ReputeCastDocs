@@ -1,18 +1,19 @@
 ---
 title: Fix content warnings before sending
-description: The composer's email spam checker flags Gmail clipping, missing alt text, image-heavy mail, risky links, missing footers and spammy subjects.
+description: The composer's email spam checker flags Gmail clipping, missing alt text, image-heavy mail, blocklisted links, missing footers and spammy subjects.
 type: how-to
 audience: [publisher]
 permissions: ['campaigns:edit']
-uiPath: 'nav.campaigns > campaigns.edit > composer.deliverability'
+uiPath: 'nav.campaigns > campaigns.edit > composer.chrome.tabChecks'
 primaryKeyword: email spam checker
 sources:
   - internal/contentcheck
   - internal/campaigns/compose.go
-  - internal/readiness/{assemble,fixes,gather}.go
-  - web/src/features/composer/{RightPanel,CanvasArea,SubjectBar,Composer}.tsx
+  - internal/campaigns/dismissals.go
+  - internal/readiness/{assemble,composer,dismissals,fixes,gather,personalization}.go
+  - web/src/features/composer/{RightPanel,CanvasArea,SubjectBar,Composer,Checks}.tsx
   - web/src/features/composer/fixes.ts
-  - web/src/features/composer/{messages,canvas.messages}.ts
+  - web/src/features/composer/{messages,canvas.messages,chrome.messages}.ts
 sidebar:
   order: 5
 ---
@@ -22,61 +23,62 @@ import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
 import TableScroll from '~/components/TableScroll.astro'
 
-The composer runs an email spam checker and a set of content checks while you write, so you can fix what would hurt inbox placement or break the law before [Send Readiness](/reference/glossary/#send-readiness) runs its full review. Most findings come with a [one-click fix](/reference/glossary/#one-click-fix).
+The composer runs an email spam checker and a set of content checks while you write, so you can fix what would hurt inbox placement or break the law before [Send Readiness](/reference/glossary/#send-readiness) runs its full review. Most findings come with a [one-click fix](/reference/glossary/#one-click-fix), and a warning you judged harmless can be dismissed with a reason.
 
 ## Before you begin
 
-- The checks run for anyone who can open the campaign. Applying a fix needs `campaigns:edit`.
-- The checks rerun about a second after each change to the canvas, subject or preheader. They don't open your links; Send Readiness does that.
+- The checks run for anyone who can open the campaign. Applying a fix or dismissing a warning needs `campaigns:edit`; dismissing is a person's judgment, so API keys and agents can't do it.
+- The checks rerun about a second after each change to the canvas, subject or preheader. They don't open your links; Send Readiness does that. They do look up your link domains live on Spamhaus DBL and SURBL, the same lookups Send Readiness uses, and both reuse a recent answer (see [check and fix blocklist listings](/deliverability/blocklists/)).
 - Set your postal address under <UiPath path="nav.settings > settings.senders" /> (<UiPath path="senders.footerAddress" />), so the footer block can carry it.
 
 ## Fix the warnings
 
 <Steps>
 
-1. Open the campaign in the [composer](/campaigns/composer/). When any check finds a problem, the canvas toolbar shows how many are blocking and how many are warnings, and the inspector gets a <UiPath path="composer.deliverability" /> tab with a count.
+1. Open the campaign in the [composer](/campaigns/composer/) and select the <UiPath path="composer.chrome.tabChecks" /> tab in the inspector. Its label counts the blocks and warnings nobody dismissed. On top, one row each says how <UiPath path="composer.chrome.groupDeliverability" /> and <UiPath path="composer.chrome.groupAccessibility" /> stand, and two rows show the [workspace rules](/campaigns/sending-rules/) and sender reputation from the campaign's latest Send Readiness run.
 
-2. Open <UiPath path="composer.deliverability" />. Blocks are listed first, then warnings, then subject findings.
+2. Read the findings below them: blocks first, then warnings, then the subject's findings, with dismissed warnings last. The issues from Review & send, the A/B variants' findings and the <UiPath path="composer.chrome.groupAccessibility" /> group follow, and a folded list of the checks that passed ends the tab. Select a finding's title to select the element it is about on the canvas.
 
-3. Select a finding's title to select the element it is about on the canvas.
+3. Apply a fix button, or change the email yourself. The list updates as you edit.
 
-4. Apply a fix button, or change the email yourself. The list updates as you edit.
+4. For a warning you decided to keep, select <UiPath path="composer.chrome.dismiss" />, pick why and, optionally, leave a note for reviewers (see [dismiss a warning](#dismiss-a-warning)).
 
-5. Select <UiPath path="composer.reviewSend" />. While Blocks remain, the button turns red and names the count.
+5. Select <UiPath path="composer.reviewSend" />. While blocks remain, the button turns red and names the count.
 
 </Steps>
 
 <Screenshot
   id="composer-warnings"
-  alt="The Deliverability tab of a sale email with two Blocks (a button linking to a domain listed on SURBL and Spamhaus DBL, and no unsubscribe link or postal address) and two warnings (99 KB of Gmail's 102 KB, and a subject that trips 3 spam heuristics), each with its fix buttons."
+  alt="The Checks · 6 tab of a sale email: Deliverability with 2 blocking and 3 warnings, Accessibility with 1 issue and Sender reputation passing; below, two blocks (a button linking to go.acme-promo.link, listed on SURBL and Spamhaus DBL, with Edit link, and no unsubscribe link or postal address, with Insert footer block), each saying why it can't be dismissed, and a warning that the email is 91 KB of Gmail's 102 KB with a fix and Dismiss."
 />
 
-Findings also show where they are: a red tag on the canvas (for example "No alt text" on an image), a red strip with <UiPath path="composer.canvas.insertFooter" /> when the footer is missing, and an amber subject field listing the heuristics it trips.
+Findings also show where they are: a red tag on the canvas (for example "No alt text" on an image or "Link domain on SURBL and Spamhaus DBL" on a button), a red strip with <UiPath path="composer.canvas.insertFooter" /> when the footer is missing, and an amber subject field listing the heuristics it trips.
 
 ## What the composer checks
 
 <TableScroll label="Composer content checks">
 
-| Check                              | Result | When it triggers                                                                                                                                     | One-click fix                                                                                                   |
-| ---------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| The subject is empty               | Block  | No subject.                                                                                                                                          | None.                                                                                                           |
-| Subject spam heuristics            | Warn   | The subject trips at least one heuristic (see below).                                                                                                | **Use suggestion**, when ReputeCast can write a version that passes.                                            |
-| Personalization syntax             | Block  | A Liquid tag in the subject, preheader or body doesn't parse. The finding names the part and the line.                                               | None. See the [Liquid reference](/campaigns/personalization/).                                                  |
-| Unknown field                      | Warn   | A token such as `{{ plan }}` isn't a contact field and has no fallback, so it prints nothing.                                                        | None. Fix the spelling or add `\| default: "…"`.                                                                |
-| No unsubscribe link or postal address | Block | The body has no visible unsubscribe link, no postal address, or neither.                                                                          | <UiPath path="composer.canvas.insertFooter" />                                                                  |
-| Gmail clipping size                | Warn   | The compiled HTML reaches 85 KB. Gmail clips messages over 102 KB and hides the rest, including the unsubscribe link.                                | **Minify inline CSS** (offered when it saves at least 1 KB), and **Remove** the section that makes up most of the size. |
-| Image-heavy email                  | Warn   | Images take up more than 85% of the email, estimated from image sizes against the amount of text.                                                    | None. Add text or use fewer images.                                                                             |
-| Image without alt text             | Warn   | An image has no `alt` attribute. An empty `alt=""` counts as a decorative image, and tracking-pixel-sized images are skipped.                        | Type a description and **Save**.                                                                                |
-| Empty plain-text version           | Warn   | The email has images but no text, so its text/plain part is blank.                                                                                  | None. Add a sentence that says what the images show.                                                            |
-| Button without a link              | Warn   | A button's link is empty or `#`.                                                                                                                     | **Edit link**                                                                                                   |
-| Link to a blocklisted domain       | Block  | A link's domain is on a blocklist in ReputeCast's latest link-domain lookups (for example SURBL or Spamhaus DBL).                                    | **Replace with** the same path on your sending domain, or **Edit link**.                                       |
-| URL shortener                      | Warn   | A link goes through a shortener such as bit.ly, tinyurl.com, t.co, goo.gl, ow.ly or rebrand.ly (19 are known).                                        | **Edit link**                                                                                                   |
-| Store product removed              | Warn   | A product block names a product your store no longer has.                                                                                           | None. Remove it or pick another product.                                                                        |
-| Sponsor creative missing           | Block  | A Sponsor block's booking has no creative yet.                                                                                                       | **Open booking**, or remove the block.                                                                          |
+| Check                                 | Result | When it triggers                                                                                                                                                                         | One-click fix                                                                                                           |
+| ------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| The subject is empty                  | Block  | No subject.                                                                                                                                                                              | None.                                                                                                                   |
+| Subject spam heuristics               | Warn   | The subject trips at least one heuristic (see below).                                                                                                                                    | **Use suggestion**, when ReputeCast can write a version that passes.                                                    |
+| Personalization syntax                | Block  | A Liquid tag in the subject, preheader or body doesn't parse. The finding names the part and the line.                                                                                   | None. See the [Liquid reference](/campaigns/personalization/).                                                          |
+| Unknown field                         | Warn   | A token such as `{{ plan }}` isn't a contact field. Without a fallback it prints nothing; with one, every recipient gets the fallback, so it is flagged too.                              | None. Fix the spelling against the fields in the token menu.                                                            |
+| No unsubscribe link or postal address | Block  | The body has no visible unsubscribe link, no postal address, or neither.                                                                                                                 | <UiPath path="composer.canvas.insertFooter" />                                                                          |
+| Gmail clipping size                   | Warn   | The compiled HTML reaches 85 KB. Gmail clips messages over 102 KB and hides the rest, including the unsubscribe link.                                                                    | **Minify inline CSS** (offered when it saves at least 1 KB), and **Remove** the section that makes up most of the size. |
+| Image-heavy email                     | Warn   | Images take up 60% or more of the email, estimated from image sizes against the amount of text. Send Readiness uses the same threshold.                                                  | None. Add text or use fewer images.                                                                                     |
+| Image without alt text                | Warn   | An image has no `alt` attribute. An empty `alt=""` counts as a decorative image, and tracking-pixel-sized images are skipped.                                                            | Type a description and **Save**.                                                                                        |
+| Empty plain-text version              | Warn   | The email has images but no text, so its text/plain part is blank.                                                                                                                       | None. Add a sentence that says what the images show.                                                                    |
+| Button without a link                 | Warn   | A button's link is empty or `#`.                                                                                                                                                         | **Edit link**                                                                                                           |
+| Link to a blocklisted domain          | Block  | A link's domain is listed on Spamhaus DBL or SURBL.                                                                                                                                      | **Edit link**                                                                                                           |
+| Link domains not checked              | <UiPath path="contentcheck.link.unknownTag" /> | The lookup of some link domains didn't answer in time, or the lists refused the server's DNS resolver. Not knowing isn't the same as clean: Send Readiness looks them up again.          | None.                                                                                                                   |
+| URL shortener                         | Warn   | A link goes through a shortener such as bit.ly, tinyurl.com, t.co, goo.gl, ow.ly or rebrand.ly (19 are known).                                                                           | **Edit link**                                                                                                           |
+| Store product removed                 | Warn   | A product block names a product your store no longer has.                                                                                                                                | None. Remove it or pick another product.                                                                                |
+| Sponsor creative missing              | Block  | A Sponsor block's booking has no creative yet.                                                                                                                                           | **Open booking**, or remove the block.                                                                                  |
 
 </TableScroll>
 
-Alt text findings move to the <UiPath path="accessibilityComposer.tab" /> tab, which runs the fuller [accessibility checks](/campaigns/accessibility/) as soon as the canvas has content.
+Alt text findings move to the <UiPath path="composer.chrome.groupAccessibility" /> group of the same <UiPath path="composer.chrome.tabChecks" /> tab, which runs the fuller [accessibility checks](/campaigns/accessibility/) as soon as the canvas has content.
 
 ### Subject heuristics
 
@@ -84,13 +86,13 @@ The subject trips a heuristic when it has:
 
 - **All caps**: at least 6 letters, 70% or more of them uppercase.
 - **Repeated punctuation**: two or more `!` or `?` in a row, or four or more dots.
-- **Urgency phrasing**: "act now", "urgent", "hurry", "last chance", "limited time", "today only", "only", "ends today", "ending soon", "don't miss", a number of hours and similar phrases.
-- **Money words**: "free", "100% free", "guarantee", "cash", "no cost", "risk-free" or `$$`.
+- **Urgency phrasing**: "act now", "urgent", "hurry", "last chance", "limited time", "today only", "expires", "ending soon", "ends today", "don't miss", "now or never", "before it's gone", or a deadline such as "48 hours only" or "only 3 days left". "Members only" and "2 hours of Q&A" don't count.
+- **Money words**: "free", "guarantee", "cash", "no cost", "risk-free" or `$$`. "Free" inside a compound such as "gluten-free" or "free-range" doesn't count.
 - **Click-bait**: "you won't believe", "shocking", "jaw-dropping", "mind-blowing", "what happens next", "doctors hate" and similar phrases.
 
 Urgency, money and click-bait phrases are matched in English subjects and in emails without a language; [language versions](/campaigns/languages/) in other languages are checked for all caps and repeated punctuation only. The suggestion lowercases a shouting subject, removes repeated punctuation and urgency words, and turns "48 hours" into "48-hour", so `FLASH SALE!!! 48 HOURS ONLY` becomes `48-hour flash sale`.
 
-Only the subject is checked for spam phrases; the preheader and body aren't. What else decides whether mail reaches the inbox is in [email deliverability for self-hosted senders](/deliverability/overview/).
+The composer checks only the subject for spam phrases. Send Readiness also checks the preheader and the body text, where it warns when three or more of these phrases, or repeated punctuation three or more times, pile up. What else decides whether mail reaches the inbox is in [email deliverability for self-hosted senders](/deliverability/overview/).
 
 ### How the footer check finds the link and the address
 
@@ -101,36 +103,57 @@ The <UiPath path="composer.blocks.footer" /> block covers both and adds the pref
 
 ## What each fix does
 
-| Fix                                            | What it changes                                                                                                                                  |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| <UiPath path="composer.canvas.insertFooter" /> | Adds the footer block at the end of the email, with your footer address and the unsubscribe, preferences and view-in-browser links.            |
-| **Use suggestion**                             | Replaces the subject with the suggested one.                                                                                                     |
-| **Minify inline CSS**                          | Turns on CSS minifying for this campaign's saves and sends. The canvas and the MJML stay as they are.                                           |
-| **Remove** a section                           | Deletes the section named in the finding. Press <kbd>⌘</kbd> <kbd>Z</kbd> to undo.                                                               |
-| **Replace with** …                             | Rewrites the link to the same path on your first sender's domain.                                                                               |
-| **Edit link**                                  | Selects the element and puts the cursor in its Link URL field in <UiPath path="composer.tabSettings" />.                                         |
-| **Save** (alt text)                            | Sets the image's alt text to what you typed.                                                                                                     |
+| Fix                                            | What it changes                                                                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="composer.canvas.insertFooter" /> | Adds the footer block at the end of the email, with your footer address and the unsubscribe, preferences and view-in-browser links. |
+| **Use suggestion**                             | Replaces the subject with the suggested one.                                                                                          |
+| **Minify inline CSS**                          | Turns on CSS minifying for this campaign's saves and sends. The canvas and the MJML stay as they are.                                |
+| **Remove** a section                           | Deletes the section named in the finding. Press <kbd>⌘</kbd> <kbd>Z</kbd> to undo.                                                    |
+| **Edit link**                                  | Selects the element and puts the cursor in its Link URL field in <UiPath path="composer.tabSettings" />.                              |
+| **Save** (alt text)                            | Sets the image's alt text to what you typed.                                                                                          |
+
+The composer never rewrites a link for you. Send Readiness, which opens every link, offers "Replace with destination URL" for a listed or shortened link only when the link redirects to a page whose domain is clean on Spamhaus DBL and SURBL.
+
+## Dismiss a warning
+
+Some warnings are deliberate: a decorative image, an email you'll keep under the clipping size, a subject style your list already knows.
+
+<Steps>
+
+1. On the warning, select <UiPath path="composer.chrome.dismiss" />.
+
+2. Pick why: <UiPath path="composer.chrome.reasonDecorative" />, <UiPath path="composer.chrome.reasonSize" />, <UiPath path="composer.chrome.reasonSubject" />, <UiPath path="composer.chrome.reasonWrong" /> or <UiPath path="composer.chrome.reasonOther" />. Add a note for reviewers if it helps.
+
+3. Select <UiPath path="composer.chrome.dismissWarning" />.
+
+</Steps>
+
+The warning stays listed in the Checks with your name and reason, and no longer counts. A size warning comes back if the email grows, and a subject warning if the subject changes. Select <UiPath path="composer.chrome.undo" /> on it to count it again. On [Review & send](/campaigns/send-readiness/), the same warning shows who dismissed it and why, and counts as already confirmed, at the send's confirmation and at the send-time recheck.
+
+Blocks can't be dismissed: they stop the send until they are fixed. The composer says why for each one: a blocklisted link would get the whole send filtered, Gmail, Yahoo and CAN-SPAM require the footer, an email without a subject can't be sent, and broken personalization would show to every reader.
 
 ## What Send Readiness checks on top
 
-[Send Readiness](/campaigns/send-readiness/) repeats most of these checks in its Content, Links and Compliance groups and adds more. Where its rules differ:
+[Send Readiness](/campaigns/send-readiness/) repeats these checks in its Content, Links and Compliance groups, in every language version and A/B variant, and adds more:
 
-- It opens every link (up to 40 per run, 4 at a time) and warns about links that return 404, 410 or a server error, or don't respond. The composer never opens links.
-- It warns when images make up 60% or more of the email, and whenever the plain-text version is empty.
-- A Warn there needs a typed acknowledgement before you can send; a Block stops the send until it is fixed.
-- It doesn't repeat the personalization checks. Fix Liquid errors in the composer: an email whose personalization doesn't render can't start sending.
+- It opens every link and image (up to its per-run limit) and warns about links that return 404, 410 or a server error, or don't respond, and about images that don't load or load over plain HTTP. A site that refuses automated requests makes the check Unknown instead of passing it.
+- It measures the size with links rewritten for tracking, which can push an email over Gmail's limit.
+- It warns whenever the plain-text version is empty, checks the preheader and body for spam phrases, and warns when recipients without a first name would get an empty greeting.
+- A broken Liquid tag blocks there too: an email whose personalization doesn't render can't start sending.
+- A Warn there needs a confirmation before you can send, unless someone dismissed it in the composer; a Block stops the send until it is fixed.
 
 ## Check that it worked
 
-- The <UiPath path="composer.deliverability" /> tab disappears: it only shows while there is a Block or a warning.
+- The <UiPath path="composer.chrome.tabChecks" /> tab shows no count, and its <UiPath path="composer.chrome.groupDeliverability" /> row passes.
 - The toolbar shows undo and redo again instead of the warning counts.
 - <UiPath path="composer.reviewSend" /> no longer names blocks.
 
 ## Troubleshooting
 
 - **No fix buttons.** Your role lacks `campaigns:edit`, or the campaign is sending or sent.
+- **No Dismiss on a finding.** It is a block, and blocks can't be dismissed. Fix it instead.
 - **The footer warning stays after you typed an address.** Use the address saved as your footer address, or write it with a street number and street word or a postcode.
-- **"Replace with" isn't offered for a blocklisted link.** The link already uses your sending domain. Change the destination with **Edit link**, and check the domain in [blocklist checks](/deliverability/blocklists/).
+- **"Couldn't check 2 link domains on Spamhaus DBL and SURBL".** DNS didn't answer in time, or the lists refused the server's resolver; Send Readiness tries again. If it keeps happening, the server needs its own recursive resolver (see [check and fix blocklist listings](/deliverability/blocklists/)).
 - **The size warning stays after minifying.** Minifying removes only whitespace and HTML comments. Remove a section, shorten long text, or split the email.
 - **Send Readiness reports a broken link the composer didn't.** Only Send Readiness opens links. Fix the address and run the checks again.
 

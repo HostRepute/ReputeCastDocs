@@ -1,6 +1,6 @@
 ---
 title: Read campaign reports
-description: 'Read a ReputeCast campaign report: an email open rate Apple Mail Privacy Protection prefetches cannot inflate, plus clicks, bounces and share links.'
+description: 'Read a ReputeCast campaign report: an email open rate Apple Mail Privacy Protection cannot inflate, settled human clicks, trends and expiring share links.'
 type: how-to
 audience: [publisher]
 permissions: ['reports:view', 'reports:share']
@@ -8,9 +8,17 @@ uiPath: 'nav.campaigns > campaigns.report'
 primaryKeyword: email open rate Apple Mail Privacy Protection
 sources:
   - internal/reports
+  - internal/counters
+  - internal/abstats
   - internal/tracking/classify.go
-  - internal/tracking/tracking.go
+  - internal/tracking/settle.go
+  - internal/tracking/record.go
+  - internal/retryaudience
+  - internal/campaigns/retry.go
+  - internal/ai/reportask.go
+  - internal/ai/summary.go
   - internal/publicurl/publicurl.go
+  - migrations/03208_r05_share_expiry.sql
   - web/src/features/reports
   - web/src/features/ai/report.tsx
 sidebar:
@@ -22,71 +30,192 @@ import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
 import LimitsTable from '~/components/LimitsTable.astro'
 
-A ReputeCast campaign report tells you what readers did, not what their mail apps did: the email open rate counts [human opens](/reference/glossary/#human-opens) only, so Apple Mail Privacy Protection prefetches and link scanners show up as machine opens instead of inflating it. The report also splits every result by mailbox provider and by sending provider, so you can see where a problem started.
+A ReputeCast campaign report tells you what readers did, not what their mail apps did. The email open rate counts
+[human opens](/reference/glossary/#human-opens) of the readers whose opens can be seen, so Apple Mail Privacy
+Protection prefetches sit in their own bucket instead of inflating it, and clicks count only once they
+[settle](/reference/glossary/#settled-click) as a person's. Every tile is compared with your last issues, and every
+result is split by mailbox provider and by sending provider, so you can see where a problem started.
 
 ## Before you begin
 
 - Reading a report needs `reports:view`.
 - Exporting it and creating read-only links needs `reports:share` (Owner, Admin and Editor have it; Viewer doesn't).
 - Adding bounced addresses to the suppression list from the report needs `subscribers:edit`.
+- Drafting a retry for addresses blocked for your reputation needs `campaigns:edit`.
+- Summaries and questions answered with AI need `ai:use` and a model connected for the
+  [AI assistant](/integrations/ai-assistant/).
 
 ## Open a report
 
 <Steps>
 
-1. Open <UiPath path="nav.campaigns" /> and select <UiPath path="campaigns.report" /> on a sent campaign. Review & send also links to the report once a campaign has finished.
+1. Open <UiPath path="nav.campaigns" /> and select <UiPath path="campaigns.report" /> on a sent campaign. Review & send
+   also links to the report once a campaign has finished.
 
-2. Check the status line under the title. "results coming in live" means the campaign is still sending. "results still coming in · final" with a date means the send finished less than 72 hours ago and late opens and clicks are still arriving. "results final after 72 h" means the numbers have settled.
+2. Check the status line under the title. "results coming in live" means the campaign is still sending. "results still
+   coming in · final" with a date means the send finished less than 72 hours ago: opens, clicks, complaints and late
+   bounces are still arriving, and nothing is compared with your last issues yet. "results final since" with a date
+   means the numbers have settled.
 
-3. Read the eight tiles at the top: sent, delivered, <UiPath path="reports.humanOpens" />, <UiPath path="reports.machineOpens" />, clicks, unsubscribes, complaints and bounces. Delivered and bounces are shares of the messages sent; opens, clicks, unsubscribes and complaints are shares of the messages delivered.
+3. While the results are still coming in, select <UiPath path="reports.emailWhenFinal" /> to be told when they are
+   final, in the app and by email as your notification preferences say. Only a signed-in person can ask, not an API key
+   or an agent.
+
+4. Read the eight tiles at the top: Sent, Delivered, <UiPath path="reports.humanOpens" />,
+   <UiPath path="reports.privacyOpens" />, <UiPath path="reports.humanClicks" />, Unsubscribes, Complaints and Bounces.
+   Once the results are final, each tile shows its change against your last issues and a trend line.
 
 </Steps>
 
 <Screenshot
   id="report"
-  alt="The report for October Product Update: 47,980 sent, 41.2% human opens and 18.6% machine opens shown apart, the engagement chart over 72 hours, the click map over the email, and result tables per mailbox provider and per sending provider."
+  alt="The report for October Product Update: a kept AI summary checked against the report and the Ask box, then 47,980 sent, 19,590 human opens (52.8% of measurable), 10,436 privacy-protected and 2,996 human clicks with 1,108 bot clicks filtered, each tile with a trend line; insights, growth, the engagement chart, the click map, results per mailbox and sending provider, bounces, the A/B test and share links."
 >
 
-1. <UiPath path="reports.engagementTitle" />: human opens, machine opens and clicks hour by hour.
-2. <UiPath path="reports.clickMap" />: where readers clicked, drawn over the email itself.
-3. <UiPath path="reports.mailboxTitle" />: Gmail, Outlook, Yahoo, iCloud and the rest, side by side.
-4. <UiPath path="reports.providerTitle" />: each sending provider's share, delivery and cost.
+1. The headline tiles, each with its change against the median of your last issues and a trend line.
+2. <UiPath path="reports.insightsTitle" />: what stands out in the numbers, each with an action such as
+   <UiPath path="reports.checkDelisting" />.
+3. <UiPath path="reports.clickMap" />: human clicks on each link, drawn over the email, with a switch to
+   <UiPath path="reports.colBotClicks" />.
+4. <UiPath path="reports.mailboxTitle" />: human opens of measurable recipients, privacy-protected opens, and n/a for
+   complaints a mailbox provider doesn't report.
+5. <UiPath path="reports.shareTitle" />: what a new link includes and when it expires, and the active links.
 
 </Screenshot>
 
-## How human and machine opens are told apart
+## How opens are counted
 
-ReputeCast counts an open as a machine open when:
+ReputeCast sorts every open into one of three buckets:
 
-- it comes from Apple Mail Privacy Protection (Apple's network or its bare user agent), at any time;
-- the Gmail or Yahoo image proxy fetches the email within 30 seconds of sending (later fetches through those proxies are people);
-- a security scanner fetches it, by user agent (Safe Links, Mimecast, Proofpoint and similar) or from a scanner network within 2 minutes of sending;
-- it arrives within 2 seconds of sending, or it is a request with no user agent.
+- **Human opens**: a person opened the email. A person's settled click counts as a human open too.
+- **Privacy-protected opens**: Apple Mail Privacy Protection (Apple's network or its bare user agent), or another
+  privacy proxy on the instance's [bot filter](/reference/glossary/#bot-filter), fetched the email when it arrived.
+  Whether anyone read it can't be seen, so these are neither people's opens nor machines'.
+- **Machine opens**: security scanners (by user agent, or from a scanner network as the email arrives), Gmail's and
+  Yahoo's image proxies in the first seconds after arrival, requests with no user agent or a `HEAD` request, and any
+  open in the first seconds after arrival. The note under the tiles counts them as scanner opens; they count nowhere
+  else.
 
-Clicks get the same treatment: clicks by scanners, clicks within 10 seconds of sending and bursts across several links within 5 seconds still redirect but are never counted. A human click also counts as a human open, and a machine open turns into a human one if the reader opens the email later. [A/B test](/campaigns/ab-testing/) winners are chosen on human opens or clicks for the same reason.
+The <UiPath path="reports.humanOpens" /> tile shows two rates. "of delivered" divides human opens by every delivered
+message, including readers whose opens can't be seen, so it is a floor. "of measurable" is the
+[measurable open rate](/reference/glossary/#measurable-open-rate): human opens divided by delivered minus
+privacy-protected. Expand <UiPath path="reports.measurableTitle" /> under the tiles for the sum with this campaign's
+numbers. The arrows on opens compare the measurable rate, so a change in how many of your readers use Apple Mail
+doesn't move them.
+
+Windows are measured from delivery when the sending provider reports it, else from the moment the provider took the
+message. When a workspace keeps a sending provider's own tracking, its opens and clicks are sorted the same way from
+the user agent and address the provider passes on.
+
+## How clicks are counted
+
+A click always redirects the reader at once, but it counts only after it settles:
+
+1. A click that looks like a person's waits a minute.
+2. ReputeCast then looks at the clicks around it. If the same email clicked several of its links within seconds, or
+   followed the email's hidden link that no person can see, the click was a scanner's and is filed as a bot click.
+3. Otherwise it settles as a person's and counts once: as a human click, a human open, a unique click on its link,
+   and in automations, segments, scores and engagement tiers.
+
+Clicks by a scanner user agent, from a scanner network as the email arrives, or in the first seconds after arrival are
+bot clicks at once. The <UiPath path="reports.humanClicks" /> tile counts people, each once, and shows how many bot
+clicks were filtered; select that line to see where they landed on the click map. An order is still credited to a
+click that is settling, because buying is a person's act.
+
+The same rules apply in every workspace of the instance. Instance admins add networks and user agents in
+[Instance admin › Bot filter](/self-hosting/instance-admin/#edit-the-bot-filter).
+
+<LimitsTable area="tracking" />
+
+## Complaints, counters and comparisons
+
+- **Complaints only where reported.** Gmail and iCloud don't report complaints to senders, so their complaint rates
+  read "n/a" with the reason, and the Complaints tile's "where reported" rate leaves their mail out. Gmail's spam rate
+  is in Google Postmaster Tools, on Deliverability. Mailbox providers are told apart by each domain's MX record: Gmail
+  includes Google Workspace and Outlook includes Microsoft 365.
+- **Counters from message states.** The numbers add up the state of each message (delivered, bounced, opened,
+  clicked), so a late or repeated event never counts twice. Once the results are final, and whenever the counting
+  rules change, each campaign's counters are rebuilt from its stored messages and events. Campaigns imported from
+  another platform keep their imported totals.
+- **Comparisons with your last issues.** Each tile compares with the median of the last six issues sent to the same
+  lists and segments, so one unusual issue doesn't move the baseline: in percent for Sent, in points for the rates.
+  The trend line draws the tile over those issues and this one. A report shows "No earlier issue to compare with yet"
+  when there is none.
 
 ## What each section shows
 
-- **Engagement over the first 72 hours.** The chart's time axis stretches the first hours, when most opens happen.
-- **Click map.** Each link's share of clicks over the sent email. Links with under 5% of clicks are grouped as Other; links with 20% or more are marked hot. With language versions you can switch the map's language.
-- **Results per mailbox provider and per sending provider.** Delivery, opens, clicks, bounces and complaints for each, with the sending provider's warm-up day and cost. A problem with one mailbox provider (Outlook complaints) looks different from a problem with one sending provider (a Postal outage).
-- **Results per language.** Shown when two or more language versions were sent. See [send each reader their language](/campaigns/languages/).
-- **Bounces by type.** Hard bounces (unknown user, domain not found), soft bounces (mailbox full, deferral expired), blocked by policy or reputation, and other, each with the sending providers' original codes such as `550 5.1.1`. Hard bounces are suppressed automatically and soft bounces are retried at the next send. For blocked bounces you can add the addresses to the [suppression list](/audience/suppressions/) from here; other bounces open a review of what the providers said. Look up a code in [SMTP error codes](/smtp-errors/).
+- **Summary by AI and Ask about this report.** See [summarize and ask with AI](#summarize-and-ask-with-ai).
+- **Insights.** What stands out, worked out from the report's own numbers: messages a mailbox provider blocked for the
+  sending IP's reputation (<UiPath path="reports.checkDelisting" />), a mailbox provider that bounced far more than the
+  others (<UiPath path="reports.insight.openSnds" /> for Outlook, <UiPath path="reports.insight.openPostmaster" /> for
+  Gmail), or a link that drew much of the human clicks (<UiPath path="reports.insight.showLink" />). Insights describe
+  numbers; they never guess a cause.
+- **Growth & revenue from this issue.** New subscribers from forwards, referrals and the web post, and
+  <UiPath path="reports.webViews" /> of the issue's archive page and website post, counted on the server without
+  cookies. With Earn, upgrades to paid and product conversions credited to this email.
+- **Engagement over the first 72 hours.** Human opens, privacy-protected opens and human clicks as a share of
+  delivered, as a chart or a table. With an A/B test, a mark shows when the winner went to the rest.
+- **Click map.** Each link's share of human clicks, over the email that was sent. Switch to
+  <UiPath path="reports.colBotClicks" /> to see where scanners clicked. With an A/B test, choose
+  <UiPath path="reports.variantToShow" />: <UiPath path="reports.allRecipients" /> or one variant. A content test has
+  no map of everyone: each variant's map shows its own email. With language versions you can switch the map's
+  language.
+- **Results per mailbox provider and per sending provider.** Delivery, human opens of measurable recipients,
+  privacy-protected opens, human clicks, bounces and complaints for each, plus unsubscribes per mailbox provider and
+  the median time to delivery, cost and warm-up day per sending provider. A problem with one mailbox provider
+  (Outlook complaints) looks different from a problem with one sending provider (a Postal outage).
+- **Results per language.** Shown when two or more language versions were sent. See
+  [send each reader their language](/campaigns/languages/).
+- **Bounces by type.** Hard, soft, blocked by policy or reputation, and other, each with the sending providers'
+  original codes such as `550 5.1.1`. Hard bounces are suppressed automatically and soft bounces are retried at the
+  next send. Addresses blocked for your sending IP or domain are valid, so they are never suppressed for it: see
+  [retry blocked addresses after fixing](#retry-blocked-addresses-after-fixing). Other bounces open a review of what
+  the providers said, from which you can add them to the [suppression list](/audience/suppressions/). Look up a code
+  in [SMTP error codes](/smtp-errors/).
 - **Unsubscribe reasons.** What people chose on the unsubscribe page, and how many chose fewer emails instead.
-- **A/B test.** Each variant's human opens, clicks and complaints, how the winner was picked, and the significance of the difference.
-- Sections that appear when they apply: polls, revenue (needs `earn:view`), sponsor, store orders, web post and product sales.
+- **A/B test.** Each variant's sample, its result on the metric that decided, and how the winner was picked. See
+  [A/B test subject, content and send time](/campaigns/ab-testing/#read-the-result).
+- Sections that appear when they apply: polls, revenue (needs `earn:view`), sponsor, store orders, web post and
+  product sales.
 
 <Screenshot
   id="report-ab"
-  alt="The A/B test section: subject B won with 42.6% human opens against 39.8% for A, at 98% confidence (two-proportion z-test, p = 0.02), and the remaining 38,384 recipients got B at 12:00."
+  alt="The A/B test card of October Product Update: Winner B at 98% confidence, decided on clicks, with 6.7% human clicks against 5.6% for A, and how the winner was picked: a two-proportion z-test 2 hours after the sample went out, at least 500 recipients per variant, the remaining 38,384 got B at 12:00."
 />
 
-The winner is the variant with the higher rate when the test window ends; the remaining recipients get it either way. The report adds a two-proportion z-test: below p = 0.05 it shows the confidence ("Winner B · 98% confidence"), otherwise "not significant".
+## Retry blocked addresses after fixing
+
+When a mailbox provider blocks mail for your sending IP's or domain's reputation, the addresses are fine. Fix the
+cause first, then send them the issue again:
+
+<Steps>
+
+1. In **Bounces by type**, select <UiPath path="reports.investigate" /> on the Blocked · policy or reputation row. The
+   dialog shows what each sending provider said.
+
+2. Select <UiPath path="reports.checkDelisting" /> to open Deliverability, and get the IP or domain delisted or the
+   block lifted.
+
+3. Back in the dialog, under <UiPath path="reports.retryTitle" />, select the retry button, which names how many
+   addresses the retry goes to. ReputeCast drafts a new campaign named after the issue with "· retry", addressed only
+   to the blocked addresses still on your list, and opens it in Review & send.
+
+4. Send it from Review & send once Send Readiness agrees. Each address gets the issue once.
+
+</Steps>
+
+Addresses that unsubscribed or were suppressed since are left out. An issue has one retry at a time, a retry is never
+retried again, and the button appears only once the send has ended. When a retry exists, the dialog links to it:
+<UiPath path="reports.retryOpen" /> while it is a draft, or its report once it went out.
 
 ## Export a report
 
-- Select <UiPath path="reports.exportCsv" /> to download the whole report as one CSV file: headline numbers, the mailbox provider, sending provider and language tables, hourly engagement, links, bounces, unsubscribe reasons and the A/B result.
-- Select <UiPath path="reports.exportPdf" /> to open your browser's print dialog with a print layout; save it as PDF from there.
+- Select <UiPath path="reports.exportCsv" /> to download the whole report as one CSV file: headline numbers with human
+  opens of measurable recipients, privacy-protected opens, the scanner opens and bot clicks left out, complaints where
+  reported, the mailbox provider, sending provider and language tables, hourly engagement, links (per variant for a
+  content test), bounces, unsubscribe reasons and the A/B result.
+- Select <UiPath path="reports.exportPdf" /> to open your browser's print dialog with a print layout; save it as PDF
+  from there.
 
 Both need `reports:share` and are recorded in the audit log.
 
@@ -94,29 +223,54 @@ Both need `reports:share` and are recorded in the audit log.
 
 <Steps>
 
-1. Select <UiPath path="reports.shareLink" />, or <UiPath path="reports.createReadOnly" /> in the <UiPath path="reports.shareTitle" /> card at the bottom of the report.
+1. Scroll to <UiPath path="reports.shareTitle" /> at the bottom of the report. <UiPath path="reports.shareLink" /> at
+   the top takes you there and copies the newest active link.
 
-2. Under <UiPath path="reports.linkExpires" />, keep <UiPath path="reports.expiresNever" /> or choose 7, 30 or 90 days.
+2. Under <UiPath path="reports.newLink" />, choose what else the link shows. The numbers, charts and tables are always
+   in; tick <UiPath path="reports.includeCost" />, <UiPath path="reports.includeWarmup" /> or
+   <UiPath path="reports.includeEmail" /> (the message as sent, in the click map).
 
-3. Select <UiPath path="reports.createLink" />. The link (`https://<your public URL>/r/<token>`) is copied. Anyone with it sees the same charts and tables without signing in.
+3. Under <UiPath path="reports.expires" />, choose 7, 30 or 90 days.
 
-4. To stop a link working, select <UiPath path="reports.revoke" />. It stops at once.
+4. Select <UiPath path="reports.createLink" />. The link (`https://<your public URL>/r/<token>`) is copied and appears
+   under the active links with who created it, when it expires and what it includes. Anyone with it sees the report
+   without signing in.
+
+5. To stop a link working, select <UiPath path="reports.revoke" /> next to it. It stops at once.
 
 </Steps>
 
-The shared page shows aggregate numbers only: it never shows who received, opened or clicked. It leaves out polls, revenue, store orders and the web section, and it is marked `noindex` and never cached. A report can have 10 active links.
+Every link expires. Links created before ReputeCast 1.2.0 never expired; the upgrade gave each of them 30 days from
+the moment it ran. Through the API and MCP (`share_campaign_report`) a link can last any number of days from 1 to 90.
+
+The shared page shows aggregate numbers only: it never shows who received, opened or clicked, the AI summary or the
+Ask box. It leaves out polls, revenue, store orders and the web section, and it is marked `noindex` and never cached.
 
 <Aside type="caution">
-A shared report still shows the subject line, the email itself with its links, your sending provider names and their cost. Share it only with people who may see those.
+A shared report still shows the campaign's name, the A/B variants' subject lines and your sending provider names, and
+the email with its links when you include it. Share it only with people who may see those.
 </Aside>
 
-## Summarize results with AI
+## Summarize and ask with AI
 
-If the workspace has connected a model for the [AI assistant](/integrations/ai-assistant/), members with `ai:use` see <UiPath path="ai.summarize" />. It writes a short summary of the report; a summary you keep is visible to everyone who can read the report, but never on read-only links.
+If the workspace has connected a model for the [AI assistant](/integrations/ai-assistant/), members with `ai:use` see
+<UiPath path="ai.summarize" />. It writes a short summary of the report from its aggregate numbers, never an address.
+
+- Every number in the summary is checked against the report. "Every number matches the report" means you can keep it;
+  otherwise the numbers that aren't in the report are listed, and an edited summary with such numbers can't be kept.
+- A summary you keep is visible to everyone who can read the report, marked
+  <UiPath path="ai.suggest.numbersMatchReport" /> or with the numbers that changed as late results came in. It never
+  appears on read-only links.
+- Type a question in <UiPath path="ai.suggest.askTitle" />, such as "Why did Outlook bounce more?". The answer comes
+  from the report's numbers only, every number in it is checked against the report, and it says so when the numbers
+  can't answer.
+
+[MCP agents](/developers/mcp/) read the same report through `get_campaign_report`, with the same permissions and the
+same three open buckets.
 
 <Screenshot
   id="report-mobile"
-  alt="The report on a phone: the Sent status line, buttons to summarize, export and share, a kept AI summary of the results, and the Sent and Delivered tiles, with the app's bottom navigation bar."
+  alt="The report on a phone: the Sent status with the send window and results final, buttons to export, share and duplicate, and the summary by AI kept by Linh Nguyen with the check that every number matches this report, above the app's bottom navigation bar."
 />
 
 ## Defaults and limits
@@ -125,20 +279,33 @@ If the workspace has connected a model for the [AI assistant](/integrations/ai-a
 
 ## Check that it worked
 
-- The status line reads "results final after 72 h" once the numbers have settled.
-- A read-only link opens in a private browser window without signing in and shows "Read-only report".
+- The status line reads "results final since" with a date once the numbers have settled, and the tiles show their
+  change against your last issues.
+- A read-only link opens in a private browser window without signing in, shows "Read-only report", and stops working
+  on its expiry date.
 
 ## Troubleshooting
 
 - **Export CSV and Share read-only link are disabled.** They need `reports:share`; the button says who can help.
 - **"There's nothing to share yet."** Read-only links exist only for campaigns that have started sending.
 - **"This report already has 10 active links."** Revoke one you no longer need, then create a new one.
-- **"Event ingestion is N minutes behind."** A sending provider's delivery events are arriving late, so recent numbers are low. See [delivery events and suppression sync](/providers/events-and-sync/).
-- **The open rate looks low next to another tool's.** That tool probably counts machine opens. Compare the sum of human and machine opens instead.
+- **"This link doesn’t open a report."** The link was revoked or it expired. Create a new one.
+- **"Event ingestion is N minutes behind."** A sending provider's delivery events are arriving late, so recent numbers
+  are low. See [delivery events and suppression sync](/providers/events-and-sync/).
+- **Complaints read "n/a" for Gmail and iCloud.** They don't report complaints to senders. Check Gmail's spam rate in
+  Google Postmaster Tools on Deliverability.
+- **The tiles show no arrows.** The results are still coming in, or no earlier issue went to the same lists and
+  segments.
+- **The retry button is missing or disabled.** The send hasn't ended, the issue is itself a retry, a retry exists
+  already, every blocked address was delivered or retried, or you don't have `campaigns:edit`. The dialog says which.
+- **The open rate looks low next to another tool's.** That tool probably counts Apple Mail prefetches as opens.
+  Compare the measurable open rate instead.
+- **Human clicks are lower than the clicks your link shortener counts.** Bot clicks are left out. Check the bot
+  clicks line under the tile.
 
 ## Related
 
 - [Monitor a send and auto-pause](/campaigns/live-monitor/) shows the same numbers while the send runs.
 - [Bounces, complaints and provider limits](/deliverability/bounces-and-complaints/) explains the bounce types.
-- [Keep your list healthy](/audience/list-health/) uses human opens to sort contacts into engagement tiers.
+- [Keep your list healthy](/audience/list-health/) uses human opens and clicks to sort contacts into engagement tiers.
 - [Public URLs and endpoints](/reference/public-urls/) lists the `/r/` and tracking paths.
