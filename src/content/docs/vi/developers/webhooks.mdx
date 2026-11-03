@@ -8,6 +8,8 @@ uiPath: 'nav.settings > settings.webhooks'
 primaryKeyword: xác minh chữ ký webhook
 sources:
   - internal/webhooks/webhooks.go
+  - internal/webhooks/batch.go
+  - internal/webhooks/email.go
   - internal/webhooks/jobs.go
   - internal/webhooks/api.go
   - internal/store/queries/webhooks.sql
@@ -45,7 +47,8 @@ yêu cầu thực sự đến từ hệ thống ReputeCast của bạn.
 
 2. Nhập URL của endpoint, tên và mô tả (không bắt buộc), rồi chọn các sự kiện. Khi đánh dấu cả một nhóm, endpoint
    đăng ký ký tự đại diện của nhóm đó, chẳng hạn `email.*`; những sự kiện được thêm vào nhóm sau này cũng được bao
-   gồm.
+   gồm. Khi đã chọn một sự kiện `email.*`, công tắc <UiPath path="webhooks.batchLabel" /> xuất hiện
+   ([nhận sự kiện email theo lô](#nhận-sự-kiện-email-theo-lô)).
 
 3. Chọn <UiPath path="webhooks.addEndpoint" />. ReputeCast hiển thị khóa bí mật ký webhook, `whsec_…`, đúng một lần.
    Hãy sao chép nó vào cấu hình của bộ nhận, ví dụ dưới dạng `REPUTECAST_WEBHOOK_SECRET`. ReputeCast lưu khóa ở dạng
@@ -70,7 +73,8 @@ Bạn cũng có thể quản lý các endpoint này qua API: `create-webhook`, `
 
 Một endpoint đăng ký từ 1 đến 40 mục. Mỗi mục là một tên sự kiện (`email.bounced`), một ký tự đại diện cho cả nhóm
 (`email.*`) hoặc `*` cho mọi sự kiện. Danh mục đầy đủ, với ý nghĩa của từng sự kiện và mẫu `data` của nó, nằm trong
-[Sự kiện webhook](/vi/reference/webhook-events/).
+[Sự kiện webhook](/vi/reference/webhook-events/). Mọi sự kiện trong danh mục đều được gửi: sự kiện `email.*` báo về
+email của chiến dịch và tự động hóa, còn thư giao dịch có các sự kiện `message.*` riêng.
 
 `webhook.test` không có trong danh mục: chỉ nút gửi thử và thao tác `test-webhook` mới gửi sự kiện này.
 
@@ -100,10 +104,39 @@ Mọi lần gửi đều kèm các header sau:
 | ------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | `Content-Type`           | `application/json`                                                                                          |
 | `User-Agent`             | `ReputeCast-Webhooks/<version>`                                                                             |
-| `X-ReputeCast-Signature` | HMAC-SHA256 của `<timestamp>.<raw body>`, mã hóa hex chữ thường. Không có tiền tố `sha256=` hay tiền tố nào khác. |
+| `X-ReputeCast-Signature` | HMAC-SHA256 của `<timestamp>.<raw body>`, mã hóa hex chữ thường. Không có tiền tố `sha256=` hay tiền tố nào khác. Trong 24 giờ sau khi [xoay vòng khóa bí mật](#xoay-vòng-khóa-bí-mật-ký), header chứa hai chữ ký cách nhau bằng dấu phẩy, chữ ký của khóa mới đứng trước. |
 | `X-ReputeCast-Timestamp` | Thời điểm ký lần thử này, tính bằng giây Unix.                                                              |
 | `X-ReputeCast-Event`     | Tên sự kiện, giống `type`.                                                                                  |
 | `X-ReputeCast-Delivery`  | ID của lần gửi: một ID cho mỗi cặp sự kiện và endpoint, giữ nguyên ở mọi lần thử lại.                      |
+
+## Nhận sự kiện email theo lô
+
+Một chiến dịch lớn tạo một sự kiện `email.delivered` cho mỗi người nhận. Khi bật <UiPath path="webhooks.batchLabel" />,
+endpoint nhận các sự kiện `email.*` của mình trong những lần gửi loại `email.batch`, mỗi lần tối đa 100 sự kiện, nên
+một lượt gửi tới một triệu người nhận chỉ tạo khoảng mười nghìn yêu cầu. Các sự kiện khác vẫn đến từng cái một. Công
+tắc này tắt theo mặc định và không thay đổi gì với các endpoint để tắt.
+
+```json title="email.batch"
+{
+  "id": "0192f1c5-0d3e-7a11-9b2c-4e6f8a0b1c2d",
+  "type": "email.batch",
+  "created_at": "2026-10-22T09:41:20Z",
+  "workspace": "acme-newsletter",
+  "data": {
+    "count": 2,
+    "events": [
+      { "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44", "type": "email.delivered", "created_at": "2026-10-22T09:41:07Z", "workspace": "acme-newsletter", "data": { "…": "…" } },
+      { "id": "0192f1c4-8c3f-7d62-8e1b-4a6f9c2b3d55", "type": "email.bounced", "created_at": "2026-10-22T09:41:09Z", "workspace": "acme-newsletter", "data": { "…": "…" } }
+    ]
+  }
+}
+```
+
+- `data.events` chứa từng sự kiện dưới dạng envelope mà nó lẽ ra được gửi riêng, theo thứ tự xảy ra. Hãy bỏ qua bản
+  trùng theo `id` của từng sự kiện bên trong, như với sự kiện đơn lẻ.
+- Lô là một lần gửi với `id`, chữ ký và `X-ReputeCast-Event: email.batch` riêng, được thử lại và phát lại nguyên cả
+  lô.
+- Khi endpoint bị tạm dừng, các lô của nó được giữ lại như mọi lần gửi khác.
 
 ## Xác minh chữ ký
 
@@ -115,8 +148,9 @@ Mọi lần gửi đều kèm các header sau:
 3. Tính HMAC-SHA256 trên dấu thời gian, một dấu chấm và phần thân thô: `<timestamp>.<raw body>`.
 4. Dùng **toàn bộ chuỗi khóa bí mật làm khóa**, gồm cả tiền tố `whsec_`, dưới dạng byte UTF-8. Đừng bỏ tiền tố và đừng
    giải mã base64 phần còn lại.
-5. Mã hóa kết quả sang hex chữ thường và so sánh với `X-ReputeCast-Signature` theo thời gian hằng định (constant time).
-   Trả lời `401` nếu không khớp.
+5. Mã hóa kết quả sang hex chữ thường và so sánh, theo thời gian hằng định (constant time), với từng giá trị cách nhau
+   bằng dấu phẩy trong `X-ReputeCast-Signature`: sau khi xoay vòng khóa, header mang hai chữ ký trong một ngày. Chấp
+   nhận yêu cầu khi có một giá trị khớp; trả lời `401` khi không giá trị nào khớp.
 
 Mỗi ví dụ dưới đây là một bộ nhận hoàn chỉnh trên cổng 3000 tại `/webhooks/reputecast`, đọc khóa bí mật từ
 `REPUTECAST_WEBHOOK_SECRET`:
@@ -134,10 +168,12 @@ const secret = process.env.REPUTECAST_WEBHOOK_SECRET
 function verify(rawBody, timestamp, signature) {
   const age = Math.abs(Date.now() / 1000 - Number(timestamp))
   if (!signature || !(age <= 300)) return false // reject timestamps more than 5 minutes off
-  const expected = createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex')
-  const a = Buffer.from(expected)
-  const b = Buffer.from(signature)
-  return a.length === b.length && timingSafeEqual(a, b)
+  const expected = Buffer.from(createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex'))
+  // For a day after a rotation the header holds two signatures, comma-separated: accept either.
+  return signature.split(',').some((s) => {
+    const b = Buffer.from(s.trim())
+    return b.length === expected.length && timingSafeEqual(expected, b)
+  })
 }
 
 createServer((req, res) => {
@@ -179,8 +215,9 @@ def verify(raw_body: bytes, timestamp: str | None, signature: str | None) -> boo
         return False
     if abs(time.time() - int(timestamp)) > 300:  # reject timestamps more than 5 minutes off
         return False
-    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected.encode(), signature.encode())
+    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest().encode()
+    # For a day after a rotation the header holds two signatures, comma-separated: accept either.
+    return any(hmac.compare_digest(expected, s.strip().encode()) for s in signature.split(","))
 
 
 @app.post("/webhooks/reputecast")
@@ -213,6 +250,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -231,8 +269,14 @@ func verify(body []byte, timestamp, signature string) bool {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(timestamp + "."))
 	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(signature))
+	expected := []byte(hex.EncodeToString(mac.Sum(nil)))
+	// For a day after a rotation the header holds two signatures, comma-separated: accept either.
+	for _, s := range strings.Split(signature, ",") {
+		if hmac.Equal(expected, []byte(strings.TrimSpace(s))) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -276,8 +320,10 @@ $timestamp = $_SERVER['HTTP_X_REPUTECAST_TIMESTAMP'] ?? '';
 $signature = $_SERVER['HTTP_X_REPUTECAST_SIGNATURE'] ?? '';
 
 $expected = hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
-// Reject timestamps more than 5 minutes off, then compare in constant time.
-if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !hash_equals($expected, $signature)) {
+// Compare in constant time. For a day after a rotation the header holds two signatures, comma-separated: accept either.
+$matches = array_filter(explode(',', $signature), fn ($s) => hash_equals($expected, trim($s)));
+// Reject timestamps more than 5 minutes off and signatures that don't match.
+if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !$matches) {
     http_response_code(401);
     exit;
 }
@@ -295,7 +341,8 @@ Chạy bằng máy chủ web của bạn, hoặc thử với `php -S 127.0.0.1:3
 <Aside type="danger" title="Giữ khóa bí mật trên máy chủ">
 Bất kỳ ai có khóa bí mật đều có thể ký những yêu cầu mà bộ nhận của bạn chấp nhận. Hãy giữ nó trong kho bí mật của
 máy chủ, không bao giờ đặt trong mã chạy trên trình duyệt hay ứng dụng di động. Nếu khóa bị lộ, hãy xoay vòng nó
-([Xoay vòng khóa bí mật ký](#xoay-vòng-khóa-bí-mật-ký)).
+([Xoay vòng khóa bí mật ký](#xoay-vòng-khóa-bí-mật-ký)) và đưa ngay khóa mới vào bộ nhận: khi đó bộ nhận từ chối các
+yêu cầu được ký bằng khóa đã lộ.
 </Aside>
 
 ## Kiểm tra kết quả
@@ -333,6 +380,9 @@ máy chủ, không bao giờ đặt trong mã chạy trên trình duyệt hay �
 - Khi một endpoint đang lỗi, ReputeCast chỉ thử lần gửi chờ lâu nhất của nó, theo lịch ở trên. Các lần gửi khác chờ và
   được gửi đi theo thứ tự ngay khi endpoint trả lời `2xx` trở lại. Không phần nào khác của ReputeCast phải chờ
   endpoint: việc gửi thư, nhập dữ liệu và tự động hóa vẫn tiếp tục.
+- Khi một endpoint đã lỗi suốt một giờ, hoặc một lần gửi chuyển vào hàng đợi dead-letter, những người quản lý webhook
+  nhận thông báo <UiPath path="notify.event.webhook_failing" />, một lần cho mỗi đợt lỗi, trên chuông thông báo và qua
+  email (xem [tùy chọn thông báo](/vi/team/notifications/)).
 
 ## Tạm dừng endpoint
 
@@ -341,10 +391,11 @@ máy chủ, không bao giờ đặt trong mã chạy trên trình duyệt hay �
 
 ## Xoay vòng khóa bí mật ký
 
-<UiPath path="webhooks.rotateSecret" /> tạo khóa bí mật mới, hiển thị nó một lần và dùng nó để ký mọi lần gửi kể từ
-thời điểm đó. Khóa cũ ngừng hoạt động ngay; không có khoảng thời gian chồng lấn. Những lần gửi thất bại trong lúc bạn
-cập nhật bộ nhận sẽ được thử lại theo lịch ở trên (1, 2, 4 phút, v.v.), vì vậy hãy cập nhật bộ nhận ngay sau khi xoay
-vòng. Chỉ người dùng mới xoay vòng được khóa bí mật; khóa API thì không.
+<UiPath path="webhooks.rotateSecret" /> tạo khóa bí mật mới và hiển thị nó một lần. Kể từ thời điểm đó, mọi lần gửi
+được ký bằng khóa mới và, trong 24 giờ, bằng cả khóa cũ: `X-ReputeCast-Signature` chứa cả hai chữ ký, cách nhau bằng
+dấu phẩy, chữ ký của khóa mới đứng trước. Hàng của endpoint cho biết khóa cũ còn ký đến khi nào. Một bộ nhận chấp
+nhận một trong hai chữ ký ([Xác minh chữ ký](#xác-minh-chữ-ký)) vẫn hoạt động trong lúc bạn chuyển nó sang khóa mới
+trong ngày đó. Chỉ người dùng mới xoay vòng được khóa bí mật; khóa API thì không.
 
 ## Endpoint do tích hợp quản lý
 
@@ -363,6 +414,8 @@ khóa API không thấy chúng. Khi một endpoint như vậy trả lời `410 G
   mà bỏ tiền tố `whsec_`, hoặc so sánh với chuỗi hex chữ hoa. Hãy thử bằng lệnh OpenSSL ở trên.
 - **Chỉ một số lần gửi bị 401**: đồng hồ máy chủ của bạn bị lệch. Hãy đồng bộ bằng NTP; phép kiểm tra 5 phút so sánh
   với đồng hồ này.
+- **Mọi lần gửi bị 401 sau khi xoay vòng khóa bí mật**: bộ nhận của bạn so sánh toàn bộ header
+  `X-ReputeCast-Signature` với một chữ ký. Hãy tách header theo dấu phẩy và chấp nhận khi một trong hai giá trị khớp.
 - **Lỗi "… is a local hostname" hoặc địa chỉ bị chặn khi lưu**: URL trỏ tới mạng riêng. Hãy dùng địa chỉ công khai,
   hoặc nhờ quản trị viên hệ thống đặt `webhooks.allow_private_networks`.
 - **Lần gửi bị hết thời gian chờ**: trình xử lý của bạn mất hơn 10 giây. Hãy trả lời trước, rồi mới xử lý.

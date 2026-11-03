@@ -47,6 +47,11 @@ describe('parseApiErrorCodes', () => {
     expect(parseApiErrorCodes(only('internal/revenue/conversions.go')).codes).toEqual(['missing_identity'])
   })
 
+  it('reads the code of a problem body marshalled by hand, not of other JSON maps', () => {
+    const path = 'internal/server/ratelimit.go'
+    expect(parseApiErrorCodes([{ path, src: readFileSync(`${root}${path}`, 'utf8') }]).codes).toEqual(['rate_limited'])
+  })
+
   it("reads local variables and expands a source error's Code to the package's Code constants", () => {
     expect(parseApiErrorCodes(only('internal/imports/sources.go', 'internal/imports/connect.go')).codes.sort()).toEqual(
       [

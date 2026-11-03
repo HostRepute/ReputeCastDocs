@@ -11,6 +11,11 @@ sources:
   - internal/contentcheck/contentcheck.go
   - internal/audience/gdpr.go
   - internal/audience/bulk.go
+  - internal/audience/erasure.go
+  - internal/audience/retention.go
+  - internal/erasure
+  - internal/automations/engine.go
+  - internal/workspaces/retention.go
   - internal/sending/engine/loop.go
   - internal/forms
   - web/src/features/audience/profile.messages.ts
@@ -54,8 +59,9 @@ readers are. Ask a lawyer about your own obligations.
 1. **Consent with evidence.** Consent is stored per list: how the contact joined (form, import or a team member), when,
    from which IP address when they confirmed, and the version of the consent text they saw. Forms use
    [double opt-in](/reference/glossary/#double-opt-in) by default, and an import can mark contacts as pending until
-   they confirm. Every change lands in the contact's consent history. See
-   [Lists, consent and double opt-in](/audience/lists-and-consent/).
+   they confirm. A confirmation counts only when the person selects the button on the confirmation page, so a mail
+   scanner opening the link can't confirm a signup for them ([double opt-in confirmation](/forms/signup-forms/#double-opt-in-confirmation)).
+   Every change lands in the contact's consent history. See [Lists, consent and double opt-in](/audience/lists-and-consent/).
 2. **A postal address and an unsubscribe link in every email.** The <UiPath path="review.groupCompliance" /> group of
    [Send Readiness](/reference/glossary/#send-readiness) is a <UiPath path="review.statusBlock" /> when the body of a
    campaign has no visible unsubscribe link or no postal address. Its one-click fix inserts the footer block, which
@@ -64,7 +70,8 @@ readers are. Ask a lawyer about your own obligations.
 3. **Opt-out that works at once.** Every Broadcast and Automation message carries the `List-Unsubscribe` and
    `List-Unsubscribe-Post` headers, so mail apps can offer one-click unsubscribe, and the footer links to the
    unsubscribe and preference pages. An unsubscribe puts the address on the suppression list immediately, which is
-   well inside CAN-SPAM's 10 business days. See [One-click unsubscribe (RFC 8058)](/deliverability/one-click-unsubscribe/)
+   well inside CAN-SPAM's 10 business days. A contact who pauses email on the preference center gets no campaign or
+   automation email until the pause ends. See [One-click unsubscribe (RFC 8058)](/deliverability/one-click-unsubscribe/)
    and [Subscribe, preference and unsubscribe pages](/forms/public-pages/).
 4. **Honest headers.** Campaigns send from verified sender addresses on domains you authenticate with SPF, DKIM and
    DMARC ([Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)). The compliance group warns when the sending
@@ -72,13 +79,21 @@ readers are. Ask a lawyer about your own obligations.
    shows Gmail's own compliance status for the domain
    ([bulk sender requirements](/deliverability/bulk-sender-requirements/)).
 5. **Access requests.** <UiPath path="audience.profile.exportData" /> on a contact's profile downloads everything
-   ReputeCast stores about that person as JSON: the profile and custom fields, consent evidence, every message with its
-   stream and delivery status, the activity timeline and any suppression. It needs `subscribers:export`, and each
-   export is recorded in the audit log.
+   ReputeCast stores about that person as one JSON file, streamed with no cap: the profile and custom fields, consent
+   evidence, every message with its stream and delivery status, the activity timeline and any suppression, plus a
+   section per other source, such as texts, push and WhatsApp messages and consents, paid membership, orders, gifts,
+   referrals, poll and survey answers and address checks. `complete` is `true` when every section was written in
+   full; otherwise `cut` names the section that stopped. A section that needs a permission you don't hold says so
+   instead of listing rows. The export needs `subscribers:export`, and each one is recorded in the audit log.
 6. **Erasure.** Select contacts under <UiPath path="nav.audience > audience.tabContacts" />, then
-   <UiPath path="audience.contacts.delete" />, and type the number of contacts to confirm. Names, fields, tags, list
-   memberships, consent history and preferences are removed, and the address is replaced; campaign statistics keep
-   their counts without the person. It needs `subscribers:delete`.
+   <UiPath path="audience.contacts.delete" />, and type the number of contacts to confirm
+   ([erase contacts](/audience/contacts/#erase-contacts)). Erasing reaches every place ReputeCast keeps the person's
+   data: names, fields, tags, list memberships, consent history and preferences, and also phone numbers, text and
+   WhatsApp messages and replies, push endpoints, paid membership, orders, gifts, website sessions, scores, automation
+   data, transactional mail and integration calls. The address is replaced, and campaign statistics keep their counts
+   without the person. A contact who still pays through Stripe can't be erased until the subscription is canceled;
+   ended subscriptions lose the billing details but keep their amounts and dates, so past MRR doesn't change.
+   Webhooks that listen for `contact.erased` get the event without the address. It needs `subscribers:delete`.
 
 <Screenshot
   id="contact-profile"
@@ -91,11 +106,29 @@ asks you to forget them and never email them again, select <UiPath path="audienc
 profile first, then erase them, so a later import can't bring the address back.
 </Aside>
 
+## Data retention
+
+GDPR also asks you to keep personal data no longer than you need it (Article 5(1)(e),
+[Regulation (EU) 2016/679](https://eur-lex.europa.eu/eli/reg/2016/679/oj), checked November 2026). Two kinds of data
+lose their use after a while, so <UiPath path="nav.settings > settings.general > workspace.retentionTitle" /> removes
+them by default:
+
+- **Signups never confirmed.** An unconfirmed double opt-in signup is an address someone typed in, maybe not its
+  owner, and you can't email it. ReputeCast erases these contacts after a while, the same way as an erasure request.
+- **Open and click details.** Each open and click stores the reader's IP address and device (user agent). After a
+  while ReputeCast clears both and keeps the event, so every count, score and report reads the same.
+
+To change the periods or turn either off, see [set data retention](/team/workspaces/#set-data-retention).
+
 ## Defaults and limits
 
 Signup forms collect consent the same way on every site:
 
 <LimitsTable area="forms" />
+
+Data retention:
+
+<LimitsTable area="data-retention" />
 
 ## When to change them
 
@@ -104,10 +137,14 @@ Signup forms collect consent the same way on every site:
 - Export a contact's data before you erase it when the person asked for both.
 - Review consent text whenever your publication or what you send changes, because each signup records the version it
   was given.
+- Shorten how long open and click details are kept when your privacy notice promises less. Choose
+  <UiPath path="workspace.retentionKeep" /> or <UiPath path="workspace.retentionNever" /> only with a reason you
+  could explain to a reader who asks.
 
 ## Related
 
 - [Manage contacts](/audience/contacts/)
 - [The suppression list](/audience/suppressions/)
 - [Audit log](/team/audit-log/)
+- [Workspaces](/team/workspaces/)
 - [Email deliverability for self-hosted senders](/deliverability/overview/)

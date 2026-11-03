@@ -8,6 +8,7 @@ sources:
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
+  - internal/cli/healthcheck.go
   - internal/cli/install.go
   - internal/cli/user.go
 sidebar:
@@ -56,7 +57,7 @@ with HTTPS on your own domain.
          retries: 20
 
      app:
-       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       image: ghcr.io/hostrepute/reputecast:v1.3.0
        depends_on:
          postgres:
            condition: service_healthy
@@ -112,31 +113,37 @@ What the file relies on:
   Base64). Coolify keeps both between deployments. `${REPUTECAST_ADMIN_EMAIL:?}` blocks deployment until it is set.
 - `appdata` keeps uploaded files. Coolify prefixes volume names with the service UUID and lists them, read-only, under
   **Persistent Storage**. Keep it a named volume: Docker fills it from the image, owned by the app's user (uid 65532).
-- No `ports:` (the proxy joins the service's network), no `healthcheck` for `app` (the image has no shell, curl or
-  wget), and no `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify documents no fixed address range for its proxy, so
-  ReputeCast records the proxy's address for every visitor ([trusted proxies](/self-hosting/docker/#trusted-proxies)).
+- No `ports:` (the proxy joins the service's network), no `healthcheck` for `app` (the image's own check runs
+  `reputecast healthcheck` against `/readyz`), and no `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify documents no fixed
+  address range for its proxy, so ReputeCast records the proxy's address for every visitor
+  ([trusted proxies](/self-hosting/docker/#trusted-proxies)).
 
 ## Check that it works
 
-- On the service's **General** page, **Compose resources** shows `postgres` as **Running (healthy)** and `app` as
-  **Running (unknown)**: no health check is configured, and the proxy routes traffic to it anyway.
-- `https://news.example.com/readyz` answers `ready` (`503 database unavailable` without PostgreSQL) and `/healthz`
-  answers `ok`. Point your uptime monitor at `/readyz` ([monitoring](/self-hosting/monitoring/)).
+- On the service's **General** page, **Compose resources** shows `postgres` and `app` as **Running (healthy)**. `app`
+  turns healthy once `/readyz` answers `ready`, after the migrations; until then Traefik doesn't route to it.
+- `https://news.example.com/readyz` answers `ready` and `/healthz` answers `ok`. Point your uptime monitor at `/readyz`
+  ([monitoring](/self-hosting/monitoring/)): it answers 503 while the database is unavailable, and a minute of failed
+  checks takes `app` out of Traefik's routing (`No Available Server`).
 - **Environment Variables** shows `SERVICE_URL_APP` as `https://news.example.com`.
 
 ## Upgrade
 
-[Back up](/self-hosting/backups/) first. On the **General** page, select **Edit Compose file**, change `v1.0.1` in the
-`app` image to the new tag and select **Save changes**. Then open the menu next to **Restart current version** and
-select **Pull latest and restart**. The app applies new migrations when it starts
-([upgrade ReputeCast](/self-hosting/upgrades/)).
+[Back up](/self-hosting/backups/) first. On the **General** page, select **Edit Compose file**, change the `app` image's
+tag (`v1.3.0` in the file above) to the new one and select **Save changes**. Then open the menu next to
+**Restart current version** and select **Pull latest and restart**. The app applies new migrations when it starts, and
+the domain answers again once it is healthy ([upgrade ReputeCast](/self-hosting/upgrades/)). Upgrading to 1.3.0
+converts `delivery_events` to monthly partitions and holds the migration lock while it runs
+([upgrade to 1.3.0](/self-hosting/upgrades/#upgrade-to-130)).
 
 ## Troubleshooting
 
 - **Coolify shows `Deploy (missing required env vars)`**: set `REPUTECAST_ADMIN_EMAIL` in **Environment Variables**.
-- **The domain answers `No Available Server`**: the `app` container isn't running; read its **Runtime Logs**. Don't add
-  a `healthcheck` to `app`: curl, wget and `CMD-SHELL` checks fail in this image, and Traefik doesn't route to an
-  unhealthy container.
+- **The domain answers `No Available Server`**: `app` isn't running or isn't healthy yet, and Traefik routes only to
+  healthy containers ([No Available Server](https://coolify.io/docs/troubleshoot/applications/no-available-server),
+  checked November 2026). Read its **Runtime Logs**: the migrations may still be running, or the database is
+  unavailable. A `healthcheck` you added to `app` with `curl`, `wget` or `CMD-SHELL` always fails (the image has no
+  shell): remove it, the image's own check covers `app`.
 - **The banner says `Sign in at http://app-….sslip.io`**: the generated domain was still first. Remove it in
   **Domains**, select **Restart current version**, and correct the public URL in the
   <UiPath path="setup.instanceBasics" /> step of the first sign-in.

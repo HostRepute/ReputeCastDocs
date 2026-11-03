@@ -8,6 +8,8 @@ uiPath: 'nav.transactional > transactional.common.tabSetup'
 primaryKeyword: transactional email API
 sources:
   - internal/transactional/send.go
+  - internal/transactional/schedule.go
+  - internal/transactional/messagesapi.go
   - internal/transactional/sendapi.go
   - internal/transactional/transactional.go
   - internal/transactional/ratelimit.go
@@ -367,7 +369,8 @@ Send an `Idempotency-Key` header (up to 255 characters) with every send, for exa
 - The same key with a different body within 24 hours gets `409 idempotency_key_reused`. Use a new key for a new
   message.
 - After 24 hours the key is forgotten and can be used again.
-- A batch's key covers the whole batch; each message in it is recorded under `<key>#<index>`.
+- A batch's key covers the whole batch; each message in it is recorded under `<key>#<index>`, so the key also
+  [cancels or moves the batch](#cancel-or-move-a-scheduled-message) later.
 
 Retry on network errors, `429` and `503` with the same key. Don't retry `422` answers without changing the request.
 
@@ -376,6 +379,41 @@ Retry on network errors, `429` and `503` with the same key. Don't retry `422` an
 Set `send_at` to send later, up to 72 hours ahead. A later time gets `422 validation_failed` ("send_at can be at most
 72 hours ahead"); schedule later sends in your own app. A time in the past, or less than a second ahead, sends now.
 The answer has `"status": "scheduled"` and the `send_at` it will use.
+
+### Cancel or move a scheduled message
+
+Until a scheduled message starts sending, a key with `transactional:send` can cancel it or give it another send
+time. People do the same on the [message's page](/transactional/message-log/#cancel-or-move-a-scheduled-message).
+Every change is recorded in the audit log.
+
+| Call                                                                                        | Body                                | What it does                                                                                              |
+| ------------------------------------------------------------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| [`POST …/messages/<id>/cancel`](/api/operations/cancel-transactional-message/)              | none                                | Cancels the message. The log keeps it as `cancelled`, its content is removed and webhooks get `message.cancelled`. |
+| [`POST …/messages/<id>/reschedule`](/api/operations/reschedule-transactional-message/)      | `{ "sendAt": "…" }`                 | Moves it to the new time.                                                                                 |
+| [`POST …/batches/cancel`](/api/operations/cancel-transactional-batch/)                      | `{ "idempotencyKey": "…" }`         | Cancels every message sent with that `Idempotency-Key` that still waits.                                  |
+| [`POST …/batches/reschedule`](/api/operations/reschedule-transactional-batch/)              | `{ "idempotencyKey": "…", "sendAt": "…" }` | Moves every message sent with that key that still waits.                                           |
+
+All four paths start with `/api/v1/workspaces/<workspace>/transactional`, and their bodies use `sendAt` and
+`idempotencyKey`, not the send call's `send_at`. The new time must be at least a minute and at most 72 hours from
+now; otherwise the call gets `422 validation_failed` and nothing moves.
+
+```sh title="reschedule-batch.sh"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/batches/reschedule \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{ "idempotencyKey": "trial-reminders-2026-10-22", "sendAt": "2026-10-23T09:00:00Z" }'
+```
+
+```json title="200 OK"
+{ "matched": 2, "changed": 1, "skipped": 1, "sendAt": "2026-10-23T09:00:00Z" }
+```
+
+`matched` counts the messages sent with the key, `changed` those cancelled or moved, and `skipped` those already on
+their way, sent or cancelled. For one message, the same case answers `409 not_scheduled`. A key that matches no
+message, or only messages past the log's retention, answers `404 not_found`.
 
 ## Test without emailing customers
 
@@ -414,8 +452,8 @@ Each key has its own send rate: 50 messages per second unless the key sets anoth
 as its number of messages. People who send from the app share 50 per second each. These endpoints don't count toward
 the general API limit of 600 requests per minute ([Rate limits](/developers/api-rate-limits/)).
 
-Each server process keeps its own counters, so several web nodes behind a load balancer together allow up to their
-number times the rate.
+Every web node takes from the same counter for a key, kept in PostgreSQL, so several nodes behind a load balancer
+together still allow the key's rate, not a multiple of it.
 
 ## Check that it worked
 

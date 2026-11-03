@@ -4,6 +4,8 @@
 //   code parameter through to api.Err or sets it on a problem (found automatically, e.g. earn's
 //   problem(ctx, status, code, key, args) or revenue's coded(ctx, code, location, key));
 // - `p.Code = …` on a problem built with api.Invalid, Err, BadRequest, Conflict or NotFound;
+// - the "code" of a problem body written by hand, `json.Marshal(map[string]any{"status": …, "title": …, "code": …})`
+//   (middleware outside huma, e.g. app's read-only guard and server's rate limits);
 // - the Code… constants of internal/api, minus UNUSED_CODES (declared there but never returned).
 // A code argument resolves when it is a literal, a constant (package-local or qualified), a local variable the same
 // function assigns literals to, `<sourceErr>.Code` (any Code… constant of the package: the importers' source errors)
@@ -23,6 +25,9 @@ export const DYNAMIC_CODES: Record<string, string[]> = {
   '"link_"+status': ['link_active', 'link_paused'],
   // internal/recommendations PauseLink and RotateSecret: l.Status is LinkEnded or LinkInvalid.
   '"link_"+l.Status': ['link_ended', 'link_invalid'],
+  // internal/audience erase (strict): the first erasure.Refusal's Code; internal/earn's Guard is the only source
+  // that refuses, with "paid_members".
+  'first.Code': ['paid_members'],
 }
 
 /** A Go source file; `path` is relative to the upstream root, e.g. 'internal/api/errors.go'. */
@@ -84,6 +89,19 @@ function problemCodeAssignments(src: string, offset = 0): Site[] {
     .map((m) => ({ at: offset + m.index, expr: m[2].trim() }))
 }
 
+/** The "code" entry of each problem body marshalled from a map literal that also has a "title". */
+function problemBodies(src: string, offset = 0): Site[] {
+  const out: Site[] = []
+  for (const m of src.matchAll(/json\.Marshal\(map\[string\]any\{/g)) {
+    const open = m.index + m[0].length - 1
+    const entries = splitTopLevel(src.slice(open + 1, closingIndex(src, open)))
+    if (!entries.some((e) => e.text.startsWith('"title":'))) continue
+    const code = entries.find((e) => e.text.startsWith('"code":'))
+    if (code) out.push({ at: offset + m.index, expr: code.text.slice('"code":'.length).trim() })
+  }
+  return out
+}
+
 /** Every code upstream returns, and the code expressions that couldn't be read ('path:line: expr'). */
 export function parseApiErrorCodes(
   files: GoFile[],
@@ -141,6 +159,7 @@ export function parseApiErrorCodes(
       const sites = [
         ...callees(f.dir).flatMap((c) => codeArgs(body, c, fn.start)),
         ...problemCodeAssignments(body, fn.start),
+        ...problemBodies(body, fn.start),
       ]
       for (const { at, expr } of sites) {
         if (expr === undefined || (fn.params.includes(expr) && isWrapper(f.dir, fn.name))) continue

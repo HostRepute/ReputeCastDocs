@@ -7,20 +7,26 @@ primaryKeyword: cấu hình PostgreSQL cho ReputeCast
 sources:
   - migrations/00008_segment_role.sql
   - migrations/00151_segment_runner.sql
+  - migrations/03372_m43_contacts_search.sql
+  - migrations/03384_m47_delivery_event_keys.sql
   - internal/segments/sqlmode.go
   - internal/db/db.go
+  - internal/db/partition.go
   - internal/cli/migrate.go
+  - internal/cli/doctor.go
   - internal/config/config.go
   - .github/workflows/ci.yml
+  - docs/deploy/partitioning.md
 sidebar:
   order: 7
 ---
 
-import { Steps } from '@astrojs/starlight/components'
+import { Aside, Steps } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
 Trang này hướng dẫn cấu hình PostgreSQL cho ReputeCast: cơ sở dữ liệu, người dùng, kết nối và migration lược đồ.
-ReputeCast lưu mọi thứ trong PostgreSQL, kể cả hàng đợi tác vụ, và không cần extension nào.
+ReputeCast lưu mọi thứ trong PostgreSQL, kể cả hàng đợi tác vụ, và cần một extension, `pg_trgm`, cho việc tìm kiếm liên
+hệ.
 
 ## Trước khi bắt đầu
 
@@ -66,7 +72,9 @@ ReputeCast lưu mọi thứ trong PostgreSQL, kể cả hàng đợi tác vụ, 
 Cơ sở dữ liệu trên đám mây thường cấp cho bạn một tài khoản quản trị không phải superuser. ReputeCast vẫn hoạt động với
 tài khoản đó:
 
-- Các migration không tạo extension nào và chỉ cần quyền sở hữu cơ sở dữ liệu.
+- Các migration chỉ cần quyền sở hữu cơ sở dữ liệu. Extension duy nhất chúng tạo, `pg_trgm`, đi kèm PostgreSQL và là
+  extension tin cậy (trusted), nên chủ sở hữu cơ sở dữ liệu tạo được nó
+  ([tài liệu pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html), kiểm tra tháng 11/2026).
 - Tạo `reputecast_segments` cần đặc quyền `CREATEROLE`. Nếu người dùng của ứng dụng không có đặc quyền này, hãy tạo
   role bằng tài khoản quản trị trước lần khởi động đầu tiên (bước 1 ở trên); nếu không, ReputeCast vẫn cài đặt bình
   thường nhưng phân khúc SQL sẽ bị tắt.
@@ -104,49 +112,70 @@ GRANT reputecast_segments TO <app user>;
 ```
 
 - **Trước lần khởi động đầu tiên** (khuyên dùng): chạy các lệnh này, rồi cài đặt ReputeCast. Không cần làm gì thêm.
-- **Trên cơ sở dữ liệu đã chạy migration**, chỉ chạy `reputecast migrate up` thì chưa đủ: migration tạo segment runner
-  (`00151_segment_runner.sql`) đã được ghi nhận là đã chạy. Sau hai lệnh trên, hãy chạy câu lệnh của migration đó một
-  lần với người dùng của ứng dụng, rồi khởi động lại mọi tiến trình ReputeCast (mỗi tiến trình chỉ kiểm tra runner một
-  lần, khi lần đầu cần đến nó):
+- **Trên cơ sở dữ liệu đã chạy migration**, hoặc sau khi khôi phục bản sao lưu trên máy chủ mới, chỉ chạy
+  `reputecast migrate up` thì chưa đủ: migration tạo segment runner đã được ghi nhận là đã chạy. Sau hai lệnh trên, hãy
+  giao runner cho role với môi trường của máy chủ, rồi khởi động lại mọi tiến trình ReputeCast (mỗi tiến trình chỉ kiểm
+  tra runner một lần, khi lần đầu cần đến nó):
 
-  ```sql title="Với người dùng của ứng dụng (psql -U reputecast -d reputecast)"
-  DO $$
-  BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'reputecast_segments') THEN
-          RAISE NOTICE 'reputecast_segments role missing: SQL segments stay disabled';
-          RETURN;
-      END IF;
-      IF NOT pg_has_role(current_user, 'reputecast_segments', 'MEMBER') THEN
-          RAISE NOTICE '% is not a member of reputecast_segments: SQL segments stay disabled', current_user;
-          RETURN;
-      END IF;
-      BEGIN
-          CREATE SCHEMA IF NOT EXISTS reputecast_sql;
-          EXECUTE $create$
-              CREATE OR REPLACE FUNCTION reputecast_sql.segment_ids(query text) RETURNS SETOF uuid
-                  LANGUAGE plpgsql SECURITY DEFINER
-                  SET search_path = pg_temp, pg_catalog
-              AS $fn$
-              BEGIN
-                  RETURN QUERY EXECUTE 'SELECT s.id::uuid FROM (' || query || ') s';
-              END
-              $fn$
-          $create$;
-          GRANT USAGE, CREATE ON SCHEMA reputecast_sql TO reputecast_segments;
-          ALTER FUNCTION reputecast_sql.segment_ids(text) OWNER TO reputecast_segments;
-          REVOKE CREATE ON SCHEMA reputecast_sql FROM reputecast_segments;
-          REVOKE ALL ON FUNCTION reputecast_sql.segment_ids(text) FROM PUBLIC;
-          EXECUTE format('GRANT EXECUTE ON FUNCTION reputecast_sql.segment_ids(text) TO %I', current_user);
-      EXCEPTION WHEN insufficient_privilege THEN
-          RAISE NOTICE 'could not set up reputecast_sql.segment_ids: SQL segments stay disabled';
-      END;
-  END;
-  $$;
+  ```sh
+  reputecast migrate segments-role
   ```
 
-Kiểm tra kết quả: `SELECT to_regprocedure('reputecast_sql.segment_ids(text)') IS NOT NULL;` trả về `t` khi phân khúc
-SQL dùng được. Role này dùng chung cho mọi cơ sở dữ liệu trên máy chủ, và `pg_dump` không bao gồm role: hãy tạo role
-trên máy chủ mới trước khi [khôi phục bản sao lưu](/vi/self-hosting/backups/).
+  Lệnh này chạy lại được an toàn, và in ra trạng thái của role, giống dòng `SQL segments role` của `reputecast doctor`.
+
+Role này dùng chung cho mọi cơ sở dữ liệu trên máy chủ, và `pg_dump` không bao gồm role: hãy tạo role trên máy chủ mới
+trước khi [khôi phục bản sao lưu](/vi/self-hosting/backups/#khôi-phục).
+
+## Phân vùng theo tháng của delivery_events
+
+`delivery_events` chứa mọi lượt gửi, giao, bounce, mở và nhấp, và là bảng lớn nhất trên hầu hết các hệ thống. Từ 1.3.0,
+bảng này được chia theo tháng dựa trên `received_at`, thời điểm ReputeCast lưu sự kiện, nên chỉ mục của mỗi tháng luôn
+nhỏ và [thời gian lưu giữ dữ liệu](/vi/team/workspaces/#đặt-thời-gian-lưu-giữ-dữ-liệu) xóa chi tiết lượt mở và lượt
+nhấp của một tháng trong một lần.
+
+- Lần nâng cấp lên 1.3.0 chuyển đổi bảng (`migrate up` và `serve --auto-migrate`), trừ khi
+  `reputecast migrate partition-events` đã làm việc đó. Không có gì bị sao chép: bảng hiện có trở thành
+  `delivery_events_legacy`, phân vùng của mọi thứ trước tháng đầu tiên, và các tháng sau có phân vùng riêng.
+- Một job bảo trì chạy mỗi giờ luôn chuẩn bị sẵn tháng hiện tại và hai tháng kế tiếp; `delivery_events_default` nhận
+  mọi thứ nằm ngoài các tháng đó, nên thao tác chèn không bao giờ thất bại.
+- Khóa chống trùng lặp chuyển sang `delivery_event_keys` và được giữ 180 ngày. Sau đó lần nâng cấp xóa chỉ mục unique
+  cũ, `delivery_events_dedupe_key`, theo cách concurrently.
+- Việc chuyển đổi giữ khóa migration, chạy được trong lúc ReputeCast đang chạy và chạy lại được sau khi bị gián đoạn.
+  Hai bước đọc toàn bộ bảng mà không chặn thao tác ghi; bước hoán đổi chờ khóa của bảng tối đa 10 giây, thử 5 lần. Với
+  một triệu liên hệ và 3,2 triệu sự kiện (1,4 GB), việc này mất 5 giây.
+
+Để tự chọn thời điểm cho một bảng rất lớn, hãy [sao lưu](/vi/self-hosting/backups/), rồi chuyển đổi trước khi nâng cấp,
+vào giờ vắng:
+
+```sh
+reputecast migrate partition-events
+```
+
+### Hoàn tác việc chuyển đổi
+
+Phiên bản 1.2 cũng hoạt động trên bảng đã phân vùng, nên việc quay lại phiên bản trước không cần bước này. Để hoàn tác
+việc chuyển đổi, hãy khôi phục bản sao lưu tạo trước đó, hoặc chạy đoạn sau với người dùng của ứng dụng, trong một
+transaction:
+
+```sql title="Hoàn tác việc phân vùng"
+BEGIN;
+LOCK TABLE delivery_events IN ACCESS EXCLUSIVE MODE;
+ALTER TABLE delivery_events DETACH PARTITION delivery_events_legacy;
+ALTER TABLE delivery_events_legacy DROP CONSTRAINT delivery_events_before_partitions;
+INSERT INTO delivery_events_legacy SELECT * FROM delivery_events;  -- the newer months' rows
+DROP TABLE delivery_events;                                         -- and its monthly partitions
+ALTER TABLE delivery_events_legacy RENAME TO delivery_events;
+ALTER TABLE delivery_events DROP CONSTRAINT delivery_events_legacy_pkey;
+ALTER TABLE delivery_events ADD CONSTRAINT delivery_events_pkey PRIMARY KEY (id);
+COMMIT;
+```
+
+Sau đó đổi tên từng chỉ mục có tên kết thúc bằng `_legacy` về lại tên không có hậu tố đó.
+
+<Aside type="caution">
+  `DROP TABLE delivery_events` xóa các phân vùng theo tháng: hãy sao lưu trước. Một bản phát hành 1.3 sẽ chuyển đổi bảng
+  lại ở lần `migrate up` hoặc lần khởi động với `--auto-migrate` tiếp theo.
+</Aside>
 
 ## Migration
 
@@ -155,24 +184,27 @@ Tệp nhị phân mang theo mọi migration lược đồ: của chính ReputeCa
 - `reputecast migrate up` áp dụng các migration đang chờ và in `Database is up to date.`; `reputecast install` và
   `serve --auto-migrate` (mặc định của Docker image) cũng làm như vậy khi khởi động.
 - `reputecast migrate status` liệt kê từng migration cùng ngày áp dụng hoặc `pending`.
-- `reputecast migrate down` chỉ hoàn tác migration ReputeCast mới nhất. Muốn lùi xa hơn, hãy khôi phục một bản sao lưu.
+- `reputecast migrate down` chỉ hoàn tác migration ReputeCast mới nhất. Lệnh này dành cho môi trường phát triển:
+  migration down xóa dữ liệu. Muốn lùi lại, hãy khôi phục một bản sao lưu.
 - Một số migration tạo chỉ mục đồng thời (concurrently), bên ngoài giao dịch, nên việc nhập dữ liệu, đăng ký và gửi thư
   vẫn tiếp tục trong lúc chỉ mục được tạo trên một bảng lớn.
-- Một tiến trình khởi động không có `--auto-migrate` trên cơ sở dữ liệu còn migration đang chờ sẽ ghi log
-  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate`` và vẫn tiếp tục chạy.
+- Migration giữ một khóa, nên các tiến trình khởi động cùng lúc chỉ migrate một lần. Một tiến trình có cơ sở dữ liệu
+  còn thiếu migration sẽ phục vụ ở chế độ chỉ đọc cho đến khi chúng được áp dụng
+  ([trong lúc còn migration chưa chạy](/vi/self-hosting/upgrades/#trong-lúc-còn-migration-chưa-chạy)).
 
 ## Kiểm tra kết quả
 
 - `/readyz` trả về `ready`; nó trả về `503 database unavailable` khi một lần ping cơ sở dữ liệu mất hơn 2 giây.
-- `reputecast migrate status` không có dòng `pending` nào.
+- `reputecast migrate status` không có dòng `pending` nào, và `reputecast doctor` báo `ok` cho cơ sở dữ liệu, schema và
+  role của phân khúc SQL.
 - Trong <UiPath path="nav.audience > audience.tabSegments" />, một phân khúc ở chế độ SQL đếm được liên hệ.
 
 ## Khắc phục sự cố
 
 - **`connect to postgres: …` khi khởi động**: sai host, mật khẩu hoặc `sslmode`; hãy thử cùng URL bằng `psql`.
 - **`FATAL: sorry, too many clients already`**: tổng các pool vượt quá `max_connections`; hãy giảm `database.max_conns`.
-- **Phân khúc SQL vẫn tắt sau khi bạn đã tạo role**: cơ sở dữ liệu đã chạy migration từ trước; hãy chạy câu lệnh trong
-  [phân khúc SQL](#phân-khúc-sql) rồi khởi động lại ReputeCast.
+- **Phân khúc SQL vẫn tắt sau khi bạn đã tạo role**: cơ sở dữ liệu đã chạy migration từ trước; hãy chạy
+  `reputecast migrate segments-role` rồi khởi động lại ReputeCast.
 
 ## Liên quan
 

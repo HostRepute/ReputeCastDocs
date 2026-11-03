@@ -7,20 +7,26 @@ primaryKeyword: PostgreSQL setup for ReputeCast
 sources:
   - migrations/00008_segment_role.sql
   - migrations/00151_segment_runner.sql
+  - migrations/03372_m43_contacts_search.sql
+  - migrations/03384_m47_delivery_event_keys.sql
   - internal/segments/sqlmode.go
   - internal/db/db.go
+  - internal/db/partition.go
   - internal/cli/migrate.go
+  - internal/cli/doctor.go
   - internal/config/config.go
   - .github/workflows/ci.yml
+  - docs/deploy/partitioning.md
 sidebar:
   order: 7
 ---
 
-import { Steps } from '@astrojs/starlight/components'
+import { Aside, Steps } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
 This page covers the PostgreSQL setup for ReputeCast: the database, its users, the connection and the schema
-migrations. ReputeCast keeps everything in PostgreSQL, including its job queue, and needs no extensions.
+migrations. ReputeCast keeps everything in PostgreSQL, including its job queue, and needs one extension, `pg_trgm`, for
+contact search.
 
 ## Before you begin
 
@@ -62,7 +68,9 @@ migrations. ReputeCast keeps everything in PostgreSQL, including its job queue, 
 
 Cloud databases usually give you an administrator that is not a superuser. ReputeCast works with that:
 
-- The migrations create no extensions and need only ownership of the database.
+- The migrations need only ownership of the database. The one extension they create, `pg_trgm`, comes with PostgreSQL
+  and is trusted, so the database's owner can create it
+  ([pg_trgm documentation](https://www.postgresql.org/docs/current/pgtrgm.html), checked November 2026).
 - Creating `reputecast_segments` needs the `CREATEROLE` privilege. If the app's user doesn't have it, create the
   role with the administrator before the first start (step 1 above); otherwise ReputeCast installs fine, but SQL
   segments stay off.
@@ -99,49 +107,70 @@ GRANT reputecast_segments TO <app user>;
 ```
 
 - **Before the first start** (recommended): run them, then install ReputeCast. Nothing else is needed.
-- **On a database that is already migrated**, `reputecast migrate up` alone doesn't finish the job: the migration that
-  creates the segment runner (`00151_segment_runner.sql`) has already been recorded. After the two commands, run that
-  migration's statement once as the app user, then restart every ReputeCast process (each checks for the runner once,
-  when it first needs it):
+- **On a database that is already migrated**, or after restoring a backup on a new server, `reputecast migrate up`
+  alone doesn't finish the job: the migration that creates the segment runner has already been recorded. After the two
+  commands, hand the runner to the role with the server's environment, then restart every ReputeCast process (each
+  checks for the runner once, when it first needs it):
 
-  ```sql title="As the app user (psql -U reputecast -d reputecast)"
-  DO $$
-  BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'reputecast_segments') THEN
-          RAISE NOTICE 'reputecast_segments role missing: SQL segments stay disabled';
-          RETURN;
-      END IF;
-      IF NOT pg_has_role(current_user, 'reputecast_segments', 'MEMBER') THEN
-          RAISE NOTICE '% is not a member of reputecast_segments: SQL segments stay disabled', current_user;
-          RETURN;
-      END IF;
-      BEGIN
-          CREATE SCHEMA IF NOT EXISTS reputecast_sql;
-          EXECUTE $create$
-              CREATE OR REPLACE FUNCTION reputecast_sql.segment_ids(query text) RETURNS SETOF uuid
-                  LANGUAGE plpgsql SECURITY DEFINER
-                  SET search_path = pg_temp, pg_catalog
-              AS $fn$
-              BEGIN
-                  RETURN QUERY EXECUTE 'SELECT s.id::uuid FROM (' || query || ') s';
-              END
-              $fn$
-          $create$;
-          GRANT USAGE, CREATE ON SCHEMA reputecast_sql TO reputecast_segments;
-          ALTER FUNCTION reputecast_sql.segment_ids(text) OWNER TO reputecast_segments;
-          REVOKE CREATE ON SCHEMA reputecast_sql FROM reputecast_segments;
-          REVOKE ALL ON FUNCTION reputecast_sql.segment_ids(text) FROM PUBLIC;
-          EXECUTE format('GRANT EXECUTE ON FUNCTION reputecast_sql.segment_ids(text) TO %I', current_user);
-      EXCEPTION WHEN insufficient_privilege THEN
-          RAISE NOTICE 'could not set up reputecast_sql.segment_ids: SQL segments stay disabled';
-      END;
-  END;
-  $$;
+  ```sh
+  reputecast migrate segments-role
   ```
 
-Check the result: `SELECT to_regprocedure('reputecast_sql.segment_ids(text)') IS NOT NULL;` returns `t` when SQL
-segments are available. The role is shared by every database on the server, and `pg_dump` doesn't include roles:
-create it on a new server before you [restore a backup](/self-hosting/backups/).
+  It is safe to run again, and prints the state of the role, as `reputecast doctor` does on its
+  `SQL segments role` line.
+
+The role is shared by every database on the server, and `pg_dump` doesn't include roles: create it on a new server
+before you [restore a backup](/self-hosting/backups/#restore).
+
+## Monthly partitions of delivery_events
+
+`delivery_events` holds every send, delivery, bounce, open and click, and is the largest table on most instances.
+Since 1.3.0 it is split by month on `received_at`, when ReputeCast stored the event, so each month's indexes stay small
+and [data retention](/team/workspaces/#set-data-retention) clears a month's open and click details in one pass.
+
+- The upgrade to 1.3.0 converts the table (`migrate up` and `serve --auto-migrate`), unless
+  `reputecast migrate partition-events` already did. Nothing is copied: the existing table becomes
+  `delivery_events_legacy`, the partition of everything before the first month, and later months get partitions of
+  their own.
+- An hourly maintenance job keeps the current month and the next two ready; `delivery_events_default` catches anything
+  outside them, so an insert never fails.
+- Dedupe keys move to `delivery_event_keys` and are kept 180 days. The upgrade then drops the old unique index,
+  `delivery_events_dedupe_key`, concurrently.
+- The conversion holds the migration lock, runs while ReputeCast runs and can run again after an interruption. Two
+  steps read the whole table without blocking writes; the swap waits at most 10 seconds for the table's lock, tried 5
+  times. On a million contacts with 3.2 million events (1.4 GB) it took 5 seconds.
+
+To choose the moment on a very large table, [back up](/self-hosting/backups/), then convert it before you upgrade, at a
+quiet hour:
+
+```sh
+reputecast migrate partition-events
+```
+
+### Undo the conversion
+
+Version 1.2 works on the partitioned table too, so a rollback doesn't need this. To undo the conversion, restore the
+backup taken before it, or run this as the app user in one transaction:
+
+```sql title="Undo the partitioning"
+BEGIN;
+LOCK TABLE delivery_events IN ACCESS EXCLUSIVE MODE;
+ALTER TABLE delivery_events DETACH PARTITION delivery_events_legacy;
+ALTER TABLE delivery_events_legacy DROP CONSTRAINT delivery_events_before_partitions;
+INSERT INTO delivery_events_legacy SELECT * FROM delivery_events;  -- the newer months' rows
+DROP TABLE delivery_events;                                         -- and its monthly partitions
+ALTER TABLE delivery_events_legacy RENAME TO delivery_events;
+ALTER TABLE delivery_events DROP CONSTRAINT delivery_events_legacy_pkey;
+ALTER TABLE delivery_events ADD CONSTRAINT delivery_events_pkey PRIMARY KEY (id);
+COMMIT;
+```
+
+Then rename each index whose name ends in `_legacy` back without the suffix.
+
+<Aside type="caution">
+  `DROP TABLE delivery_events` drops the monthly partitions: take a backup first. A 1.3 release converts the table again
+  at its next `migrate up` or `--auto-migrate` start.
+</Aside>
 
 ## Migrations
 
@@ -150,24 +179,26 @@ The binary carries every schema migration: ReputeCast's own, then those of its j
 - `reputecast migrate up` applies what is pending and prints `Database is up to date.`; `reputecast install` and
   `serve --auto-migrate` (the Docker image's default) do the same at start.
 - `reputecast migrate status` lists each migration with its applied date or `pending`.
-- `reputecast migrate down` rolls back only the latest ReputeCast migration. Restore a backup to go further back.
+- `reputecast migrate down` rolls back only the latest ReputeCast migration. It is meant for development: down
+  migrations drop data. Restore a backup to go back.
 - A few migrations build an index concurrently, outside a transaction, so imports, sign-ups and sends keep going while
   the index builds on a large table.
-- A process started without `--auto-migrate` on a database with pending migrations logs
-  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate`` and keeps running.
+- Migrations hold a lock, so processes started together migrate once. A process whose database still misses migrations
+  serves read-only until they're applied ([while migrations are pending](/self-hosting/upgrades/#while-migrations-are-pending)).
 
 ## Check that it worked
 
 - `/readyz` answers `ready`; it answers `503 database unavailable` when a database ping takes longer than 2 seconds.
-- `reputecast migrate status` shows no `pending` line.
+- `reputecast migrate status` shows no `pending` line, and `reputecast doctor` shows `ok` for the database, the schema
+  and the SQL segments role.
 - In <UiPath path="nav.audience > audience.tabSegments" />, a segment in SQL mode counts contacts.
 
 ## Troubleshooting
 
 - **`connect to postgres: …` at start**: wrong host, password or `sslmode`; test the same URL with `psql`.
 - **`FATAL: sorry, too many clients already`**: the pools exceed `max_connections`; lower `database.max_conns`.
-- **SQL segments stay off after you created the role**: the database was migrated before; run the statement in
-  [SQL segments](#sql-segments) and restart ReputeCast.
+- **SQL segments stay off after you created the role**: the database was migrated before; run
+  `reputecast migrate segments-role` and restart ReputeCast.
 
 ## Related
 

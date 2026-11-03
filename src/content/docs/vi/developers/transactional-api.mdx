@@ -8,6 +8,8 @@ uiPath: 'nav.transactional > transactional.common.tabSetup'
 primaryKeyword: API gửi email giao dịch
 sources:
   - internal/transactional/send.go
+  - internal/transactional/schedule.go
+  - internal/transactional/messagesapi.go
   - internal/transactional/sendapi.go
   - internal/transactional/transactional.go
   - internal/transactional/ratelimit.go
@@ -368,7 +370,8 @@ Gửi header `Idempotency-Key` (tối đa 255 ký tự) với mọi lượt gử
 - Một lần thử lại với cùng khóa và cùng body trong vòng 24 giờ nhận lại phản hồi đầu tiên và không gửi gì cả.
 - Cùng khóa nhưng body khác trong vòng 24 giờ nhận `409 idempotency_key_reused`. Hãy dùng khóa mới cho thư mới.
 - Sau 24 giờ, khóa bị quên và có thể dùng lại.
-- Khóa của một lô áp dụng cho cả lô; mỗi thư trong lô được ghi nhận dưới `<key>#<index>`.
+- Khóa của một lô áp dụng cho cả lô; mỗi thư trong lô được ghi nhận dưới `<key>#<index>`, nên sau này khóa đó cũng
+  dùng để [hủy hoặc dời cả lô](#hủy-hoặc-dời-một-thư-đã-lên-lịch).
 
 Hãy thử lại khi gặp lỗi mạng, `429` và `503` với cùng khóa. Đừng thử lại phản hồi `422` nếu chưa sửa yêu cầu.
 
@@ -377,6 +380,42 @@ Hãy thử lại khi gặp lỗi mạng, `429` và `503` với cùng khóa. Đ�
 Đặt `send_at` để gửi sau, tối đa 72 giờ tới. Thời điểm xa hơn sẽ nhận `422 validation_failed` ("send_at can be at most
 72 hours ahead"); hãy lên lịch các lượt gửi xa hơn trong ứng dụng của bạn. Thời điểm trong quá khứ, hoặc chưa tới một
 giây nữa, sẽ được gửi ngay. Phản hồi có `"status": "scheduled"` và giá trị `send_at` sẽ được dùng.
+
+### Hủy hoặc dời một thư đã lên lịch
+
+Trước khi một thư đã lên lịch bắt đầu được gửi, một khóa có `transactional:send` có thể hủy thư hoặc đặt cho thư thời
+điểm gửi khác. Người dùng làm điều tương tự trên
+[trang của thư](/vi/transactional/message-log/#hủy-hoặc-dời-một-thư-đã-lên-lịch). Mọi thay đổi đều được ghi vào nhật
+ký kiểm tra.
+
+| Lệnh gọi                                                                                    | Body                                | Tác dụng                                                                                                  |
+| ------------------------------------------------------------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| [`POST …/messages/<id>/cancel`](/api/operations/cancel-transactional-message/)              | không có                            | Hủy thư. Nhật ký giữ thư ở trạng thái `cancelled`, nội dung bị xóa và webhook nhận `message.cancelled`.   |
+| [`POST …/messages/<id>/reschedule`](/api/operations/reschedule-transactional-message/)      | `{ "sendAt": "…" }`                 | Dời thư sang thời điểm mới.                                                                               |
+| [`POST …/batches/cancel`](/api/operations/cancel-transactional-batch/)                      | `{ "idempotencyKey": "…" }`         | Hủy mọi thư còn đang chờ đã được gửi với `Idempotency-Key` đó.                                            |
+| [`POST …/batches/reschedule`](/api/operations/reschedule-transactional-batch/)              | `{ "idempotencyKey": "…", "sendAt": "…" }` | Dời mọi thư còn đang chờ đã được gửi với khóa đó.                                                  |
+
+Cả bốn đường dẫn đều bắt đầu bằng `/api/v1/workspaces/<workspace>/transactional`, và body của chúng dùng `sendAt` và
+`idempotencyKey`, không phải `send_at` của lệnh gửi. Thời điểm mới phải cách hiện tại ít nhất một phút và nhiều nhất
+72 giờ; nếu không, lệnh gọi nhận `422 validation_failed` và không thư nào bị dời.
+
+```sh title="reschedule-batch.sh"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with transactional:send.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/transactional/batches/reschedule \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{ "idempotencyKey": "trial-reminders-2026-10-22", "sendAt": "2026-10-23T09:00:00Z" }'
+```
+
+```json title="200 OK"
+{ "matched": 2, "changed": 1, "skipped": 1, "sendAt": "2026-10-23T09:00:00Z" }
+```
+
+`matched` đếm các thư đã được gửi với khóa, `changed` là những thư đã bị hủy hoặc dời, và `skipped` là những thư đã
+đang gửi, đã gửi hoặc đã hủy. Với một thư đơn lẻ, trường hợp đó nhận `409 not_scheduled`. Một khóa không khớp thư
+nào, hoặc chỉ khớp các thư đã quá thời gian lưu của nhật ký, nhận `404 not_found`.
 
 ## Thử nghiệm mà không gửi email cho khách hàng
 
@@ -417,8 +456,8 @@ thư trong lô. Khi gửi từ ứng dụng, mỗi người dùng có một mứ
 endpoint này không tính vào giới hạn API chung là 600 yêu cầu mỗi phút ([Giới hạn tốc độ
 API](/vi/developers/api-rate-limits/)).
 
-Mỗi tiến trình máy chủ giữ bộ đếm riêng, nên nhiều node web phía sau một bộ cân bằng tải cùng cho phép tối đa số node
-nhân với tốc độ đó.
+Mọi node web đều lấy từ cùng một bộ đếm của khóa, được lưu trong PostgreSQL, nên nhiều node phía sau một bộ cân bằng
+tải cộng lại vẫn chỉ cho phép đúng tốc độ của khóa, không phải bội số của nó.
 
 ## Kiểm tra kết quả
 

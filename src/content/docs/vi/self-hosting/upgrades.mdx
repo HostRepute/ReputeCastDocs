@@ -13,14 +13,18 @@ sources:
   - internal/cli/migrate.go
   - internal/cli/serve.go
   - internal/db/db.go
+  - internal/db/partition.go
+  - internal/app/schema.go
   - internal/version/version.go
   - internal/instance/updates.go
   - web/src/features/admin/instance/InstancePage.tsx
+  - web/src/lib/systemStatus.ts
   - internal/config/config.go
   - internal/jobs/jobs.go
   - internal/mailbox
   - internal/app/wire_mailbox.go
   - migrations/{03208_r05_share_expiry.sql,03256_m39_contacts_live_idx.sql,03312_m40_default_reply_rules.sql}
+  - docs/deploy/{README.md,backup-restore.md,partitioning.md}
 sidebar:
   order: 10
 ---
@@ -41,7 +45,7 @@ changelog của nó trong <UiPath path="shell.userMenuInstanceAdmin > admin.inst
 
 <Screenshot
   id="instance-settings"
-  alt="Thẻ Phiên bản và cập nhật hiển thị phiên bản đã cài, bản phát hành mới nhất kèm phần có gì mới và liên kết đến nhật ký thay đổi, lệnh nâng cấp và việc kiểm tra bản phát hành mỗi ngày đang bật."
+  alt="Thẻ Phiên bản và cập nhật: phiên bản đã cài, bản phát hành mới nhất v1.3.0 được đánh dấu Đã là bản mới nhất kèm liên kết đến nhật ký thay đổi, phần Có gì mới trong v1.3.0, lệnh nâng cấp kèm lời nhắc sao lưu PostgreSQL trước, và việc kiểm tra bản phát hành mỗi ngày đang bật."
 />
 
 - Nhãn <UiPath path="admin.updateAvailable" /> xuất hiện khi bản phát hành mới nhất mới hơn phiên bản đã cài. Các bản
@@ -88,7 +92,8 @@ changelog của nó trong <UiPath path="shell.userMenuInstanceAdmin > admin.inst
    ```
 
    Image khởi động với `serve --auto-migrate`, nên nó áp dụng các migration còn chờ trước khi phục vụ yêu cầu. Log
-   hiển thị một dòng `migration applied` cho mỗi migration.
+   hiển thị một dòng `migration applied` cho mỗi migration, và `docker compose ps` cho thấy `app` ở trạng thái
+   `healthy` khi đã sẵn sàng.
 
 </Steps>
 
@@ -127,11 +132,48 @@ changelog của nó trong <UiPath path="shell.userMenuInstanceAdmin > admin.inst
 </TabItem>
 </Tabs>
 
-<Aside type="caution">
-  Một tiến trình khởi động không có `--auto-migrate` trên cơ sở dữ liệu còn migration chờ áp dụng vẫn tiếp tục chạy và
-  chỉ ghi log ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate``. Hãy chạy migration
-  trước khi dựa vào phiên bản mới.
-</Aside>
+## Trong lúc còn migration chưa chạy
+
+Một tiến trình có cơ sở dữ liệu còn thiếu migration mà nó cần, chẳng hạn một tệp nhị phân được thay trước khi chạy
+`reputecast migrate up`, sẽ không ghi vào cơ sở dữ liệu đó:
+
+- Các trang và API vẫn đọc như bình thường. Ứng dụng hiển thị biểu ngữ <UiPath path="shell.bannerMaintenance" /> trước
+  mọi thao tác chỉnh sửa.
+- Thao tác ghi trả về `503` với mã `maintenance`. Đăng nhập và đăng xuất vẫn hoạt động, và webhook của nhà cung cấp gửi
+  thư vẫn được lưu.
+- Worker chờ, nên không có gì được gửi.
+- `/readyz` trả về `503`, nên load balancer hoặc công cụ điều phối tiếp tục gửi lưu lượng đến bản phát hành trước.
+
+Tiến trình kiểm tra lại mỗi 5 giây và tự tiếp tục khi `reputecast migrate up`, hoặc `--auto-migrate` của một tiến trình
+khác, đã áp dụng xong. Các tab trình duyệt còn mở qua lần nâng cấp sẽ đề nghị <UiPath path="shell.bannerReload" /> để
+dùng phiên bản mới.
+
+Migration giữ một khóa trong PostgreSQL: khi nhiều tiến trình cùng khởi động với `--auto-migrate`, một tiến trình áp
+dụng migration còn các tiến trình khác chờ (tối đa 15 phút), nên mỗi migration chỉ chạy một lần. Hãy chạy migration qua
+kết nối trực tiếp hoặc ở chế độ session, không qua PgBouncer ở chế độ transaction.
+
+## Nâng cấp lên 1.3.0
+
+Phiên bản 1.3.0 thay đổi những điều sau trên máy chủ; [ghi chú phát hành](/vi/reference/release-notes/#130) liệt kê
+phần còn lại.
+
+- **23 migration mới** (`03360` đến `03388`); một số tạo chỉ mục đồng thời (concurrently). Một migration tạo extension
+  `pg_trgm` cho việc tìm kiếm liên hệ, và chủ sở hữu cơ sở dữ liệu được phép tạo extension này
+  ([PostgreSQL](/vi/self-hosting/postgres/#postgresql-được-quản-lý)).
+- **`delivery_events` được chia thành phân vùng theo tháng.** Sau các migration, `migrate up` và `serve --auto-migrate`
+  chuyển đổi bảng chứa mọi lượt gửi, giao, bounce, mở và nhấp, trừ khi `reputecast migrate partition-events` đã làm việc
+  đó. Không có gì bị sao chép và việc ghi vẫn tiếp tục, nhưng có hai bước đọc toàn bộ bảng: với bảng rất lớn, hãy tự
+  chạy `reputecast migrate partition-events` trước, vào giờ vắng
+  ([phân vùng theo tháng](/vi/self-hosting/postgres/#phân-vùng-theo-tháng-của-delivery_events)).
+- **Chỉ đọc cho đến khi migrate xong, và migration có khóa**, như mô tả [ở trên](#trong-lúc-còn-migration-chưa-chạy).
+- **`/metrics` đã chuyển** sang listener riêng, `:9464`. Nếu Prometheus scrape cổng chính, hãy trỏ nó đến 9464 hoặc đặt
+  `metrics.token` ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+- **Health check cho container.** Image chạy `reputecast healthcheck`, nên Docker báo ứng dụng là `healthy` khi
+  `/readyz` trả lời.
+- **Giới hạn tần suất theo phiên trình duyệt.** Mỗi trình duyệt đã đăng nhập có riêng 600 yêu cầu mỗi phút; các trình
+  duyệt sau cùng một địa chỉ dùng chung 6,000 ([bảo mật và gia cố](/vi/self-hosting/security/)).
+- **nginx với HTTP/2.** [Ví dụ nginx](/vi/self-hosting/reverse-proxy/) giờ bật HTTP/2, giúp ứng dụng tải nhanh hơn nhiều
+  trên điện thoại.
 
 ## Nâng cấp lên 1.2.0
 
@@ -160,24 +202,34 @@ phần còn lại.
 - <UiPath path="admin.versionCard" /> hiển thị phiên bản mới là phiên bản đã cài.
 - `reputecast migrate status` liệt kê mọi migration kèm ngày áp dụng và không có migration nào ở trạng thái `pending`.
   Trong Docker: `docker compose exec app /usr/local/bin/reputecast migrate status`.
-- `/readyz` trả về `ready` ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+- `/readyz` trả về `ready` ([health check, metrics và log](/vi/self-hosting/monitoring/)), và `reputecast doctor` báo
+  schema là `current`.
 
 ## Quay lại phiên bản trước
 
-Chạy lại image hoặc tệp nhị phân cũ không hoàn tác migration: cơ sở dữ liệu vẫn giữ schema mới hơn.
+Chạy lại image hoặc tệp nhị phân cũ không hoàn tác migration: cơ sở dữ liệu vẫn giữ schema mới hơn. Trong cùng một bản
+phát hành minor (1.3.0 sang 1.3.2), migration chỉ thêm vào, và khi lùi một bản minor (1.3 về 1.2), tệp nhị phân cũ hơn
+vẫn chạy trên schema mới hơn. Hãy đọc ghi chú phát hành trước: bản phát hành nào xóa hoặc đổi tên một thứ gì đó sẽ nói
+rõ. Lùi xa hơn thì hãy khôi phục bản sao lưu.
 
 - **Khôi phục bản sao lưu** để trở về chính xác trạng thái trước khi nâng cấp: dừng ReputeCast, khôi phục bản dump bạn
   đã tạo (xem [khôi phục](/vi/self-hosting/backups/#khôi-phục)), rồi khởi động phiên bản bạn chạy trước đó. Mọi thay đổi
   sau khi nâng cấp sẽ mất.
 - **Ghim phiên bản trước** (`REPUTECAST_VERSION` trong `.env`, rồi `docker compose up -d`), như thẻ
-  <UiPath path="admin.versionCard" /> gợi ý, khi bạn muốn giữ dữ liệu đã ghi từ lúc nâng cấp.
+  <UiPath path="admin.versionCard" /> gợi ý, khi bạn muốn giữ dữ liệu đã ghi từ lúc nâng cấp. Bản 1.2 cũng hoạt động
+  trên `delivery_events` đã phân vùng.
 - `reputecast migrate down` chỉ hoàn tác migration mới nhất của ReputeCast, mỗi lần chạy một migration, và không đụng
-  đến các bảng của hàng đợi công việc. Nên ưu tiên khôi phục bản sao lưu.
+  đến các bảng của hàng đợi công việc. Lệnh này dành cho môi trường phát triển: migration down xóa dữ liệu, nên đừng chạy
+  nó trên cơ sở dữ liệu production.
 
 ## Khắc phục sự cố
 
 - **Container mới thoát ngay khi khởi động**: đọc `docker compose logs app`. Migration thất bại sẽ dừng quá trình khởi
   động với `migrate: …`; hãy khôi phục bản sao lưu và báo lỗi kèm phiên bản phát hành.
+- **Ứng dụng mãi không `healthy` và `/readyz` trả về `database schema behind this release`**: chưa tiến trình nào áp
+  dụng migration. Hãy chạy `reputecast migrate up`, hoặc khởi động một tiến trình với `--auto-migrate`.
+- **`migrate: another migrator held the lock for 15m0s`**: một tiến trình khác vẫn đang migrate, ví dụ đang chuyển đổi
+  một bảng `delivery_events` lớn. Hãy để nó chạy xong, rồi khởi động lại tiến trình này.
 - **Thẻ phiên bản báo kiểm tra cập nhật thất bại**: máy chủ không kết nối được `api.github.com`, hoặc GitHub trả về lỗi.
   Không có gì khác bị ảnh hưởng; lần kiểm tra tiếp theo chạy vào ngày hôm sau.
 - **Bản phát hành mới nhất hiển thị dấu gạch ngang**: việc kiểm tra đang tắt hoặc chưa chạy lần nào.

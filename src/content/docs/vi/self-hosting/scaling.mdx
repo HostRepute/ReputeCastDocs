@@ -7,12 +7,18 @@ primaryKeyword: mở rộng quy mô ReputeCast
 sources:
   - internal/config/config.go
   - internal/app/app.go
+  - internal/app/metrics.go
   - internal/app/register.go
   - internal/app/wire_smtprelay.go
   - internal/app/wire_publicurl.go
   - internal/cli/serve.go
+  - internal/cli/seed.go
   - internal/jobs/jobs.go
   - internal/providers/remote/runtime.go
+  - internal/server/sessionlimit.go
+  - internal/loadtest
+  - deploy/docker-compose.yml
+  - docs/deploy/performance.md
   - README.md
 sidebar:
   order: 8
@@ -41,8 +47,8 @@ nền; PostgreSQL giữ dữ liệu và hàng đợi tác vụ, còn các nhà c
 
 - `reputecast serve` chạy cả ba; `serve --role=web,ingest` (hoặc `REPUTECAST_ROLES=web,ingest`) chạy một phần;
   `reputecast worker` tương đương `serve --role=worker`.
-- Một tiến trình chỉ có HTTP listener (với `/healthz`, `/readyz` và `/metrics`) khi nó chạy `web` hoặc `ingest`. Hãy đặt
-  `metrics.addr` cho tiến trình chỉ chạy worker, ví dụ `:9090`, để công bố metrics của nó.
+- Chỉ tiến trình chạy `web` hoặc `ingest` mới có HTTP listener. Mọi tiến trình đều mở listener metrics (`:9464`), nơi
+  tiến trình chỉ chạy worker cũng trả lời `/healthz` và `/readyz`, nên health check của image cũng dùng được cho nó.
 
 ## Trước khi bắt đầu
 
@@ -67,15 +73,18 @@ nền; PostgreSQL giữ dữ liệu và hàng đợi tác vụ, còn các nhà c
    nhất một `worker`. Nhiều worker dùng chung hàng đợi qua PostgreSQL. Để tăng năng lực nhận webhook một cách riêng
    biệt, hãy chạy các tiến trình `--role=ingest` và chuyển `/hooks/` đến chúng trong proxy.
 
-4. Chỉ áp dụng migration từ một nơi: một tiến trình có `--auto-migrate`, hoặc `reputecast migrate up` trước khi bạn khởi
-   động phiên bản mới ở mọi nơi. `worker` không bao giờ chạy migration.
+4. Áp dụng migration từ một nơi: một tiến trình có `--auto-migrate`, hoặc `reputecast migrate up` trước khi bạn khởi
+   động phiên bản mới ở mọi nơi. Nhiều tiến trình khởi động với `--auto-migrate` sẽ lần lượt chờ nhau, nên mỗi migration
+   chỉ chạy một lần. `worker` không bao giờ chạy migration; nếu khởi động trên schema cũ hơn, nó chờ đến khi migration
+   chạy xong.
 
 5. Chạy cùng một phiên bản ReputeCast trong mọi tiến trình.
 
 </Steps>
 
-Ví dụ Compose này chạy vai trò web và ingest trong `app` và các tác vụ trong một container `worker` riêng, trên một máy
-chủ, dùng chung volume `appdata` (khóa bí mật và tệp):
+Tệp `docker-compose.yml` đi kèm có sẵn cách tách này ở dạng comment. Viết thành tệp override, nó chạy vai trò web và
+ingest trong `app` và các tác vụ trong một container `worker` riêng, trên một máy chủ, dùng chung volume `appdata` (khóa
+bí mật và tệp):
 
 ```yaml title="docker-compose.override.yml"
 services:
@@ -87,14 +96,21 @@ services:
     restart: unless-stopped
     command: ["worker"]
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     environment:
       REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
       REPUTECAST_PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
-      REPUTECAST_METRICS__ADDR: ":9090"
     volumes:
       - appdata:/var/lib/reputecast
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
 ```
+
+Worker khởi động khi `app` đã `healthy`, nên khóa bí mật và các migration đều đã sẵn sàng.
 
 <Aside type="caution">
   Hãy tách hệ thống sau lần khởi động đầu tiên, khi tệp khóa bí mật đã tồn tại. Một worker khởi động trên volume trống
@@ -108,11 +124,34 @@ services:
 - **Thiết lập lưu trong ứng dụng**: mọi tiến trình đọc lại URL công khai đã lưu trong Quản trị hệ thống mỗi 30 giây, và
   danh sách adapter cộng đồng đã cài mỗi 15 giây.
 - **Tệp**: `files.dir`, như ở trên.
+- **Không dùng chung giới hạn tần suất**: mỗi tiến trình web tự đếm yêu cầu của riêng nó, nên sau load balancer với ba
+  tiến trình web, một client có thể đạt gấp ba lần [giới hạn](/vi/self-hosting/security/#mặc-định-và-giới-hạn).
+
+## Hiệu năng đo được
+
+Trên dữ liệu kiểm thử tải (một triệu liên hệ, 3,2 triệu sự kiện gửi thư), ReputeCast và PostgreSQL 16 trên một máy 4
+vCPU trả về một trang liên hệ trong 6–7 ms, một lượt tìm kiếm trong 23 ms, báo cáo của một chiến dịch gửi đến 975,000
+người nhận trong 272 ms và lượt đếm một phân khúc hai điều kiện trong 927 ms. Khi chịu tải, trên một runner GitHub 4
+vCPU với PostgreSQL 18 và k6 trên cùng máy, mọi mục tiêu đều đạt (1/11/2026):
+
+| Kiểm thử tải                                | p95    | Mục tiêu     |
+| ------------------------------------------- | ------ | ------------ |
+| Trang liên hệ, 10 người, 278 yêu cầu/giây   | 35 ms  | dưới 200 ms  |
+| Tìm kiếm liên hệ, cùng điều kiện            | 140 ms | dưới 150 ms  |
+| Mười người cùng duyệt                       | 140 ms | dưới 200 ms  |
+| Đếm phân khúc                               | 5 ms   | dưới 2 giây  |
+| API gửi thư, 135 thư/giây                   | 247 ms | dưới 300 ms  |
+
+Để đo trên phần cứng của bạn, hãy dùng một hệ thống phát triển (`REPUTECAST_ENV=development`): sau `reputecast seed`,
+`reputecast seed --sample load --contacts 1000000` thêm một không gian làm việc "Load test" với kích thước đó, mất
+khoảng 8 phút và 3 GB. Các script k6 trong thư mục `loadtest/k6` của kho mã chạy danh sách liên hệ, đếm phân khúc, API
+gửi thư và nhận webhook trên đó.
 
 ## Kiểm tra kết quả
 
 - `curl http://<web process>:8080/readyz` trả về `ready` trên mọi tiến trình web và ingest.
-- `curl http://<worker>:9090/metrics` có phản hồi trên worker được đặt `metrics.addr`.
+- `docker compose ps` cho thấy `worker` ở trạng thái `healthy`: `/readyz` của nó trên cổng 9464 trả lời khi các worker
+  đã chạy.
 - Dòng log `http listening` của mỗi tiến trình web hiện các vai trò của nó, và mỗi worker ghi log `workers started` kèm
   mức đồng thời.
 - Các lượt gửi đã lên lịch bắt đầu chạy và theo dõi trực tiếp có cập nhật: các worker đang xử lý hàng đợi.
@@ -124,8 +163,10 @@ services:
   hãy cấp cho mọi tiến trình cùng `secrets.key` hoặc cùng tệp khóa.
 - **Tải sản phẩm thất bại ở một số tiến trình**: `files.dir` không được dùng chung.
 - **`FATAL: sorry, too many clients already`**: hãy giảm `database.max_conns` cho mỗi tiến trình.
-- **Worker không có `/healthz`**: đây là điều bình thường, vì worker không có HTTP listener. Hãy theo dõi `metrics.addr`
-  của nó.
+- **Một tiến trình ghi log `metrics listener not started`**: một tiến trình khác trên máy đã giữ cổng 9464. Hãy cho mỗi
+  tiến trình trên một máy một `metrics.addr` riêng.
+- **Worker mãi không `healthy` với `workers not started` hoặc `database schema behind this release`**: migration chưa
+  chạy; hãy khởi động `app` với `--auto-migrate` hoặc chạy `reputecast migrate up`.
 
 ## Liên quan
 

@@ -6,10 +6,10 @@
   description:
     en: >-
       Flags override the config file and environment variables. Commands that need no configuration (`openapi`,
-      `secrets generate-key`, `version`) ignore them.
+      `secrets generate-key`, `healthcheck`, `version`) ignore them.
     vi: >-
       Cờ ghi đè tệp cấu hình và biến môi trường. Các lệnh không cần cấu hình (`openapi`, `secrets generate-key`,
-      `version`) bỏ qua các cờ này.
+      `healthcheck`, `version`) bỏ qua các cờ này.
   flags:
     - name: --config
       type: string
@@ -44,13 +44,14 @@
   description:
     en: >-
       By default one process runs every role. Use `--role` to split the roles across processes, for example several
-      web and ingest nodes behind a load balancer and one worker. Without `--auto-migrate`, pending migrations only log
-      a warning. Processes with the web role also run the SMTP relay once an instance admin turns it on.
+      web and ingest nodes behind a load balancer and one worker. Without `--auto-migrate`, a process whose database
+      schema is behind the release serves read-only and holds its workers until `reputecast migrate up` runs. Processes
+      with the web role also run the SMTP relay once an instance admin turns it on.
     vi: >-
       Theo mặc định, một tiến trình chạy mọi vai trò. Dùng `--role` để chia các vai trò cho nhiều tiến trình, ví dụ vài
-      node web và ingest sau một bộ cân bằng tải cùng một worker. Không có `--auto-migrate`, các migration đang chờ chỉ
-      ghi một cảnh báo vào log. Các tiến trình có vai trò web cũng chạy SMTP relay sau khi quản trị viên hệ thống bật
-      nó.
+      node web và ingest sau một bộ cân bằng tải cùng một worker. Không có `--auto-migrate`, tiến trình có lược đồ cơ sở
+      dữ liệu cũ hơn bản phát hành sẽ chỉ cho đọc và giữ các worker lại cho đến khi chạy `reputecast migrate up`. Các
+      tiến trình có vai trò web cũng chạy SMTP relay sau khi quản trị viên hệ thống bật nó.
   flags:
     - name: --role
       type: string
@@ -109,12 +110,13 @@
     vi: Chỉ chạy các worker nền.
   description:
     en: >-
-      Same as `serve --role=worker`. Runs sends, event processing, syncs and scheduled jobs. It opens no HTTP listener,
-      except the metrics server when `metrics.addr` is set, and does not apply migrations. Run at least one worker per
-      instance.
+      Same as `serve --role=worker`. Runs sends, event processing, syncs and scheduled jobs. Its only HTTP listener is
+      the metrics listener (`metrics.addr`, `:9464` by default), which also answers `/healthz` and `/readyz`. It doesn't
+      apply migrations: while the schema is behind the release, its workers wait. Run at least one worker per instance.
     vi: >-
-      Tương đương `serve --role=worker`. Chạy việc gửi, xử lý sự kiện, đồng bộ và các tác vụ theo lịch. Lệnh này không
-      mở cổng HTTP nào, trừ máy chủ số liệu khi đặt `metrics.addr`, và không áp dụng migration. Hãy chạy ít nhất một
+      Tương đương `serve --role=worker`. Chạy việc gửi, xử lý sự kiện, đồng bộ và các tác vụ theo lịch. Cổng HTTP duy
+      nhất của lệnh này là cổng số liệu (`metrics.addr`, mặc định `:9464`), cổng này cũng trả lời `/healthz` và
+      `/readyz`. Lệnh không áp dụng migration: khi lược đồ cũ hơn bản phát hành, các worker sẽ chờ. Hãy chạy ít nhất một
       worker cho mỗi hệ thống.
   examples:
     - code: reputecast worker
@@ -123,7 +125,7 @@
         vi: Khởi động một tiến trình worker bên cạnh các tiến trình chạy `serve --role=web,ingest`.
 
 - id: migrate
-  command: reputecast migrate <up|down|status>
+  command: reputecast migrate <up|down|status|partition-events|segments-role>
   summary:
     en: Manage the database schema.
     vi: Quản lý lược đồ cơ sở dữ liệu.
@@ -134,8 +136,12 @@
     en: Apply all pending migrations.
     vi: Áp dụng mọi migration đang chờ.
   description:
-    en: Applies ReputeCast's migrations, then the job queue's, and prints `Database is up to date.`
-    vi: Áp dụng các migration của ReputeCast, rồi của hàng đợi tác vụ, và in ra `Database is up to date.`
+    en: >-
+      Applies ReputeCast's migrations, then the job queue's, and prints `Database is up to date.` Migrations take a
+      lock, so processes that start together run them once.
+    vi: >-
+      Áp dụng các migration của ReputeCast, rồi của hàng đợi tác vụ, và in ra `Database is up to date.` Migration giữ
+      một khóa, nên các tiến trình khởi động cùng lúc chỉ chạy chúng một lần.
   examples:
     - code: reputecast migrate up
       description:
@@ -171,6 +177,52 @@
       description:
         en: Check for pending migrations before an upgrade.
         vi: Kiểm tra migration đang chờ trước khi nâng cấp.
+
+- id: migrate partition-events
+  command: reputecast migrate partition-events
+  summary:
+    en: Split `delivery_events` into monthly partitions, without copying it.
+    vi: Chia `delivery_events` thành các phân vùng theo tháng mà không sao chép bảng.
+  description:
+    en: >-
+      The upgrade to 1.3 does this at `migrate up` (or `serve --auto-migrate`); run it first to pick the moment, at a
+      quiet hour on a very large table. Nothing is copied: the current table becomes the partition of everything before
+      next month, and later months get their own. It builds an index without blocking writes, checks a bound, then swaps
+      tables under a short lock. Safe while ReputeCast runs and safe to run again; on a partitioned table it only makes
+      missing months. Back up first.
+    vi: >-
+      Bản nâng cấp lên 1.3 làm việc này khi chạy `migrate up` (hoặc `serve --auto-migrate`); hãy chạy lệnh này trước để
+      tự chọn thời điểm, vào giờ vắng nếu bảng rất lớn. Không có gì bị sao chép: bảng hiện tại trở thành phân vùng chứa
+      mọi thứ trước tháng sau, và các tháng tiếp theo có phân vùng riêng. Lệnh tạo một chỉ mục mà không chặn ghi, kiểm
+      tra một giới hạn, rồi hoán đổi bảng trong một lần khóa ngắn. An toàn khi ReputeCast đang chạy và khi chạy lại; với
+      bảng đã phân vùng, lệnh chỉ tạo các tháng còn thiếu. Hãy sao lưu trước.
+  examples:
+    - code: reputecast migrate partition-events
+      description:
+        en: Partition `delivery_events` before upgrading, so the upgrade only drops the old dedupe index.
+        vi: Phân vùng `delivery_events` trước khi nâng cấp, để bản nâng cấp chỉ còn xóa chỉ mục chống trùng cũ.
+
+- id: migrate segments-role
+  command: reputecast migrate segments-role
+  summary:
+    en: Set up the role SQL segments run as again, after restoring on a new server.
+    vi: Thiết lập lại vai trò mà phân khúc SQL chạy dưới quyền, sau khi khôi phục trên máy chủ mới.
+  description:
+    en: >-
+      `pg_dump` doesn't carry roles. After restoring on a new server, create the role as a superuser (unless the app's
+      user has `CREATEROLE`) with `CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;` and `GRANT reputecast_segments TO
+      <app user>;`, then run this: it hands the segment function back to the role and prints the role check of
+      `doctor`. Safe to run again.
+    vi: >-
+      `pg_dump` không mang theo vai trò. Sau khi khôi phục trên máy chủ mới, hãy tạo vai trò bằng tài khoản superuser
+      (trừ khi người dùng của ứng dụng có `CREATEROLE`) với `CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;` và
+      `GRANT reputecast_segments TO <app user>;`, rồi chạy lệnh này: lệnh trả hàm phân khúc về cho vai trò đó và in ra
+      kết quả kiểm tra vai trò của `doctor`. An toàn khi chạy lại.
+  examples:
+    - code: reputecast migrate segments-role
+      description:
+        en: Turn SQL segments back on after a restore.
+        vi: Bật lại phân khúc SQL sau khi khôi phục.
 
 - id: install
   command: reputecast install [--email <address>] [--name <name>] [--password <password>]
@@ -331,7 +383,7 @@
         vi: Cho người bị khóa đăng nhập vào lại mà không phải chờ hết thời gian khóa.
 
 - id: seed
-  command: reputecast seed [--sample <acme|northwind>] [--force]
+  command: reputecast seed [--sample <acme|northwind|load>] [--contacts <n>] [--force]
   summary:
     en: Load demo data for development and screenshots.
     vi: Nạp dữ liệu demo để phát triển và chụp ảnh màn hình.
@@ -350,8 +402,18 @@
       type: string
       default: acme
       description:
-        en: 'Which sample to load: `acme`, or `northwind` (an agency with seven clients, into an empty database).'
-        vi: 'Mẫu cần nạp: `acme`, hoặc `northwind` (một agency với bảy khách hàng, nạp vào cơ sở dữ liệu trống).'
+        en: >-
+          Which sample to load: `acme`; `northwind` (an agency with seven clients, into an empty database); or `load` (a
+          large "Load test" workspace for load tests, on an instance that already has a user, such as after `acme`).
+        vi: >-
+          Mẫu cần nạp: `acme`; `northwind` (một agency với bảy khách hàng, nạp vào cơ sở dữ liệu trống); hoặc `load` (một
+          không gian làm việc "Load test" lớn để kiểm thử tải, trên hệ thống đã có người dùng, ví dụ sau `acme`).
+    - name: --contacts
+      type: int
+      default: '1000000'
+      description:
+        en: 'With `--sample load`: how many contacts. Their messages and delivery events span five months.'
+        vi: 'Với `--sample load`: số liên hệ cần tạo. Thư và sự kiện gửi của họ trải dài trong năm tháng.'
     - name: --force
       type: bool
       default: 'false'
@@ -367,6 +429,10 @@
       description:
         en: Load the agency sample into an empty database.
         vi: Nạp mẫu agency vào cơ sở dữ liệu trống.
+    - code: REPUTECAST_ENV=development reputecast seed --sample load --contacts 1000000
+      description:
+        en: Add a workspace with a million contacts for load tests.
+        vi: Thêm một không gian làm việc với một triệu liên hệ để kiểm thử tải.
   devOnly: true
 
 - id: demo
@@ -510,6 +576,43 @@
         en: Create a key to set as `REPUTECAST_SECRETS__KEY` instead of using a key file.
         vi: Tạo một khóa để đặt làm `REPUTECAST_SECRETS__KEY` thay vì dùng tệp khóa.
 
+- id: secrets reseal
+  command: reputecast secrets reseal [--dry-run]
+  summary:
+    en: Re-encrypt every stored secret with the current key, so previous keys can be dropped.
+    vi: Mã hóa lại mọi bí mật đã lưu bằng khóa hiện tại, để có thể bỏ các khóa trước.
+  description:
+    en: >-
+      After a key change (`secrets.key` set to a new key, the old one moved to `secrets.previous_keys`), re-encrypts
+      every stored credential, token and secret with the new key and prints, per kind of value, how many were on a
+      previous key, resealed and unreadable. Safe while ReputeCast runs and safe to run again; the reseal is in the
+      instance audit log. Exits 1 when some values open with no configured key. Once nothing is left on a previous key,
+      that key only checks links in emails already sent; remove it after a leak, at least a day later, since signup
+      forms hand out tokens sealed with it for that long.
+    vi: >-
+      Sau khi đổi khóa (`secrets.key` đặt thành khóa mới, khóa cũ chuyển sang `secrets.previous_keys`), lệnh mã hóa lại
+      mọi thông tin xác thực, token và bí mật đã lưu bằng khóa mới và in ra, theo từng loại giá trị, số giá trị còn dùng
+      khóa trước, đã mã hóa lại và không đọc được. An toàn khi ReputeCast đang chạy và khi chạy lại; lần mã hóa lại được
+      ghi vào nhật ký kiểm tra của hệ thống. Thoát với mã 1 khi có giá trị không mở được bằng khóa nào đã cấu hình. Khi
+      không còn gì dùng khóa trước, khóa đó chỉ còn dùng để kiểm tra liên kết trong các email đã gửi; nếu khóa bị lộ, hãy
+      gỡ nó sau ít nhất một ngày, vì biểu mẫu đăng ký phát token được mã hóa bằng khóa đó trong khoảng thời gian này.
+  flags:
+    - name: --dry-run
+      type: bool
+      default: 'false'
+      description:
+        en: Count what would be resealed, without writing.
+        vi: Đếm những gì sẽ được mã hóa lại, không ghi gì.
+  examples:
+    - code: reputecast secrets reseal --dry-run
+      description:
+        en: See how many values still use a previous key.
+        vi: Xem còn bao nhiêu giá trị dùng khóa trước.
+    - code: reputecast secrets reseal
+      description:
+        en: Re-encrypt them with the current key after a rotation.
+        vi: Mã hóa lại chúng bằng khóa hiện tại sau khi xoay vòng khóa.
+
 - id: adapter
   command: reputecast adapter <command>
   summary:
@@ -629,6 +732,75 @@
       description:
         en: Remove an adapter after disconnecting the providers that use it.
         vi: Gỡ một adapter sau khi ngắt kết nối các nhà cung cấp dùng nó.
+
+- id: healthcheck
+  command: reputecast healthcheck [--live] [--url <url>] [--timeout <duration>]
+  summary:
+    en: Check that the ReputeCast process on this host is ready, for container health checks.
+    vi: Kiểm tra tiến trình ReputeCast trên máy này đã sẵn sàng chưa, dùng cho kiểm tra tình trạng container.
+  description:
+    en: >-
+      Asks the local process's `/readyz`: ready means its database answers, the schema has every migration and, in a
+      worker, the workers run. It tries the HTTP listener (`REPUTECAST_HTTP__ADDR`, `:8080` by default), then the
+      metrics listener (`REPUTECAST_METRICS__ADDR`, `:9464`), so it checks a worker-only process too. Prints the answer
+      and exits 0 when ready, 1 otherwise. The Docker image's health check runs it.
+    vi: >-
+      Hỏi `/readyz` của tiến trình trên máy: sẵn sàng nghĩa là cơ sở dữ liệu phản hồi, lược đồ có đủ mọi migration và,
+      với worker, các worker đang chạy. Lệnh thử cổng HTTP (`REPUTECAST_HTTP__ADDR`, mặc định `:8080`), rồi đến cổng số
+      liệu (`REPUTECAST_METRICS__ADDR`, `:9464`), nên kiểm tra được cả tiến trình chỉ chạy worker. Lệnh in ra câu trả lời
+      và thoát với mã 0 khi sẵn sàng, 1 trong trường hợp còn lại. Bước kiểm tra tình trạng của Docker image chạy lệnh này.
+  flags:
+    - name: --live
+      type: bool
+      default: 'false'
+      description:
+        en: Check liveness (`/healthz`) instead of readiness.
+        vi: Kiểm tra tiến trình còn sống (`/healthz`) thay vì đã sẵn sàng.
+    - name: --url
+      type: string
+      default: ''
+      description:
+        en: The URL to check. Without it, the local HTTP listener, then the metrics listener.
+        vi: URL cần kiểm tra. Nếu không có cờ này, lệnh dùng cổng HTTP trên máy, rồi đến cổng số liệu.
+    - name: --timeout
+      type: duration
+      default: 3s
+      description:
+        en: How long to wait for an answer.
+        vi: Thời gian chờ câu trả lời.
+  examples:
+    - code: reputecast healthcheck
+      description:
+        en: Check readiness, as the Docker image's health check does.
+        vi: Kiểm tra mức sẵn sàng, như bước kiểm tra tình trạng của Docker image.
+    - code: reputecast healthcheck --live
+      description:
+        en: Check only that the process answers, even while it waits for migrations.
+        vi: Chỉ kiểm tra tiến trình có phản hồi, kể cả khi nó đang chờ migration.
+
+- id: doctor
+  command: reputecast doctor
+  summary:
+    en: Check the database, schema, secret key, files folder and roles, after a restore or a move.
+    vi: Kiểm tra cơ sở dữ liệu, lược đồ, khóa bí mật, thư mục tệp và vai trò, sau khi khôi phục hoặc chuyển máy chủ.
+  description:
+    en: >-
+      Checks what a restore or a move to another host can get wrong, one line each marked `ok`, `warn` or `FAIL`: the
+      PostgreSQL version (16 to 18), pending migrations, whether the secret key opens a sample of every kind of sealed
+      value (and whether values still use a previous key), whether the files folder can be written, the
+      `reputecast_segments` role SQL segments run as (`pg_dump` doesn't carry roles) and `http.public_url`. Exits 1 when
+      a check fails.
+    vi: >-
+      Kiểm tra những gì có thể sai khi khôi phục hoặc chuyển sang máy chủ khác, mỗi mục một dòng đánh dấu `ok`, `warn`
+      hoặc `FAIL`: phiên bản PostgreSQL (16 đến 18), migration đang chờ, khóa bí mật có mở được một mẫu của mọi loại giá
+      trị đã mã hóa không (và còn giá trị nào dùng khóa trước không), thư mục tệp có ghi được không, vai trò
+      `reputecast_segments` mà phân khúc SQL chạy dưới quyền (`pg_dump` không mang theo vai trò) và `http.public_url`.
+      Thoát với mã 1 khi có mục kiểm tra thất bại.
+  examples:
+    - code: reputecast doctor
+      description:
+        en: Check a restored instance before starting it; every line should read `ok`.
+        vi: Kiểm tra hệ thống vừa khôi phục trước khi khởi động; mọi dòng đều nên là `ok`.
 
 - id: version
   command: reputecast version

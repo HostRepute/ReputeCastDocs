@@ -8,6 +8,9 @@ sources:
   - internal/cli/install.go
   - internal/cli/serve.go
   - internal/app/app.go
+  - internal/app/schema.go
+  - internal/app/metrics.go
+  - internal/cli/doctor.go
   - internal/accounts/service.go
   - internal/accounts/reset.go
   - internal/config/config.go
@@ -38,11 +41,12 @@ cách sửa. Mỗi mục bắt đầu bằng những gì bạn nhìn thấy.
 1. Đọc log của ứng dụng. Với Docker Compose: `docker compose logs app --since 1h`. Với tệp nhị phân chạy dưới systemd:
    `journalctl -u reputecast --since "1 hour ago"`.
 
-2. Kiểm tra tiến trình và cơ sở dữ liệu: `curl -s http://localhost:8080/readyz` trả về `ready` khi ReputeCast kết nối
-   được PostgreSQL ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+2. Kiểm tra tiến trình: `curl -s http://localhost:8080/readyz` trả về `ready` khi ReputeCast kết nối được PostgreSQL,
+   schema đã cập nhật và các worker đang chạy, nếu không thì trả về `503` kèm lý do
+   ([health check, metrics và log](/vi/self-hosting/monitoring/)).
 
-3. Kiểm tra schema: `docker compose exec app /usr/local/bin/reputecast migrate status` (hoặc `reputecast migrate status`)
-   liệt kê mọi migration đang ở trạng thái `pending`.
+3. Kiểm tra cơ sở dữ liệu, schema, khóa bí mật, thư mục tệp và role của phân khúc SQL:
+   `docker compose exec app /usr/local/bin/reputecast doctor` (hoặc `reputecast doctor`) in một dòng cho mỗi mục kiểm tra.
 
 4. Để có thêm chi tiết, hãy khởi động lại với `REPUTECAST_LOG__LEVEL=debug`, rồi đặt lại như cũ sau đó.
 
@@ -88,11 +92,19 @@ Xem [khôi phục quyền truy cập từ dòng lệnh](/vi/self-hosting/account
 - `Error: migrate: …`: một migration thất bại. Hãy khôi phục bản sao lưu đã tạo trước khi nâng cấp và báo lỗi kèm phiên
   bản ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
 
-### Log cảnh báo có migration đang chờ
+### Ứng dụng chỉ đọc trong lúc nâng cấp
 
-Tệp nhị phân mới hơn schema của cơ sở dữ liệu và tiến trình được khởi động mà không có `--auto-migrate`. Hãy chạy
-`reputecast migrate up` một lần với môi trường của máy chủ, rồi khởi động lại mọi tiến trình. Image Docker tự chạy
-migration khi khởi động.
+Ứng dụng hiển thị biểu ngữ <UiPath path="shell.bannerMaintenance" />, các thao tác chỉnh sửa và gửi trả về `503` với mã
+`maintenance`, và `/readyz` trả về ``database schema behind this release: run `reputecast migrate up` ``. Tệp nhị phân
+mới hơn schema của cơ sở dữ liệu và chưa tiến trình nào áp dụng migration. Hãy chạy `reputecast migrate up` một lần với
+môi trường của máy chủ, hoặc khởi động một tiến trình với `--auto-migrate`: mọi tiến trình sẽ tiếp tục trong vài giây mà
+không cần khởi động lại ([trong lúc còn migration chưa chạy](/vi/self-hosting/upgrades/#trong-lúc-còn-migration-chưa-chạy)).
+
+### Prometheus nhận `404` từ `/metrics`
+
+Từ 1.3.0, `/metrics` có listener riêng trên cổng 9464, và cổng chính trả về `404` trừ khi bạn đặt `metrics.token`. Hãy
+trỏ Prometheus đến cổng 9464 (tệp Compose không công bố cổng này: hãy chạy Prometheus trong cùng network Docker), hoặc
+đặt `metrics.token` và gửi nó dưới dạng bearer token ([health check, metrics và log](/vi/self-hosting/monitoring/)).
 
 ### `/readyz` trả về `503 database unavailable`
 
@@ -173,7 +185,7 @@ Khi tạo một phân khúc SQL, ứng dụng trả lời `Phân khúc SQL đang
 `reputecast_segments` bị thiếu, hoặc user cơ sở dữ liệu của ứng dụng không phải thành viên của role đó, thường gặp trên
 PostgreSQL được quản lý, nơi user không thể tạo role. Hãy làm theo
 [các bước cho phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql): trên cơ sở dữ liệu đã được migrate trước khi role
-tồn tại, chỉ chạy `reputecast migrate up` là chưa đủ để bật tính năng này.
+tồn tại, hãy chạy `reputecast migrate segments-role` sau khi tạo role.
 
 ## Kiểm tra danh sách chặn thất bại
 
@@ -186,9 +198,10 @@ Kết quả danh sách chặn của Spamhaus hoặc URIBL báo lỗi như
 ## Liên kết trong email đã gửi ngừng hoạt động
 
 Liên kết hủy đăng ký, liên kết tùy chọn và liên kết theo dõi trong các email gửi trước đó dẫn đến trang lỗi. Các liên
-kết được ký bằng một khóa suy ra từ khóa bí mật, nên chúng hỏng khi khóa thay đổi (xoay vòng khóa, hoặc khôi phục mà
-không có khóa gốc). Email mới vẫn hoạt động bình thường. Hãy khôi phục khóa gốc nếu bạn vẫn còn giữ
-([bảo mật và gia cố hệ thống](/vi/self-hosting/security/#khóa-bí-mật)).
+kết được ký bằng một khóa suy ra từ khóa bí mật, và liên kết ký bằng một khóa trong `secrets.previous_keys` vẫn hoạt
+động. Chúng chỉ hỏng khi khóa đã ký chúng không còn: khôi phục mà không có khóa gốc, hoặc một khóa cũ bị xóa sau khi xoay
+vòng. Email mới vẫn hoạt động bình thường. Hãy đặt lại khóa cũ vào `secrets.previous_keys` nếu bạn vẫn còn giữ
+([xoay vòng khóa](/vi/self-hosting/security/#xoay-vòng-khóa)).
 
 <Aside type="tip">
   Vẫn chưa giải quyết được? Hãy tìm hoặc mở một issue tại [github.com/hostrepute/reputecast](https://github.com/hostrepute/reputecast/issues)
