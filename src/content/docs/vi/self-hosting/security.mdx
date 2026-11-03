@@ -7,12 +7,15 @@ primaryKeyword: bảo mật email tự host
 sources:
   - README.md
   - internal/secrets/secrets.go
+  - internal/sealed/sealed.go
+  - internal/cli/secrets.go
   - internal/app/app.go
   - internal/config/config.go
   - internal/linktoken/linktoken.go
   - internal/netguard/netguard.go
   - internal/server/middleware.go
   - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
   - internal/authn/password.go
   - internal/authn/breached.go
   - internal/accounts/service.go
@@ -100,15 +103,9 @@ dõi lượt mở và lượt nhấp. Hãy sao lưu khóa cùng cơ sở dữ li
 
 ### Xoay vòng khóa
 
-Hãy xoay vòng khóa khi khóa có thể đã bị lộ. ReputeCast không mã hóa lại các giá trị đã lưu: giá trị niêm phong bằng
-khóa cũ vẫn mở được chừng nào khóa cũ còn nằm trong `secrets.previous_keys`, và một giá trị chỉ chuyển sang khóa mới khi
-có người lưu lại nó.
-
-<Aside type="caution" title="Xoay vòng khóa làm hỏng liên kết trong các email đã gửi">
-  Liên kết trong email chỉ được ký bằng khóa hiện tại; `secrets.previous_keys` không áp dụng cho chúng. Sau khi xoay
-  vòng, liên kết hủy đăng ký, liên kết tùy chọn và liên kết theo dõi trong mọi email gửi trước đó đều ngừng hoạt động.
-  Chỉ xoay vòng khi bắt buộc, và hãy chuẩn bị cho việc nhận khiếu nại về liên kết hủy đăng ký trong các email cũ.
-</Aside>
+Hãy xoay vòng khóa khi khóa có thể đã bị lộ, hoặc theo định kỳ. Giá trị niêm phong bằng khóa cũ vẫn mở được chừng nào
+khóa đó còn nằm trong `secrets.previous_keys`, và liên kết trong các email gửi trước lần xoay vòng cũng vậy; giá trị và
+liên kết mới dùng khóa mới. Sau đó `reputecast secrets reseal` chuyển mọi giá trị đã lưu sang khóa mới.
 
 <Steps>
 
@@ -135,18 +132,32 @@ có người lưu lại nó.
 
    Khi đã đặt `REPUTECAST_SECRETS__KEY`, tệp khóa không còn được đọc nữa.
 
-4. Khởi động lại ReputeCast (`docker compose up -d`) và đăng nhập bằng ứng dụng xác thực để kiểm tra rằng các giá trị cũ
-   vẫn mở được.
+4. Khởi động lại mọi tiến trình ReputeCast (`docker compose up -d`) và đăng nhập bằng ứng dụng xác thực để kiểm tra rằng
+   các giá trị cũ vẫn mở được.
 
-5. Giữ mọi khóa cũ chừng nào còn có thể tồn tại giá trị được niêm phong bằng chúng. Không có chỗ nào liệt kê những giá
-   trị vẫn dùng khóa cũ, nên trên thực tế hãy giữ khóa cũ cho đến khi mọi thông tin xác thực, client secret và ứng dụng
-   xác thực đều đã được lưu lại.
+5. Mã hóa lại mọi secret đã lưu bằng khóa mới:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets reseal
+   ```
+
+   Lệnh này chạy được an toàn trong lúc ReputeCast đang chạy và chạy lại được. Nó liệt kê từng loại giá trị kèm số giá
+   trị đang dùng khóa cũ, đã niêm phong lại và không đọc được, và được ghi vào nhật ký kiểm tra của hệ thống.
+   `--dry-run` chỉ đếm mà không ghi. Lệnh kết thúc bằng lỗi khi có giá trị mà không khóa nào đã cấu hình mở được; lẽ ra
+   không có giá trị nào như vậy.
+
+6. Quyết định giữ khóa cũ trong `secrets.previous_keys` bao lâu. Khi reseal báo không còn giá trị nào dùng khóa đó, nó
+   không còn mã hóa gì nữa, nhưng vẫn xác minh liên kết trong các email đã gửi. Với lần xoay vòng định kỳ, hãy giữ nó
+   mãi: người nhận vẫn bấm liên kết hủy đăng ký trong email cũ. Sau khi khóa bị lộ, hãy xóa nó khi reseal báo không còn
+   giá trị nào dùng nó, ít nhất một ngày sau, vì biểu mẫu đăng ký phát token ngắn hạn được niêm phong bằng khóa đó.
+   `reputecast doctor` cảnh báo chừng nào giá trị đã lưu vẫn dùng khóa cũ.
 
 </Steps>
 
 <Aside type="caution">
-  `REPUTECAST_SECRETS__PREVIOUS_KEYS` để trống sẽ làm quá trình khởi động dừng với
-  `Error: previous secret key: key must be 32 bytes, got 0`. Khi không có khóa cũ nào, hãy xóa biến này cùng dòng của nó
+  Xóa một khóa cũ sẽ làm hỏng liên kết hủy đăng ký, liên kết tùy chọn và liên kết theo dõi trong mọi email gửi trước lần
+  xoay vòng. `REPUTECAST_SECRETS__PREVIOUS_KEYS` để trống sẽ làm quá trình khởi động dừng với
+  `Error: previous secret key: key must be 32 bytes, got 0`: khi không có khóa cũ nào, hãy xóa biến này cùng dòng của nó
   trong `docker-compose.override.yml` thay vì để trống.
 </Aside>
 
@@ -189,8 +200,8 @@ phiên và khóa đăng nhập) nằm ở <UiPath path="shell.userMenuInstanceAd
   được tính, theo thứ tự.
 - **Dùng URL công khai `https://`** trong môi trường production, để cookie có `Secure` và HSTS được gửi. Xem
   [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/).
-- **Không công khai `/metrics`**: endpoint này không yêu cầu xác thực. Xem
-  [health check, metrics và log](/vi/self-hosting/monitoring/).
+- **Không công khai `/metrics`**: endpoint này lắng nghe trên cổng riêng, 9464, mà bạn không nên công bố. Chỉ đặt
+  `metrics.token` khi cần scrape qua địa chỉ công khai. Xem [health check, metrics và log](/vi/self-hosting/monitoring/).
 - **Chỉ cho phép mạng nội bộ** với những dịch vụ thật sự cần, và chỉ bật thiết lập bao gồm những dịch vụ đó.
 
 ## Báo cáo lỗ hổng bảo mật

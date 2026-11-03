@@ -8,6 +8,7 @@ sources:
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
+  - internal/cli/healthcheck.go
   - internal/cli/install.go
   - internal/cli/user.go
 sidebar:
@@ -56,7 +57,7 @@ sau proxy của Coolify với HTTPS trên tên miền của bạn.
          retries: 20
 
      app:
-       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       image: ghcr.io/hostrepute/reputecast:v1.3.0
        depends_on:
          postgres:
            condition: service_healthy
@@ -115,32 +116,39 @@ Những điểm tệp này dựa vào:
 - `appdata` lưu các tệp tải lên. Coolify thêm UUID của dịch vụ vào đầu tên volume và liệt kê chúng, ở chế độ chỉ đọc,
   trong **Persistent Storage**. Hãy giữ `appdata` là named volume: Docker điền nội dung từ image vào volume, thuộc sở
   hữu của người dùng của ứng dụng (uid 65532).
-- Không có `ports:` (proxy tham gia network của dịch vụ), không có `healthcheck` cho `app` (image không có shell, curl
-  hay wget), và không có `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify không công bố dải địa chỉ cố định nào cho proxy của
-  mình, nên ReputeCast ghi nhận địa chỉ của proxy cho mọi người truy cập ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)).
+- Không có `ports:` (proxy tham gia network của dịch vụ), không có `healthcheck` cho `app` (kiểm tra có sẵn trong image
+  chạy `reputecast healthcheck` để hỏi `/readyz`), và không có `REPUTECAST_HTTP__TRUSTED_PROXIES`: Coolify không công bố
+  dải địa chỉ cố định nào cho proxy của mình, nên ReputeCast ghi nhận địa chỉ của proxy cho mọi người truy cập
+  ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)).
 
 ## Kiểm tra kết quả
 
-- Trên trang **General** của dịch vụ, **Compose resources** hiển thị `postgres` là **Running (healthy)** và `app` là
-  **Running (unknown)**: `app` không có health check, và proxy vẫn định tuyến lưu lượng đến nó.
-- `https://news.example.com/readyz` trả về `ready` (`503 database unavailable` khi không kết nối được PostgreSQL) và
-  `/healthz` trả về `ok`. Hãy trỏ công cụ giám sát uptime đến `/readyz` ([giám sát](/vi/self-hosting/monitoring/)).
+- Trên trang **General** của dịch vụ, **Compose resources** hiển thị cả `postgres` và `app` là **Running (healthy)**.
+  `app` chuyển sang healthy khi `/readyz` trả về `ready`, sau khi chạy xong các migration; trước đó Traefik chưa định
+  tuyến đến nó.
+- `https://news.example.com/readyz` trả về `ready` và `/healthz` trả về `ok`. Hãy trỏ công cụ giám sát uptime đến
+  `/readyz` ([giám sát](/vi/self-hosting/monitoring/)): nó trả về 503 khi không kết nối được cơ sở dữ liệu, và sau một
+  phút kiểm tra thất bại, Traefik ngừng định tuyến đến `app` (`No Available Server`).
 - **Environment Variables** hiển thị `SERVICE_URL_APP` là `https://news.example.com`.
 
 ## Nâng cấp
 
-Hãy [sao lưu](/vi/self-hosting/backups/) trước. Trên trang **General**, chọn **Edit Compose file**, đổi `v1.0.1` trong
-image của `app` sang tag mới rồi chọn **Save changes**. Sau đó mở menu bên cạnh **Restart current version** và chọn
-**Pull latest and restart**. Ứng dụng áp dụng các migration mới khi khởi động
-([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+Hãy [sao lưu](/vi/self-hosting/backups/) trước. Trên trang **General**, chọn **Edit Compose file**, đổi tag trong image
+của `app` (`v1.3.0` trong tệp ở trên) sang tag mới rồi chọn **Save changes**. Sau đó mở menu bên cạnh
+**Restart current version** và chọn **Pull latest and restart**. Ứng dụng áp dụng các migration mới khi khởi động, và
+tên miền phản hồi lại khi ứng dụng đã healthy ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)). Nâng cấp lên 1.3.0
+chia `delivery_events` thành các phân vùng theo tháng và giữ khóa migration trong lúc chạy
+([nâng cấp lên 1.3.0](/vi/self-hosting/upgrades/#nâng-cấp-lên-130)).
 
 ## Khắc phục sự cố
 
 - **Coolify hiển thị `Deploy (missing required env vars)`**: hãy đặt `REPUTECAST_ADMIN_EMAIL` trong
   **Environment Variables**.
-- **Tên miền trả về `No Available Server`**: container `app` không chạy; hãy đọc **Runtime Logs** của nó. Đừng thêm
-  `healthcheck` cho `app`: các kiểm tra bằng curl, wget và `CMD-SHELL` đều thất bại trong image này, và Traefik không
-  định tuyến đến container ở trạng thái unhealthy.
+- **Tên miền trả về `No Available Server`**: `app` không chạy hoặc chưa healthy, mà Traefik chỉ định tuyến đến container
+  healthy ([No Available Server](https://coolify.io/docs/troubleshoot/applications/no-available-server), kiểm tra tháng
+  11/2026). Hãy đọc **Runtime Logs** của nó: các migration có thể vẫn đang chạy, hoặc không kết nối được cơ sở dữ liệu.
+  Một `healthcheck` bạn tự thêm cho `app` bằng `curl`, `wget` hay `CMD-SHELL` luôn thất bại (image không có shell): hãy
+  bỏ nó đi, kiểm tra có sẵn trong image đã đủ cho `app`.
 - **Thông báo ghi `Sign in at http://app-….sslip.io`**: tên miền do Coolify sinh vẫn đứng đầu. Hãy xóa nó trong
   **Domains**, chọn **Restart current version**, rồi sửa URL công khai ở bước <UiPath path="setup.instanceBasics" />
   của lần đăng nhập đầu tiên.

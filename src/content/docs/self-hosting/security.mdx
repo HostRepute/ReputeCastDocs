@@ -7,12 +7,15 @@ primaryKeyword: self-hosted email security
 sources:
   - README.md
   - internal/secrets/secrets.go
+  - internal/sealed/sealed.go
+  - internal/cli/secrets.go
   - internal/app/app.go
   - internal/config/config.go
   - internal/linktoken/linktoken.go
   - internal/netguard/netguard.go
   - internal/server/middleware.go
   - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
   - internal/authn/password.go
   - internal/authn/breached.go
   - internal/accounts/service.go
@@ -95,15 +98,9 @@ the dump files.
 
 ### Rotate the key
 
-Rotate the key when it may have leaked. ReputeCast does not re-encrypt stored values: values sealed with the old key
-keep opening as long as the old key is in `secrets.previous_keys`, and a value moves to the new key only when someone
-saves it again.
-
-<Aside type="caution" title="Rotating breaks links in emails already sent">
-  Email links are signed with the current key only; `secrets.previous_keys` doesn't apply to them. After a rotation,
-  unsubscribe, preference and tracking links in every email sent before it stop working. Rotate only when you must,
-  and expect complaints about unsubscribe links in older emails.
-</Aside>
+Rotate the key when it may have leaked, or as a routine. Values sealed with an old key keep opening while that key is in
+`secrets.previous_keys`, and so do the links in emails sent before the rotation; new values and links use the new key.
+`reputecast secrets reseal` then moves every stored value to the new key.
 
 <Steps>
 
@@ -130,17 +127,31 @@ saves it again.
 
    Once `REPUTECAST_SECRETS__KEY` is set, the key file is no longer read.
 
-4. Restart ReputeCast (`docker compose up -d`) and sign in with your authenticator app to check that old values still
-   open.
+4. Restart every ReputeCast process (`docker compose up -d`) and sign in with your authenticator app to check that old
+   values still open.
 
-5. Keep every previous key for as long as values sealed with it may exist. Nothing lists which values still use an old
-   key, so in practice keep it until every credential, client secret and authenticator has been saved again.
+5. Re-encrypt every stored secret with the new key:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets reseal
+   ```
+
+   It is safe while ReputeCast runs and safe to run again. It lists each kind of value with how many were on a
+   previous key, resealed and unreadable, and is recorded in the instance audit log. `--dry-run` counts without writing.
+   It ends with an error when values open with no configured key; there should be none.
+
+6. Decide how long the old key stays in `secrets.previous_keys`. It no longer encrypts anything once the reseal reports
+   nothing left on it, but it still verifies the links in emails already sent. For a routine rotation, keep it for good:
+   people click unsubscribe links in old emails. After a leak, remove it once the reseal reports nothing left on it,
+   at least a day later, because signup forms hand out short-lived tokens sealed with it. `reputecast doctor` warns
+   while stored values still use a previous key.
 
 </Steps>
 
 <Aside type="caution">
-  An empty `REPUTECAST_SECRETS__PREVIOUS_KEYS` stops the start with
-  `Error: previous secret key: key must be 32 bytes, got 0`. When you have no previous key, remove the variable and its
+  Removing a previous key breaks the unsubscribe, preference and tracking links in every email sent before the
+  rotation. An empty `REPUTECAST_SECRETS__PREVIOUS_KEYS` stops the start with
+  `Error: previous secret key: key must be 32 bytes, got 0`: when you have no previous key, remove the variable and its
   line in `docker-compose.override.yml` instead of leaving it empty.
 </Aside>
 
@@ -182,7 +193,8 @@ lives in <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; s
   the address ranges its provider publishes. Every `X-Forwarded-For` line counts, in order.
 - **Use an `https://` public URL** in production, so cookies are `Secure` and HSTS is sent. See
   [reverse proxy and TLS](/self-hosting/reverse-proxy/).
-- **Keep `/metrics` private**: it needs no authentication. See [health checks, metrics and logs](/self-hosting/monitoring/).
+- **Keep `/metrics` private**: it listens on its own port, 9464, which you shouldn't publish. Set `metrics.token` only
+  to scrape it through the public address. See [health checks, metrics and logs](/self-hosting/monitoring/).
 - **Allow private networks** only for the services that need it, and only the setting that covers them.
 
 ## Report a vulnerability

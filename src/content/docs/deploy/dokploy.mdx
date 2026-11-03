@@ -8,6 +8,7 @@ sources:
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
+  - internal/cli/healthcheck.go
   - internal/cli/user.go
 sidebar:
   order: 3
@@ -65,7 +66,7 @@ Let's Encrypt certificate. It was checked against Dokploy v0.30.10.
          retries: 20
 
      reputecast:
-       image: ghcr.io/hostrepute/reputecast:v1.0.1
+       image: ghcr.io/hostrepute/reputecast:v1.3.0
        restart: unless-stopped
        depends_on:
          reputecast-db:
@@ -84,9 +85,10 @@ Let's Encrypt certificate. It was checked against Dokploy v0.30.10.
    ```
 
    There is no `ports:` or `networks:`: at deploy time Dokploy adds the Traefik labels for your domain and connects
-   `reputecast` to `dokploy-network`. Keep `appdata` (uploaded files) a named volume, which Docker fills from the image
-   so it belongs to uid 65532; ReputeCast can't write to a `../files` bind mount. The image's default command applies
-   migrations and creates the first Owner.
+   `reputecast` to `dokploy-network`. Nor is there a `healthcheck:` for `reputecast`: the image runs its own,
+   `reputecast healthcheck`, which asks `/readyz`. Keep `appdata` (uploaded files) a named volume, which Docker fills
+   from the image so it belongs to uid 65532; ReputeCast can't write to a `../files` bind mount. The image's default
+   command applies migrations and creates the first Owner.
 
 4. On the **Environment** tab, paste your values and click **Save**:
 
@@ -106,7 +108,8 @@ Let's Encrypt certificate. It was checked against Dokploy v0.30.10.
    **Let's Encrypt** as **Certificate Provider** and click **Create**.
 
 6. On the **General** tab, click **Deploy**, then **Confirm**. Dokploy opens **Deployments**; the log ends with
-   `Docker Compose Deployed: ✅`. Once PostgreSQL is healthy, ReputeCast applies the migrations and creates the Owner.
+   `Docker Compose Deployed: ✅`. Once PostgreSQL is healthy, ReputeCast applies the migrations and creates the Owner;
+   the domain answers once `reputecast` is healthy too.
 
 7. On the **Logs** tab, select the container whose name ends in `reputecast-1`, choose **1000 lines** and search for
    `Password`. The line reads `Password    XXXX-XXXX-XXXX-XXXX   (temporary: you'll replace it at first sign-in)`.
@@ -117,18 +120,22 @@ Let's Encrypt certificate. It was checked against Dokploy v0.30.10.
 
 ## Check that it works
 
-- The **Containers** tab shows both containers as `running`, and the `reputecast-db` status ends in `(healthy)`.
-- From your computer, `https://news.example.com/readyz` answers `ready` (`503 database unavailable` without PostgreSQL)
-  and `/healthz` answers `ok`. Point uptime monitoring at `/readyz` from outside the server.
+- The **Containers** tab shows both containers as `running`, and both statuses end in `(healthy)` once `/readyz`
+  answers `ready`.
+- From your computer, `https://news.example.com/readyz` answers `ready` and `/healthz` answers `ok`. Point uptime
+  monitoring at `/readyz` from outside the server: it answers 503 while the database is unavailable, and Traefik stops
+  routing to a container that stays unhealthy.
 - On the **Domains** tab, **Validate DNS** on your domain turns to **DNS Valid**.
 
 ## Upgrade
 
 Read the [upgrade notes](/self-hosting/upgrades/) and [back up](/self-hosting/backups/) first; the **Volume Backups**
 tab can copy the `pgdata` and `appdata` named volumes to S3. On the **General** tab, change the image tag in the
-Compose file (such as `v1.0.1` to the new release), click **Save**, then **Deploy** and **Confirm**. Compose pulls the
-new image and recreates the container; ReputeCast applies new migrations at start. Never use **Fresh Volumes**: it
-deletes all of the service's volumes, including the database.
+Compose file (such as `v1.3.0` to the new release), click **Save**, then **Deploy** and **Confirm**. Compose pulls the
+new image and recreates the container; ReputeCast applies new migrations at start. Upgrading to 1.3.0 converts
+`delivery_events` to monthly partitions and holds the migration lock while it runs
+([upgrade to 1.3.0](/self-hosting/upgrades/#upgrade-to-130)). Never use **Fresh Volumes**: it deletes all of the
+service's volumes, including the database.
 
 ## Troubleshooting
 
@@ -137,8 +144,10 @@ deletes all of the service's volumes, including the database.
 - **The domain returns 404 or has no valid certificate**: domain changes on a Compose service apply only after a
   redeploy. If the `A` record pointed elsewhere when you added the domain, fix it, check **Validate DNS**, delete and
   add the domain again, then deploy.
-- **The domain never answers after you added a `healthcheck:`**: a failing health check keeps the domain from working,
-  and the image has no shell or `curl` to run one. Remove it from the `reputecast` service.
+- **The deployment succeeded but the domain never answers**: Traefik routes to `reputecast` only once its health check
+  passes ([Domains & Traefik](https://docs.dokploy.com/docs/core/troubleshooting/domains), checked November 2026). On
+  the **Logs** tab, see whether the migrations are still running or PostgreSQL is unreachable. A `healthcheck:` you
+  added with `curl` or `CMD-SHELL` always fails (the image has no shell): remove it, the image's own check is enough.
 - **The password line isn't in the logs**: choose **5000 lines**. Still missing? The database already had users; over
   SSH, run `docker exec <container-name> /usr/local/bin/reputecast user reset-password --email you@company.com`
   ([recover access](/self-hosting/account-recovery/)).

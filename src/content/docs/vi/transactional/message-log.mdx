@@ -1,17 +1,21 @@
 ---
 title: Nhật ký thư và cảnh báo
-description: Tìm mọi thư trong nhật ký email giao dịch, xem dòng thời gian, xem nội dung, gửi lại hoặc xuất dữ liệu, và nhận cảnh báo khi việc gửi thư gặp vấn đề.
+description: Tìm mọi thư trong nhật ký email giao dịch, xem dòng thời gian, hủy hoặc dời một lần gửi đã lên lịch, gửi lại hoặc xuất dữ liệu, và nhận cảnh báo khi gửi lỗi.
 type: how-to
 audience: [admin, developer]
-permissions: ['transactional:view', 'transactional:content', 'transactional:send']
+permissions: ['transactional:view', 'transactional:content', 'transactional:send', 'subscribers:edit']
 uiPath: 'nav.transactional > transactional.common.tabMessages'
 primaryKeyword: nhật ký email giao dịch
 sources:
   - web/src/features/transactional/MessagesPage.tsx
   - web/src/features/transactional/MessagePage.tsx
   - web/src/features/transactional/log.messages.ts
+  - web/src/features/transactional/schedule.tsx
+  - web/src/features/transactional/schedule.messages.ts
   - internal/transactional/messages.go
   - internal/transactional/messagesapi.go
+  - internal/transactional/schedule.go
+  - internal/transactional/logcache.go
   - internal/transactional/alerts.go
   - internal/transactional/retention.go
 sidebar:
@@ -23,31 +27,34 @@ import Screenshot from '~/components/Screenshot.astro'
 import UiPath from '~/components/UiPath.astro'
 
 Dùng nhật ký email giao dịch để trả lời câu hỏi "khách hàng của tôi đã nhận được email chưa?": tìm thư, đọc dòng thời
-gian gửi của nó, rồi gửi lại hoặc xuất nhật ký khi cần.
+gian gửi của nó, hủy hoặc dời thư trước thời điểm gửi, rồi gửi lại hoặc xuất nhật ký khi cần.
 
 ## Trước khi bắt đầu
 
 - `transactional:view` để đọc nhật ký và dòng thời gian.
 - `transactional:content` để mở nội dung đã kết xuất của một thư và để xuất nhật ký, vì cả hai đều chứa dữ liệu cá
   nhân. Mỗi lần xem nội dung và xuất dữ liệu đều được ghi vào [nhật ký kiểm tra](/vi/team/audit-log/).
-- `transactional:send` để gửi lại một thư.
+- `transactional:send` để gửi lại một thư, và để hủy hoặc dời một thư đã lên lịch.
+- `subscribers:edit` để gỡ một người nhận bị từ chối khỏi [danh sách chặn gửi](/vi/audience/suppressions/).
 
 ## Tìm một thư
 
 <Steps>
 
-1. Mở <UiPath path="nav.transactional > transactional.common.tabMessages" />. Nhật ký hiển thị 24 giờ qua và cập nhật
-   trực tiếp; chọn **Tạm dừng** để hàng mới không làm danh sách xê dịch trong khi bạn đọc.
+1. Mở <UiPath path="nav.transactional > transactional.common.tabMessages" />. Nhật ký hiển thị 24 giờ qua và cứ 10
+   giây lại đưa thư mới lên đầu; số lượng được làm mới mỗi phút. Chọn **Tạm dừng** để hàng mới không làm danh sách xê
+   dịch trong khi bạn đọc.
 
 2. Tìm theo người nhận, ID thư, khóa idempotency, thẻ hoặc metadata, hoặc lọc theo mẫu, nhà cung cấp gửi thư, khóa và
    khoảng thời gian (giờ qua, 24 giờ, 7 ngày, 30 ngày hoặc ngày tùy chọn).
 
 3. Thu hẹp theo trạng thái bằng các nút lọc phía trên bảng: Gửi thành công, Bị hoãn, Bị trả lại, Bị khiếu nại, Bị từ
-   chối, Thất bại hoặc Thử nghiệm, mỗi nút kèm số lượng.
+   chối, Thất bại hoặc Thử nghiệm, mỗi nút kèm số lượng. Đang chờ gửi, Đã lên lịch và Đã hủy có nút lọc riêng khi
+   khoảng thời gian có những thư như vậy.
 
    <Screenshot
      id="transactional-messages"
-     alt="Nhật ký thư giao dịch: 1.993 thư trong 24 giờ qua với các nút lọc trạng thái, và các hàng hiển thị người nhận, mẫu và tiêu đề, nhà cung cấp gửi thư, trạng thái và mức tương tác."
+     alt="Nhật ký thư giao dịch trong 24 giờ qua: các nút lọc trạng thái kèm số lượng, chỉ báo Trực tiếp và nút Tạm dừng, và các hàng hiển thị người nhận, mẫu và tiêu đề, nhà cung cấp gửi thư, trạng thái và mức tương tác."
    />
 
 4. Đọc chi tiết trạng thái ở mỗi hàng. Ví dụ, **Bị từ chối · bị chặn gửi** nghĩa là địa chỉ nằm trong
@@ -61,12 +68,52 @@ gian gửi của nó, rồi gửi lại hoặc xuất nhật ký khi cần.
 
 </Steps>
 
+## Hủy hoặc dời một thư đã lên lịch
+
+Thư mà ứng dụng của bạn gửi kèm `send_at` hiển thị **Đã lên lịch** cho đến thời điểm gửi. Trang của thư cho biết khi
+nào thư được gửi, theo múi giờ của bạn.
+
+<Steps>
+
+1. Mở thư. Để xem mọi thư đang chờ, chọn nút lọc Đã lên lịch.
+
+2. Để gửi vào lúc khác, chọn <UiPath path="transactional.schedule.reschedule" />, chọn ngày và giờ (tối đa 72 giờ
+   tới) rồi xác nhận.
+
+3. Để dừng thư, chọn <UiPath path="transactional.schedule.cancelSend" /> và xác nhận bằng
+   <UiPath path="transactional.schedule.cancelBadge" />.
+
+4. Nếu ứng dụng của bạn gửi thư trong một lô kèm `Idempotency-Key`, cả hai hộp thoại đều hỏi
+   <UiPath path="transactional.schedule.batchLegend" />: <UiPath path="transactional.schedule.batchOne" />, hoặc mọi
+   thư còn đang chờ trong lô. Các thư trong lô đã đang gửi hoặc đã xong được giữ nguyên; thông báo xác nhận cho biết
+   số lượng của chúng.
+
+</Steps>
+
+Thư đã hủy vẫn nằm trong nhật ký với trạng thái **Đã hủy**, kèm người đã hủy trong dòng thời gian. Nội dung của thư bị
+xóa ngay; metadata và sự kiện được giữ 90 ngày. Các [endpoint webhook](/vi/developers/webhooks/) nhận
+`message.cancelled` sẽ được báo. Mỗi lần hủy và dời đều được ghi vào [nhật ký kiểm tra](/vi/team/audit-log/). Ứng dụng
+của bạn có thể làm điều tương tự qua API: xem
+[hủy hoặc dời một thư đã lên lịch](/vi/developers/transactional-api/#hủy-hoặc-dời-một-thư-đã-lên-lịch).
+
+## Gỡ một người nhận khỏi danh sách chặn gửi
+
+Thư bị từ chối vì địa chỉ bị chặn gửi có giải thích lý do trên trang của thư, kèm hai thao tác:
+
+- <UiPath path="transactional.schedule.removeSuppression" /> hỏi lý do, được lưu trong nhật ký kiểm tra, rồi gỡ địa
+  chỉ khỏi danh sách chặn gửi. Nếu địa chỉ được thêm vì bị trả lại hoặc bị khiếu nại, email giao dịch được gửi lại
+  bình thường, còn email marketing chờ đến khi liên hệ xác nhận đăng ký lại.
+- <UiPath path="transactional.schedule.openSuppression" /> mở mục đó trong
+  <UiPath path="nav.audience > audience.tabSuppressions" />.
+
+Bản thân thư bị từ chối chưa bao giờ được gửi: hãy gửi lại từ ứng dụng của bạn.
+
 ## Xem nội dung
 
 Trên trang của một thư, chọn <UiPath path="transactional.log.showContent" />. Nội dung được giữ trong thời gian lưu
-của không gian làm việc (mặc định 30 ngày); sau đó chỉ còn metadata và sự kiện, được giữ 90 ngày. Biến nhạy cảm chưa
-bao giờ được lưu, nên chúng hiển thị một ký hiệu thay thế. Thay đổi thời gian lưu trong
-[cài đặt giao dịch](/vi/transactional/settings/).
+của không gian làm việc (mặc định 30 ngày); sau đó chỉ còn metadata và sự kiện, được giữ 90 ngày. Nội dung của thư đã
+hủy bị xóa ngay khi thư bị hủy. Biến nhạy cảm chưa bao giờ được lưu, nên chúng hiển thị một ký hiệu thay thế. Thay đổi
+thời gian lưu trong [cài đặt giao dịch](/vi/transactional/settings/).
 
 ## Gửi lại một thư
 
@@ -111,8 +158,9 @@ thể xử lý.
 
 - **Không thấy thư** → hãy mở rộng khoảng thời gian; metadata và sự kiện được giữ 90 ngày. Kiểm tra bộ lọc khóa nếu
   có nhiều ứng dụng cùng gửi.
-- **Bị từ chối · bị chặn gửi** → địa chỉ đã trả thư, khiếu nại hoặc bị chặn gửi từ trước. Hãy sửa địa chỉ, hoặc gỡ mục đó
-  khỏi danh sách chặn gửi nếu đó là nhầm lẫn.
+- **Bị từ chối · bị chặn gửi** → địa chỉ đã trả thư, khiếu nại hoặc bị chặn gửi từ trước. Hãy sửa địa chỉ, hoặc
+  [gỡ địa chỉ khỏi danh sách chặn gửi](#gỡ-một-người-nhận-khỏi-danh-sách-chặn-gửi) nếu đó là nhầm lẫn.
+- **Trang của thư không cho hủy hoặc dời** → thư đã đang gửi hoặc đã xong, hoặc bạn không có `transactional:send`.
 - **Bị trả lại · tạm thời** → nhà cung cấp hộp thư tạm hoãn hoặc tạm từ chối thư (ví dụ hộp thư đầy). Sau 3 lần trả thư tạm
   thời trong vòng 7 ngày, địa chỉ bị chặn gửi.
 - **Chọn Hiện nội dung nhưng nội dung không hiển thị** → bạn cần `transactional:content`; trang này nêu tên người có

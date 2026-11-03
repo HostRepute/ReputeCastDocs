@@ -14,6 +14,8 @@ sources:
   - internal/app/app.go
   - internal/app/wire_mailbox.go
   - internal/mailbox/mx.go
+  - internal/cli/healthcheck.go
+  - migrations/03372_m43_contacts_search.sql
 sidebar:
   order: 1
 ---
@@ -28,8 +30,8 @@ ReputeCast bằng tệp nhị phân hoặc Docker image.
 | Thành phần      | Yêu cầu                                                                                                                                                                                                                                                         |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Tệp nhị phân    | Linux, macOS hoặc Windows trên `amd64` hoặc `arm64`. Một tệp tĩnh duy nhất (build không dùng cgo) chứa ứng dụng web và các migration cơ sở dữ liệu. Mỗi bản phát hành cung cấp tệp này dưới dạng `.tar.gz` (`.zip` cho Windows) kèm `checksums.txt`.            |
-| Container image | `ghcr.io/hostrepute/reputecast` cho `linux/amd64` và `linux/arm64`. Xây dựng trên `gcr.io/distroless/static-debian13:nonroot`: không có shell, chạy với người dùng `nonroot` (uid 65532), lắng nghe ở cổng 8080, lưu dữ liệu trong volume `/var/lib/reputecast`. |
-| Cơ sở dữ liệu   | PostgreSQL 16, 17 hoặc 18. Bộ kiểm thử của ReputeCast chạy trên cả ba phiên bản; tệp Compose đi kèm dùng PostgreSQL 18. Không cần extension nào. Tác vụ nền được xếp hàng ngay trong PostgreSQL, nên không cần thêm dịch vụ nào khác.                            |
+| Container image | `ghcr.io/hostrepute/reputecast` cho `linux/amd64` và `linux/arm64`. Xây dựng trên `gcr.io/distroless/static-debian13:nonroot`: không có shell, chạy với người dùng `nonroot` (uid 65532), lắng nghe ở cổng 8080, lưu dữ liệu trong volume `/var/lib/reputecast` và khai báo một health check chạy `reputecast healthcheck`. |
+| Cơ sở dữ liệu   | PostgreSQL 16, 17 hoặc 18. Bộ kiểm thử của ReputeCast chạy trên cả ba phiên bản; tệp Compose đi kèm dùng PostgreSQL 18. Các migration tạo một extension, `pg_trgm`, vốn đi kèm PostgreSQL ([PostgreSQL](/vi/self-hosting/postgres/#postgresql-được-quản-lý)). Tác vụ nền được xếp hàng ngay trong PostgreSQL, nên không cần thêm dịch vụ nào khác. |
 | Môi trường chạy | Không cần gì thêm. Bạn chỉ cần Node.js và Go khi [build ReputeCast từ mã nguồn](/vi/developers/contributing/).                                                                                                                                                   |
 
 ## Mạng
@@ -37,7 +39,7 @@ ReputeCast bằng tệp nhị phân hoặc Docker image.
 | Chiều | Nội dung                                                                                                                                                                                                                                                                                    |
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Vào   | Một địa chỉ HTTPS công khai (`http.public_url`) mà các nhà cung cấp gửi thư truy cập được: họ gửi sự kiện đến `<public URL>/hooks/…`, và Zapier, Make cũng gọi đến địa chỉ này. Hãy kết thúc TLS ở một [reverse proxy](/vi/self-hosting/reverse-proxy/).                                      |
-| Vào   | Cổng 8080 (`http.addr`), chỉ mở cho reverse proxy. Cổng 587 và 465 khi bật [SMTP relay](/vi/transactional/smtp-relay/); mặc định hai cổng này tắt.                                                                                                                                           |
+| Vào   | Cổng 8080 (`http.addr`), chỉ mở cho reverse proxy. Cổng 9464 (`metrics.addr`), chỉ mở cho Prometheus, không bao giờ công khai. Cổng 587 và 465 khi bật [SMTP relay](/vi/transactional/smtp-relay/); mặc định hai cổng này tắt. |
 | Ra    | HTTPS đến API của các nhà cung cấp gửi thư và đến mọi dịch vụ khác bạn kết nối (thanh toán, cửa hàng, mô hình AI, HostRepute).                                                                                                                                                              |
 | Ra    | Truy vấn DNS cho các kiểm tra xác thực, danh sách chặn và bản ghi MX cho biết [nhà cung cấp hộp thư](/vi/reference/glossary/#mailbox-provider) nào lưu trữ tên miền của một liên hệ (Google Workspace được tính là Gmail, Microsoft 365 là Outlook). Không có DNS, tên miền của các công ty vẫn là Khác trong định tuyến, giới hạn tốc độ và báo cáo. Spamhaus từ chối truy vấn đi qua resolver công cộng, nên hãy trỏ `dns.servers` đến resolver của riêng bạn nếu bạn dựa vào kiểm tra danh sách chặn (xem [danh sách chặn](/vi/deliverability/blocklists/)).                           |
 | Ra    | `https://api.github.com` mỗi ngày một lần để kiểm tra bản phát hành mới. Tắt bằng `updates.check: false` hoặc trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />.                                                                                                       |
@@ -54,8 +56,8 @@ ReputeCast bằng tệp nhị phân hoặc Docker image.
 
 - Image PostgreSQL 18 lưu dữ liệu trong `/var/lib/postgresql`, không phải `/var/lib/postgresql/data`; hãy gắn volume vào
   đúng đường dẫn đó.
-- Image không có shell và không có `HEALTHCHECK`. Hãy kiểm tra `/healthz` và `/readyz` qua HTTP
-  ([kiểm tra sức khỏe, metrics và log](/vi/self-hosting/monitoring/)).
+- Image không có shell; health check của nó chạy chính tệp nhị phân ReputeCast. Load balancer kiểm tra `/healthz` và
+  `/readyz` qua HTTP ([kiểm tra sức khỏe, metrics và log](/vi/self-hosting/monitoring/)).
 - Mặc định, một tiến trình chạy mọi vai trò. Hãy [mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/)
   khi bạn cần thông lượng cao hơn.
 - [PostgreSQL](/vi/self-hosting/postgres/) nói về cơ sở dữ liệu được quản lý, pool kết nối và role PostgreSQL mà phân khúc

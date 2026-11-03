@@ -1,11 +1,13 @@
 ---
 title: Giới hạn tốc độ API
-description: Rate limit API trong ReputeCast. Số yêu cầu mỗi phút cho mỗi khóa, giới hạn đăng nhập và MCP, tốc độ gửi giao dịch, các header X-RateLimit và cách xử lý 429.
+description: Rate limit API trong ReputeCast. Yêu cầu mỗi phút cho mỗi khóa và phiên trình duyệt, giới hạn đăng nhập và MCP, tốc độ gửi giao dịch, header X-RateLimit và 429.
 type: reference
 audience: [developer, operator]
 primaryKeyword: rate limit API
 sources:
   - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/api/auth.go
   - internal/app/app.go
   - internal/config/config.go
   - internal/transactional/ratelimit.go
@@ -26,14 +28,16 @@ cầu, máy chủ đếm chúng thế nào, và máy chủ trả về gì khi m�
 
 <LimitsTable area="rate-limits" />
 
-- Lệnh gọi bằng khóa API được đếm theo từng khóa, bất kể đến từ địa chỉ nào. Lệnh gọi không có bearer token (phiên
-  trình duyệt) được đếm theo địa chỉ IP của client.
+- Lệnh gọi bằng khóa API hoặc token tác tử được đếm theo từng khóa, bất kể đến từ địa chỉ nào. Một trình duyệt đã đăng
+  nhập được đếm theo phiên sau khi phiên đăng nhập được kiểm tra, và mọi trình duyệt đã đăng nhập từ cùng một địa chỉ IP
+  dùng chung một mức trần cao hơn, nên một nhóm dùng chung mạng văn phòng không phải chia nhau một hạn mức. Lệnh gọi
+  không có cả hai được đếm theo địa chỉ IP của client.
 - Lệnh gọi gửi giao dịch đơn lẻ và theo lô không tính vào giới hạn yêu cầu của mỗi khóa; thay vào đó, mỗi khóa có tốc
   độ gửi thư riêng (xem [gửi email giao dịch bằng API](/vi/developers/transactional-api/)).
 - Trang công khai, liên kết theo dõi và webhook của nhà cung cấp (`/p/`, `/t/`, `/hooks/`) nằm ngoài các giới hạn này.
   Biểu mẫu đăng ký có giới hạn riêng (xem [biểu mẫu đăng ký](/vi/forms/signup-forms/)).
-- Mỗi tiến trình máy chủ đếm riêng. Khi có nhiều node web phía sau một bộ cân bằng tải, một bên gọi có thể chạm giới
-  hạn trên từng node.
+- Mỗi tiến trình máy chủ đếm riêng, trừ tốc độ gửi giao dịch: mọi node web cùng lấy từ một hạn mức. Khi có nhiều node
+  web phía sau một bộ cân bằng tải, một bên gọi có thể chạm các giới hạn còn lại trên từng node.
 
 ## Header
 
@@ -41,10 +45,10 @@ cầu, máy chủ đếm chúng thế nào, và máy chủ trả về gì khi m�
 
 | Header                  | Được gửi kèm                                                             | Giá trị                                                                                                                                               |
 | ----------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `X-RateLimit-Limit`     | Mọi phản hồi `/api/` trừ gửi giao dịch đơn lẻ và theo lô                 | Số yêu cầu được phép mỗi phút cho bên gọi này.                                                                                                        |
+| `X-RateLimit-Limit`     | Mọi phản hồi `/api/` trừ gửi giao dịch đơn lẻ và theo lô                 | Số yêu cầu được phép mỗi phút cho bên gọi này (với trình duyệt đã đăng nhập, là mức trần chung của địa chỉ đó).                                      |
 | `X-RateLimit-Remaining` | Như trên                                                                 | Số yêu cầu còn lại trong khung thời gian hiện tại.                                                                                                    |
 | `X-RateLimit-Reset`     | Như trên                                                                 | Thời điểm khung thời gian hiện tại kết thúc, tính bằng giây Unix.                                                                                     |
-| `Retry-After`           | Phản hồi `429`                                                           | Số giây cần chờ. `60` với giới hạn theo khóa, giới hạn đăng nhập và giới hạn MCP; với gửi giao dịch và chuyển đổi, là thời gian cho đến khi khóa có chỗ trở lại (tối thiểu 1). |
+| `Retry-After`           | Phản hồi `429`                                                           | Số giây cần chờ. `60` với giới hạn theo khóa, theo địa chỉ, giới hạn đăng nhập và giới hạn MCP; với phiên trình duyệt, gửi giao dịch và chuyển đổi, là thời gian cho đến khi có chỗ trở lại (tối thiểu 1). |
 
 </TableScroll>
 
@@ -88,6 +92,9 @@ Khi vượt tốc độ gửi thư của một khóa chỉ gửi (ở đây là 
 Khi vượt giới hạn đăng nhập, detail là "Mạng của bạn đã thử đăng nhập quá nhiều lần. Hãy đợi một phút rồi thử lại." Ứng
 dụng web gửi ngôn ngữ của nó trong `Accept-Language`; khi không có header này, detail là "Too many sign-in attempts from
 your network. Wait a minute and try again."
+Khi một phiên trình duyệt vượt giới hạn, detail là "Phiên này gửi quá nhiều yêu cầu: tối đa 600 yêu cầu mỗi phút. Yêu
+cầu sẽ tiếp tục sau 12 giây.", với cùng số giây trong `Retry-After`; mức trần theo địa chỉ trả lời giống giới hạn theo
+khóa.
 Máy chủ MCP báo giới hạn của nó bằng văn bản thuần kèm `Retry-After: 60`: "Rate limit reached: 120 calls per minute
 per agent. Calls resume within a minute." (với giới hạn riêng của tác tử thay cho 120). Xem [lỗi API](/vi/developers/api-errors/)
 để biết định dạng problem document.
@@ -103,9 +110,10 @@ per agent. Calls resume within a minute." (với giới hạn riêng của tác 
 
 ## Thay đổi giới hạn
 
-Người vận hành máy chủ đặt giới hạn yêu cầu trong cấu hình: `http.rate_limit_api` cho lệnh gọi API và
-`http.rate_limit_auth` cho đăng nhập (xem [tham chiếu cấu hình](/vi/reference/configuration/)). Đặt
-`http.rate_limit_api` thành 0 sẽ tắt cả hai. Khi ReputeCast chạy sau một reverse proxy, hãy đặt `http.trusted_proxies`
-để các bên gọi không có khóa được đếm theo địa chỉ của chính họ, không phải địa chỉ của proxy (xem [reverse proxy và
-TLS](/vi/self-hosting/reverse-proxy/)). Tốc độ gửi thư của khóa chỉ gửi được đặt khi tạo khóa, còn giới hạn lệnh gọi
-của tác tử MCP được đặt trong phần cài đặt MCP của không gian làm việc.
+Người vận hành máy chủ đặt giới hạn yêu cầu trong cấu hình: `http.rate_limit_api` cho mỗi khóa API và mỗi phiên trình
+duyệt, `http.rate_limit_ip` cho mọi trình duyệt đã đăng nhập từ cùng một địa chỉ cộng lại, và `http.rate_limit_auth`
+cho đăng nhập (xem [tham chiếu cấu hình](/vi/reference/configuration/)). Đặt `http.rate_limit_api` thành 0 sẽ tắt cả
+ba. Khi ReputeCast chạy sau một reverse proxy, hãy đặt `http.trusted_proxies` để các bên gọi được đếm theo địa chỉ của
+chính họ, không phải địa chỉ của proxy (xem [reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)). Tốc độ gửi thư
+của khóa chỉ gửi được đặt khi tạo khóa, còn giới hạn lệnh gọi của tác tử MCP được đặt trong phần cài đặt MCP của không
+gian làm việc.

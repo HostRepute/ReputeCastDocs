@@ -150,7 +150,11 @@ async function goto(page: Page, url: string): Promise<void> {
 }
 
 async function runStep(page: Page, step: NonNullable<Shot['before']>[number]): Promise<void> {
-  if ('click' in step) await page.locator(step.click).first().click()
+  if ('click' in step)
+    await page
+      .locator(step.click)
+      .first()
+      .click(step.position ? { position: step.position } : {})
   else if ('dblclick' in step) await page.locator(step.dblclick).first().dblclick()
   else if ('hover' in step) await page.locator(step.hover).first().hover()
   else if ('press' in step) await page.keyboard.press(step.press)
@@ -202,7 +206,8 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
     })
     await goto(page, app + path)
     await page.evaluate('document.fonts.ready')
-    if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 15_000 })
+    // A draft's first open re-runs Send Readiness in the background, which can take most of a minute in development.
+    if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 60_000 })
     for (const step of s.before ?? []) await runStep(page, step)
     await page.waitForTimeout(400)
     if (rateLimited) throw new RateLimited()

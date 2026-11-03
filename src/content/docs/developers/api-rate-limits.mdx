@@ -1,11 +1,13 @@
 ---
 title: Rate limits
-description: API rate limits in ReputeCast. Requests per minute per key, sign-in and MCP limits, transactional send rates, the X-RateLimit headers and handling 429.
+description: API rate limits in ReputeCast. Requests per minute per key and browser session, sign-in and MCP limits, transactional send rates, X-RateLimit headers and 429.
 type: reference
 audience: [developer, operator]
 primaryKeyword: API rate limits
 sources:
   - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/api/auth.go
   - internal/app/app.go
   - internal/config/config.go
   - internal/transactional/ratelimit.go
@@ -26,14 +28,15 @@ counts them, and what it answers when a caller goes over.
 
 <LimitsTable area="rate-limits" />
 
-- Calls with an API key are counted per key, whatever address they come from. Calls without a bearer token (browser
-  sessions) are counted per client IP address.
+- Calls with an API key or agent token are counted per key, whatever address they come from. A signed-in browser is
+  counted per session once its sign-in is checked, and all signed-in browsers from one IP address share a higher cap,
+  so a team behind one office network doesn't share one budget. Calls with neither are counted per client IP address.
 - Transactional send and batch calls don't count against the per-key request limit; each key has its own message rate
   instead (see [send transactional email with the API](/developers/transactional-api/)).
 - Public pages, tracking links and provider webhooks (`/p/`, `/t/`, `/hooks/`) are outside these limits. Signup forms
   have their own limits (see [signup forms](/forms/signup-forms/)).
-- Each server process counts on its own. With several web nodes behind a load balancer, a caller can reach the limit
-  on each node.
+- Each server process counts on its own, except the transactional send rates, which every web node takes from the
+  same budget. With several web nodes behind a load balancer, a caller can reach the other limits on each node.
 
 ## Headers
 
@@ -41,10 +44,10 @@ counts them, and what it answers when a caller goes over.
 
 | Header                  | Sent on                                                                  | Value                                                                                                                                                 |
 | ----------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `X-RateLimit-Limit`     | Every `/api/` answer except transactional send and batch                 | Requests allowed per minute for this caller.                                                                                                          |
+| `X-RateLimit-Limit`     | Every `/api/` answer except transactional send and batch                 | Requests allowed per minute for this caller (for a signed-in browser, its address's shared cap).                                                     |
 | `X-RateLimit-Remaining` | The same                                                                 | Requests left in the current window.                                                                                                                  |
 | `X-RateLimit-Reset`     | The same                                                                 | When the current window ends, in Unix seconds.                                                                                                        |
-| `Retry-After`           | `429` answers                                                            | Seconds to wait. `60` for the per-key, sign-in and MCP limits; for transactional sends and conversions, the time until the key has room again (at least 1). |
+| `Retry-After`           | `429` answers                                                            | Seconds to wait. `60` for the per-key, per-address, sign-in and MCP limits; for a browser session, transactional sends and conversions, the time until there is room again (at least 1). |
 
 </TableScroll>
 
@@ -86,6 +89,8 @@ Over a send-only key's message rate (here 50 per second), with `Retry-After: 1`:
 ```
 
 Over the sign-in limit, the detail is "Too many sign-in attempts from your network. Wait a minute and try again."
+Over a browser session's limit, it is "Too many requests from this session: at most 600 a minute. Requests resume in
+12 s.", with the same seconds in `Retry-After`; the per-address cap answers like the per-key limit.
 The MCP server answers its limit with plain text and `Retry-After: 60`: "Rate limit reached: 120 calls per minute
 per agent. Calls resume within a minute." (with the agent's own limit in place of 120). See [errors](/developers/api-errors/)
 for the problem format.
@@ -101,9 +106,9 @@ for the problem format.
 
 ## Change the limits
 
-Server operators set the request limits in the configuration: `http.rate_limit_api` for API calls and
-`http.rate_limit_auth` for sign-in (see the [configuration reference](/reference/configuration/)). Setting
-`http.rate_limit_api` to 0 turns off both. When ReputeCast runs behind a reverse proxy, set `http.trusted_proxies`
-so callers without a key are counted by their own address, not the proxy's (see [reverse proxy and
-TLS](/self-hosting/reverse-proxy/)). A send-only key's message rate is set when the key is created, and an MCP
-agent's call limit in the workspace's MCP settings.
+Server operators set the request limits in the configuration: `http.rate_limit_api` for each API key and browser
+session, `http.rate_limit_ip` for all signed-in browsers from one address together, and `http.rate_limit_auth` for
+sign-in (see the [configuration reference](/reference/configuration/)). Setting `http.rate_limit_api` to 0 turns off
+all three. When ReputeCast runs behind a reverse proxy, set `http.trusted_proxies` so callers are counted by their
+own address, not the proxy's (see [reverse proxy and TLS](/self-hosting/reverse-proxy/)). A send-only key's message
+rate is set when the key is created, and an MCP agent's call limit in the workspace's MCP settings.

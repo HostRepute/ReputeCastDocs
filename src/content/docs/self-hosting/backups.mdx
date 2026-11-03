@@ -11,10 +11,13 @@ sources:
   - internal/app/app.go
   - internal/config/config.go
   - internal/accounts/signin.go
+  - internal/cli/doctor.go
+  - internal/cli/migrate.go
   - migrations/00008_segment_role.sql
   - migrations/00151_segment_runner.sql
   - migrations/00300_composer.sql
   - web/src/features/admin/instance/InstancePage.tsx
+  - docs/deploy/backup-restore.md
 sidebar:
   order: 9
 ---
@@ -176,6 +179,12 @@ database, it creates a new first Owner, which you don't want on top of a restore
 
    If the image is newer than the backup, it applies the pending migrations at start.
 
+7. Check the restore (see [check that it worked](#check-that-it-worked)):
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast doctor
+   ```
+
 </Steps>
 
 </TabItem>
@@ -212,7 +221,8 @@ database, it creates a new first Owner, which you don't want on top of a restore
    tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
    ```
 
-6. If the binary is newer than the backup, run `reputecast migrate up`, then start ReputeCast again.
+6. If the binary is newer than the backup, run `reputecast migrate up`. Then check the restore with
+   `reputecast doctor` (see [check that it worked](#check-that-it-worked)) and start ReputeCast again.
 
 </Steps>
 
@@ -221,13 +231,20 @@ database, it creates a new first Owner, which you don't want on top of a restore
 
 ## Check that it worked
 
+- `reputecast doctor` prints `ok` for the database, the schema, the secret key, the files folder and the SQL segments
+  role. It opens a few stored values of every kind with the key, so a wrong key fails here rather than in a provider
+  call, and it exits with `1` when a check fails:
+  - **SQL segments role** warns on a new server: create the role (step 3), then run `reputecast migrate segments-role`
+    and restart ReputeCast.
+  - **Previous keys** warns while stored values still use a key in `secrets.previous_keys`
+    ([rotate the secret key](/self-hosting/security/#rotate-the-key)).
+  - **Public URL** warns when it isn't `https://`. If the server's address changed, set `REPUTECAST_PUBLIC_URL`; saving
+    it in <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> also moves the provider webhooks.
 - `curl -s http://localhost:8080/readyz` answers `ready`. See [health checks, metrics and logs](/self-hosting/monitoring/).
 - The app logs don't contain `generated a new secret key`. If they do, ReputeCast didn't find the restored key: stop it,
   put the key back and start it again.
-- Sign in with your password and authenticator app. A working authenticator sign-in proves the key matches the
-  database.
-- Open <UiPath path="nav.providers" /> in a workspace: connected sending providers keep their status instead of asking
-  for credentials.
+- Sign in with your password and authenticator app, and open <UiPath path="nav.providers" /> in a workspace: connected
+  sending providers keep their status instead of asking for credentials.
 
 Test a restore before you need one: restore the latest backup into a second Compose project on another port (for
 example `docker compose -p reputecast-restore-test` with `REPUTECAST_PORT=8090`) and sign in there.
@@ -236,11 +253,11 @@ example `docker compose -p reputecast-restore-test` with `REPUTECAST_PORT=8090`)
 
 - **`role "reputecast_segments" does not exist` during `pg_restore`**: the server is new. Create the role (step 3 of
   the restore), recreate the empty database and restore again.
-- **Authenticator sign-in fails with `secrets: cannot decrypt value`**: the database was restored without its key, or
-  with the wrong one. Put the original key back. If it is lost, people sign in with a recovery code or passkey, an
-  instance admin removes their authenticator with
-  [`reputecast user reset-2fa`](/self-hosting/account-recovery/), and each workspace enters its provider credentials
-  again.
+- **`reputecast doctor` reports `… sampled values don't open (…): is this the key backed up with the database?`**, or
+  authenticator sign-in fails with `secrets: cannot decrypt value`: the database was restored without its key, or with
+  the wrong one. Put the original key back. If it is lost, people sign in with a recovery code or passkey, an instance
+  admin removes their authenticator with [`reputecast user reset-2fa`](/self-hosting/account-recovery/), and each
+  workspace enters its provider credentials again.
 - **A new Owner with a temporary password appears in the logs**: the app started before the database was restored.
   Stop it, recreate the database and restore again.
 - **`pg_restore: error: unsupported version` or similar**: your `pg_restore` is older than the `pg_dump` that wrote

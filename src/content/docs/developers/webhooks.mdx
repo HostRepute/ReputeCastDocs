@@ -8,6 +8,8 @@ uiPath: 'nav.settings > settings.webhooks'
 primaryKeyword: webhook signature verification
 sources:
   - internal/webhooks/webhooks.go
+  - internal/webhooks/batch.go
+  - internal/webhooks/email.go
   - internal/webhooks/jobs.go
   - internal/webhooks/api.go
   - internal/store/queries/webhooks.sql
@@ -44,7 +46,9 @@ came from your ReputeCast instance.
 1. Open <UiPath path="nav.settings > settings.webhooks" /> and select <UiPath path="webhooks.addEndpoint" />.
 
 2. Enter the endpoint's URL, an optional name and description, and pick the events. Ticking a whole group
-   subscribes to its wildcard, such as `email.*`; new events added to that group later are included.
+   subscribes to its wildcard, such as `email.*`; new events added to that group later are included. Once an `email.*`
+   event is picked, <UiPath path="webhooks.batchLabel" /> appears
+   ([receive email events in batches](#receive-email-events-in-batches)).
 
 3. Select <UiPath path="webhooks.addEndpoint" />. ReputeCast shows the signing secret, `whsec_…`, once. Copy it into
    your receiver's configuration, for example as `REPUTECAST_WEBHOOK_SECRET`. ReputeCast stores it encrypted and never
@@ -69,7 +73,8 @@ The same endpoints can be managed through the API: `create-webhook`, `update-web
 
 An endpoint subscribes to 1–40 entries. Each entry is an event name (`email.bounced`), a group wildcard (`email.*`)
 or `*` for every event. The full catalog, with what each event means and a sample of its `data`, is in
-[Webhook events](/reference/webhook-events/).
+[Webhook events](/reference/webhook-events/). Every event in it is sent: `email.*` events report campaign and
+automation email, and transactional messages have their own `message.*` events.
 
 `webhook.test` isn't in the catalog: only the test button and the `test-webhook` operation send it.
 
@@ -98,10 +103,39 @@ These headers come with every delivery:
 | ------------------------ | ------------------------------------------------------------------------------------------- |
 | `Content-Type`           | `application/json`                                                                          |
 | `User-Agent`             | `ReputeCast-Webhooks/<version>`                                                             |
-| `X-ReputeCast-Signature` | Lowercase hex HMAC-SHA256 of `<timestamp>.<raw body>`. There is no `sha256=` or other prefix. |
+| `X-ReputeCast-Signature` | Lowercase hex HMAC-SHA256 of `<timestamp>.<raw body>`. There is no `sha256=` or other prefix. For 24 hours after a [secret rotation](#rotate-the-signing-secret), two signatures separated by a comma, the new secret's first. |
 | `X-ReputeCast-Timestamp` | When this attempt was signed, in Unix seconds.                                              |
 | `X-ReputeCast-Event`     | The event name, the same as `type`.                                                         |
 | `X-ReputeCast-Delivery`  | The delivery ID: one per event and endpoint, the same on every retry.                      |
+
+## Receive email events in batches
+
+A large campaign makes one `email.delivered` event per recipient. With <UiPath path="webhooks.batchLabel" /> on, the
+endpoint gets its `email.*` events in deliveries of type `email.batch` instead, up to 100 events each, so a
+million-recipient send makes about ten thousand requests. Other events still arrive one by one. The switch is off by
+default and changes nothing for endpoints that leave it off.
+
+```json title="email.batch"
+{
+  "id": "0192f1c5-0d3e-7a11-9b2c-4e6f8a0b1c2d",
+  "type": "email.batch",
+  "created_at": "2026-10-22T09:41:20Z",
+  "workspace": "acme-newsletter",
+  "data": {
+    "count": 2,
+    "events": [
+      { "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44", "type": "email.delivered", "created_at": "2026-10-22T09:41:07Z", "workspace": "acme-newsletter", "data": { "…": "…" } },
+      { "id": "0192f1c4-8c3f-7d62-8e1b-4a6f9c2b3d55", "type": "email.bounced", "created_at": "2026-10-22T09:41:09Z", "workspace": "acme-newsletter", "data": { "…": "…" } }
+    ]
+  }
+}
+```
+
+- `data.events` holds each event as the envelope it would have been posted as alone, in the order they happened.
+  Skip duplicates by each inner `id`, as for single events.
+- The batch is one delivery with its own `id`, signature and `X-ReputeCast-Event: email.batch`, retried and replayed
+  as a whole.
+- While the endpoint is paused, its batches are held like any other delivery.
 
 ## Verify the signature
 
@@ -113,8 +147,9 @@ To check a delivery:
 3. Compute HMAC-SHA256 over the timestamp, a dot and the raw body: `<timestamp>.<raw body>`.
 4. Use the **whole secret string as the key**, `whsec_` prefix included, as UTF-8 bytes. Don't strip the prefix and
    don't base64-decode the rest.
-5. Hex-encode the result in lowercase and compare it with `X-ReputeCast-Signature` in constant time. Answer `401` on
-   a mismatch.
+5. Hex-encode the result in lowercase and compare it, in constant time, with each comma-separated value of
+   `X-ReputeCast-Signature`: after a rotation the header carries two signatures for a day. Accept the request when one
+   matches; answer `401` when none does.
 
 Each example below is a complete receiver on port 3000 at `/webhooks/reputecast` that reads the secret from
 `REPUTECAST_WEBHOOK_SECRET`:
@@ -132,10 +167,12 @@ const secret = process.env.REPUTECAST_WEBHOOK_SECRET
 function verify(rawBody, timestamp, signature) {
   const age = Math.abs(Date.now() / 1000 - Number(timestamp))
   if (!signature || !(age <= 300)) return false // reject timestamps more than 5 minutes off
-  const expected = createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex')
-  const a = Buffer.from(expected)
-  const b = Buffer.from(signature)
-  return a.length === b.length && timingSafeEqual(a, b)
+  const expected = Buffer.from(createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex'))
+  // For a day after a rotation the header holds two signatures, comma-separated: accept either.
+  return signature.split(',').some((s) => {
+    const b = Buffer.from(s.trim())
+    return b.length === expected.length && timingSafeEqual(expected, b)
+  })
 }
 
 createServer((req, res) => {
@@ -177,8 +214,9 @@ def verify(raw_body: bytes, timestamp: str | None, signature: str | None) -> boo
         return False
     if abs(time.time() - int(timestamp)) > 300:  # reject timestamps more than 5 minutes off
         return False
-    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected.encode(), signature.encode())
+    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest().encode()
+    # For a day after a rotation the header holds two signatures, comma-separated: accept either.
+    return any(hmac.compare_digest(expected, s.strip().encode()) for s in signature.split(","))
 
 
 @app.post("/webhooks/reputecast")
@@ -211,6 +249,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -229,8 +268,14 @@ func verify(body []byte, timestamp, signature string) bool {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(timestamp + "."))
 	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(signature))
+	expected := []byte(hex.EncodeToString(mac.Sum(nil)))
+	// For a day after a rotation the header holds two signatures, comma-separated: accept either.
+	for _, s := range strings.Split(signature, ",") {
+		if hmac.Equal(expected, []byte(strings.TrimSpace(s))) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -274,8 +319,10 @@ $timestamp = $_SERVER['HTTP_X_REPUTECAST_TIMESTAMP'] ?? '';
 $signature = $_SERVER['HTTP_X_REPUTECAST_SIGNATURE'] ?? '';
 
 $expected = hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
-// Reject timestamps more than 5 minutes off, then compare in constant time.
-if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !hash_equals($expected, $signature)) {
+// Compare in constant time. For a day after a rotation the header holds two signatures, comma-separated: accept either.
+$matches = array_filter(explode(',', $signature), fn ($s) => hash_equals($expected, trim($s)));
+// Reject timestamps more than 5 minutes off and signatures that don't match.
+if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !$matches) {
     http_response_code(401);
     exit;
 }
@@ -292,7 +339,8 @@ Serve it with your web server, or try it with `php -S 127.0.0.1:3000 webhook.php
 
 <Aside type="danger" title="Keep the secret on the server">
 Anyone with the secret can sign requests your receiver accepts. Keep it in your server's secret store, never in
-browser or mobile code. If it leaks, rotate it ([Rotate the signing secret](#rotate-the-signing-secret)).
+browser or mobile code. If it leaks, rotate it ([Rotate the signing secret](#rotate-the-signing-secret)) and give
+your receiver the new secret at once: it then rejects requests signed with the leaked one.
 </Aside>
 
 ## Check that it worked
@@ -331,6 +379,9 @@ browser or mobile code. If it leaks, rotate it ([Rotate the signing secret](#rot
 - While an endpoint is failing, ReputeCast tries only its oldest waiting delivery, on the schedule above. The others
   wait and go out in order as soon as the endpoint answers `2xx` again. Nothing else in ReputeCast waits for the
   endpoint: sending, imports and automations carry on.
+- When an endpoint has failed for an hour, or a delivery goes to the dead-letter queue, the people who manage webhooks
+  get <UiPath path="notify.event.webhook_failing" />, once per failing spell, in the bell and by email (see
+  [notification preferences](/team/notifications/)).
 
 ## Pause an endpoint
 
@@ -339,10 +390,11 @@ during maintenance. <UiPath path="webhooks.resumeEndpoint" /> delivers everythin
 
 ## Rotate the signing secret
 
-<UiPath path="webhooks.rotateSecret" /> creates a new secret, shows it once, and signs every delivery with it from that
-moment. The old secret stops working at once; there is no overlap. Deliveries that fail while you update your receiver
-are retried on the schedule above (1, 2, 4 minutes and so on), so update the receiver right after rotating. Only a
-person can rotate a secret; API keys can't.
+<UiPath path="webhooks.rotateSecret" /> creates a new secret and shows it once. From that moment every delivery is
+signed with the new secret and, for 24 hours, with the old one too: `X-ReputeCast-Signature` holds both signatures,
+comma-separated, the new one first. The endpoint's row says until when the old secret signs. A receiver that accepts
+either signature ([Verify the signature](#verify-the-signature)) keeps working while you move it to the new secret
+within that day. Only a person can rotate a secret; API keys can't.
 
 ## Endpoints managed by integrations
 
@@ -362,6 +414,8 @@ don't see them. When such an endpoint answers `410 Gone`, ReputeCast removes it.
   above.
 - **401 only for some deliveries**: your server's clock is off. Sync it with NTP; the 5-minute check compares against
   it.
+- **401 on every delivery after rotating the secret**: your receiver compares the whole `X-ReputeCast-Signature`
+  header with one signature. Split it on commas and accept a match with either value.
 - **"… is a local hostname" or a blocked address when saving**: the URL points to a private network. Use a public
   address, or ask an instance admin to set `webhooks.allow_private_networks`.
 - **Deliveries time out**: your handler takes more than 10 seconds. Answer first, then process.

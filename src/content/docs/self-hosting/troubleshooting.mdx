@@ -8,6 +8,9 @@ sources:
   - internal/cli/install.go
   - internal/cli/serve.go
   - internal/app/app.go
+  - internal/app/schema.go
+  - internal/app/metrics.go
+  - internal/cli/doctor.go
   - internal/accounts/service.go
   - internal/accounts/reset.go
   - internal/config/config.go
@@ -38,11 +41,12 @@ it. Each entry starts with what you see.
 1. Read the app's logs. With Docker Compose: `docker compose logs app --since 1h`. With the binary under systemd:
    `journalctl -u reputecast --since "1 hour ago"`.
 
-2. Check the process and the database: `curl -s http://localhost:8080/readyz` answers `ready` when ReputeCast can reach
-   PostgreSQL ([health checks, metrics and logs](/self-hosting/monitoring/)).
+2. Check the process: `curl -s http://localhost:8080/readyz` answers `ready` when ReputeCast reaches PostgreSQL, its
+   schema is current and its workers run, and `503` with the reason otherwise
+   ([health checks, metrics and logs](/self-hosting/monitoring/)).
 
-3. Check the schema: `docker compose exec app /usr/local/bin/reputecast migrate status` (or `reputecast migrate status`)
-   lists any migration as `pending`.
+3. Check the database, schema, secret key, files folder and SQL segments role:
+   `docker compose exec app /usr/local/bin/reputecast doctor` (or `reputecast doctor`) prints one line per check.
 
 4. For more detail, restart with `REPUTECAST_LOG__LEVEL=debug`, and set it back afterwards.
 
@@ -86,11 +90,19 @@ Read the last lines of `docker compose logs app`. The start stops with `Error: â
 - `Error: migrate: â€¦`: a migration failed. Restore the backup taken before the upgrade and report the error with the
   version ([upgrade ReputeCast](/self-hosting/upgrades/)).
 
-### The logs warn about pending migrations
+### The app is read-only during an upgrade
 
-The binary is newer than the database schema and the process was started without `--auto-migrate`. Run
-`reputecast migrate up` once with the server's environment, then restart every process. The Docker image migrates at
-start by itself.
+The app shows the <UiPath path="shell.bannerMaintenance" /> banner, edits and sends answer `503` with the code
+`maintenance`, and `/readyz` answers ``database schema behind this release: run `reputecast migrate up` ``. The binary
+is newer than the database schema and no process has applied the migrations. Run `reputecast migrate up` once with the
+server's environment, or start one process with `--auto-migrate`: every process carries on within seconds, without a
+restart ([while migrations are pending](/self-hosting/upgrades/#while-migrations-are-pending)).
+
+### Prometheus gets `404` from `/metrics`
+
+Since 1.3.0, `/metrics` has its own listener on port 9464, and the main port answers `404` unless `metrics.token` is set.
+Point Prometheus at port 9464 (the Compose file doesn't publish it: run Prometheus on the same Docker network), or set
+`metrics.token` and send it as a bearer token ([health checks, metrics and logs](/self-hosting/monitoring/)).
 
 ### `/readyz` answers `503 database unavailable`
 
@@ -169,7 +181,7 @@ in [reverse proxy and TLS](/self-hosting/reverse-proxy/).
 Building a SQL segment answers `SQL segments are turned off on this database.` The PostgreSQL role
 `reputecast_segments` is missing, or the app's database user isn't a member of it, typically on managed PostgreSQL
 where the user can't create roles. Follow [the SQL segments steps](/self-hosting/postgres/#sql-segments): on a database
-that was migrated before the role existed, `reputecast migrate up` alone doesn't turn them on.
+that was migrated before the role existed, run `reputecast migrate segments-role` after creating it.
 
 ## Blocklist checks fail
 
@@ -181,8 +193,10 @@ through public resolvers (1.1.1.1, 8.8.8.8). Point `dns.servers` at your own rec
 ## Links in sent emails stop working
 
 Unsubscribe, preference and tracking links in emails sent earlier lead to an error. The links are signed with a key
-derived from the secret key, so they break when the key changes (a rotation, or a restore without the original key).
-New emails work. Restore the original key if you still have it ([security and hardening](/self-hosting/security/#the-secret-key)).
+derived from the secret key, and links signed with a key in `secrets.previous_keys` keep working. They break when the
+key they were signed with is gone: a restore without the original key, or a previous key removed after a rotation. New
+emails work. Put the old key back in `secrets.previous_keys` if you still have it
+([rotate the key](/self-hosting/security/#rotate-the-key)).
 
 <Aside type="tip">
   Still stuck? Search or open an issue at [github.com/hostrepute/reputecast](https://github.com/hostrepute/reputecast/issues)

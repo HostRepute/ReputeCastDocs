@@ -20,7 +20,7 @@ export type Shot = {
   fullPage?: boolean // default false (viewport only)
   clip?: string // CSS selector: capture only this element at dsf 2
   before?: (
-    | { click: string }
+    | { click: string; position?: { x: number; y: number } } // position: from the element's top-left corner
     | { dblclick: string }
     | { hover: string }
     | { press: string }
@@ -63,6 +63,13 @@ export const shots: Shot[] = [
     ],
   },
   { id: 'overview-mobile', path: `${ws}`, feature: 'overview', viewport: 'mobile' },
+  // The command palette (⌘K on a Mac, Ctrl+K elsewhere), searching every kind the role can open.
+  {
+    id: 'command-palette',
+    path: `${ws}/campaigns`,
+    feature: 'shell',
+    before: [{ press: 'ControlOrMeta+k' }, { fill: ['[role="dialog"] input', 'digest'] }, { wait: 1500 }],
+  },
 
   // Sending providers and the connect wizard
   { id: 'providers-catalog', path: `${ws}/providers/connect`, feature: 'connect' },
@@ -81,7 +88,8 @@ export const shots: Shot[] = [
       { n: 2, selector: 'main table tbody tr:nth-child(4)' },
       { n: 3, selector: 'main table tbody tr:nth-child(6)' },
       { n: 4, selector: 'main table tbody tr:nth-child(7)' },
-      { n: 5, selector: 'main span[role="status"]' },
+      // Left of the status, the number would cover its first word.
+      { n: 5, selector: 'main span[role="status"]', badge: 'right' },
     ],
   },
   { id: 'connect-test-send', path: `${ws}/providers/connect/ses?setup={setup:ses}&step=test`, feature: 'connect' },
@@ -120,6 +128,15 @@ export const shots: Shot[] = [
   // Campaigns, composer, Send Readiness, live monitor, reports
   { id: 'campaigns-list', path: `${ws}/campaigns`, feature: 'campaigns' },
   { id: 'campaigns-list-mobile', path: `${ws}/campaigns`, feature: 'campaigns', viewport: 'mobile' },
+  // Rows selected: the bulk bar (tags, archive, delete) above the table.
+  {
+    id: 'campaigns-bulk',
+    path: `${ws}/campaigns`,
+    feature: 'campaigns',
+    before: [{ click: 'main thead input[type="checkbox"]' }, { wait: 500 }],
+  },
+  // qa-map: CampaignsCalendar
+  { id: 'campaigns-calendar', path: `${ws}/campaigns/calendar`, feature: 'campaigns' },
   {
     id: 'composer',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/edit?select=2`,
@@ -235,6 +252,14 @@ export const shots: Shot[] = [
   // qa-map: SettingsSendingRules
   { id: 'sending-rules', path: `${ws}/settings/sending-rules`, feature: 'sending-rules' },
   {
+    // The Marketing cap card (review 2026-11 AT-9), switched on so its numbers show (3 in 7 days); nothing is saved.
+    id: 'sending-rules-cap',
+    path: `${ws}/settings/sending-rules`,
+    feature: 'sending-rules',
+    clip: 'section.card:has(input[max="90"])',
+    before: [{ click: 'section.card:has(input[max="90"]) input[role="switch"]' }],
+  },
+  {
     // The steady scenario is the normal one without the simulated provider's chance throttling (and without a canary).
     id: 'live-monitor',
     path: `${ws}/campaigns/{campaign:Weekly Digest #142}/live`,
@@ -293,6 +318,14 @@ export const shots: Shot[] = [
     feature: 'reports',
     clip: 'section[aria-labelledby="rep-ab-h"]',
   },
+  // The report's Follow up menu, first choice: the resend-to-non-openers dialog.
+  {
+    id: 'campaign-followup',
+    path: `${ws}/campaigns/{campaign:October Product Update}/report`,
+    feature: 'campaigns',
+    before: [{ click: 'button.btn[aria-haspopup="menu"]' }, { click: '[role="menuitem"] >> nth=0' }, { wait: 800 }],
+    clip: '[role="dialog"]',
+  },
   {
     id: 'digest-overview',
     path: `${ws}/campaigns/digests/{digest:Engineering blog roundup}`,
@@ -302,9 +335,25 @@ export const shots: Shot[] = [
   // Audience and imports
   { id: 'contacts', path: `${ws}/audience`, feature: 'audience' },
   { id: 'contacts-mobile', path: `${ws}/audience`, feature: 'audience', viewport: 'mobile' },
+  // Every contact on the page selected: the bulk bar and "Select all N matching".
+  {
+    id: 'contacts-bulk',
+    path: `${ws}/audience`,
+    feature: 'audience',
+    before: [{ click: 'main thead input[type="checkbox"]' }, { wait: 800 }],
+  },
+  // qa-map: AudienceListsFields
+  { id: 'lists-fields', path: `${ws}/audience/lists`, feature: 'audience' },
   { id: 'contact-profile', path: `${ws}/audience/contacts/{contact:sam.rivera@outlook.com}`, feature: 'audience' },
   { id: 'segments', path: `${ws}/audience/segments`, feature: 'audience' },
   { id: 'list-health', path: `${ws}/audience/health`, feature: 'audience' },
+  // The same page's Sunset policy card: the switch, the editable numbers and the erase step.
+  {
+    id: 'sunset-policy',
+    path: `${ws}/audience/health`,
+    feature: 'audience',
+    clip: 'section[aria-labelledby="policy-h"]',
+  },
   { id: 'suppressions', path: `${ws}/audience/suppressions`, feature: 'audience' },
   { id: 'import-source', path: `${ws}/import`, feature: 'imports' },
   { id: 'import-fields', path: `${ws}/import/{import:draft}/fields`, feature: 'imports' },
@@ -328,6 +377,26 @@ export const shots: Shot[] = [
   { id: 'automations-list', path: `${ws}/automations`, feature: 'automations' },
   { id: 'automation-flow', path: `${ws}/automations/{automation:Welcome series}?step=n3`, feature: 'automations' },
   { id: 'automation-channels', path: `${ws}/automations/{automation:Acme Summit reminders}`, feature: 'automations' },
+  // The trigger step selected: more triggers, re-entry and leaving the list.
+  { id: 'automation-trigger', path: `${ws}/automations/{automation:Welcome series}?step=n1`, feature: 'automations' },
+  // The right panel's Stats tab with no step selected (a click on the empty canvas): the sequence, email by email.
+  {
+    id: 'automation-sequence',
+    path: `${ws}/automations/{automation:Welcome series}?panel=stats`,
+    feature: 'automations',
+    before: [{ click: '.react-flow__pane', position: { x: 24, y: 400 } }, { wait: 1000 }],
+  },
+  // The "Wait 2 days" step's Stats tab, then the contacts waiting at it.
+  {
+    id: 'automation-step-contacts',
+    path: `${ws}/automations/{automation:Welcome series}?step=n5`,
+    feature: 'automations',
+    before: [
+      { click: '[id$="-trigger-stats"] >> nth=1' },
+      { click: '[id$="-content-stats"] .fe-prop > button' },
+      { wait: 1200 },
+    ],
+  },
 
   // Transactional
   { id: 'transactional', path: `${ws}/transactional`, feature: 'transactional' },
@@ -409,7 +478,7 @@ export const shots: Shot[] = [
   { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai' },
   {
     // A Shorten suggestion on #143's intro: edit the text block (the canvas is an iframe), then the text toolbar's
-    // first AI action. The demo model answers in a moment.
+    // first AI action, after its last separator. The demo model answers in a moment.
     id: 'ai-composer',
     path: `${ws}/campaigns/{campaign:Weekly Digest #143}/edit`,
     feature: 'ai',
@@ -418,7 +487,7 @@ export const shots: Shot[] = [
         dblclick:
           '#main iframe >> nth=0 >> internal:control=enter-frame >> div:has-text("schedule flag changes") >> nth=-1',
       },
-      { click: '.rte .rsep + button[aria-pressed] >> visible=true' },
+      { click: '.rte > .rsep:last-of-type + button >> visible=true' },
       { wait: 4000 },
     ],
   },
@@ -430,10 +499,11 @@ export const shots: Shot[] = [
     path: `${ws}/deliverability`,
     feature: 'deliverability',
     fullPage: true,
+    // Top to bottom: domain and IP cards, provider account health, blocklists.
     markers: [
       { n: 1, selector: 'section[aria-labelledby="h-assets"]' },
-      { n: 2, selector: 'section[aria-labelledby="h-blocklists"]' },
-      { n: 3, selector: 'section[aria-labelledby="h-provider-health"]' },
+      { n: 2, selector: 'section[aria-labelledby="h-provider-health"]' },
+      { n: 3, selector: 'section[aria-labelledby="h-blocklists"]' },
     ],
   },
   { id: 'deliverability-mobile', path: `${ws}/deliverability`, feature: 'deliverability', viewport: 'mobile' },
@@ -447,6 +517,13 @@ export const shots: Shot[] = [
 
   // Workspace, team, account and instance admin
   { id: 'workspace-settings', path: `${ws}/settings`, feature: 'workspace' },
+  // The General page's Data retention card.
+  {
+    id: 'data-retention',
+    path: `${ws}/settings`,
+    feature: 'workspace',
+    clip: 'section[aria-labelledby="retention-h"]',
+  },
   { id: 'settings-team', path: `${ws}/settings/team`, feature: 'team' },
   { id: 'team-viewer', path: `${ws}/settings/team`, feature: 'team', user: 'aisha' },
   { id: 'roles', path: `${ws}/settings/roles`, feature: 'roles' },
@@ -463,6 +540,8 @@ export const shots: Shot[] = [
   { id: 'instance-auth', path: `${ws}/admin/authentication`, feature: 'admin' },
   { id: 'instance-settings', path: `${ws}/admin/instance`, feature: 'admin' },
   { id: 'bot-filter', path: `${ws}/admin/bot-filter`, feature: 'admin' },
+  // qa-map: InstanceSystem
+  { id: 'instance-system', path: `${ws}/admin/system`, feature: 'admin' },
   { id: 'sso-setup', path: `${ws}/admin/sso/{sso:Microsoft Entra ID}`, feature: 'admin' },
 
   // Agency accounts (the Northwind Studio sample)

@@ -13,14 +13,18 @@ sources:
   - internal/cli/migrate.go
   - internal/cli/serve.go
   - internal/db/db.go
+  - internal/db/partition.go
+  - internal/app/schema.go
   - internal/version/version.go
   - internal/instance/updates.go
   - web/src/features/admin/instance/InstancePage.tsx
+  - web/src/lib/systemStatus.ts
   - internal/config/config.go
   - internal/jobs/jobs.go
   - internal/mailbox
   - internal/app/wire_mailbox.go
   - migrations/{03208_r05_share_expiry.sql,03256_m39_contacts_live_idx.sql,03312_m40_default_reply_rules.sql}
+  - docs/deploy/{README.md,backup-restore.md,partitioning.md}
 sidebar:
   order: 10
 ---
@@ -41,7 +45,7 @@ changelog under <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, 
 
 <Screenshot
   id="instance-settings"
-  alt="The Version & updates card shows the installed version, the latest release with its changelog, the upgrade command and the daily release check switched on."
+  alt="The Version & updates card: installed version, the latest release v1.3.0 marked Up to date with its changelog link, What's new in v1.3.0, the upgrade command with a reminder to back up PostgreSQL first, and the daily release check switched on."
 />
 
 - The badge <UiPath path="admin.updateAvailable" /> appears when the latest release is newer than the installed
@@ -86,7 +90,7 @@ changelog under <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, 
    ```
 
    The image starts with `serve --auto-migrate`, so it applies pending migrations before it serves requests. The logs
-   show one `migration applied` line per migration.
+   show one `migration applied` line per migration, and `docker compose ps` shows `app` as `healthy` once it is ready.
 
 </Steps>
 
@@ -124,11 +128,45 @@ changelog under <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, 
 </TabItem>
 </Tabs>
 
-<Aside type="caution">
-  A process started without `--auto-migrate` on a database with pending migrations keeps running and only logs
-  ``database has pending migrations; run `reputecast migrate up` or pass --auto-migrate``. Run the migrations before you
-  rely on the new version.
-</Aside>
+## While migrations are pending
+
+A process whose database is missing migrations it needs, such as a binary replaced before `reputecast migrate up`
+ran, doesn't write to it:
+
+- Pages and the API read as usual. The app shows the <UiPath path="shell.bannerMaintenance" /> banner before any edit.
+- Writes answer `503` with the code `maintenance`. Signing in and out still works, and sending providers' webhooks are
+  still stored.
+- Workers wait, so nothing is sent.
+- `/readyz` answers `503`, so a load balancer or orchestrator keeps sending traffic to the previous release.
+
+The process looks again every 5 seconds and carries on by itself once `reputecast migrate up`, or another process's
+`--auto-migrate`, has applied them. Browser tabs left open across an upgrade offer <UiPath path="shell.bannerReload" />
+to load the new version.
+
+Migrations hold a lock in PostgreSQL: when several processes start with `--auto-migrate`, one applies them while the
+others wait for it (up to 15 minutes), so each migration runs once. Run them over a direct or session-mode connection,
+not through PgBouncer in transaction mode.
+
+## Upgrade to 1.3.0
+
+Version 1.3.0 changes these things on the server; the [release notes](/reference/release-notes/#130) list the rest.
+
+- **23 new migrations** (`03360` to `03388`); some build indexes concurrently. One creates the `pg_trgm` extension for
+  contact search, which the database's owner may create ([PostgreSQL](/self-hosting/postgres/#managed-postgresql)).
+- **`delivery_events` becomes monthly partitions.** After the migrations, `migrate up` and `serve --auto-migrate`
+  convert the table of every send, delivery, bounce, open and click, unless `reputecast migrate partition-events`
+  already did. Nothing is copied and writes go on, but two steps read the whole table: on a very large table, run
+  `reputecast migrate partition-events` yourself first, at a quiet hour
+  ([monthly partitions](/self-hosting/postgres/#monthly-partitions-of-delivery_events)).
+- **Read-only until migrated, and locked migrations**, as described [above](#while-migrations-are-pending).
+- **`/metrics` moved** to its own listener, `:9464`. If Prometheus scraped the main port, point it at 9464 or set
+  `metrics.token` ([health checks, metrics and logs](/self-hosting/monitoring/)).
+- **A container health check.** The image runs `reputecast healthcheck`, so Docker reports the app as `healthy` once
+  `/readyz` answers.
+- **Rate limits per browser session.** Each signed-in browser has its own 600 requests a minute; the browsers behind
+  one address share 6,000 ([security and hardening](/self-hosting/security/)).
+- **nginx with HTTP/2.** The [nginx example](/self-hosting/reverse-proxy/) now turns HTTP/2 on, which loads the app
+  much faster on phones.
 
 ## Upgrade to 1.2.0
 
@@ -155,24 +193,33 @@ Version 1.2.0 changes these things on the server; the [release notes](/reference
 - <UiPath path="admin.versionCard" /> shows the new version as installed.
 - `reputecast migrate status` lists every migration with an applied date and none as `pending`. In Docker:
   `docker compose exec app /usr/local/bin/reputecast migrate status`.
-- `/readyz` answers `ready` ([health checks, metrics and logs](/self-hosting/monitoring/)).
+- `/readyz` answers `ready` ([health checks, metrics and logs](/self-hosting/monitoring/)), and `reputecast doctor`
+  reports the schema as `current`.
 
 ## Roll back
 
-Going back to the previous image or binary does not undo migrations: the database keeps the newer schema.
+Going back to the previous image or binary does not undo migrations: the database keeps the newer schema. Within a
+minor release (1.3.0 to 1.3.2) migrations only add, and across one minor release (1.3 to 1.2) the older binary runs on
+the newer schema. Read the release notes first: a release that drops or renames something says so. Further back,
+restore the backup.
 
 - **Restore the backup** for an exact return to the state before the upgrade: stop ReputeCast, restore the dump you
   took (see [restore](/self-hosting/backups/#restore)), then start the version you ran before. Changes made after the
   upgrade are lost.
 - **Pin the previous version** (`REPUTECAST_VERSION` in `.env`, then `docker compose up -d`), as the
-  <UiPath path="admin.versionCard" /> card suggests, when you want to keep the data written since the upgrade.
+  <UiPath path="admin.versionCard" /> card suggests, when you want to keep the data written since the upgrade. 1.2
+  works on the partitioned `delivery_events` as well.
 - `reputecast migrate down` rolls back only the latest ReputeCast migration, one per run, and leaves the job queue's
-  tables alone. Prefer a restore.
+  tables alone. It is meant for development: down migrations drop data, so don't run it on a production database.
 
 ## Troubleshooting
 
 - **The new container exits at start**: read `docker compose logs app`. A failed migration stops the start with
   `migrate: …`; restore the backup and report the error with the release version.
+- **The app stays unhealthy and `/readyz` answers `database schema behind this release`**: no process applied the
+  migrations. Run `reputecast migrate up`, or start one process with `--auto-migrate`.
+- **`migrate: another migrator held the lock for 15m0s`**: another process was still migrating, for example converting
+  a large `delivery_events`. Let it finish, then start this one again.
 - **The version card says the update check failed**: the server can't reach `api.github.com`, or GitHub answered with an
   error. Nothing else is affected; the next check runs the following day.
 - **The latest release shows a dash**: the check is off, or has not run yet.

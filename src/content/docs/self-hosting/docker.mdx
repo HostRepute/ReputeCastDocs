@@ -10,6 +10,7 @@ sources:
   - Dockerfile
   - internal/cli/install.go
   - internal/cli/serve.go
+  - internal/cli/healthcheck.go
   - internal/config/config.go
   - internal/server/middleware.go
   - README.md
@@ -123,8 +124,40 @@ services:
       REPUTECAST_AUTO_INSTALL: "true"
       # Set when ReputeCast runs behind a reverse proxy (CIDRs or IPs):
       # REPUTECAST_HTTP__TRUSTED_PROXIES: 172.16.0.0/12
+      # Prometheus metrics listen on port 9464 inside the container (not
+      # published). To scrape the main port instead, set a bearer token:
+      # REPUTECAST_METRICS__TOKEN: change-me-at-least-16-chars
     volumes:
       - appdata:/var/lib/reputecast
+    # Ready once the database answers and its schema has every migration
+    # this release needs (/readyz); a worker-only container answers on the
+    # metrics port, which `reputecast healthcheck` tries next.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 2m
+
+  # To run background workers in their own container, add --role=web,ingest
+  # to the app (command: ["serve", "--role=web,ingest"]) and uncomment:
+  # worker:
+  #   image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+  #   restart: unless-stopped
+  #   command: ["worker"]
+  #   depends_on:
+  #     app:
+  #       condition: service_healthy
+  #   environment:
+  #     REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+  #     REPUTECAST_PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+  #   volumes:
+  #     - appdata:/var/lib/reputecast
+  #   healthcheck:
+  #     test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 4
 
 volumes:
   pgdata:
@@ -153,9 +186,17 @@ volumes:
 - **`REPUTECAST_AUTO_MIGRATE`** and **`REPUTECAST_AUTO_INSTALL`** turn on migrations at start and the creation of the
   first Owner. The image's command, `serve --auto-migrate --auto-install`, already passes both flags.
 - **`REPUTECAST_HTTP__TRUSTED_PROXIES`** is commented out; see [trusted proxies](#trusted-proxies).
+- **`REPUTECAST_METRICS__TOKEN`** is commented out. Prometheus metrics listen on port 9464 inside the container, which
+  the file doesn't publish; see [health checks, metrics and logs](/self-hosting/monitoring/).
 - **`appdata:/var/lib/reputecast`** keeps the secret key (`secret.key`) and uploaded files (`files/`). The image points
   `REPUTECAST_SECRETS__KEY_FILE` there, logs as JSON (`REPUTECAST_LOG__FORMAT=json`) and runs as user `nonroot`
   (uid 65532).
+- **The app's `healthcheck`** runs `reputecast healthcheck` every 15 seconds, the same check the image declares. The
+  container turns `healthy` once `/readyz` answers: PostgreSQL is reachable and every migration is applied. It doesn't
+  count failures for the first 2 minutes, so migrations at start have time; then 4 failures in a row mark it
+  `unhealthy`.
+- **`worker`** is commented out. Uncomment it, with `command: ["serve", "--role=web,ingest"]` on `app`, to run the
+  background jobs in their own container ([scale with web, ingest and worker roles](/self-hosting/scaling/)).
 
 ## Production settings in .env
 
@@ -227,8 +268,8 @@ notices a private address that keeps forwarding requests and sends instance admi
 
 ## Check that it worked
 
-- `docker compose ps` shows `postgres` as `healthy` and `app` as running.
-- `curl http://127.0.0.1:8080/readyz` answers `ready` (`503 database unavailable` when PostgreSQL can't be reached).
+- `docker compose ps` shows `postgres` and `app` as `healthy`.
+- `curl http://127.0.0.1:8080/readyz` answers `ready` (503 with the reason otherwise, such as `database unavailable`).
 - `docker compose exec app /usr/local/bin/reputecast migrate status` lists no migration as `pending`.
 - The public URL opens the ReputeCast sign-in page through your proxy.
 
