@@ -1,0 +1,122 @@
+---
+title: Límites de solicitudes
+description: "Límites de solicitudes de la API en ReputeCast: por clave y por sesión, inicio de sesión y MCP, envíos transaccionales, cabeceras X-RateLimit y respuestas 429."
+type: reference
+audience: [developer, operator]
+primaryKeyword: límites de solicitudes de la API
+sources:
+  - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/api/auth.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/send.go
+  - internal/revenue/conversions.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 6
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Estos son los límites de solicitudes de la API de una instancia de ReputeCast: cuántas solicitudes puede hacer cada
+cliente, cómo las cuenta el servidor y qué responde cuando alguien los supera.
+
+## Límites
+
+<LimitsTable area="rate-limits" />
+
+- Las llamadas con una clave de API o un token de agente se cuentan por clave, vengan de la dirección que vengan. Un
+  navegador con la sesión iniciada se cuenta por sesión una vez comprobado su inicio de sesión, y todos los
+  navegadores con sesión iniciada desde una misma dirección IP comparten un límite más alto, para que un equipo detrás
+  de la red de una oficina no comparta un único presupuesto. Las llamadas sin ninguna de las dos se cuentan por
+  dirección IP del cliente.
+- Las llamadas de envío transaccional y por lotes no cuentan para el límite de solicitudes por clave; en su lugar,
+  cada clave tiene su propio ritmo de mensajes (consulta [enviar correo transaccional con la API](/es/developers/transactional-api/)).
+- Las páginas públicas, los enlaces de seguimiento y los webhooks de los proveedores (`/p/`, `/t/`, `/hooks/`) quedan
+  fuera de estos límites. Los formularios de suscripción tienen sus propios límites (consulta
+  [formularios de suscripción](/es/forms/signup-forms/)).
+- Cada proceso del servidor cuenta por su cuenta, salvo los ritmos de envío transaccional, que todos los nodos web
+  toman del mismo presupuesto. Con varios nodos web detrás de un balanceador de carga, un cliente puede alcanzar los
+  demás límites en cada nodo.
+
+## Cabeceras
+
+<TableScroll label="Cabeceras de límite de solicitudes">
+
+| Cabecera                | Se envía en                                                               | Valor                                                                                                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-RateLimit-Limit`     | Todas las respuestas de `/api/` salvo el envío transaccional y por lotes   | Solicitudes permitidas por minuto para este cliente (para un navegador con sesión iniciada, el límite compartido de su dirección).                                                                 |
+| `X-RateLimit-Remaining` | Las mismas                                                                | Solicitudes que quedan en la ventana actual.                                                                                                                                                        |
+| `X-RateLimit-Reset`     | Las mismas                                                                | Cuándo termina la ventana actual, en segundos Unix.                                                                                                                                                 |
+| `Retry-After`           | Las respuestas `429`                                                      | Segundos que hay que esperar. `60` para los límites por clave, por dirección, de inicio de sesión y de MCP; para una sesión de navegador, los envíos transaccionales y las conversiones, el tiempo hasta que vuelve a haber margen (al menos 1). |
+
+</TableScroll>
+
+```http title="Cabeceras de la respuesta"
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Ratelimit-Limit: 600
+X-Ratelimit-Remaining: 590
+X-Ratelimit-Reset: 1792671646
+```
+
+Los nombres de las cabeceras HTTP no distinguen mayúsculas de minúsculas; léelas sin depender de ello.
+
+## Respuestas al alcanzar un límite
+
+Por encima del límite de solicitudes por clave:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Los "1,000 items" de este mensaje valen para añadir supresiones; la operación transaccional por lotes acepta hasta 100
+mensajes.
+
+Por encima del ritmo de mensajes de una clave solo de envío (aquí, 50 por segundo), con `Retry-After: 1`:
+
+```json title="429 Too Many Requests"
+{
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This key sends at most 50 messages per second. Wait 1 second (Retry-After) and send again with the same idempotency key.",
+  "code": "rate_limited"
+}
+```
+
+Por encima del límite de inicio de sesión, el detalle es "Too many sign-in attempts from your network. Wait a minute
+and try again." Por encima del límite de una sesión de navegador, es "Too many requests from this session: at most 600
+a minute. Requests resume in 12 s.", con los mismos segundos en `Retry-After`; el límite por dirección responde como
+el límite por clave. El servidor MCP responde a su límite con texto plano y `Retry-After: 60`: "Rate limit reached:
+120 calls per minute per agent. Calls resume within a minute." (con el límite propio del agente en lugar de 120).
+Consulta [errores](/es/developers/api-errors/) para el formato de los problemas.
+
+## Mantenerse por debajo de los límites
+
+- Lee `X-RateLimit-Remaining` y reduce el ritmo antes de que llegue a 0.
+- Ante un `429`, espera el número de segundos de `Retry-After` y vuelve a intentarlo. Reintentar antes solo trae otro
+  `429`.
+- Usa operaciones por lotes y el tamaño de página más grande que necesites (consulta
+  [paginación](/es/developers/api-pagination/)).
+- [Recibe webhooks](/es/developers/webhooks/) en lugar de consultar periódicamente si hay cambios.
+- Reintenta los envíos transaccionales con la misma `Idempotency-Key`, para que el mensaje se envíe una sola vez.
+- Da a cada tarea su propia clave, para que una tarea con mucha actividad no agote el límite de otra.
+
+## Cambiar los límites
+
+Los operadores del servidor definen los límites de solicitudes en la configuración: `http.rate_limit_api` para cada
+clave de API y cada sesión de navegador, `http.rate_limit_ip` para todos los navegadores con sesión iniciada desde una
+misma dirección en conjunto, y `http.rate_limit_auth` para el inicio de sesión (consulta la
+[referencia de configuración](/es/reference/configuration/)). Poner `http.rate_limit_api` a 0 desactiva los tres.
+Cuando ReputeCast funciona detrás de un proxy inverso, define `http.trusted_proxies` para que los clientes se cuenten
+por su propia dirección y no por la del proxy (consulta [proxy inverso y TLS](/es/self-hosting/reverse-proxy/)). El
+ritmo de mensajes de una clave solo de envío se define al crear la clave, y el límite de llamadas de un agente MCP, en
+la configuración de MCP del espacio de trabajo.

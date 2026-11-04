@@ -1,0 +1,190 @@
+---
+title: Récupérer l’accès depuis la ligne de commande
+description: Réinitialiser le mot de passe admin, la 2FA et les blocages de connexion depuis le serveur avec les commandes reputecast user, dans Docker ou avec le binaire.
+type: how-to
+audience: [operator]
+primaryKeyword: réinitialiser le mot de passe admin
+sources:
+  - internal/cli/user.go
+  - internal/cli/root.go
+  - internal/accounts/reset.go
+  - internal/accounts/signin.go
+  - internal/store/queries/users.sql
+  - internal/store/queries/throttle.sql
+  - internal/instance/users.go
+  - web/src/features/admin/users/UsersPage.tsx
+  - web/src/features/admin/users/UserDialogs.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Quand personne ne peut réparer un compte dans l’application, réinitialisez le mot de passe admin, l’authentification à
+deux facteurs et les blocages de connexion depuis le serveur avec les commandes `reputecast user`. Elles parlent
+directement à la base de données : elles fonctionnent donc avant qu’un fournisseur d’envoi soit connecté et quand tous
+les admins sont bloqués.
+
+## Avant de commencer
+
+- Un accès shell au serveur qui exécute ReputeCast.
+- Les commandes ont besoin de la même configuration que le serveur, au minimum l’URL de la base de données :
+  - **Docker Compose :** exécutez-les dans le conteneur de l’application en cours d’exécution, qui dispose déjà de
+    son environnement : `docker compose exec app /usr/local/bin/reputecast user …`
+  - **Binaire :** chargez d’abord l’environnement qu’utilise le service, par exemple
+    `set -a; . /etc/reputecast/env; set +a`, puis exécutez `reputecast user …`.
+- L’adresse e-mail du compte de la personne. Chaque commande prend `--email`.
+
+Chaque commande écrit une entrée dans le [journal d’audit](/fr/reference/glossary/#audit-log) avec l’acteur
+**CLI (server)**. Les commandes se terminent avec `0` en cas de succès, `2` pour une erreur d’utilisation (un
+`--reason` manquant, un mot de passe trop court) et `1` pour les autres erreurs, comme `Error: no account for <email>`.
+
+| Situation                                                  | Commande                                                        |
+| ---------------------------------------------------------- | --------------------------------------------------------------- |
+| Mot de passe oublié                                        | `reputecast user reset-password --email <address>`              |
+| Mot de passe oublié, et aucun moyen de transmettre un lien | `reputecast user reset-password --email <address> --password …` |
+| Application d’authentification perdue                      | `reputecast user reset-2fa --email <address> --reason "…"`      |
+| Bloqué après des échecs de connexion                       | Consultez [lever un blocage de connexion](#lever-un-blocage-de-connexion) |
+| Plus aucun admin de l’instance                             | `reputecast user make-admin --email <address>`                  |
+
+## Réinitialiser un mot de passe oublié
+
+<Steps>
+
+1. Affichez un lien de réinitialisation à usage unique :
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io
+   ```
+
+   ```txt title="Sortie"
+   One-time password reset link for aisha@acme.io (works once, until 12:39 UTC):
+
+     https://reputecast.acme.io/reset-password/<token>
+
+   Send it to them privately. Their current password keeps working until they use it.
+   ```
+
+   Le lien utilise l’URL publique enregistrée dans <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, ou
+   `http.public_url` tant qu’aucune n’est enregistrée. Un compte désactivé est refusé :
+   `<email> is deactivated; reactivate the account first`.
+
+2. Envoyez le lien à la personne par un canal privé. Il fonctionne une fois, pendant 15 minutes.
+
+3. Elle l’ouvre et choisit un nouveau mot de passe. La politique de mot de passe de l’instance s’applique (longueur,
+   réutilisation, contrôle des mots de passe compromis). Le définir déconnecte toutes les sessions et lève un blocage
+   de connexion ; la connexion suivante demande toujours son second facteur.
+
+</Steps>
+
+Tant qu’aucun fournisseur d’envoi ne peut envoyer sur le flux Système, le lien <UiPath path="auth.forgotPassword" />
+de la page de connexion affiche cette même commande au lieu d’envoyer un e-mail.
+
+### Définir directement un mot de passe
+
+Avec `--password`, la commande définit immédiatement le mot de passe au lieu d’afficher un lien :
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io --password 'a long passphrase here'
+```
+
+Elle répond `Password set for aisha@acme.io. Every session was signed out.` et annule les liens de réinitialisation
+ouverts. Le mot de passe doit respecter `auth.password_min_length` de la [configuration](/fr/reference/configuration/)
+(12 caractères par défaut), et non la politique définie dans Administration de l’instance ; un mot de passe plus court
+s’arrête avec `Error: Use at least 12 characters. Passphrases are fine.`
+
+<Aside type="caution">
+  Un mot de passe passé en ligne de commande atterrit dans l’historique de votre shell. Préférez le lien de
+  réinitialisation, ou demandez à la personne de changer son mot de passe juste après sa connexion.
+</Aside>
+
+## Retirer une application d’authentification perdue
+
+<Steps>
+
+1. Vérifiez que la demande vient bien de la personne, par exemple lors d’un appel, et non d’un e-mail qui la réclame.
+
+2. Retirez son application d’authentification en indiquant une raison, qui est consignée dans le journal d’audit :
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-2fa --email aisha@acme.io --reason "lost phone, verified by video call"
+   ```
+
+   Elle répond `Two-factor reset for aisha@acme.io. They have 72 hours to set it up again.` Sans `--reason`, elle
+   s’arrête avec `Error: --reason is required; it's written to the audit log`.
+
+3. La personne se connecte avec son mot de passe. La commande a retiré son application d’authentification et ses codes
+   de récupération et a fermé ses sessions ; ses clés d’accès restent. Il lui est demandé d’ajouter de nouveau une clé
+   d’accès ou une application d’authentification, ce qu’elle doit faire sous 72 heures.
+
+</Steps>
+
+Une personne qui a encore un [code de récupération](/fr/reference/glossary/#recovery-code) n’en a pas besoin : elle
+choisit l’option du code de récupération à la deuxième étape de connexion. Dans l’application, un admin de l’instance
+peut effectuer la même réinitialisation avec <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, puis
+**⋯** › <UiPath path="admin.resetTwoFactor" />. Cette version demande le mot de passe de l’admin, prévient la
+personne et utilise le délai de grâce de la politique au lieu de 72 heures.
+
+## Lever un blocage de connexion
+
+Après trop d’échecs de mot de passe (10 par défaut), la connexion pour cette adresse e-mail répond
+`Sign-in is locked after too many attempts. Try again after <time>, reset your password, or use a passkey.`
+
+- **Dans l’application :** <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, puis **⋯** ›
+  <UiPath path="admin.unlockSignIn" /> lève le blocage immédiatement.
+- **Avec un lien de réinitialisation :** définir un nouveau mot de passe via un lien `reputecast user reset-password`
+  lève le blocage.
+- **En attendant :** le blocage prend fin de lui-même après la période de blocage (15 minutes par défaut).
+
+`reputecast user unlock --email <address>` répond `<email> can sign in again.` et remet à zéro le nombre de tentatives
+échouées du compte. Dans cette version, la commande ne lève pas le blocage que la connexion par mot de passe vérifie
+en premier : la connexion par mot de passe reste donc bloquée jusqu’à la fin de la période de blocage. Utilisez l’un
+des trois moyens ci-dessus.
+
+## Nommer quelqu’un admin de l’instance
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user make-admin --email linh@acme.io
+```
+
+Elle répond `linh@acme.io is now an instance admin.` La commande ne fait qu’accorder le rôle. Pour le retirer, utilisez
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" />, puis **⋯** › <UiPath path="admin.removeInstanceAdmin" />.
+
+<Aside type="tip" title="Quand l’authentification unique est en panne">
+  Sur un domaine où le [SSO est imposé](/fr/self-hosting/sso/), la connexion par mot de passe est désactivée : une
+  réinitialisation du mot de passe n’aide donc pas. Les Propriétaires de ce domaine marqués comme comptes d’urgence, y
+  compris le premier Propriétaire créé par `reputecast install`, conservent la connexion par mot de passe et
+  authentification à deux facteurs. Si aucun ne peut se connecter, nommez admin de l’instance un compte d’un autre
+  domaine et désactivez l’obligation dans <UiPath path="shell.userMenuInstanceAdmin > admin.sso" />.
+</Aside>
+
+## Vérifier le résultat
+
+- La personne se connecte, ou ouvre son lien de réinitialisation avant son expiration.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> liste la commande avec l’acteur **CLI (server)**.
+
+## Dépannage
+
+- **`Error: no account for <email>`** : l’adresse e-mail ne correspond à aucun compte. Les commandes comparent les
+  adresses sans tenir compte de la casse ; vérifiez les fautes de frappe ou une ancienne adresse.
+- **Le lien de réinitialisation pointe vers `http://localhost:8080`** : aucune URL publique n’est encore enregistrée,
+  et `http.public_url` a sa valeur par défaut. Définissez l’URL publique, ou remplacez l’hôte du lien par l’adresse
+  qu’utilisent les personnes.
+- **La commande ne peut pas se connecter à la base de données** avec le binaire : elle n’a pas l’URL de la base de
+  données du serveur et se rabat sur la valeur par défaut `localhost:5432`. Chargez d’abord l’environnement du
+  service.
+- **Toujours bloqué après `reputecast user unlock`** : c’est attendu dans cette version. Utilisez
+  <UiPath path="admin.unlockSignIn" /> dans l’application, un lien de réinitialisation, ou attendez la fin du blocage.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="authentication" />
+
+## Voir aussi
+
+- [Administration de l’instance](/fr/self-hosting/instance-admin/) : les mêmes actions dans l’application.
+- [Sécuriser votre compte](/fr/team/account-security/) : mots de passe, clés d’accès, applications d’authentification
+  et codes de récupération.
+- [Référence de la CLI](/fr/reference/cli/) : toutes les commandes et options de `reputecast`.

@@ -1,0 +1,246 @@
+---
+title: Kontakte aus CSV oder XLSX importieren
+description: E-Mail-Liste per CSV importieren oder als XLSX-Datei, ohne Einwilligungen zu verlieren. Felder zuordnen, riskante Adressen prüfen, übersprungene Zeilen laden.
+type: how-to
+audience: [publisher]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: E-Mail-Liste per CSV importieren
+sources:
+  - internal/imports
+  - internal/emailaddr/emailaddr.go
+  - internal/verification/imports.go
+  - internal/audience/optin.go
+  - internal/audience/retention.go
+  - internal/store/queries/imports.sql
+  - web/src/features/imports
+  - web/src/features/verification/ImportCheck.tsx
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+So importieren Sie eine E-Mail-Liste per CSV oder XLSX in fünf Schritten (Quelle, Felder zuordnen, Einwilligung,
+Vorschau, Import) und lesen danach die Zusammenfassung. Jede Zeile behält ihre
+[Einwilligung](/de/reference/glossary/#consent): Adressen, die sich im alten Tool abgemeldet haben, einen Bounce hatten
+oder sich beschwert haben, kommen direkt auf die [Sperrliste](/de/audience/suppressions/), und kein Import kann sie je
+wieder anmelden.
+
+Die Bildschirme sind für eine Datei und für eine API-Quelle wie Mailchimp oder Brevo dieselben; die Screenshots unten
+zeigen API-Importe. Wie Sie Kontakte über die API einer anderen Plattform übernehmen, steht unter
+[Zu ReputeCast wechseln, ohne Einwilligungen zu verlieren](/de/migrate/overview/).
+
+## Bevor Sie beginnen
+
+- Sie brauchen `subscribers:import`. Die Rollen Inhaber, Admin und Bearbeiter haben diese Berechtigung, Betrachter
+  nicht.
+- Bereiten Sie eine `.csv`- oder `.xlsx`-Datei vor. Die erste nicht leere Zeile muss die Spaltenüberschriften
+  enthalten. XLSX-Dateien werden nur aus dem ersten Arbeitsblatt gelesen; `.xls`-Dateien werden nicht unterstützt,
+  speichern Sie sie also zuerst als XLSX oder CSV.
+- Verbinden Sie nach Möglichkeit zuerst Ihre [Versandanbieter](/de/providers/connect/). Der Import ruft dann die
+  Bounces, Beschwerden und Abmeldungen ab, die diese bereits blockieren, bevor er jemanden hinzufügt.
+- Optional: Verbinden Sie einen [Prüfdienst](/de/audience/verification/) für Adressen, um neue Adressen in der
+  Vorschau zu prüfen.
+
+<LimitsTable area="imports" />
+
+### Wie ReputeCast die Datei liest
+
+- **Trennzeichen**: Komma, Semikolon, Tab oder senkrechter Strich, je nachdem, was in der ersten Zeile am häufigsten
+  vorkommt.
+- **Zeichenkodierung**: UTF-8 (eine Byte-Order-Mark wird ignoriert); alles, was kein gültiges UTF-8 ist, wird als
+  Latin-1 gelesen.
+- **E-Mail-Spalte**: eine Spalte mit der Überschrift `email`, `e-mail`, `email address` oder `mail`. Fehlt sie, wählt
+  ReputeCast die Spalte mit den meisten gültigen Adressen unter ihren ersten 20 Werten.
+- **Statusspalte**: eine Spalte mit der Überschrift `status`, `consent`, `subscribed`, `subscription status`,
+  `opt-in status` oder `email status`. Ihre Werte entscheiden, was aus jeder Zeile im Schritt Einwilligung wird (siehe
+  die Tabelle dort).
+- **Tag-Spalte**: eine Spalte mit der Überschrift `tags`, `tag`, `labels` oder `label`. Die Werte werden an Kommas,
+  Semikolons oder senkrechten Strichen getrennt und in Kleinbuchstaben umgewandelt.
+
+<Aside type="caution">
+  In einer Statusspalte zählt jeder Wert, den ReputeCast nicht erkennt, als **abgemeldet**, und die Zeile wird
+  gesperrt. Prüfen Sie die Zahlen im Schritt Einwilligung, bevor Sie fortfahren, und benennen Sie die Spalte um, wenn
+  sie keinen Abonnementstatus enthält.
+</Aside>
+
+## Die Datei importieren
+
+<Steps>
+
+1. Wählen Sie <UiPath path="shell.importContacts" /> in der Seitenleiste oder <UiPath path="nav.audience > audience.tabContacts > audience.contacts.import" />.
+   Ziehen Sie unter <UiPath path="imports.stepSource" /> die Datei auf die Seite oder wählen Sie
+   <UiPath path="imports.chooseFile" />.
+
+   <Screenshot
+     id="import-source"
+     alt="Schritt 1 von 5, Quelle: Kacheln für Brevo, Mailchimp, MailerLite, listmonk, Keila, Notifuse und CSV oder XLSX, dazu eine Tabelle, die jede Liste der Quelle einer Liste in ReputeCast zuweist."
+   />
+
+   Hat eine CSV-Zeile eine andere Anzahl Spalten als die Kopfzeile (meist ein Komma ohne Anführungszeichen in einem
+   Wert), nennt die Seite die Zeile. Überspringen Sie solche Zeilen, laden Sie sie herunter oder laden Sie eine
+   korrigierte Datei hoch.
+
+2. Wählen Sie in <UiPath path="imports.chooseTitle" /> unter <UiPath path="imports.intoList" /> die Liste, in die die
+   Datei kommt: eine vorhandene Liste oder eine neue, nach der Datei benannte Liste. Lassen Sie
+   <UiPath path="imports.pullSuppressions" /> aktiviert und wählen Sie dann <UiPath path="imports.continueFields" />.
+
+3. Prüfen Sie unter <UiPath path="imports.stepFields" /> die Vorschläge. Jede Spalte wird einem integrierten Feld
+   (Vorname, Nachname, Name, Firma, Land, Zeitzone, Sprache, Telefon, SMS-Einwilligung), einem vorhandenen eigenen Feld,
+   einem neuen eigenen Feld (Text, Zahl, Datum oder Boolesch) oder **Überspringen** zugeordnet. Genau eine Spalte muss
+   der E-Mail-Adresse zugeordnet sein.
+
+   <Screenshot
+     id="import-fields"
+     alt="Felder zuordnen: jedes Mailchimp-Feld mit Beispielwerten, dem zugeordneten Feld in ReputeCast, seinem Typ und einem Badge Zugeordnet oder Neues Feld, unter Chips mit 10 zugeordneten, 2 neuen und 2 übersprungenen Feldern."
+   />
+
+   Eine Sprachspalte wird in Sprachcodes umgewandelt („Spanish“, „español“ und „ES“ werden zu `es`). Werte, die keine
+   Sprachen sind, bleiben leer und werden unter der Spalte gezählt. Wählen Sie
+   <UiPath path="imports.continueConsent" />.
+
+4. Prüfen Sie unter <UiPath path="imports.stepConsent" />, was aus jedem Status wird. Abgemeldete, bereinigte
+   (Bounce) und beschwerte Zeilen sind gesperrt: Sie werden zu Einträgen auf der Sperrliste.
+
+   <TableScroll label="Was aus jedem Status der Datei wird">
+
+   | Wert in der Statusspalte | Wird zu | Wirkung |
+   | --- | --- | --- |
+   | Leer, `subscribed`, `active`, `yes`, `true`, `1`, `confirmed`, `opted in`, `opt-in`, `enabled` | Abonniert (stattdessen auch Ausstehend oder Überspringen wählbar) | Erhält sofort Massenversand und Automationen |
+   | `pending`, `unconfirmed`, `not confirmed` | Ausstehend, mit einer Re-Permission-E-Mail, oder Überspringen | Keine Marketing-E-Mails, bis der Kontakt bestätigt |
+   | `bounced`, `cleaned`, `hard bounce`, `invalid`, `undeliverable` | Als Hard Bounce gesperrt (fest) | Alle Streams blockiert |
+   | `complained`, `spam`, `abuse`, `junk` | Als Beschwerde gesperrt (fest) | Alle Streams blockiert |
+   | `transactional` | Überspringen oder Abonniert · ausstehend | Nicht importiert oder ausstehend |
+   | Jeder andere Wert | Als Abmeldung gesperrt (fest) | Massenversand und Automationen blockiert; System-E-Mails erlaubt |
+
+   </TableScroll>
+
+   Wählen Sie unter <UiPath path="imports.evidenceTitle" /> eine Option:
+
+   - Dem Opt-in der Datei vertrauen: nur, wenn jeder Kontakt eingewilligt hat. Die Kontakte werden mit
+     Single-Opt-in-Einwilligung angemeldet.
+   - <UiPath path="imports.repermission" />: Die Kontakte werden als ausstehend importiert und erhalten nach dem Import
+     eine Bestätigungs-E-Mail über den Stream System. Es ist die gestaltete E-Mail Ihrer Formulare, in der Sprache des
+     Kontakts, und sie nennt die Listen, auf denen der Kontakt aussteht. Unabhängig davon, was sie auslöst, erhält eine
+     Adresse höchstens eine Bestätigungs-E-Mail alle 10 Minuten und fünf am Tag (siehe
+     [Double-Opt-in](/de/audience/lists-and-consent/)). Sicherer für alte Listen oder Listen mit Single-Opt-in.
+     Kontakte, die nach 14 Tagen nicht bestätigt haben, werden für Massenversand und Automationen gesperrt (siehe den
+     Hinweis unten).
+
+   Lassen Sie <UiPath path="imports.pullBefore" /> und <UiPath path="imports.recordHistory" /> aktiviert. Um diese
+   Kontakte später zu finden, geben Sie unter <UiPath path="imports.importTag" /> ein Tag ein: Es kommt an jeden Kontakt,
+   den der Import hinzufügt oder zusammenführt. Wählen Sie dann <UiPath path="imports.continuePreview" />.
+
+   <Screenshot
+     id="import-consent"
+     alt="Einwilligung: jeder Status der Quelle mit seiner Kontaktzahl und dem, was daraus wird; abgemeldete und bereinigte Zeilen sind fest als Sperren gesetzt, darunter die Wahl für Re-Permission."
+   />
+
+5. Lesen Sie unter <UiPath path="imports.stepPreview" /> den Probelauf. Noch wird nichts gespeichert. Die Kacheln
+   zählen die Zeilen, die importiert, mit vorhandenen Kontakten zusammengeführt, gesperrt, als ungültig übersprungen
+   werden oder riskant sind.
+
+   <Screenshot
+     id="import-preview"
+     alt="Der Probelauf für 13.739 geprüfte Zeilen: Kacheln für 10.958 zu importieren, 318 zusammengeführt, 1.259 gesperrt, 449 ungültig und 755 riskant, darunter die Gruppen riskanter Adressen mit je einer Aktion."
+   />
+
+   Wählen Sie für jede riskante Gruppe eine Aktion:
+
+   <TableScroll label="Gruppen riskanter Adressen">
+
+   | Gruppe | Was sie erfasst | Standardaktion |
+   | --- | --- | --- |
+   | Rollenadressen | `info@`, `sales@`, `support@`, `noreply@` und ähnliche | Importieren, automatisch vom Massenversand ausgeschlossen |
+   | Wegwerf-Domains | Domains von Wegwerfpostfächern | Überspringen |
+   | Vermutlich Tippfehler | Einen Buchstaben entfernt von gmail.com, outlook.com, hotmail.com, yahoo.com, icloud.com und anderen | Domain korrigieren und importieren, mit Tag `review-typo` |
+   | Bekannte Spamfallen-Muster | Lokale Teile wie `spamtrap` oder `honeypot` | Überspringen (empfohlen) |
+
+   </TableScroll>
+
+   Duplikate werden anhand der E-Mail-Adresse erkannt, ohne Groß- und Kleinschreibung zu beachten. Behalten Sie unter
+   <UiPath path="imports.onConflict" /> die Option <UiPath path="imports.conflictFill" />, um nur leere Felder zu
+   füllen, oder überschreiben bzw. behalten Sie die Werte in ReputeCast. Beim Zusammenführen kommen Liste und Tags
+   hinzu; die Einwilligung eines Kontakts ändert es nie. Ungültige Zeilen (keine Domain, kein MX-Eintrag, keine
+   Adresse) werden übersprungen; <UiPath path="imports.downloadThese" /> liefert Ihnen die Liste.
+
+   Ist ein Prüfdienst verbunden, können Sie die neuen Adressen vorher prüfen, mit Anzeige der Kosten, oder
+   <UiPath path="verification.importWithout" /> wählen.
+
+6. Wählen Sie **_N_ Kontakte importieren**. Der Import läuft im Hintergrund in Batches von 500 Zeilen. Wählen Sie
+   <UiPath path="imports.leaveRunning" />, um die App währenddessen zu nutzen; bereits importierte Kontakte sind sofort
+   verwendbar, und nach Abschluss erhalten Sie eine Benachrichtigung mit dem Bericht.
+   <UiPath path="imports.stopImport" /> behält die bereits importierten Zeilen; ein gestoppter Import lässt sich nicht
+   fortsetzen, Sie können aber einen neuen starten.
+
+7. Lesen Sie die Zusammenfassung. Sie zählt importierte, zusammengeführte, gesperrte, ausstehende und übersprungene
+   Zeilen, erklärt jede übersprungene oder geänderte Gruppe und bietet zwei Downloads:
+
+   - **Übersprungene Zeilen herunterladen · CSV**: `row,value,source_status,reason`.
+   - <UiPath path="imports.downloadReport" />: `row,email,source_status,outcome,reason` für jede Zeile.
+
+   Beide Dateien enthalten jede Adresse, die der Import gelesen hat, deshalb bewahrt ReputeCast sie nur für die Dauer
+   aus der Tabelle oben auf; die Zusammenfassung nennt das Datum. Danach sind die Buttons deaktiviert, und ein Download
+   antwortet mit `410`. [Endgültiges Löschen eines Kontakts](/de/audience/contacts/) entfernt seine Zeilen aus den noch
+   aufbewahrten Dateien.
+
+   <Screenshot
+     id="import-report"
+     alt="Zusammenfassung des Imports: 39.402 Kontakte importiert, 1.033 gesperrt, 6.716 warten auf Re-Permission und 214 übersprungen, darunter die beiden Downloads mit den bis 8. Nov. 2026 aufbewahrten Dateien und der Grund für jede übersprungene oder geänderte Gruppe."
+   />
+
+   Neue Sperren werden an die Versandanbieter übertragen, die sie annehmen, sodass die nächste Kampagne diese Adressen
+   bei keinem Anbieter erreichen kann.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- <UiPath path="imports.viewImported" /> in der Zusammenfassung öffnet
+  <UiPath path="nav.audience > audience.tabContacts" />, gefiltert auf die Kontakte, die der Import hinzugefügt hat
+  (<UiPath path="audience.contacts.moreFilters > audience.contacts.fromImport" />); zusammengeführte Kontakte tragen
+  das Tag des Imports, falls Sie eins gesetzt haben. Filtern Sie <UiPath path="audience.contacts.consent" /> nach
+  <UiPath path="audience.consentPendingFilter" />, um zu sehen, wer noch bestätigen muss.
+- Jede Liste, die die Zusammenfassung nennt, zeigt ihre neue Kontaktzahl.
+- <UiPath path="nav.audience > audience.tabSuppressions" /> zeigt die importierten Sperren, gruppiert unter dem Import,
+  mit <UiPath path="audience.suppressions.viewRows" />, um sie zu öffnen.
+
+## Fehlerbehebung
+
+- **„Zeile _N_ hat _X_ Spalten, die Kopfzeile hat _Y_“** → Ein Wert enthält ein Komma ohne Anführungszeichen.
+  Überspringen Sie die Zeilen oder setzen Sie den Wert in Anführungszeichen und laden Sie die Datei erneut hoch.
+- **„Die Datei ist größer als 100 MB“** → Teilen Sie die Datei auf, oder importieren Sie über die API der Quelle.
+- **Für die E-Mail-Adresse wurde die falsche Spalte verwendet** → Benennen Sie die Überschrift dieser Spalte in
+  `email` um und laden Sie die Datei erneut hoch.
+- **Viele Zeilen wurden gesperrt** → Die Statusspalte enthält Werte, die ReputeCast nicht erkennt. Benennen Sie die
+  Spalte um, damit sie nicht als Status gelesen wird, oder ändern Sie die Werte in `subscribed`.
+- **Ausstehende Kontakte haben nie eine Bestätigungs-E-Mail erhalten** → Es ist kein Anbieter für System verbunden.
+  Verbinden Sie einen im [Routing](/de/providers/routing/) und wählen Sie dann unter Kontakte
+  <UiPath path="audience.contacts.resendOptin" /> für diese Kontakte.
+- **Tags fehlen** → Nur eine Spalte mit der Überschrift `tags`, `tag`, `labels` oder `label` wird als Tags gelesen.
+- **„Dieser Import wurde bereits gestartet.“** → Der Import wurde zweimal gestartet, aus einem zweiten Tab oder per
+  Doppelklick. ReputeCast lehnt den zweiten Start ab (`409`), die Zeilen werden also nur einmal importiert.
+- **Das Protokoll des Imports meldet „Die hochgeladene Datei wurde entfernt, weil sie einen endgültig gelöschten
+  Kontakt enthielt.“** → Ein Kontakt aus der Datei wurde endgültig gelöscht, bevor der Import fertig war. Laden Sie
+  die Datei erneut hoch, um fortzufahren.
+
+<Aside type="note">
+  Ein Re-Permission-Kontakt, der 14 Tage nach seiner letzten Bestätigungs-E-Mail nicht bestätigt hat, wird wie bei
+  einer Abmeldung für Massenversand und Automationen gesperrt, mit der Quelle
+  <UiPath path="audience.suppressionSource.repermission" /> auf der [Sperrliste](/de/audience/suppressions/). Ein
+  erneutes Senden durch Ihr Team startet die 14 Tage neu, und eine spätere Bestätigung, aus derselben E-Mail oder über
+  eine neue Anmeldung, hebt die Sperre auf. Der stündliche Lauf, der das erledigt, erfasst einen Eintrag
+  `suppression.add` durch System im [Audit-Protokoll](/de/team/audit-log/).
+</Aside>
+
+## Verwandte Themen
+
+- [Listen, Einwilligung und Double-Opt-in](/de/audience/lists-and-consent/)
+- [Die Sperrliste](/de/audience/suppressions/)
+- [E-Mail-Adressen prüfen](/de/audience/verification/)
+- [Von Mailchimp migrieren](/de/migrate/mailchimp/) und die anderen [Migrationsanleitungen](/de/migrate/overview/)

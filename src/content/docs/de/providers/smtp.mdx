@@ -1,0 +1,146 @@
+---
+title: Über einen beliebigen SMTP-Server senden
+description: 'Newsletter über SMTP-Server versenden mit ReputeCast: Host, TLS und Anmeldung verbinden, dazu ein Bounce-Postfach per IMAP oder POP3 für Bounces.'
+type: how-to
+audience: [admin, operator]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Newsletter über SMTP-Server versenden
+sources:
+  - internal/providers/smtp
+  - internal/providers/bounce
+  - internal/providers/mimemsg
+  - internal/ingest/jobs.go
+  - internal/connect/connection.go
+  - web/src/features/connect/ConnectionSMTP.tsx
+  - web/src/features/connect/connection.messages.ts
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Mit ReputeCast können Sie Ihren Newsletter über SMTP-Server versenden: über Ihren eigenen Mailserver, ein Relay oder
+den SMTP-Endpunkt eines Anbieters. SMTP hat keine Ereignis-Webhooks, daher verbinden Sie zusätzlich ein
+[Bounce-Postfach](/de/reference/glossary/#bounce-mailbox): ReputeCast liest die Zustellfehler und Spam-Meldungen, die
+dort landen, und macht daraus dieselben Bounce- und Beschwerdeereignisse, die andere Anbieter per Webhook senden.
+
+<ProviderMatrix family="email" id="smtp" />
+
+## Bevor Sie beginnen
+
+- **Die Serverdaten:** Hostname, Port, Verschlüsselung und, falls der Server eine verlangt, eine Anmeldung. ReputeCast
+  meldet sich mit `AUTH PLAIN` oder `AUTH LOGIN` an; Server, die nur andere Methoden anbieten (etwa CRAM-MD5 oder
+  XOAUTH2), lassen sich nicht verwenden. TLS erfordert Version 1.2 oder höher und ein für den Hostnamen gültiges
+  Zertifikat.
+- **DKIM-Signierung auf dem Server oder Relay.** ReputeCast übergibt jede Nachricht unsigniert, daher muss der Server
+  sie mit dem DKIM-Schlüssel Ihrer Domain signieren.
+- **Ein eigenes Bounce-Postfach**, erreichbar über IMAP oder POP3, dessen Adresse der Return-Path (Envelope-Absender)
+  jeder Nachricht wird. Lesen Sie es nicht in einem E-Mail-Programm: ReputeCast ruft nur ungelesene Nachrichten ab.
+- **Für einen Server in Ihrem eigenen Netzwerk** (Loopback- oder private Adressen) aktiviert ein Instanz-Admin
+  `providers.allow_private_networks` (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Cloud-Metadaten-Adressen
+  werden immer abgelehnt.
+- **Berechtigungen.** Zum Verbinden brauchen Sie `providers:manage`; um eine neue Versand-Domain hinzuzufügen,
+  `domains:manage`.
+
+## SMTP-Server verbinden
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.providers" />, wählen Sie <UiPath path="providers.overview.addProvider" /> und im
+   Katalog die SMTP-Karte. [Versandanbieter verbinden](/de/providers/connect/) erklärt die Schritte, die alle Anbieter
+   gemeinsam haben.
+
+2. Füllen Sie unter <UiPath path="connect.connection.smtp.serverTitle" /> Folgendes aus:
+   - <UiPath path="connect.connection.smtp.host" />, zum Beispiel `smtp.example.com`;
+   - <UiPath path="connect.connection.smtp.port" /> und <UiPath path="connect.connection.smtp.encryption" />: STARTTLS
+     auf 587 (der Standard), implizites TLS auf 465 oder kein TLS (nur in einem privaten Netzwerk);
+   - <UiPath path="connect.connection.smtp.username" /> und <UiPath path="connect.connection.smtp.password" />, wenn
+     der Server eine Anmeldung verlangt;
+   - <UiPath path="connect.connection.smtp.maxRate" /> und <UiPath path="connect.connection.smtp.dailyCap" />.
+     SMTP-Server veröffentlichen ihre Limits nicht, daher drosselt ReputeCast auf die eingegebene Rate (10 Nachrichten
+     pro Sekunde, wenn Sie das Feld leer lassen) und weicht zurück, wenn der Server mit einem 4xx-Code antwortet.
+
+3. Wählen Sie <UiPath path="connect.connection.smtp.testConnection" />. ReputeCast verbindet sich, sendet EHLO mit dem
+   Hostnamen Ihrer öffentlichen URL, startet TLS und meldet sich an, dann trennt es die Verbindung; es wird nichts
+   gesendet. Das Ergebnis zeigt, was funktioniert hat, zum Beispiel „STARTTLS, TLS 1.3 · AUTH PLAIN akzeptiert“, mit den
+   Antworten des Servers.
+
+4. Füllen Sie unter <UiPath path="connect.connection.smtp.mailboxTitle" /> die
+   <UiPath path="connect.connection.smtp.returnPath" />, das <UiPath path="connect.connection.smtp.protocol" /> (IMAP
+   wird empfohlen), den <UiPath path="connect.connection.smtp.mailServer" />, Port, Anmeldung und bei IMAP den
+   <UiPath path="connect.connection.smtp.folder" /> (standardmäßig `INBOX`) aus. Wählen Sie
+   <UiPath path="connect.connection.smtp.testMailbox" />. ReputeCast liest das Postfach, ohne es zu verändern, und sagt,
+   wie viele Nachrichten es gefunden hat und wie viele nach Zustellberichten aussehen.
+
+5. Wählen Sie <UiPath path="connect.connection.continueDomain" />; das wird freigeschaltet, sobald beide Tests bestanden
+   sind. Geben Sie Ihre Versand-Domain ein. ReputeCast kann auf dem Server keine Einträge anlegen, daher listet es auf,
+   was Sie veröffentlichen müssen: einen SPF-Eintrag mit `a:<your SMTP host>`, zusammengeführt mit Ihrem bestehenden
+   SPF-Eintrag, und DMARC, wenn die Domain keinen Eintrag hat. Veröffentlichen Sie den DKIM-Eintrag, den Ihr Server oder
+   Relay Ihnen gibt.
+
+6. Senden Sie unter <UiPath path="connect.stepTest" /> einen Test. Die Zustellung wird durch die Antwort `250` des
+   Servers bestätigt; ein Bounce für eine nicht existierende Adresse kommt später über das Bounce-Postfach an.
+
+7. Schließen Sie <UiPath path="connect.stepStreams" /> und <UiPath path="connect.stepContacts" /> ab. Von einem
+   SMTP-Server gibt es nichts abzurufen: Die Sperrliste bleibt in ReputeCast.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Die SMTP-Karte unter <UiPath path="nav.providers > providers.tabProviders" /> zeigt
+  <UiPath path="providers.statusHealthy" />. ReputeCast wiederholt die Prüfung von Verbindung und Anmeldung etwa alle 5
+  Minuten.
+- Ein Bounce an eine nicht existierende Adresse erscheint innerhalb weniger Minuten unter
+  <UiPath path="nav.providers > providers.tabEvents" />, mit dem ursprünglichen Statuscode.
+
+ReputeCast sendet bis zu 25 Nachrichten über eine SMTP-Verbindung, mit den Headern `Message-ID`, `List-Unsubscribe`,
+`List-Unsubscribe-Post` und `Feedback-ID` und der Adresse des Bounce-Postfachs als Envelope-Absender. SMTP-Server melden
+keine Zustellungen: ReputeCast zählt eine Nachricht als zugestellt (abgeleitet), sobald der Server sie mit seiner
+Antwort `250` annimmt, und erfährt von Fehlern über das Bounce-Postfach. Kündigt der Server DSN-Unterstützung an,
+fordert ReputeCast außerdem Zustellstatusbenachrichtigungen bei Erfolg, Fehler und Verzögerung an, nur mit den Headern;
+eine Erfolgsmeldung bestätigt die Zustellung und wird nie als Bounce gelesen. Im Bounce-Postfach liest es
+standardkonforme Zustellstatusbenachrichtigungen (RFC 3464), Spam-Meldungen im ARF-Format (RFC 5965) und die üblichen
+nicht standardkonformen Bounce-Formate; Abwesenheitsnotizen und andere E-Mails werden ignoriert. Eine Meldung zählt nur,
+wenn sie eine Nachricht betrifft, die ReputeCast gesendet hat (erkannt an ihrem Header `X-ReputeCast-Message` oder an
+der `Message-ID`), und den Empfänger dieser Nachricht nennt; andere Meldungen werden als Ereignisse aufbewahrt und
+ändern nichts. Ein dauerhafter Fehler ist ein Hard Bounce und sperrt die Adresse im ganzen Arbeitsbereich;
+vorübergehende Fehler sind Soft Bounces. Unklare Codes zählen als vorübergehend, damit nichts auf Verdacht gesperrt
+wird.
+
+<Aside type="note">
+  ReputeCast prüft das Bounce-Postfach jede Minute und liest dabei jeweils bis zu 200 ungelesene Nachrichten. Es
+  markiert IMAP-Nachrichten als gelesen und löscht POP3-Nachrichten nach dem Lesen. Die Optionen
+  <UiPath path="connect.connection.smtp.pollEvery" /> und <UiPath path="connect.connection.smtp.afterProcessing" /> im
+  Formular werden gespeichert, ändern daran aber noch nichts.
+</Aside>
+
+## Fehlerbehebung
+
+- **„ECONNREFUSED · an diesem Port lauscht nichts“**, **„ENOTFOUND · der Hostname lässt sich nicht auflösen“** oder
+  **„ETIMEDOUT · keine Antwort innerhalb von 15 s“**. Prüfen Sie Host und Port und ob eine Firewall ausgehendes SMTP vom
+  ReputeCast-Host blockiert.
+- **„… bietet auf Port … kein STARTTLS an.“** Verwenden Sie implizites TLS auf 465 oder deaktivieren Sie die
+  Verschlüsselung nur in einem privaten Netzwerk.
+- **„… bietet keine Anmeldemethode an, die ReputeCast unterstützt“.** Der Server bietet weder `PLAIN` noch `LOGIN` an.
+  Aktivieren Sie eine davon für das Konto oder verwenden Sie ein anderes Relay.
+- **Der Verbindungstest schlägt mit `535` fehl.** Der Server hat Benutzername oder Passwort abgelehnt.
+- **„ReputeCast verbindet sich nicht mit dieser Adresse“.** Der Host liegt auf einer privaten oder Loopback-Adresse.
+  Aktivieren Sie `providers.allow_private_networks` oder verwenden Sie den öffentlichen Namen des Servers.
+- **„Das Postfach hat Benutzername oder Passwort abgelehnt.“** Prüfen Sie die Anmeldung des Bounce-Postfachs; manche
+  Hoster verlangen für IMAP oder POP3 ein App-Passwort.
+- **Bounces erscheinen nie.** Prüfen Sie, ob die Return-Path-Adresse das Bounce-Postfach ist, ob niemand das Postfach in
+  einem E-Mail-Programm liest (gelesene Nachrichten werden übersprungen) und ob der Ordner stimmt.
+- **Gmail oder Yahoo melden DKIM als fehlend.** ReputeCast signiert SMTP-E-Mails nicht. Aktivieren Sie die
+  DKIM-Signierung auf dem Server oder Relay und veröffentlichen Sie dessen Schlüssel.
+
+## Verwandte Themen
+
+- [Versandanbieter verbinden](/de/providers/connect/)
+- [Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/)
+- [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/)
+- [Mit Ihrem eigenen Postal-Server senden](/de/providers/postal/)
+- [Bounces, Beschwerden und Anbietergrenzen](/de/deliverability/bounces-and-complaints/)

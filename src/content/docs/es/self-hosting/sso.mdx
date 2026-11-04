@@ -1,0 +1,225 @@
+---
+title: Inicio de sesión único con OIDC
+description: Configurar SSO con OIDC en ReputeCast con Google Workspace, Microsoft Entra ID, Okta, Keycloak o Authentik, con cuentas automáticas y roles por grupo.
+type: how-to
+audience: [operator, admin]
+primaryKeyword: configurar SSO con OIDC
+uiPath: 'shell.userMenuInstanceAdmin > admin.sso'
+sources:
+  - internal/sso
+  - internal/accounts/signin.go
+  - internal/instance/policy.go
+  - migrations/00750_instance_admin_sso.sql
+  - web/src/features/admin/sso
+  - web/src/features/admin/auth/AuthenticationPage.tsx
+  - web/src/features/auth/signin.messages.ts
+sidebar:
+  order: 14
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Al configurar SSO con OIDC, las personas inician sesión en ReputeCast con el proveedor de identidad (IdP) de tu
+organización, sus cuentas se crean en el primer inicio de sesión y reciben los roles de los espacios de trabajo a partir
+de sus grupos del IdP. ReputeCast usa OpenID Connect; no admite SAML ni SCIM.
+
+## Antes de empezar
+
+- [Administras la instancia](/es/reference/glossary/#instance-admin). El SSO se configura una sola vez para toda la
+  instancia.
+- La URL pública es definitiva y usa `https://`
+  (<UiPath path="shell.userMenuInstanceAdmin > admin.instance > admin.publicUrl" />). La URI de redirección que
+  registras en el IdP se construye a partir de ella; si la URL cambia más adelante, actualiza también el registro en el
+  IdP.
+- Puedes crear una aplicación (cliente) en tu IdP, y sabes qué dominios de correo usa tu gente.
+- <UiPath path="admin.methodSso" /> está activado en
+  <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> (lo está por defecto).
+
+## Configurar un proveedor
+
+<Screenshot
+  id="sso-setup"
+  alt="Configuración de Microsoft Entra ID: paso 1, la configuración predefinida con Microsoft Entra ID seleccionado; paso 2, la conexión con la URI de redirección que hay que copiar, la URL del emisor cuya prueba de discovery fue correcta, el Client ID, el client secret de solo escritura ya guardado y los scopes; el paso 3, la asignación de claims, empieza debajo."
+/>
+
+<Steps>
+
+1. Abre <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> y elige <UiPath path="admin.addSsoProvider" />. En
+   <UiPath path="sso.cardPreset" />, elige tu IdP: Google Workspace, Microsoft Entra ID, Okta, Keycloak, Authentik u
+   OIDC genérico. ReputeCast guarda un borrador al instante; nada está activo hasta que lo activas.
+
+2. En <UiPath path="sso.cardConnection" />, copia la <UiPath path="sso.redirectUri" />. Tiene la forma
+   `<public URL>/auth/oidc/<slug>/callback`, donde el slug viene de la configuración predefinida: `google`, `entra`,
+   `okta`, `keycloak`, `authentik` u `oidc` (un segundo proveedor con la misma configuración predefinida recibe `-2`).
+
+3. Registra ReputeCast en tu IdP como aplicación web que usa el flujo de código de autorización, con la URI de
+   redirección del paso 2. Anota la URL del emisor, el Client ID y el client secret.
+
+   <Tabs syncKey="idp">
+   <TabItem label="Google Workspace">
+
+   - Crea un OAuth client ID del tipo **Web application** en la consola de Google Cloud (APIs & Services ›
+     Credentials) y añade la URI de redirección como authorized redirect URI
+     ([documentación de OpenID Connect de Google](https://developers.google.com/identity/openid-connect/openid-connect),
+     comprobado en octubre de 2026).
+   - URL del emisor: siempre `https://accounts.google.com` (la configuración predefinida la rellena).
+   - Grupos: Google no envía un claim de grupos por OIDC, así que la asignación de grupos no está disponible. Da a las
+     cuentas nuevas un rol predeterminado con las cuentas automáticas (paso 7), o asigna los roles en la
+     [configuración del equipo](/es/team/members/) de cada espacio de trabajo.
+   - Verificación en dos pasos: ReputeCast considera el inicio de sesión de Google como verificación en dos pasos
+     (verificación en dos pasos exigida en Workspace).
+
+   </TabItem>
+   <TabItem label="Microsoft Entra ID">
+
+   - Crea un registro de aplicación (plataforma Web) en el Centro de administración de Microsoft Entra, añade la URI
+     de redirección y crea un client secret
+     ([plataforma de identidad de Microsoft y OpenID Connect](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc),
+     comprobado en octubre de 2026). Los client secrets de Entra caducan: escribe la fecha de caducidad en ReputeCast
+     para que te indique cuándo reemplazar el secreto.
+   - URL del emisor: `https://login.microsoftonline.com/<tenant-id>/v2.0`, con tu ID de inquilino (un GUID) o tu
+     dominio verificado. Encontrarás el ID de inquilino en Entra ID › Overview.
+   - Grupos: abre **Token configuration** en el registro de aplicación, elige **Add groups claim** e incluye los grupos
+     de seguridad en el ID token. Entra envía los **ID de objeto** de los grupos, no sus nombres: pega el ID en una
+     asignación y ponle una etiqueta. Quien pertenece a más de 200 grupos recibe un enlace de overage en lugar del
+     claim; en ese caso, usa roles de aplicación.
+   - La verificación en dos pasos cuenta cuando el claim `amr` del ID token indica MFA (por ejemplo, exigida por el
+     acceso condicional).
+
+   </TabItem>
+   <TabItem label="Okta">
+
+   - Crea una integración de aplicación web OIDC con la URI de redirección como sign-in redirect URI
+     ([Okta: customize tokens with a groups claim](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/),
+     comprobado en octubre de 2026).
+   - URL del emisor: tu dominio de Okta o un servidor de autorización, como `https://acme.okta.com/oauth2/default`. La
+     encontrarás en Security › API › Authorization Servers.
+   - Grupos: añade un claim de grupos al servidor de autorización (filtro: matches regex `.*`). La configuración
+     predefinida de Okta ya pide el scope `groups`.
+   - La verificación en dos pasos cuenta cuando el claim `amr` del ID token indica MFA (exigida por una sign-on
+     policy).
+
+   </TabItem>
+   <TabItem label="Keycloak">
+
+   - En tu realm, crea un cliente OpenID Connect con la autenticación de cliente activada y la URI de redirección como
+     valid redirect URI
+     ([guía de administración del servidor de Keycloak](https://www.keycloak.org/docs/latest/server_admin/#_oidc),
+     comprobado en octubre de 2026).
+   - URL del emisor: termina con el realm, por ejemplo `https://sso.acme.io/realms/acme`.
+   - Grupos: en Clients › tu cliente › Client scopes › el scope dedicado, añade un mapper **Group Membership** con el
+     nombre de claim del token `groups` y la ruta completa del grupo desactivada.
+   - La verificación en dos pasos cuenta cuando el claim `amr` del ID token indica MFA (OTP exigido por el browser
+     flow del realm).
+
+   </TabItem>
+   <TabItem label="Authentik">
+
+   - Crea un proveedor OAuth2/OpenID (cliente confidencial) con la URI de redirección, y una aplicación que lo use
+     ([proveedor OAuth2 de Authentik](https://docs.goauthentik.io/docs/add-secure-apps/providers/oauth2/), comprobado
+     en octubre de 2026).
+   - URL del emisor: termina con el slug de la aplicación y una barra, por ejemplo
+     `https://auth.acme.io/application/o/reputecast/`.
+   - Grupos: Authentik los envía en el claim `groups` del scope `profile`. Mantén la asignación de perfil
+     predeterminada en los scope mappings del proveedor.
+   - La verificación en dos pasos cuenta cuando el claim `amr` del ID token indica MFA (una etapa de MFA en el flujo de
+     autenticación).
+
+   </TabItem>
+   </Tabs>
+
+4. De vuelta en <UiPath path="sso.cardConnection" />, escribe la <UiPath path="sso.issuerUrl" /> y elige
+   <UiPath path="sso.testDiscovery" />. ReputeCast descarga `<issuer>/.well-known/openid-configuration` y sus claves de
+   firma; el emisor tiene que usar `https://` y coincidir exactamente con el documento. Después escribe el Client ID y
+   el client secret. El secreto se cifra y no se vuelve a mostrar nunca; solo puedes reemplazarlo.
+
+5. Scopes: `openid`, `profile` y `email` se piden siempre. Añade otros solo si tu IdP los necesita para los grupos.
+
+6. En <UiPath path="sso.cardClaims" />, comprueba qué claims rellenan la cuenta: `email`, `email_verified`, `name` y,
+   cuando la configuración predefinida tiene grupos, `groups`. Los valores predeterminados sirven para cada
+   configuración predefinida; cambia un nombre solo si tu IdP usa otro. Se rechaza un correo que el IdP marca como no
+   verificado. Si falta `email_verified`, el correo solo cuenta como verificado para los dominios permitidos del paso 7.
+
+7. En <UiPath path="sso.cardAccess" />, decide quién entra y con qué rol:
+
+   - En <UiPath path="sso.allowedDomains" /> (hasta 50), los inicios de sesión desde otros dominios se rechazan y se
+     registran. La página de inicio de sesión muestra “Continuar con …” para este proveedor solo a las personas cuyo
+     correo pertenece a uno de estos dominios. Sin ningún dominio, puede iniciar sesión cualquier dominio, pero el botón
+     no aparece en la página de inicio de sesión.
+   - El interruptor <UiPath path="sso.jit" /> crea una cuenta en el primer inicio de sesión, en un espacio de trabajo
+     predeterminado con un rol predeterminado (Lector, salvo que elijas otro; nunca Propietario). Desactivado, solo
+     pueden iniciar sesión las personas que ya tienen una cuenta. El <UiPath path="admin.domainAllowlist" /> de toda la
+     instancia, en Autenticación, limita qué dominios pueden obtener cuentas automáticas.
+   - En <UiPath path="sso.groupMapping" />, elige <UiPath path="sso.addMapping" /> para cada grupo del IdP (hasta 200
+     asignaciones). Las asignaciones se vuelven a aplicar en cada inicio de sesión y sustituyen a los roles definidos a
+     mano. Cuando alguien sale de un grupo asignado, el siguiente inicio de sesión lo quita de ese espacio de trabajo y
+     revoca las claves de API y los agentes que creó ahí; en el espacio de trabajo predeterminado de las cuentas
+     automáticas, en cambio, vuelve al rol predeterminado. Una asignación nunca convierte a nadie en Propietario ni
+     cambia a un Propietario. Solo puedes asignar un rol cuyos permisos tengas tú en ese espacio de trabajo.
+   - El interruptor de obligatoriedad desactiva los demás métodos de inicio de sesión para los dominios permitidos:
+     consulta [exigir SSO en tus dominios](#exigir-sso-en-tus-dominios).
+
+8. En <UiPath path="sso.cardTest" />, elige <UiPath path="sso.runTestSignIn" />. Se abre una ventana emergente con tu
+   IdP; después de iniciar sesión, ReputeCast muestra los claims que recibió y lo que haría un inicio de sesión real
+   (cuenta nueva o existente, espacios de trabajo, roles, verificación en dos pasos). No inicia la sesión de nadie ni
+   cambia nada.
+
+9. Elige **Activar** (o <UiPath path="sso.saveDraft" /> para terminar más tarde). Para activarlo hace falta una prueba
+   de discovery correcta, el Client ID y un client secret guardado.
+
+</Steps>
+
+## Exigir SSO en tus dominios
+
+La obligatoriedad desactiva el inicio de sesión con contraseña, con llave de acceso y con redes sociales para todas las
+cuentas de los dominios permitidos del proveedor, así que las personas de esos dominios solo pueden iniciar sesión a
+través del IdP. Actívala en <UiPath path="sso.cardAccess" />; el cuadro de diálogo muestra cómo inicia sesión cada
+persona hoy y cómo lo hará después, y confirmas con <UiPath path="sso.turnOnEnforcement" />.
+
+- **Los Propietarios con cuenta de emergencia** conservan el inicio de sesión con contraseña y verificación en dos
+  pasos, para que puedas entrar cuando el IdP no funcione. Al activar la obligatoriedad, todos los Propietarios de esos
+  dominios pasan a tener cuenta de emergencia; el primer Propietario creado por `reputecast install` también la tiene.
+  Sus inicios de sesión con contraseña se registran como de emergencia.
+- Si ningún Propietario del dominio conserva una contraseña, el cuadro de diálogo te avisa: si el IdP fallara, nadie de
+  ese dominio podría iniciar sesión. Mantén a una persona que administre la instancia en otro dominio, o consulta
+  [recuperar el acceso desde la línea de comandos](/es/self-hosting/account-recovery/).
+- Un dominio solo puede tener la obligatoriedad de un proveedor activado. Al desactivar el proveedor, termina su
+  obligatoriedad.
+
+## Comprobar que funciona
+
+- En una ventana privada del navegador, abre la página de inicio de sesión y escribe un correo de un dominio permitido:
+  “Continuar con …” te lleva al IdP y te devuelve con la sesión iniciada.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> muestra a la persona con su método de inicio de sesión
+  SSO, y “Vía IdP” en la columna 2FA cuando el IdP avaló la verificación en dos pasos.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> registra el inicio de sesión, y cualquier cuenta o rol que
+  haya creado.
+
+## Solución de problemas
+
+- **Falla el discovery**: la URL del emisor no es correcta o el servidor no puede llegar a ella. Cópiala exactamente
+  como la muestra tu IdP, incluida la barra final en Authentik, y usa el emisor específico del inquilino en Entra ID.
+  Un proveedor que ya está activado sigue usando su emisor guardado hasta que una prueba nueva sea correcta.
+- **El IdP dice que la URI de redirección no coincide**: la URL pública cambió, o la URI se pegó con una errata. Vuelve
+  a copiar la <UiPath path="sso.redirectUri" /> y actualiza el IdP.
+- **“No hay ninguna cuenta para …”**: las cuentas automáticas están desactivadas y la persona no tiene cuenta, o su
+  dominio no está permitido aquí o en la lista de dominios permitidos de la instancia. Invítala, o activa
+  <UiPath path="sso.jit" />.
+- **La prueba dice “Falta el claim de grupos”**: el IdP no envió grupos, así que las asignaciones no se aplican; los
+  roles existentes se mantienen y las cuentas nuevas reciben el rol predeterminado. Sigue el paso de los grupos de tu
+  IdP de arriba y vuelve a ejecutar la prueba.
+- **“El client secret no se puede descifrar con la clave de este servidor”**: la clave secreta del servidor cambió
+  desde que se guardó el secreto. Reemplaza el client secret. Consulta
+  [seguridad y protección](/es/self-hosting/security/#la-clave-secreta).
+- **El inicio de sesión tardó demasiado**: un inicio de sesión tiene que volver del IdP en menos de 10 minutos. Vuelve
+  a empezar.
+
+## Relacionado
+
+- [Inicio de sesión con Google, Microsoft y GitHub](/es/self-hosting/social-sign-in/): inicio de sesión para personas
+  invitadas sin IdP.
+- [Administración de la instancia](/es/self-hosting/instance-admin/): la política de inicio de sesión y la
+  obligatoriedad de la verificación en dos pasos.
+- [Roles y permisos](/es/team/roles-and-permissions/): qué puede hacer cada rol que concede una asignación.

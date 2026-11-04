@@ -12,5 +12,5 @@
 
 - [ ] `pnpm lint`, `pnpm check`, `pnpm lint:prose`, `pnpm test` and `pnpm build` pass
 - [ ] Facts are checked against the upstream code, and the page's `sources` lists the files
-- [ ] The Vietnamese page says the same as the English page ([TRANSLATING.md](../TRANSLATING.md))
+- [ ] Each translated page (de, es, fr, vi) says the same as the English page ([TRANSLATING.md](../TRANSLATING.md))
 - [ ] App screenshots come from `pnpm shots`, and each legend matches its markers

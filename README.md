@@ -9,7 +9,8 @@ Source of [docs.reputecast.com](https://docs.reputecast.com): the documentation 
 platform by [HostRepute](https://hostrepute.com).
 
 The site is built with [Astro](https://astro.build) and [Starlight](https://starlight.astro.build). Pages are MDX in
-English (root URLs) and Vietnamese (`/vi/`); the REST API reference is generated from the upstream OpenAPI spec.
+English (root URLs), German (`/de/`), Spanish (`/es/`), French (`/fr/`) and Vietnamese (`/vi/`), the languages of the
+app itself; the REST API reference is generated from the upstream OpenAPI spec.
 
 ## Prerequisites
 
@@ -47,9 +48,9 @@ English (root URLs) and Vietnamese (`/vi/`); the REST API reference is generated
 - **Screenshots**: `pnpm shots` drives the upstream dev build (`make dev` in `../ReputeCast`) with Playwright, reseeds
   the demo data, signs in as the demo users and writes `src/assets/screenshots/<locale>/<id>.webp` for every entry in
   `scripts/screenshots/manifest.ts`, plus `<id>.json` with the numbered markers' boxes. Use `--only id,id`,
-  `--locale en|vi`, `--no-reseed`. The dev database is left reseeded with the Acme demo when the run ends; to keep
-  yours, run a second upstream stack on other ports and point the run at it with `REPUTECAST_SRC`, `PG_PORT` and
-  `--app`.
+  `--locale de,es,fr` (any of `en`, `de`, `es`, `fr`, `vi`), `--no-reseed`. The dev database is left reseeded with
+  the Acme demo when the run ends; to keep yours, run a second upstream stack on other ports and point the run at it
+  with `REPUTECAST_SRC`, `PG_PORT` and `--app`.
 
 ## Deployment
 
@@ -71,7 +72,7 @@ One-time setup by the owner:
 ## Contributing
 
 Fixes and new pages are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) (page types, voice, components, SEO rules)
-and, for Vietnamese, [TRANSLATING.md](TRANSLATING.md). Everyone taking part follows the
+and, for the translations, [TRANSLATING.md](TRANSLATING.md). Everyone taking part follows the
 [code of conduct](CODE_OF_CONDUCT.md). For help, see [SUPPORT.md](SUPPORT.md); report security problems as
 [SECURITY.md](SECURITY.md) describes.
 

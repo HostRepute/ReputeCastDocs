@@ -1,0 +1,162 @@
+---
+title: Exiger une approbation pour les envois à risque
+description: 'Mettre en place un circuit d’approbation des e-mails dans ReputeCast : choisir les envois soumis à une deuxième personne, demander et examiner les approbations.'
+type: how-to
+audience: [publisher, admin]
+permissions: ['workspace:manage', 'campaigns:approve', 'campaigns:edit']
+uiPath: 'nav.settings > settings.approvals'
+primaryKeyword: circuit d’approbation des e-mails
+sources:
+  - internal/approvals
+  - internal/workspaces/workspaces.go
+  - internal/webhooks/webhooks.go
+  - web/src/features/approvals
+  - web/src/features/review/ApprovalCard.tsx
+  - web/src/features/review/logic.ts
+  - web/src/features/composer/QuickReview.tsx
+  - web/src/features/composer/banners.messages.ts
+  - internal/campaigns/approval.go
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Dans ReputeCast, un circuit d’approbation des e-mails fait vérifier un envoi par une deuxième personne avant son départ, mais seulement quand il est risqué : une grande audience, un fournisseur d’envoi nouveau ou en chauffe, un auteur sans autorisation d’envoi. Chaque espace de travail a une seule politique d’[approbation](/fr/reference/glossary/#approval). Quand l’une de ses règles correspond, l’auteur demande une approbation au lieu d’envoyer, et un approbateur approuve exactement ce qui sera envoyé.
+
+## Avant de commencer
+
+- Modifier la politique demande `workspace:manage`. Les autres la voient en lecture seule.
+- Les approbateurs sont les personnes dont le rôle permet d’approuver les campagnes (`campaigns:approve`) : les rôles Propriétaire et Admin le peuvent, Éditeur et Observateur non. Dans l’espace de travail client d’une agence, le rôle Approbateur client le peut aussi. La page de la politique liste nommément les approbateurs actuels.
+- Demander une approbation demande `campaigns:edit`. Un auteur n’approuve jamais sa propre campagne.
+- Quand une action est refusée, ReputeCast nomme les personnes qui peuvent la faire ou ce qui manque à leur rôle, et non une clé d’autorisation.
+
+## Choisir quand une approbation est requise
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.approvals" />. L’approbation est requise dès qu’une règle activée correspond.
+
+2. Activez les règles voulues :
+
+   | Règle                                                                                                              | Dans un nouvel espace de travail |
+   | ------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
+   | Une audience de diffusion d’au moins N destinataires, comptée après exclusions                                    | Activée, 10 000                  |
+   | La route inclut un fournisseur en chauffe, ou connecté ces 14 derniers jours                                       | Activée                          |
+   | Le contrôle avant envoi est « Prête, avec avertissements » (les envois bloqués ne démarrent jamais de toute façon) | Désactivée                       |
+   | L’auteur n’a pas l’autorisation d’envoi (`campaigns:send`, ou `sms:send` pour les SMS)                             | Activée                          |
+   | L’audience inclut une liste marquée « Approbation requise »                                                        | Désactivée                       |
+   | Une campagne SMS ou WhatsApp a un coût estimé d’au moins N $US                                                     | Désactivée (50 $US une fois activée) |
+   | La publication d’une automatisation requiert aussi une approbation                                                 | Désactivée                       |
+   | La publication d’un modèle transactionnel nécessite aussi une approbation                                          | Désactivée                       |
+   | La publication d’un article ou d’une page nécessite une approbation                                                | Désactivée                       |
+
+   Les règles s’appliquent aussi à chaque numéro d’un [récapitulatif récurrent](/fr/campaigns/recurring-digests/). Dans l’espace de travail client d’une agence, il existe une règle de plus : chaque envoi nécessite une approbation d’un Approbateur client.
+
+3. Sous <UiPath path="approvals.policy.requiredLegend" />, choisissez <UiPath path="approvals.policy.oneApproval" /> ou <UiPath path="approvals.policy.twoApprovals" />. Deux approbations viennent de deux approbateurs différents, dont aucun n’est l’auteur ; l’option est disponible dès que deux membres peuvent approuver les campagnes.
+
+4. Sous <UiPath path="approvals.policy.bypassTitle" />, choisissez si les Propriétaires peuvent envoyer sans approbation en donnant un motif (voir [contournement d’urgence](#contournement-durgence)).
+
+5. Sélectionnez <UiPath path="approvals.policy.savePolicy" />. Le changement est consigné dans le journal d’audit.
+
+</Steps>
+
+<Screenshot
+  id="approval-policy"
+  alt="Paramètres › Approbations avec la règle d’audience activée à 10 000 destinataires, la règle du fournisseur en chauffe qui correspond à Postal au jour 9 sur 21, la règle de l’auteur sans droit d’envoi activée avec Daniel Park nommé, la règle de coût SMS et WhatsApp à 50 $US, Linh Nguyen et Marcus Chen nommés comme approbateurs, et le contournement d’urgence activé, utilisé 0 fois ces 90 derniers jours."
+/>
+
+<Aside type="note">
+Les listes ne peuvent pas encore être marquées « Approbation requise » depuis l’application ou l’API : la règle des listes n’a donc aucun effet en pratique.
+</Aside>
+
+## Demander une approbation
+
+<Steps>
+
+1. Sur la page <UiPath path="composer.reviewSend" /> de la campagne, la carte d’approbation affiche <UiPath path="review.requiredTitle" />, le verdict du contrôle avant envoi et les règles qui correspondent, en termes clairs : « Votre rôle Content Writer nécessite une approbation pour envoyer : Marcus Chen ou Linh Nguyen peut approuver ». Quand quelqu’un a choisi d’envoyer sans les contrôles qui n’ont pas pu s’exécuter, le verdict indique lesquels ont été ignorés, par exemple « Prête, avec avertissements · 1 contrôle ignoré ».
+
+2. Corrigez d’abord chaque blocage : une campagne Bloquée ne peut pas être soumise à approbation. Choisissez quand elle doit partir. Si les contrôles ne sont plus à jour, ils s’exécutent d’abord de nouveau : demandez l’approbation à nouveau quand ils sont terminés.
+
+3. Ajoutez une note pour les approbateurs si elle est utile, puis sélectionnez <UiPath path="review.requestApproval" />. ReputeCast refuse la demande s’il n’y a pas assez d’approbateurs en dehors de vous.
+
+4. La carte passe à <UiPath path="review.waitingTitle" />. Les approbateurs reçoivent une notification dans l’application et par e-mail.
+
+5. Si personne n’a répondu, sélectionnez <UiPath path="review.remind" />. Les relances ne sont jamais envoyées automatiquement, et vous pouvez relancer au plus une fois par heure. Pour retirer la demande, sélectionnez <UiPath path="review.cancelRequest" />.
+
+</Steps>
+
+## Examiner une demande
+
+<Steps>
+
+1. Ouvrez la demande depuis la notification, depuis <UiPath path="review.reviewRequest" /> sur la page Vérifier et envoyer de la campagne, ou depuis la boîte des approbations à `/w/<workspace>/approvals` (elle se trouve sous <UiPath path="nav.campaigns" />). Les approbateurs voient toutes les demandes ; les autres voient les leurs. Dans la boîte, <UiPath path="approvals.searchByName" /> trouve une demande d’après son objet, et les onglets comptent dans le périmètre de la recherche et des filtres ; les demandes se chargent page par page, et <UiPath path="approvals.showOlder" /> en charge davantage. Sur un téléphone, la relecture rapide de l’éditeur propose aussi <UiPath path="composer.chrome.approve" /> quand une demande attend votre décision (voir [approuver depuis un téléphone](#approuver-depuis-un-téléphone)).
+
+2. Lisez ce que vous approuvez : l’e-mail, l’objet, l’expéditeur, les liens, l’audience et son nombre, la route, la programmation, les seuils et le résultat du contrôle avant envoi au moment de la demande, y compris les contrôles que l’auteur a choisi d’ignorer.
+
+3. Décidez sous « Votre décision » :
+   - Sélectionnez <UiPath path="approvals.review.approve" /> (un commentaire est facultatif).
+   - Sélectionnez <UiPath path="approvals.review.requestChanges" /> et indiquez ce qui doit changer.
+   - Sélectionnez <UiPath path="approvals.review.reject" /> et expliquez pourquoi.
+
+4. Après une approbation, l’auteur programme la campagne avec <UiPath path="review.actionApproved" />. Après une demande de modifications ou un refus, la campagne repasse en brouillon et l’auteur est averti.
+
+</Steps>
+
+<Screenshot
+  id="approval-inbox"
+  alt="La boîte des approbations sur Toutes : onglets En attente · 2, Approuvées · 5, Modifications demandées · 1, Refusées · 0, Invalidées · 1 et Toutes · 9, la recherche par nom de campagne et les filtres par auteur, approbateur et période. Chaque demande liste les règles correspondantes, l’auteur, l’audience, la route, la programmation, la date de la demande et son état, avec Examiner sur les demandes en attente, Voir les différences sur la demande invalidée et Rapport sur les campagnes envoyées."
+/>
+
+Les états d’une demande sont <UiPath path="approvals.statusPending" />, <UiPath path="approvals.statusApproved" />, <UiPath path="approvals.statusChangesRequested" />, <UiPath path="approvals.statusRejected" /> et <UiPath path="approvals.statusInvalidated" />.
+
+Ouvrir la boîte revérifie uniquement les demandes ouvertes qui ne sont peut-être plus à jour, si bien qu’elle reste rapide même avec beaucoup de demandes ; une tâche en arrière-plan tient les autres à jour. Le tableau des [valeurs par défaut et limites](#valeurs-par-défaut-et-limites) indique lesquelles.
+
+## Approuver depuis un téléphone
+
+Sur un téléphone, l’[éditeur](/fr/campaigns/composer/) ouvre une relecture rapide de la campagne. Quand une demande attend votre décision, elle affiche <UiPath path="composer.chrome.approve" /> : le volet indique qui a demandé quelle version et combien d’approbations manquent encore. Sélectionnez <UiPath path="composer.chrome.approve" /> pour approuver, ou <UiPath path="composer.chrome.reviewRequest" /> pour ouvrir la demande, où vous pouvez demander des modifications ou la refuser.
+
+## Ce que couvre une approbation
+
+Une approbation couvre un instantané de l’envoi, et non la campagne en général. Elle est invalidée, avec la différence exacte affichée, quand l’un de ces éléments change après la demande : objet, texte d’aperçu, liens, contenu, expéditeur, définition de l’audience, route, programmation ou versions linguistiques. Elle est aussi invalidée quand le nombre de destinataires varie de plus de 10 % par rapport à celui du moment de la demande.
+
+Modifier une campagne approuvée demande d’abord confirmation. L’éditeur indique qui a approuvé quelle version et que la modification annule l’approbation ; la première modification ouvre une boîte de dialogue, et <UiPath path="composer.banners.editAnyway" /> annule l’approbation, après quoi l’en-tête n’affiche plus <UiPath path="approvals.statusApproved" />. Modifier une campagne en attente d’approbation retire la demande de la même façon. Le brouillon d’un agent n’annule jamais l’approbation d’une personne : son enregistrement est refusé à la place.
+
+Quand une approbation est invalidée, la campagne repasse en brouillon et l’auteur et les approbateurs sont avertis. Une campagne programmée garde son créneau mais ne démarre pas sans nouvelle approbation. Rétablir la version approuvée du contenu, de l’audience ou de la programmation conserve l’approbation.
+
+Comme l’heure fait partie de l’approbation, une campagne approuvée ne peut pas être déplacée sur le [calendrier des campagnes](/fr/campaigns/calendar/#quand-une-approbation-couvre-lheure) : déprogrammez-la et demandez une approbation pour la nouvelle heure. Supprimer une campagne clôture sa demande ouverte.
+
+À l’heure d’envoi, ReputeCast vérifie de nouveau : le contrôle avant envoi s’exécute 15 minutes avant l’envoi et à son démarrage, et une approbation manquante, refusée ou invalidée retient l’envoi comme le fait un blocage. Voir [quand les contrôles s’exécutent](/fr/campaigns/send-readiness/#quand-les-contrôles-sexécutent).
+
+## Contournement d’urgence
+
+Quand la politique le permet, un Propriétaire peut utiliser <UiPath path="review.moreActions" /> › <UiPath path="review.sendWithoutApproval" /> dans Vérifier et envoyer pour un envoi auquel une règle correspond ; pour toute autre personne, l’élément de menu indique qui peut le faire. Il rédige un motif (au moins 10 caractères) et, si son compte a un mot de passe, le confirme. Le contournement est consigné sous `campaign.approval_bypassed` avec le motif, l’adresse IP et l’instantané de la campagne, et chaque approbateur est averti. Les avertissements doivent toujours être confirmés, et un résultat Bloquée du contrôle avant envoi arrête toujours l’envoi. La page de la politique indique combien de fois le contournement a été utilisé ces 90 derniers jours.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="approvals" />
+
+## Vérifier le résultat
+
+- Une campagne à laquelle une règle correspond affiche Approbation requise dans Vérifier et envoyer, avec la liste des règles correspondantes.
+- La demande apparaît sous En attente dans la boîte, et les approbateurs ont reçu une notification.
+- Les intégrations peuvent suivre le processus avec les [événements webhook](/fr/reference/webhook-events/) `approval.requested` et `approval.decided`.
+
+## Dépannage
+
+- **« Personne d’autre ne peut approuver les campagnes. Un Propriétaire peut autoriser un autre rôle à les approuver. »** Il vous faut au moins un membre en dehors de l’auteur dont le rôle permet d’approuver les campagnes (`campaigns:approve` ; deux pour 2 approbations). Demandez à un Propriétaire de modifier un rôle dans <UiPath path="nav.settings > settings.roles" />.
+- **« Les approbateurs ont été relancés il y a moins d’une heure. »** Les relances sont limitées à une par heure ; le message indique quand vous pourrez relancer.
+- **L’approbation a été invalidée alors que personne n’a touché à l’e-mail.** Le nombre de destinataires a varié de plus de 10 %, par exemple après un import important. La boîte affiche « le nombre de destinataires a changé de… » avec la différence ; demandez de nouveau l’approbation.
+- **L’option 2 approbations est grisée.** Moins de deux membres peuvent approuver les campagnes.
+- **La page de la politique est en lecture seule et indique « Votre rôle ne permet pas de la modifier. »** La modifier demande `workspace:manage`.
+- **L’approbation a disparu après une modification.** Modifier le contenu d’une campagne approuvée annule l’approbation ; rétablissez la version approuvée depuis Vérifier et envoyer, ou demandez de nouveau l’approbation.
+
+## Voir aussi
+
+- [Programmer et envoyer une campagne](/fr/campaigns/schedule-and-send/) explique l’envoi une fois l’approbation obtenue.
+- [Rôles et autorisations](/fr/team/roles-and-permissions/) explique `campaigns:approve` et les rôles intégrés.
+- [Gérer des espaces de travail clients en agence](/fr/team/agencies/) traite de la validation client.
+- [Publier les modifications d’une automatisation en toute sécurité](/fr/automations/publish-and-versions/) utilise les mêmes approbateurs pour les automatisations.

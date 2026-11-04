@@ -1,0 +1,229 @@
+---
+title: Router les e-mails entre fournisseurs
+description: Faites passer chaque flux par le bon fournisseur d’envoi, répartissez le trafic par poids et configurez le basculement e-mail entre plusieurs fournisseurs.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabRouting'
+primaryKeyword: basculement e-mail entre plusieurs fournisseurs
+sources:
+  - internal/routing
+  - internal/mailbox
+  - internal/providers/state/vet.go
+  - internal/sending/engine/audience.go
+  - internal/providers/manage/health.go
+  - internal/connect/streams.go
+  - web/src/features/providers/RoutingPage.tsx
+  - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing-model.ts
+  - web/src/features/providers/routing.messages.ts
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Le routage décide quel [fournisseur d’envoi](/fr/reference/glossary/#sending-provider) délivre chaque e-mail : par flux, par
+liste, par domaine de l’expéditeur ou par fournisseur de messagerie du destinataire, avec des répartitions pondérées et
+un secours. Cette page met en place des routes et un basculement e-mail entre plusieurs fournisseurs, puis vérifie le
+résultat avec le [testeur de routes](/fr/reference/glossary/#route-tester) avant l’enregistrement.
+
+## Avant de commencer
+
+- Connectez au moins un fournisseur ; le basculement et les répartitions en demandent deux. Lisez
+  [Connecter un fournisseur d’envoi](/fr/providers/connect/).
+- Il vous faut `providers:manage` pour modifier le routage. Avec `providers:view`, vous pouvez ouvrir la page et utiliser
+  le testeur de routes.
+
+## Comment une route décide
+
+Chaque e-mail appartient à l’un des quatre [flux](/fr/reference/glossary/#stream) : Diffusions (campagnes),
+Automatisations, Système (confirmations de double opt-in, liens vers les préférences, invitations d’équipe) et
+Transactionnel (e-mails de votre produit). Pour chaque destinataire, ReputeCast :
+
+1. Prend les règles du flux.
+2. Vérifie les conditions du flux dans l’ordre. La première qui correspond décide : elle envoie à un fournisseur, ou par
+   une répartition pondérée qui lui est propre.
+3. Si aucune condition ne correspond, utilise la route par défaut du flux : le fournisseur principal, ou une
+   [répartition stable](/fr/reference/glossary/#sticky-split). Chaque fournisseur de la répartition note l’adresse avec un
+   hachage de l’adresse et du fournisseur, pondéré par son poids, et le score le plus élevé l’emporte. Ainsi, un même
+   destinataire garde le même fournisseur d’un envoi à l’autre, l’ordre de la répartition ne change rien, et augmenter
+   le poids d’un fournisseur ne lui transfère qu’à peu près la différence ; personne d’autre ne change de fournisseur.
+4. Vérifie la liste de suppression partagée. Une adresse exclue ne reçoit rien, quel que soit le fournisseur vers lequel
+   elle a été routée.
+5. Si le fournisseur est [en chauffe](/fr/providers/warm-up/), applique son plan : les niveaux d’engagement et le plafond
+   du jour, l’excédent passant par un fournisseur de la route dont la chauffe est terminée ou attendant le plafond du
+   lendemain.
+6. Si le fournisseur choisi ne peut pas accepter d’e-mails, applique la politique de basculement du flux. Les e-mails ne
+   passent que sur un secours qui réussit ses contrôles : disponible, conditions autorisant les e-mails du flux, domaine
+   d’envoi vérifié, quota suffisant et hors du sandbox. Un secours encore en chauffe ne prend des e-mails que si la
+   politique l’accepte.
+
+Le [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider) (Gmail, Outlook, Yahoo, iCloud ou Autre) se
+déduit du domaine de l’adresse. Les domaines grand public comme `gmail.com` sont reconnus par leur nom ; le domaine
+propre d’une entreprise est classé d’après ses enregistrements MX : Google Workspace compte comme Gmail, Microsoft 365
+comme Outlook, les domaines hébergés par Yahoo comme Yahoo et les domaines personnalisés iCloud comme iCloud, et
+l’hébergement est conservé comme détail. Une tâche d’arrière-plan analyse les domaines des nouveaux contacts, et un envoi
+analyse ce qui reste en attente avant de constituer son audience. Une adresse dont le domaine n’a pas encore été analysé
+compte comme Autre.
+
+## Configurer les routes
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers > providers.tabRouting" />. Il y a une carte par flux, avec à côté le testeur de
+   routes et les paramètres communs à tous les fournisseurs.
+
+   <Screenshot
+     id="providers-routing"
+     alt="Routage et basculement pour les Diffusions : une répartition pondérée stable 90/10 entre Amazon SES et Postal, en chauffe au jour 9 sur 21, deux conditions (l’une envoie à Amazon SES uniquement, l’autre à une répartition 70/30), et le testeur de routes qui répond Amazon SES pour une adresse Outlook, étape par étape."
+   />
+
+2. Pour Automatisations, Système et Transactionnel, choisissez le <UiPath path="providers.routing.primary" /> et, si
+   vous avez un deuxième fournisseur, le <UiPath path="providers.routing.fallback" />. Le secours prend le relais quand le
+   principal ne peut pas accepter d’e-mails.
+
+3. Pour les Diffusions, définissez la <UiPath path="providers.routing.weightedSplit" />. Chaque ligne est un fournisseur
+   avec sa part en pourcentage ; les parts doivent totaliser 100 % pour pouvoir enregistrer.
+   <UiPath path="providers.routing.addToSplit" /> ajoute un fournisseur connecté ; un fournisseur à 0 % peut quitter la
+   répartition. Faites glisser une ligne, ou utilisez ses flèches haut et bas au clavier, pour la réordonner : l’ordre ne
+   change que la lecture de la barre, et personne ne change de fournisseur. Tant qu’un fournisseur de la répartition est
+   [en chauffe](/fr/providers/warm-up/), le planificateur de chauffe augmente sa part selon le calendrier et la carte liste
+   les étapes prévues.
+
+4. Ajoutez des conditions là où un type d’e-mail doit toujours utiliser certains fournisseurs :
+   <UiPath path="providers.routing.addCondition" />. Les Diffusions et les Automatisations peuvent filtrer sur la liste,
+   le domaine de l’expéditeur ou le fournisseur de messagerie du destinataire ; Transactionnel filtre sur la catégorie
+   transactionnelle ou le fournisseur de messagerie. Les e-mails Système n’ont pas de conditions. Sous le fournisseur de
+   la condition, choisissez <UiPath path="providers.routing.thenOne" />, ou <UiPath path="providers.routing.thenSplit" />
+   avec une part par fournisseur (une répartition stable elle aussi). Ce que vous saisissez sous
+   <UiPath path="providers.routing.why" /> s’affiche à côté de la condition, par exemple « Outlook est strict avec les
+   nouvelles IP ».
+
+5. Définissez la <UiPath path="providers.routing.failoverPolicy" /> des Diffusions. La carte indique le déclencheur que
+   la vérification de l’état utilise réellement : au moins la moitié des appels au fournisseur échouent sur 3 minutes
+   (5 appels ou plus), ou 2 vérifications d’état échouent d’affilée. Des webhooks silencieux déclenchent à eux seuls une
+   alerte, pas un basculement. Choisissez le <UiPath path="providers.routing.fallback" />, puis ce qui se passe quand le
+   déclencheur se produit (<UiPath path="providers.routing.whenTriggerFires" />) :
+   - <UiPath path="providers.routing.pauseAndAsk" /> : les destinataires restants sont retenus et on vous demande quoi
+     faire. Faire passer un envoi en masse sur un fournisseur sans historique peut nuire à sa réputation.
+   - <UiPath path="providers.routing.warmOnly" /> : l’envoi bascule de lui-même dès que le secours a terminé sa chauffe ;
+     d’ici là, il se comporte comme mettre en pause et demander.
+   - <UiPath path="providers.routing.automatic" />.
+
+   Sous la politique, la carte liste les contrôles que le secours doit réussir avant tout basculement, chacun avec un
+   repère : disponible, conditions autorisant les Diffusions, domaine d’envoi vérifié, quota ou plafond de chauffe du
+   jour restant, chauffe terminée et hors du sandbox. Si un contrôle échoue, les Diffusions se mettent en pause et
+   demandent à la place.
+
+6. Les e-mails Automatisations, Système et Transactionnel basculent automatiquement vers leur secours, car ils doivent
+   continuer de partir ; chaque carte indique son déclencheur, et le trafic revient au principal après 10 minutes de
+   fonctionnement normal. Avant de prendre le relais, le secours réussit les mêmes contrôles. Si un contrôle échoue,
+   ReputeCast continue de réessayer le principal et vous alerte au lieu de basculer. Sans secours, les e-mails attendent
+   que le fournisseur se rétablisse.
+
+7. Pour les e-mails Transactionnel, <UiPath path="providers.routing.firstInLine" /> fait passer les messages
+   transactionnels en premier sur un fournisseur qui envoie aussi une campagne, dans la limite de la cadence du
+   fournisseur.
+
+8. Vérifiez vos modifications avant d’enregistrer. Dès que vous changez quelque chose, une barre reste en bas de la page
+   sous <UiPath path="providers.routing.unsavedTitle" />. Elle indique ce que l’enregistrement change pour chaque flux,
+   par exemple « Répartition de Diffusions 90/10 → 85/15 · environ 1 600 destinataires de Diffusions : SES → Postal ;
+   personne d’autre ne change de fournisseur », et pour les autres flux la part de leurs adresses (sur les 30 derniers
+   jours) qui changerait de fournisseur. Chaque carte de flux modifiée porte un badge Modification non enregistrée.
+
+9. Choisissez <UiPath path="providers.routing.saveRouting" />, ou <UiPath path="providers.routing.discard" /> pour
+   revenir au routage enregistré. Seuls les flux que vous avez modifiés sont enregistrés. Les nouveaux envois utilisent
+   le routage immédiatement ; les envois déjà en cours gardent leur route.
+
+</Steps>
+
+Sur un téléphone, les cartes de flux s’empilent et le testeur de routes les suit :
+
+<Screenshot
+  id="providers-routing-mobile"
+  alt="La page de routage sur un téléphone : la carte Diffusions avec sa répartition pondérée stable, la part de chaque fournisseur avec des flèches haut et bas, les étapes de chauffe prévues pour Postal et la première condition."
+/>
+
+<Aside type="caution">
+Avant d’enregistrer, ReputeCast vérifie que les conditions de chaque fournisseur des Diffusions autorisent le marketing
+de masse. Si l’une ne le permet pas, il affiche la modification et son avertissement, et propose une correction (créer un
+flux Broadcast Postmark, utiliser un autre fournisseur ou enregistrer sans secours) ; vos autres modifications sont
+conservées pendant que vous corrigez. Si vous gardez malgré tout ce choix, il est consigné dans le journal d’audit, et le
+[contrôle avant envoi](/fr/campaigns/send-readiness/) bloque chaque diffusion jusqu’à ce que la route change. Lisez
+[Choisir un fournisseur d’envoi](/fr/providers/choose/#conditions-de-marketing-de-masse).
+</Aside>
+
+## Tester une route
+
+Le <UiPath path="providers.routing.testerTitle" /> teste le routage enregistré et, tant que vous avez des modifications
+non enregistrées, indique ce qu’elles changeraient.
+
+- **<UiPath path="providers.routing.tabRecipient" />** : choisissez le flux, une liste et un domaine d’expéditeur (ou un
+  modèle transactionnel) et saisissez une adresse. Il répond avec le fournisseur, le fournisseur de messagerie et l’hôte
+  MX qui a permis de l’identifier, le sélecteur DKIM, le coût d’un message, chaque étape de la décision (la condition qui
+  a correspondu, ou la tranche dans laquelle tombe le hachage de l’adresse dans une répartition à deux) et ce qui se passe
+  si le fournisseur échoue. Avec une répartition non enregistrée, il indique en plus si cette adresse reste sur son
+  fournisseur ou en change.
+- **<UiPath path="providers.routing.tabCampaign" />** : fait passer l’audience de la prochaine diffusion (la prochaine
+  programmée, ou le dernier brouillon modifié) par le routage à sa date d’envoi. Il affiche les destinataires par
+  fournisseur, les conditions qui ont correspondu, les contacts en arrêt progressif laissés de côté, et ce que ferait
+  l’envoi : les destinataires hors des niveaux d’engagement d’un fournisseur en chauffe ou au-delà de son plafond qui
+  passent par un fournisseur à chauffe terminée, les destinataires retenus par le plafond jusqu’au plafond du lendemain
+  ou pendant que le plan est en pause, et l’endroit où un fournisseur qui ne peut pas envoyer maintenant placerait sa
+  part. Avec des modifications non enregistrées, il indique combien de destinataires changent de fournisseur. Une grande
+  audience est estimée à partir de ses premiers destinataires, puis extrapolée.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="routing" />
+
+## Vérifier le résultat
+
+- L’en-tête de la page indique quand le routage a été enregistré et par qui.
+- <UiPath path="nav.providers > providers.tabProviders" /> affiche le routage de chaque flux sous forme de barre avec la
+  part de chaque fournisseur, le secours et la politique de basculement.
+- Le testeur de routes donne le fournisseur attendu pour une adresse de chaque liste et de chaque fournisseur de
+  messagerie qui a une condition, et son onglet Campagne montre la répartition prévue.
+- Pendant un envoi, le [suivi en direct](/fr/campaigns/live-monitor/) affiche la part de la campagne pour chaque
+  fournisseur.
+
+## Dépannage
+
+- **« Les pondérations totalisent 95 %. Ramenez-les à 100 % pour enregistrer. »** : modifiez une part pour que le total
+  fasse 100. La même règle s’applique à la répartition d’une condition.
+- **« Modifié pendant votre édition : Diffusions »** : quelqu’un a enregistré le routage, ou le planificateur de chauffe
+  a augmenté une part, depuis que vous avez ouvert la page. Rien n’a été enregistré et vos modifications sont toujours
+  là. Choisissez <UiPath path="providers.routing.conflictShowLatest" /> pour repartir du routage le plus récent, ou
+  <UiPath path="providers.routing.conflictKeepMine" />. Une modification d’un autre flux ne bloque jamais votre
+  enregistrement. Par l’[opération d’API save-routing](/api/operations/save-routing/), chaque flux est enregistré avec
+  la version à laquelle il a été lu, et une version périmée est refusée avec `409` et le code `routing_changed`.
+- **« Impossible d’actualiser le routage »** : une actualisation en arrière-plan a échoué. Vos modifications restent sur
+  la page, et les e-mails continuent de partir selon le routage enregistré.
+- **« Le flux Diffusions n’a pas de fournisseur principal »** : chaque flux sauf Transactionnel a besoin d’un principal.
+  Transactionnel peut rester sans route tant que votre produit n’envoie pas d’e-mails.
+- **Une carte de flux indique qu’un fournisseur « ne peut pas accepter d’e-mails pour le moment »** : un fournisseur
+  qu’utilise la route est en panne, en pause, ou ses webhooks sont silencieux. Ses e-mails basculent ou attendent selon la
+  politique ; quand il s’agit du secours, le flux n’a pas de secours opérationnel jusqu’à son retour. Lisez
+  [État et pannes des fournisseurs](/fr/providers/health-and-outages/).
+- **Un avertissement indique que le secours est en chauffe** : la protection de chauffe bloque le basculement vers lui
+  jusqu’au jour indiqué par l’avertissement. Avec la politique réservée aux fournisseurs à chauffe terminée, les
+  Diffusions se mettent en pause et demandent en attendant.
+- **Le testeur indique que l’e-mail attendrait** : le fournisseur est en panne ou ses webhooks sont silencieux, sa part
+  l’attend donc, ou attend le secours.
+- **Le testeur indique que l’adresse est exclue** : rien ne lui est envoyé, chez aucun fournisseur. Lisez
+  [La liste de suppression](/fr/audience/suppressions/).
+- **Une adresse Google Workspace ou Microsoft 365 s’affiche comme Autre** : son domaine n’a pas encore été analysé, ou
+  le serveur ne peut pas joindre le DNS. Lisez [Configuration requise](/fr/self-hosting/requirements/).
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="État et pannes des fournisseurs" href="/fr/providers/health-and-outages/" />
+  <LinkCard title="Chauffer un nouveau fournisseur ou une nouvelle IP" href="/fr/providers/warm-up/" />
+  <LinkCard title="Suivre un envoi et la pause automatique" href="/fr/campaigns/live-monitor/" />
+  <LinkCard title="Comment fonctionne ReputeCast" href="/fr/getting-started/concepts/" />
+</CardGrid>

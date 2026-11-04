@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
-import { allPages, apiPages, localPath, SITE } from './pages.ts'
+import { PREFIXED_LOCALES } from '../../src/lib/locales.ts'
+import { allPages, apiPages, localeOf, localPath, SITE } from './pages.ts'
 
 type JsonLd = { '@graph': { '@type': string }[] }
 
@@ -7,7 +8,7 @@ for (const path of allPages) {
   test(`SEO head: ${path}`, async ({ page, request }) => {
     await page.goto(path)
     const isApi = apiPages.includes(path)
-    const lang = path.startsWith('/vi/') ? 'vi' : 'en'
+    const lang = localeOf(path)
 
     await expect(page.locator('h1')).toHaveCount(1)
     const h1 = (await page.locator('h1').innerText()).trim()
@@ -24,7 +25,7 @@ for (const path of allPages) {
       .locator('link[rel="alternate"][hreflang]')
       .evaluateAll((links) => links.map((l) => l.getAttribute('hreflang')))
     if (isApi) expect(alternates).toEqual([])
-    else expect(alternates.sort()).toEqual(['en', 'vi', 'x-default'])
+    else expect(alternates.sort()).toEqual(['en', ...PREFIXED_LOCALES, 'x-default'].sort())
 
     const ogImage = await page.locator('meta[property="og:image"]').getAttribute('content')
     expect(ogImage).toMatch(new RegExp(`^${SITE}/og/.+\\.png$`))
@@ -36,13 +37,13 @@ for (const path of allPages) {
       (s) => JSON.parse(s) as JsonLd,
     )
     const types = ld.flatMap((doc) => doc['@graph'].map((node) => node['@type']))
-    if (path === '/' || path === '/vi/')
+    if (path === '/' || PREFIXED_LOCALES.some((l) => path === `/${l}/`))
       expect(types).toEqual(expect.arrayContaining(['WebSite', 'SoftwareApplication']))
     else expect(types).toEqual(expect.arrayContaining(['TechArticle', 'BreadcrumbList']))
   })
 }
 
-test('sitemap lists both languages', async ({ request }) => {
+test('sitemap lists every language', async ({ request }) => {
   const index = await (await request.get('/sitemap-index.xml')).text()
   const sitemaps = [...index.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => localPath(m[1]))
   expect(sitemaps.length).toBeGreaterThan(0)
@@ -50,9 +51,11 @@ test('sitemap lists both languages', async ({ request }) => {
     [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]),
   )
   expect(urls).toContain(`${SITE}/`)
-  expect(urls).toContain(`${SITE}/vi/`)
   expect(urls).toContain(`${SITE}/deliverability/spf-dkim-dmarc/`)
-  expect(urls).toContain(`${SITE}/vi/deliverability/spf-dkim-dmarc/`)
+  for (const l of PREFIXED_LOCALES) {
+    expect(urls).toContain(`${SITE}/${l}/`)
+    expect(urls).toContain(`${SITE}/${l}/deliverability/spf-dkim-dmarc/`)
+  }
 })
 
 test('robots.txt names the sitemap', async ({ request }) => {
@@ -60,11 +63,11 @@ test('robots.txt names the sitemap', async ({ request }) => {
   expect(robots).toContain(`Sitemap: ${SITE}/sitemap-index.xml`)
 })
 
-test('llms.txt files exist and list no Vietnamese pages', async ({ request }) => {
+test('llms.txt files exist and list English pages only', async ({ request }) => {
   for (const file of ['/llms.txt', '/llms-full.txt']) {
     const res = await request.get(file)
     expect(res.status()).toBe(200)
     const text = await res.text()
-    expect(text).not.toContain(`${SITE}/vi/`)
+    for (const l of PREFIXED_LOCALES) expect(text).not.toContain(`${SITE}/${l}/`)
   }
 })

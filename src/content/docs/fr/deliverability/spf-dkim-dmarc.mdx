@@ -1,0 +1,360 @@
+---
+title: Configurer SPF, DKIM et DMARC
+description: Configurer SPF DKIM DMARC pour un domaine d’envoi ReputeCast, avec les enregistrements de chaque fournisseur, chez Cloudflare, Route 53 ou tout hébergeur DNS.
+type: how-to
+audience: [admin]
+permissions: ['domains:manage']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: configurer SPF DKIM DMARC
+sources:
+  - internal/connect/domainstep.go
+  - internal/domains/records.go
+  - internal/domains/attach.go
+  - internal/domains/check.go
+  - internal/domains/detail.go
+  - internal/domains/cloudflare.go
+  - internal/domains/api.go
+  - internal/dnscheck/auth.go
+  - internal/dnscheck/domain.go
+  - internal/readiness/assemble.go
+  - internal/providers/ses/ses.go
+  - web/src/features/connect/DomainStep.tsx
+  - web/src/features/connect/DomainRecords.tsx
+  - web/src/features/connect/domain.messages.ts
+  - web/src/features/senders
+sidebar:
+  order: 3
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[SPF](/fr/reference/glossary/#spf), [DKIM](/fr/reference/glossary/#dkim) et [DMARC](/fr/reference/glossary/#dmarc)
+prouvent aux fournisseurs de messagerie que les e-mails de votre domaine viennent bien de vous. Ce guide pour configurer
+SPF DKIM DMARC présente les enregistrements que ReputeCast vous demande de publier pour un [domaine
+d’envoi](/fr/reference/glossary/#sending-domain), la façon de les ajouter chez Cloudflare, Amazon Route 53 ou tout autre
+hébergeur DNS, et la lecture de leur état en direct.
+
+## Rôle de chaque enregistrement
+
+<TableScroll label="Enregistrements SPF, DKIM et DMARC">
+
+| Enregistrement | Type DNS       | Publié sur                                                | Ce qu’il prouve                                                                                         |
+| -------------- | -------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| SPF            | TXT            | Le domaine de l’expéditeur d’enveloppe (MAIL FROM)        | Le serveur qui a remis le message a le droit d’envoyer pour ce domaine.                                 |
+| DKIM           | CNAME ou TXT   | `<selector>._domainkey.<domain>`                          | Le message a été signé par le fournisseur d’envoi avec une clé que vous avez publiée, et n’a pas été modifié. |
+| DMARC          | TXT            | `_dmarc.<domain>`, ou le domaine organisationnel          | Ce que font les destinataires quand ni SPF ni DKIM ne réussit en accord avec l’adresse From.            |
+
+</TableScroll>
+
+DMARC réussit quand SPF ou DKIM réussit **et** que son domaine est aligné sur le domaine de l’adresse From. En mode
+souple (relaxed), le mode par défaut, les deux domaines doivent avoir le même domaine organisationnel :
+`bounce.news.acme.io` est aligné sur `news.acme.io`. En mode strict, ils doivent être identiques
+([RFC 7489, section 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), vérifié en octobre 2026).
+
+C’est pourquoi ReputeCast demande un return-path personnalisé (MAIL FROM) sur votre propre domaine partout où le
+fournisseur d’envoi le permet : SPF est vérifié sur le return-path, donc avec le return-path par défaut du fournisseur
+d’envoi, seul DKIM peut être aligné. Le contrôle avant envoi signale ce cas par un avertissement (« utilise le MAIL FROM
+par défaut : SPF n’est donc pas aligné ») mais ne bloque pas, car DMARC réussit tout de même grâce à DKIM.
+
+## Les enregistrements affichés par ReputeCast
+
+ReputeCast liste les enregistrements à deux endroits, dans le même tableau :
+
+- Dans l’assistant de connexion, à l’étape 3, <UiPath path="connect.stepDomain" /> (voir
+  [Connecter un fournisseur d’envoi](/fr/providers/connect/)).
+- Plus tard, dans <UiPath path="nav.settings > settings.senders" /> : sélectionnez <UiPath path="senders.records" /> à
+  côté d’un domaine. Quand plusieurs fournisseurs d’envoi utilisent le domaine, un onglet par fournisseur filtre le
+  tableau.
+
+Chaque fournisseur d’envoi signe avec sa propre clé DKIM, chacun a donc besoin de ses propres enregistrements. Les
+fournisseurs d’envoi dotés d’une API de domaine (Amazon SES, Mailgun, SendGrid, Resend, Mailjet, Brevo, SparkPost, et
+Postmark avec un jeton de compte) renvoient les enregistrements exacts, et ReputeCast ajoute les lignes SPF et DMARC
+valables pour tout le domaine. Pour Amazon SES sur `news.acme.io`, le tableau ressemble à ceci :
+
+<TableScroll label="Enregistrements pour Amazon SES sur news.acme.io">
+
+| Rôle                            | Type  | Nom                                | Valeur                                                        |
+| ------------------------------- | ----- | ---------------------------------- | ------------------------------------------------------------- |
+| DKIM 1 sur 3 (2 et 3 identiques) | CNAME | `<token>._domainkey.news.acme.io` | `<token>.dkim.amazonses.com`                                  |
+| Return-path / MAIL FROM         | MX    | `bounce.news.acme.io`              | `10 feedback-smtp.us-east-1.amazonses.com`                    |
+| SPF pour MAIL FROM              | TXT   | `bounce.news.acme.io`              | `v=spf1 include:amazonses.com ~all`                           |
+| SPF du domaine d’envoi          | TXT   | `news.acme.io`                     | Votre enregistrement SPF actuel, avec `include:amazonses.com` en plus |
+| DMARC                           | TXT   | `_dmarc.news.acme.io`              | `v=DMARC1; p=quarantine; adkim=s; aspf=r` (suggestion)        |
+
+</TableScroll>
+
+<Screenshot
+  id="connect-domain"
+  alt="L’étape de vérification du domaine pour Amazon SES sur news.acme.io : sept enregistrements, des trois CNAME DKIM jusqu’à DMARC, tous vérifiés, avec les boutons Cloudflare et fichier de zone au-dessus du tableau."
+>
+  1. Le premier des trois enregistrements DKIM avec lesquels Amazon SES signe, chacun une clé de 2048 bits.
+  2. Le return-path (MAIL FROM) sur `bounce.news.acme.io`, pour que les rebonds et SPF soient alignés sur votre domaine.
+  3. L’enregistrement SPF du domaine d’envoi, fusionné avec celui que vous publiez déjà.
+  4. DMARC : ici, `news.acme.io` suit la politique de `acme.io`, l’enregistrement se trouve donc sur `_dmarc.acme.io`.
+  5. La ligne d’état en direct : quand tous les enregistrements sont vérifiés, elle indique l’heure du dernier contrôle.
+</Screenshot>
+
+Certains fournisseurs d’envoi n’ont pas d’API de domaine dans ReputeCast : les serveurs SMTP, Postal, Azure
+Communication Services, l’adaptateur HTTP générique, et Postmark sans jeton de compte.
+Pour eux, le tableau ne contient que la ligne SPF du domaine d’envoi et DMARC. Ajoutez le domaine chez le fournisseur
+d’envoi lui-même et publiez l’enregistrement DKIM qu’il y affiche ; ReputeCast vérifie SPF et DMARC immédiatement, et
+DKIM dès le premier envoi. Pour un serveur SMTP ou Postal, la ligne SPF autorise le nom d’hôte du serveur avec
+`a:<host>`.
+
+### Construction de la valeur SPF
+
+Un domaine ne peut avoir qu’un seul enregistrement SPF, ReputeCast n’en demande donc jamais un second. Il lit
+l’enregistrement que vous publiez et insère les mécanismes nécessaires à chaque fournisseur d’envoi avant le terme
+final `all`, `redirect=` ou `exp=`. Les termes que vous avez déjà restent tels quels ; si rien ne manque, la valeur est
+votre enregistrement inchangé. Sans aucun enregistrement, ReputeCast propose `v=spf1 <mechanisms> -all`.
+
+```txt title="Exemples de fusion SPF"
+Published:  v=spf1 include:_spf.google.com ~all
+Proposed:   v=spf1 include:_spf.google.com include:amazonses.com ~all
+
+Published:  v=spf1 mx
+Proposed:   v=spf1 mx include:spf.mtasv.net -all
+```
+
+### La ligne DMARC
+
+Quand aucun enregistrement DMARC n’existe pour le domaine ou son domaine organisationnel, ReputeCast suggère
+`v=DMARC1; p=quarantine; adkim=s; aspf=r`, avec `rua=mailto:` et l’adresse de rapport de HostRepute quand
+[HostRepute](/fr/reference/glossary/#hostrepute) est connecté. La ligne compte comme vérifiée dès qu’un enregistrement
+DMARC valide est publié sur `_dmarc.<domain>` ou sur le domaine organisationnel, `p=none` compris. Lisez
+[Choisir une politique DMARC](#choisir-une-politique-dmarc) avant de publier la suggestion.
+
+## Avant de commencer
+
+- Il vous faut `domains:manage` pour ajouter des domaines et modifier leurs enregistrements (les rôles Propriétaire et
+  Admin l’ont).
+  Dans l’assistant de connexion, il vous faut aussi `providers:manage`. Voir
+  [Autorisations et rôles](/fr/reference/permissions/).
+- Il vous faut un accès au DNS du domaine, chez l’hébergeur DNS vers lequel pointent ses serveurs de noms.
+- Listez tous les autres services qui envoient des e-mails au nom de ce domaine, comme votre messagerie de bureau, un
+  service d’assistance ou un CRM. Leurs mécanismes SPF doivent rester dans l’enregistrement, et chacun d’eux doit signer
+  avec sa propre clé DKIM.
+
+## Ouvrir les enregistrements
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.senders" /> et sélectionnez <UiPath path="senders.records" /> à côté
+   du domaine. Si le domaine n’est pas encore listé, ajoutez-le d’abord
+   ([Ajouter des domaines d’envoi et des expéditeurs](/fr/providers/senders-and-domains/)). Dans l’assistant de
+   connexion, vous êtes déjà sur le bon écran.
+
+2. Si plusieurs fournisseurs d’envoi utilisent le domaine, choisissez l’onglet d’un fournisseur ou gardez tous les
+   fournisseurs.
+
+3. Regardez le badge au-dessus du tableau. Quand ReputeCast reconnaît votre hébergeur DNS d’après les serveurs de noms,
+   il l’affiche, par exemple **Serveurs de noms : Cloudflare**. Choisissez l’onglet correspondant ci-dessous.
+
+</Steps>
+
+<Screenshot
+  id="settings-sender-domain"
+  alt="Les enregistrements DNS de news.acme.io dans les paramètres des expéditeurs : des onglets pour tous les fournisseurs, Amazon SES, Postmark et Postal, le badge Serveurs de noms : Cloudflare, et 11 enregistrements vérifiés sur 11."
+/>
+
+## Publier les enregistrements chez votre hébergeur DNS
+
+<Tabs syncKey="dns">
+<TabItem label="Cloudflare">
+
+Quand les serveurs de noms sont ceux de Cloudflare, ReputeCast peut ajouter les enregistrements pour vous via l’API
+Cloudflare.
+
+<Steps>
+
+1. Dans le tableau de bord Cloudflare, allez dans **My Profile** > **API Tokens**, sélectionnez **Create Token** et
+   utilisez le modèle **Edit zone DNS**. Sous les ressources de zone, choisissez la zone de votre domaine, puis
+   sélectionnez **Continue to summary** et **Create Token**
+   ([Cloudflare, « Create API token »](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/),
+   vérifié en octobre 2026).
+
+2. Dans ReputeCast, sélectionnez <UiPath path="connect.domain.addViaCloudflare" />, collez le jeton et sélectionnez
+   <UiPath path="connect.domain.addRecords" />. Le jeton doit avoir **Zone › DNS › Edit** sur cette zone. ReputeCast
+   l’utilise pour cette seule requête et ne le conserve jamais.
+
+3. Lisez le résultat. ReputeCast ajoute les enregistrements manquants et corrige ceux dont la valeur est erronée ; les
+   enregistrements dont il n’a pas besoin restent tels quels :
+
+   - Un enregistrement SPF existant est modifié sur place, pour que la zone n’en ait jamais deux.
+   - Un enregistrement DMARC existant n’est pas touché.
+   - Les enregistrements CNAME sont créés en **DNS only** (sans proxy), avec un TTL automatique.
+
+   Les enregistrements refusés par Cloudflare sont listés dans le message ; ajoutez-les à la main.
+
+</Steps>
+
+Pour ajouter plutôt les enregistrements à la main, allez dans **DNS** > **Records** dans le tableau de bord Cloudflare,
+sélectionnez **Add record**, choisissez le type, renseignez le nom et la valeur, puis sélectionnez **Save**
+([Cloudflare, « Manage DNS records »](https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/),
+vérifié en octobre 2026). Réglez **Proxy status** sur **DNS only** pour les enregistrements CNAME : Cloudflare
+recommande DNS only pour les enregistrements liés aux e-mails
+([Cloudflare, « Proxy status »](https://developers.cloudflare.com/dns/proxy-status/), vérifié en octobre 2026).
+
+L’ajout des enregistrements via l’API exige un membre connecté disposant de `domains:manage`. Les clés d’API et les
+agents IA ne peuvent pas l’utiliser.
+
+</TabItem>
+<TabItem label="Amazon Route 53">
+
+ReputeCast n’a pas d’intégration Route 53 : ajoutez les enregistrements dans la console Route 53.
+
+<Steps>
+
+1. Ouvrez la console Route 53, choisissez **Hosted zones** puis la zone de votre domaine.
+
+2. Pour chaque ligne du tableau de ReputeCast, choisissez **Create record** :
+
+   - **Record name** : la partie du nom avant la zone hébergée. Dans la zone `acme.io`, les enregistrements MAIL FROM
+     sont `bounce.news`. Laissez le champ vide pour un enregistrement sur la zone elle-même.
+   - **Record type** : le type indiqué dans le tableau.
+   - **Value** : la valeur indiquée dans le tableau. Mettez les valeurs TXT entre guillemets droits doubles. Une valeur
+     TXT de plus de 255 caractères se saisit en plusieurs chaînes entre guillemets sur une seule ligne :
+     `"first part" "second part"`.
+
+3. Si le nom a déjà un enregistrement TXT (par exemple un enregistrement SPF sur la zone elle-même), modifiez cet
+   enregistrement au lieu d’en créer un autre. Route 53 garde toutes les valeurs TXT d’un nom dans un seul
+   enregistrement, une valeur par ligne ; remplacez l’ancienne valeur `v=spf1` par la valeur fusionnée plutôt que
+   d’ajouter une seconde ligne `v=spf1`.
+
+4. Choisissez **Create records**. Les modifications atteignent généralement tous les serveurs de noms Route 53 en
+   moins de 60 secondes
+   ([AWS, « Creating records by using the Amazon Route 53 console »](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating.html)
+   et [« Supported DNS record types »](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html#TXTFormat),
+   vérifié en octobre 2026).
+
+</Steps>
+
+Route 53 peut aussi importer un fichier de zone (<UiPath path="connect.domain.copyZone" /> vous en fournit un), mais
+l’import échoue quand la zone contient déjà l’un des enregistrements du fichier, et aucun enregistrement n’est créé
+([AWS, « Creating records by importing a zone file »](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating-import.html),
+vérifié en octobre 2026). Pour une zone existante, créez les enregistrements un par un.
+
+</TabItem>
+<TabItem label="Tout hébergeur DNS">
+
+<Steps>
+
+1. Sélectionnez <UiPath path="connect.domain.copyZone" />. ReputeCast copie chaque ligne du tableau dans le
+   presse-papiers sous forme de lignes de fichier de zone, avec un TTL de 3 600 secondes. Il ne télécharge aucun
+   fichier.
+
+   ```txt title="Lignes de fichier de zone (exemple)"
+   bounce.news.acme.io. 3600 IN MX 10 feedback-smtp.us-east-1.amazonses.com.
+   bounce.news.acme.io. 3600 IN TXT "v=spf1 include:amazonses.com ~all"
+   ```
+
+2. Si votre hébergeur DNS importe les fichiers de zone, collez-y les lignes ou importez-les. Sinon, créez chaque
+   enregistrement à la main et utilisez le bouton **Copier** de chaque ligne pour la valeur.
+
+3. Vérifiez comment votre hébergeur DNS attend les noms. Beaucoup ajoutent le nom de la zone à votre place : dans la
+   zone `acme.io`, `bounce.news.acme.io` se saisit alors `bounce.news`. Y saisir le nom complet crée
+   `bounce.news.acme.io.acme.io`.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Attendre la vérification des enregistrements
+
+ReputeCast vérifie les enregistrements tant que le tableau est ouvert : toutes les 30 secondes jusqu’à ce qu’ils soient
+tous vérifiés, avec la ligne « Vérification toutes les 30 s · dernier contrôle à … ». L’ouverture de la page relance un
+contrôle si le dernier date de plus de 20 secondes, et une tâche de fond vérifie chaque domaine toutes les 30 minutes :
+une modification faite plus tard apparaît donc aussi dans le [contrôle avant envoi](/fr/reference/glossary/#send-readiness)
+dans l’heure.
+
+| État                                         | Signification                                                                                         |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Vérifié                                      | L’enregistrement est publié avec la bonne valeur.                                                     |
+| En attente                                   | Pas encore trouvé, ou pas encore vérifié.                                                             |
+| En attente · ancienne valeur encore en cache | Un enregistrement TXT répond encore avec son ancienne valeur ; il se met à jour une fois le TTL affiché écoulé. |
+| Valeur incorrecte                            | Un enregistrement CNAME ou MX pointe ailleurs ; la valeur trouvée s’affiche en dessous.                |
+| Manquant                                     | Aucun enregistrement de ce type n’existe sous ce nom.                                                 |
+| Vérification impossible                      | La requête DNS a échoué. ReputeCast réessaie au contrôle suivant.                                     |
+
+La plupart des hébergeurs DNS publient les modifications en quelques minutes ; certains mettent jusqu’à 48 heures. Tant
+que SPF n’autorise pas le fournisseur d’envoi et que DKIM n’est pas vérifié, le contrôle avant envoi bloque les
+campagnes de ce domaine, et un enregistrement DMARC manquant les bloque aussi. Une requête DNS qui échoue (délai
+dépassé, échec du serveur ou requête refusée) ne dit rien de l’enregistrement : le contrôle avant envoi affiche ce
+contrôle en <UiPath path="review.statusUnknown" />, jamais en <UiPath path="review.statusBlock" />, et l’interroge de
+nouveau lors de la [nouvelle vérification au moment de l’envoi](/fr/campaigns/send-readiness/).
+
+## Choisir une politique DMARC
+
+`p=none` demande aux destinataires de livrer normalement les e-mails qui échouent à DMARC et de vous envoyer seulement
+des rapports. `p=quarantine` les envoie en spam, et `p=reject` les refuse. Gmail, Yahoo et Microsoft acceptent `p=none`
+de la part des expéditeurs de gros volumes
+([Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)).
+
+- **D’autres services envoient au nom du domaine, ou vous n’en êtes pas sûr :** commencez par `p=none` et une adresse
+  `rua` qui collecte les rapports agrégés. Le conseil DMARC de ReputeCast dit la même chose quand sa suggestion serait
+  trop stricte.
+- **Seuls les fournisseurs d’envoi de ReputeCast envoient au nom du domaine :** la suggestion de ReputeCast,
+  `p=quarantine`, est sûre dès que tous les enregistrements du tableau sont vérifiés.
+
+```txt title="_dmarc.news.acme.io TXT (politique de départ)"
+v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
+```
+
+Lisez ensuite les rapports pendant quelques semaines et durcissez la politique quand toutes les sources légitimes
+réussissent, comme l’explique [Lire les rapports agrégés DMARC](/fr/deliverability/dmarc-reports/). Un enregistrement
+DMARC sur le domaine organisationnel (`_dmarc.acme.io`) couvre aussi les sous-domaines comme `news.acme.io` ; sa
+balise `sp=` fixe leur politique, et ReputeCast la lit quand le sous-domaine n’a pas d’enregistrement propre.
+
+## Vérifier le résultat
+
+- Le titre du tableau indique « Enregistrements · 7 sur 7 vérifiés » (avec vos nombres), et la ligne d’état dit « Tous
+  les enregistrements sont vérifiés ».
+- Dans le tableau des domaines de <UiPath path="nav.settings > settings.senders" />, SPF affiche `pass`, DKIM affiche
+  `Vérifié` (ou, avec plusieurs fournisseurs d’envoi, un décompte comme `3 sur 3 fournisseurs`) et DMARC affiche la
+  politique, par exemple `p=quarantine`. `p=none` s’affiche comme un avertissement, pas comme une erreur.
+- Le groupe Authentification du [contrôle avant envoi](/fr/campaigns/send-readiness/) réussit pour une campagne de ce
+  domaine : « SPF autorise … », « Signature DKIM sur … », « DMARC p=… » et, quand le fournisseur d’envoi le permet,
+  « Domaine MAIL FROM personnalisé vérifié ».
+- Un [test de placement](/fr/deliverability/placement-tests/) montre les résultats SPF, DKIM et DMARC que de vraies
+  boîtes aux lettres ont enregistrés pour les copies.
+
+## Dépannage
+
+- **SPF affiche « Non valide ».** Le domaine publie deux enregistrements `v=spf1`, ce qui fait échouer SPF avec une
+  erreur permanente ([RFC 7208, section 4.5](https://www.rfc-editor.org/rfc/rfc7208#section-4.5), vérifié en octobre
+  2026). Fusionnez-les en un seul enregistrement avec la valeur affichée par ReputeCast, et supprimez l’autre.
+- **SPF affiche « Trop de requêtes DNS ».** SPF autorise au plus 10 requêtes DNS pour l’ensemble des termes `include`,
+  `a`, `mx`, `ptr`, `exists` et `redirect`, includes imbriqués compris
+  ([RFC 7208, section 4.6.4](https://www.rfc-editor.org/rfc/rfc7208#section-4.6.4), vérifié en octobre 2026). Retirez
+  les includes des services que vous n’utilisez plus ; les termes `ip4` et `ip6` ne comptent pas. ReputeCast ne compte
+  pas les requêtes d’une valeur fusionnée avant que vous la publiiez : regardez donc l’état après la publication.
+- **SPF se termine par `+all`.** ReputeCast le considère comme non valide, car il permet à n’importe qui d’envoyer au
+  nom du domaine. Utilisez `~all` ou `-all`.
+- **Un enregistrement reste « Manquant » alors que vous l’avez ajouté.** Vérifiez que le nom ne contient pas la zone en
+  double (`news.acme.io.acme.io`) et que vous avez modifié la zone chez l’hébergeur DNS vers lequel pointent les
+  serveurs de noms.
+- **Un CNAME DKIM chez Cloudflare reste « En attente ».** Vérifiez que l’enregistrement est en **DNS only**, sans
+  proxy.
+- **Le contrôle avant envoi signale des clés DKIM de moins de 1024 bits.** Les fournisseurs de messagerie attendent des
+  clés d’au moins 1024 bits ; générez une clé plus longue chez le fournisseur d’envoi et publiez le nouvel
+  enregistrement.
+- **« Cloudflare a refusé ce jeton. »** Le jeton n’a pas **Zone › DNS › Edit** sur cette zone. Créez un jeton avec le
+  modèle **Edit zone DNS** pour la bonne zone.
+- **« Aucune zone Cloudflare pour … n’est visible avec ce jeton. »** Les ressources de zone du jeton n’incluent pas la
+  zone du domaine.
+- **Le bouton Cloudflare n’apparaît pas.** Les serveurs de noms ne sont pas ceux de Cloudflare, ou ReputeCast ne les a
+  pas encore interrogés. Utilisez le fichier de zone.
+- **Gmail refuse les e-mails avec 550 5.7.26.** Le message a échoué à l’authentification ; voir
+  [Gmail 550 5.7.26](/fr/smtp-errors/gmail-550-5-7-26/).
+
+## Voir aussi
+
+- [Lire les rapports agrégés DMARC](/fr/deliverability/dmarc-reports/)
+- [Configurer BIMI](/fr/deliverability/bimi/)
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)
+- [Ajouter des domaines d’envoi et des expéditeurs](/fr/providers/senders-and-domains/)
+- [Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/)

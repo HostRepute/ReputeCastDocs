@@ -1,0 +1,127 @@
+---
+title: Mit Brevo senden
+description: 'Newsletter über die Brevo API aus ReputeCast senden: API-v3-Schlüssel verbinden; Webhooks, Domain-Einträge und Sperreinträge von Brevo folgen automatisch.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Newsletter über die Brevo API
+sources:
+  - internal/providers/brevo
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/suppressions/sync.go
+  - web/src/features/connect
+sidebar:
+  order: 10
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Ein Newsletter über die Brevo API geht aus ReputeCast über die Transaktions-E-Mail-API von Brevo hinaus, ein Aufruf pro
+Nachricht. Sie verbinden einen API-v3-Schlüssel; ReputeCast registriert einen Transaktions-Webhook, authentifiziert Ihre
+Versand-Domain und ruft die blockierten Kontakte von Brevo in die gemeinsame Sperrliste ab. Zwei Verhaltensweisen von
+Brevo sind wichtig, bevor Sie senden: Brevo fügt einen eigenen Abmelde-Header hinzu, und es erfasst Öffnungen und Klicks
+auf eine Weise, die ReputeCast nicht abschalten kann.
+
+<ProviderMatrix family="email" id="brevo" />
+
+## Bevor Sie beginnen
+
+- **Ein Brevo-API-Schlüssel** aus Brevo › SMTP & API › API keys. Er beginnt mit `xkeysib-`. Brevo stellt für sein
+  SMTP-Relay auch SMTP-Schlüssel aus; die funktionieren hier nicht
+  ([Brevo: Create and manage your API keys](https://help.brevo.com/hc/en-us/articles/209467485-Create-and-manage-your-API-keys),
+  geprüft im Oktober 2026).
+- **Ein Konto, das senden kann.** Solange Brevo ein neues Konto validiert oder wenn das Konto keine Credits mehr hat,
+  schlägt die Schlüsselprüfung fehl.
+- **Berechtigungen.** Zum Verbinden brauchen Sie `providers:manage`; um eine neue Versand-Domain hinzuzufügen,
+  `domains:manage`.
+- **Eine öffentliche HTTPS-Adresse** für den Webhook: `<public URL>/hooks/brevo/<token>`.
+
+Drei Verhaltensweisen von Brevo sind wichtig, bevor Sie E-Mails darüber leiten:
+
+- **Der Abmelde-Header von Brevo.** Brevo fügt einen eigenen `List-Unsubscribe`-Header hinzu und hat keine API, um ihn
+  zu ändern, daher lässt ReputeCast bei E-Mails über Brevo seinen eigenen Header weg. Abmeldungen mit einem Klick bei
+  Postfachanbietern gehen an Brevo, das sie über den Webhook meldet, und die Adresse kommt auf die gemeinsame
+  [Sperrliste](/de/reference/glossary/#suppression-list). Der Abmeldelink in Ihrer Fußzeile führt weiterhin zu
+  ReputeCast.
+- **Das Öffnungs- und Klick-Tracking von Brevo.** Brevo erfasst Öffnungen und Klicks in Transaktions-E-Mails
+  standardmäßig und hat weder eine API noch einen Schalter pro Nachricht, um das zu verhindern; in den Einstellungen
+  können Sie dieses Tracking nur anonymisieren
+  ([Brevo: Can I anonymize the tracking of opens and clicks for my emails?](https://help.brevo.com/hc/en-us/articles/11643306229906-Can-I-anonymize-the-tracking-of-opens-and-clicks-for-my-emails),
+  geprüft im Oktober 2026). Brevo fügt zusätzlich zum Tracking von ReputeCast ein eigenes Öffnungspixel hinzu und
+  schreibt Links um; seine Zahlen erreichen die Berichte von ReputeCast nie. Die
+  <UiPath path="providers.events.trackingTitle" /> kann die Einstellung von Brevo nicht auslesen, und die
+  [Versandbereitschaft](/de/reference/glossary/#send-readiness) warnt nicht davor; prüfen Sie die Tracking-Einstellungen
+  von Brevo deshalb selbst.
+- **Sperreinträge nur abrufen.** ReputeCast importiert die blockierten Kontakte von Brevo (Hard Bounces,
+  Spam-Beschwerden und Abmeldungen) alle 15 Minuten, überträgt seine Liste aber nicht an Brevo, dessen API Kontakte nur
+  einzeln pro Absender blockiert. ReputeCast prüft die gemeinsame Liste, bevor es eine Nachricht an Brevo übergibt,
+  daher erreichen gesperrte Adressen Brevo nie.
+
+## Brevo verbinden
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.providers" />, wählen Sie <UiPath path="providers.overview.addProvider" /> und im
+   Katalog Brevo. [Versandanbieter verbinden](/de/providers/connect/) erklärt die Schritte, die alle Anbieter gemeinsam
+   haben.
+
+2. Fügen Sie den <UiPath path="providers.fields.apiKey" /> ein. Hat Ihr Tarif ein monatliches Kontingent, geben Sie
+   unter den zusätzlichen Brevo-Einstellungen <UiPath path="providers.fields.monthlyLimit" /> für die Kontingentanzeige
+   ein.
+
+3. Wählen Sie <UiPath path="connect.connection.connect" />. ReputeCast liest Ihr Konto mit dem Schlüssel aus und
+   speichert ihn verschlüsselt. Die Karte zeigt Ihren Firmennamen, den Tarif und die verbleibenden E-Mails oder Credits.
+
+4. Unter <UiPath path="connect.connection.webhooksTitle" /> prüft ReputeCast, ob seine Webhook-Adresse aus dem Internet erreichbar ist, und legt dann einen
+   Transaktions-Webhook namens „ReputeCast“ an (oder aktualisiert ihn), und zwar für die Ereignisse Zustellung, Hard und
+   Soft Bounce, Zurückstellung, blockiert, ungültig, Spam und Abmeldung. Brevo signiert keine Webhooks, daher gibt
+   ReputeCast Brevo ein Bearer-Token, das bei jeder Anfrage mitgesendet wird. Webhooks für Ihre Marketingkampagnen in
+   Brevo bleiben unberührt.
+
+5. Wählen Sie <UiPath path="connect.connection.continueDomain" /> und geben Sie Ihre Versand-Domain ein. ReputeCast
+   legt sie in Brevo an, bittet Brevo, sie zu authentifizieren, und listet die Einträge von Brevo auf: den
+   TXT-Verifizierungseintrag `brevo-code`, DKIM, SPF, sofern Brevo einen liefert, und DMARC.
+
+6. Senden Sie unter <UiPath path="connect.stepTest" /> einen Test und verfolgen Sie, wie das Zustellereignis ankommt.
+
+7. Wählen Sie unter <UiPath path="connect.stepStreams" /> und <UiPath path="connect.stepContacts" /> die Streams und
+   lassen Sie die Option zum Abrufen der bereits blockierten Kontakte von Brevo angehakt.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Die Brevo-Karte unter <UiPath path="nav.providers > providers.tabProviders" /> zeigt
+  <UiPath path="providers.statusHealthy" /> und was von Ihrem Tarif übrig ist. Ihre
+  [Versand-IPs](/de/providers/senders-and-domains/#versand-ips-prüfen) zeigen die aktiven dedizierten IPs des Kontos,
+  beim Verbinden und täglich aus Brevo gelesen, oder den gemeinsamen Pool von Brevo.
+- In Brevo listen die Transaktions-Webhooks einen Webhook „ReputeCast“, der auf `/hooks/brevo/…` zeigt.
+- Zustellungen und Bounces erscheinen unter <UiPath path="nav.providers > providers.tabEvents" />.
+
+## Fehlerbehebung
+
+- **„Brevo hat diesen Schlüssel abgelehnt.“** Verwenden Sie einen API-v3-Schlüssel (er beginnt mit `xkeysib-`), keinen
+  SMTP-Schlüssel.
+- **„Brevo hat auf die Prüfung nicht geantwortet“**, obwohl der Schlüssel sicher stimmt. Brevo lehnt ab, solange das
+  Konto validiert wird oder keine Credits mehr hat. Schließen Sie die Kontovalidierung bei Brevo ab oder laden Sie
+  Guthaben auf und versuchen Sie es dann erneut.
+- **Der Domain-Schritt schlägt mit „Brevo hat … nicht hinzugefügt“ fehl.** Brevo hat die Domain abgelehnt; der Grund
+  folgt auf die Meldung. Beheben Sie das Problem in Brevo und führen Sie den Schritt dann erneut aus.
+- **Die Zahl der Abmeldungen in ReputeCast wirkt niedrig.** Abmeldungen mit einem Klick bei Gmail oder Yahoo gehen
+  zuerst an Brevo und kommen über den Webhook an. Prüfen Sie, ob der Webhook in Brevo noch registriert ist.
+- **Der Katalog zeigt ein Kennzeichen „Sandbox-Modus“.** ReputeCast sendet nie über eine Brevo-Sandbox: Jede
+  Nachricht, die es übergibt, wird zugestellt.
+- **Sie haben Brevo getrennt.** ReputeCast löscht die Transaktions-Webhooks, die auf seine URL zeigen. Die Domain bleibt
+  in Brevo.
+
+## Verwandte Themen
+
+- [Versandanbieter verbinden](/de/providers/connect/)
+- [Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/)
+- [Abmeldung mit einem Klick (RFC 8058)](/de/deliverability/one-click-unsubscribe/)
+- [Von Brevo migrieren](/de/migrate/brevo/)
+- [Versandanbieter auswählen](/de/providers/choose/)

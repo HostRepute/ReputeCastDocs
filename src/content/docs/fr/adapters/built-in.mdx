@@ -1,0 +1,248 @@
+---
+title: Contribuer un adaptateur intégré
+description: 'Contribuer un adaptateur e-mail en Go à ReputeCast : contrat du fournisseur, descripteur, règles de webhook, suite de contrat et enregistrement dans le build.'
+type: how-to
+audience: [developer]
+primaryKeyword: adaptateur e-mail en Go
+sources:
+  - docs/adapters.md
+  - internal/providers/provider.go
+  - internal/providers/text.go
+  - internal/providers/optional.go
+  - internal/providers/extras.go
+  - internal/providers/{ips.go,idempotency.go}
+  - internal/providers/contracttest
+  - internal/providers/apiclient
+  - internal/providers/webhookauth
+  - internal/providers/bounce
+  - internal/providers/resend
+  - internal/sms
+  - internal/app/wire_adapters.go
+  - internal/providers/manage/adapters.go
+  - internal/connect/catalog.go
+  - internal/connect/copy.go
+  - internal/connect/messages/en.json
+  - docs/i18n/glossary-vi.md
+  - Makefile
+sidebar:
+  order: 5
+---
+
+import { Steps, FileTree } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Ce guide montre comment contribuer un adaptateur e-mail en Go à ReputeCast : un adaptateur intégré pour un [fournisseur d’envoi](/fr/reference/glossary/#sending-provider), compilé dans le binaire, testé avec la suite de tests de contrat partagée et publié avec chaque version. Si seule votre instance doit joindre un fournisseur, une [correspondance HTTP générique](/fr/adapters/generic-http/) ou un [adaptateur communautaire](/fr/adapters/community/) est plus rapide ; la page [adaptateurs de fournisseurs](/fr/adapters/overview/) compare les trois.
+
+## Avant de commencer
+
+- Une copie locale du dépôt ReputeCast et Go 1.27 (la chaîne d’outils se télécharge automatiquement). [Exécuter ReputeCast depuis les sources](/fr/developers/contributing/) met en place `make dev`.
+- [golangci-lint](https://golangci-lint.run/welcome/install/) v2, pour `make lint`.
+- La documentation de l’API du fournisseur, sa politique d’utilisation acceptable actuelle et des exemples de payloads de webhook tirés de sa documentation.
+- `docs/dev/CONVENTIONS.md` dans le dépôt, que chaque modification respecte.
+
+## Écrire l’adaptateur
+
+<Steps>
+
+1. Lisez le contrat dans `internal/providers/provider.go`. Il est en lecture seule pour les auteurs d’adaptateurs. Chaque adaptateur implémente `providers.Provider` :
+
+   | Méthode                                       | Rôle                                                                                                     |
+   | --------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+   | `Adapter() string`                            | La clé dans le registre, comme `"mailgun"`.                                                              |
+   | `Capabilities() Capabilities`                 | Les badges : politique de marketing de masse, webhooks, API de domaine, synchronisation de la liste de suppression, taille de lot, IP dédiées, sandbox, détection du quota et du débit, tarifs, suivi. |
+   | `Send(ctx, msgs) ([]SendResult, error)`       | Envoie au plus `BatchSize` messages et renvoie un résultat par message, dans l’ordre d’entrée.           |
+   | `ParseWebhook(ctx, r, body) ([]Event, error)` | Vérifie la requête et convertit son payload en événements normalisés.                                    |
+
+   Implémentez ensuite chaque interface facultative que l’API du fournisseur prend réellement en charge. Le code du cœur vérifie le type avant de les utiliser, et les écrans expliquent celles qui manquent :
+
+   <TableScroll label="Interfaces facultatives d’un adaptateur">
+
+   | Interface                                                | Sert à                                                                                                                     |
+   | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+   | `Verifier`, `QuotaReporter`                              | L’étape de connexion et la tâche de vérification de l’état (toutes les 5 minutes, chaque minute tant que le fournisseur est en panne). `Quota` l’emporte quand les deux existent. |
+   | `ReputationReporter`                                     | Les taux de rebond et de plainte propres au fournisseur, auxquels s’appliquent ses seuils d’examen.                        |
+   | `IPReporter`                                             | Les IP dédiées depuis lesquelles le compte envoie (`SendingIPs`), lues à la connexion du fournisseur, quand son étape de connexion est refaite et chaque jour. Le déclencheur « nouvelle IP » du canari, les lignes de liste de blocage d’IP du contrôle avant envoi, la délivrabilité et la chauffe les lisent. Définissez `Capabilities.ReportsIPs` avec elle, et renvoyez une erreur, jamais une liste vide, quand le fournisseur ne peut pas être interrogé. Sans elle, on saisit les IP à la main. |
+   | `IdempotentSender`                                       | La durée pendant laquelle le fournisseur reconnaît un message qu’il a déjà accepté (`IdempotencyWindow`). Dans cette fenêtre, un message dont la réponse d’envoi a été perdue est renvoyé ; sans elle, le message est « incertain » et une personne décide. |
+   | `DomainManager`                                          | Les enregistrements DNS avec leur état en direct pour l’étape du domaine et la délivrabilité.                              |
+   | `WebhookRegistrar`, `WebhookUnregistrar`                 | L’enregistrement du webhook de ReputeCast, et sa suppression quand le fournisseur est supprimé.                            |
+   | `WebhookInspector`, `WebhookTester`                      | Le diagnostic « webhook silencieux » et « Envoyer un événement de test ».                                                  |
+   | `WebhookVerifier`, `WebhookHandshaker`                   | La vérification avant que l’ingestion n’enregistre une requête ; la réponse aux handshakes (abonnements SNS, validation Event Grid) sans les enregistrer. |
+   | `WebhookSecrets`                                         | Désigner les en-têtes qui portent tel quel un secret de webhook partagé, pour que l’ingestion les retire de l’événement brut enregistré. |
+   | `SuppressionSyncer`                                      | La synchronisation bidirectionnelle avec la liste de suppression partagée. Renvoyez `providers.ErrNotSupported` depuis `AddSuppressions` pour l’import seul. |
+   | `SuppressionRemover`, `SuppressionReasonAdder`, `SuppressionScoper` | Retirer de la liste du fournisseur ce qui a quitté la liste partagée, transmettre une plainte en tant que plainte, et indiquer où se trouve la liste du fournisseur et si ReputeCast peut y écrire : une liste partagée avec des e-mails que ReputeCast n’envoie pas est seulement lue. |
+   | `TrackingManager`                                        | Lire et désactiver le suivi côté fournisseur, pour que les ouvertures et les clics ne soient pas comptés deux fois.        |
+   | `EventBackfiller`                                        | Récupérer l’état des messages quand les webhooks se sont tus.                                                              |
+   | `StatusPage`, `StatusReporter`                           | Le bouton d’état et le texte de l’incident pendant une panne.                                                              |
+   | `BroadcastStreamCreator`                                 | Les fournisseurs dont les conditions exigent un flux séparé pour les envois de masse (Postmark).                           |
+   | `ExtrasSender`                                           | L’envoi de copies et de pièces jointes ; un message avec ces extras ne part que vers un fournisseur qui l’implémente.       |
+
+   </TableScroll>
+
+2. Créez le paquet. `internal/providers/resend` est un exemple compact à suivre :
+
+   <FileTree>
+   - internal/providers/example/
+     - example.go commentaire du paquet avec les conditions du fournisseur, Descriptor, settings, credentials, New, Send
+     - webhook.go VerifyWebhook, ParseWebhook, normalisation
+     - account.go Verify ou Quota, domaines, enregistrement du webhook, liste de suppression, suivi, rattrapage
+     - lang.go le catalogue de messages et ses messages (le texte destiné aux personnes)
+     - messages/
+       - en.json l’anglais que lisent les personnes
+       - vi.json sa traduction
+     - example_test.go fausse API, contracttest.Run, tests propres à l’adaptateur
+     - testdata/ payloads de webhook enregistrés
+   </FileTree>
+
+3. Écrivez le descripteur, enregistrez-le depuis `init` et remplissez ses textes à partir du catalogue de messages de l’adaptateur :
+
+   ```go title="internal/providers/example/example.go"
+   //go:embed messages/*.json
+   var messagesFS embed.FS
+
+   var msgs = i18n.MustLoad(messagesFS, "providers.example")
+
+   func init() { providers.Register(Descriptor()) }
+
+   func Descriptor() providers.Descriptor {
+   	return providers.Descriptor{
+   		Adapter: "example",
+   		Name:    "Example ESP",
+   		Kind:    "api", // api, smtp, self_hosted, http
+   		Capabilities: providers.Capabilities{
+   			Bulk:            providers.BulkAllowed, // cite the AUP in the package comment
+   			Webhooks:        "Registered",
+   			DomainAPI:       "full",
+   			SuppressionSync: true,
+   			BatchSize:       1,
+   			Sandbox:         "mode",
+   			QuotaDiscovery:  true,
+   			// Pricing and DedicatedIPs are in messages/en.json.
+   		},
+   		Version:    version.Version,
+   		Maintainer: "HostRepute",
+   		Terms: []providers.Terms{{Bulk: providers.BulkAllowed,
+   			Streams: []providers.Stream{providers.StreamBroadcast, providers.StreamAutomation, providers.StreamSystem}}},
+   		Fields: []providers.Field{
+   			{Key: "api_key", Secret: true, Required: true},
+   			{Key: "region", Options: []string{"us", "eu"}},
+   		},
+   		New: New,
+   	}.WithMessages(msgs)
+   }
+   ```
+
+   Les textes que lisent les personnes vont dans `messages/en.json`, avec une `note` là où un traducteur en a besoin, et leur
+   traduction dans `messages/vi.json`, avec les termes de `docs/i18n/glossary-vi.md` :
+
+   ```json title="internal/providers/example/messages/en.json"
+   {
+     "pricing": { "message": "plan, from $10 per month", "note": "on a capability chip: Pricing · …" },
+     "terms.0.note": { "message": "Opted-in lists only…", "note": "what the terms allow, on Routing" },
+     "events": "Webhooks",
+     "domainSetup": "API",
+     "suppressionMode": "Two-way",
+     "field.api_key.label": "API key",
+     "field.api_key.help": { "message": "Example › Settings › API keys.", "note": "Example's own menus" },
+     "field.region.label": "Region"
+   }
+   ```
+
+   Les badges doivent être vrais pour le fournisseur aujourd’hui :
+   - **Bulk :** `BulkAllowed`, `BulkBroadcastStreams` (uniquement sur un flux dédié), `BulkForbidden` ou `BulkYourPolicy` (auto-hébergé). Citez la politique d’utilisation acceptable du fournisseur dans le commentaire du paquet, avec son URL et la date à laquelle vous l’avez vérifiée, et mettez les conditions importantes dans `Terms.Note` (le message `terms.0.note`) : l’écran de routage l’affiche.
+   - **Sandbox :** `detection`, `test token`, `mode` ou `test addresses` ; vide s’il n’y en a pas.
+   - **Détection du quota et du débit :** ne les définissez que si un appel d’API les renvoie.
+   - **Tarifs et IP dédiées :** de courts résumés dans les messages `pricing` et `dedicatedIps` ; préférez un nom de forfait à un prix qui deviendra obsolète.
+   - **Suivi :** définissez `RewritesLinks` ou `AddsOpenPixel` quand le fournisseur suit par défaut et que l’adaptateur ne peut pas le désactiver message par message.
+   - Les messages `events`, `domainSetup` et `suppressionMode` sont les mots qu’affiche l’onglet Adaptateurs, comme « SNS webhooks », « API » et « Two-way ».
+
+4. Écrivez le texte destiné aux personnes. Ce qu’un adaptateur dit aux personnes s’affiche dans la langue de chaque lecteur : le texte du serveur suit la langue de l’application du lecteur (`i18n.LangFrom(ctx)`), et les clients d’API qui n’envoient pas d’`Accept-Language` lisent l’anglais. Les catalogues sont globaux : le code du cœur lit donc un message conservé sans importer l’adaptateur.
+   - **Les textes du descripteur.** `WithMessages(msgs)` remplit le descripteur à partir de clés connues : `field.<key>.label` et `field.<key>.help`, `terms.<n>.variant` et `terms.<n>.note` (le n-ième `Terms`, à partir de 0), `pricing`, `dedicatedIps`, et les `events`, `domainSetup` et `suppressionMode` de l’onglet Adaptateurs. La logique continue de comparer l’anglais.
+   - **Ce que l’adaptateur écrit à l’exécution** garde son message à côté de l’anglais : `Quota.AccountText` (la situation du compte), `ConnectionReport.SummaryText`, `ProvisionStep.LabelText`, `ProvisionResult.DoneText`, `Tracking.DetailText` et `ScopeText`, `ServiceStatus.SummaryText`, et `CallError.Text` pour une erreur que l’adaptateur formule lui-même. Renvoyez l’anglais comme avant et le message avec `msg.Keep(args)` ; la plupart des adaptateurs ont dans `lang.go` une fonction `say(m, args)` qui renvoie les deux. Passez les nombres en tant que nombres et les heures en tant que `time.Time`, pour que `{n, number}` et `{at, time}` suivent le format régional du lecteur.
+   - **Les noms restent tels quels :** le nom du fournisseur et ses propres mots pour ses forfaits, clés, menus et types de flux, ses réponses (codes d’erreur, messages d’API), les noms d’événements, les journaux et les erreurs internes.
+   - **Texte enregistré.** Le code qui conserve le texte d’un adaptateur pour des lecteurs ultérieurs (l’état d’un fournisseur, l’avancement d’une configuration, un incident) enregistre l’anglais et le message. Une ligne écrite avant que son message ne soit conservé s’affiche en anglais.
+
+   Les adaptateurs SMS (`internal/sms/<name>`) fonctionnent de la même façon : l’espace de noms de leur catalogue est `sms.<name>`, `Manifest.WithMessages` lit les clés `summary`, `badge.<capability>.note`, `field.<key>.label` et `field.<key>.help`, et `internal/sms/contracttest` vérifie les textes.
+
+5. Gérez les paramètres et les identifiants. `providers.Config.Settings` contient les champs non secrets ; `Config.Credentials` contient les secrets déchiffrés sous forme d’objet JSON plat dont les clés sont celles des champs `Secret`. Les identifiants sont en écriture seule : scellés au repos, jamais renvoyés par l’API, remplacés une clé à la fois. Marquez comme `Secret` chaque champ dont la clé ressemble à un secret (`password`, `token`, `secret`, ou se terminant par `api_key`), sinon la suite de contrat échoue.
+
+   `New` ne doit faire aucune entrée/sortie réseau et ne doit pas échouer parce qu’une valeur facultative manque ; signalez les identifiants manquants dès le premier appel. La fabrique construit un adaptateur par requête : conservez donc ce qui mérite d’être réutilisé dans un cache au niveau du paquet, indexé par compte. Conservez le matériel de signature lu dans l’API du fournisseur dans un `webhookauth.Material`, qui le relit quand une signature échoue (au plus une fois par minute) et toutes les heures.
+
+6. Implémentez `Send` :
+   - Renvoyez un `SendError` par message pour un refus qui ne concerne qu’un message (une adresse non valide, un expéditeur non vérifié). Renvoyez une erreur pour une défaillance du compte ou du service, en enveloppant `providers.ErrUnauthorized` (identifiants refusés) ou `providers.ErrUnavailable` (panne). `apiclient` fait cette correspondance : `Do` pour les appels JSON, `Exec` pour les corps de formulaire ou multipart, les requêtes signées et les en-têtes de réponse. 401 et 403 deviennent des identifiants refusés, 429 une limitation de débit, 408 et 5xx des pannes ; `apiclient.MessageError` transforme les autres réponses 4xx en `SendError` permanent.
+   - Pour un appel par message, utilisez `apiclient.Fanout` : il conserve l’ordre des résultats, ne lance plus de nouvel appel après une défaillance au niveau du compte, et donne aux messages non envoyés une erreur temporaire pour que le moteur les réessaie.
+   - Renvoyez l’ID du message ReputeCast dans tout ce que le fournisseur restitue dans ses événements (custom args, tags, métadonnées), et envoyez l’en-tête `X-ReputeCast-Message`.
+   - Si le fournisseur prend en charge l’idempotence, dérivez la clé de l’ID du message, pour qu’une nouvelle tentative après un délai dépassé n’envoie jamais deux fois.
+   - Désactivez le suivi des ouvertures et des clics du fournisseur sur chaque message : ReputeCast fait son propre suivi.
+   - Ne marquez jamais en échec un message accepté. Si le fournisseur l’accepte sans renvoyer d’ID, utilisez l’ID ReputeCast comme ID du fournisseur.
+
+7. Vérifiez et normalisez les webhooks :
+   - `VerifyWebhook` doit renvoyer une erreur qui enveloppe `providers.ErrBadSignature` pour chaque échec, y compris « impossible de récupérer la clé ». L’ingestion enregistre comme vérifiée une requête qui renvoie toute autre erreur.
+   - `ParseWebhook` vérifie, sauf si `providers.SignatureVerified(ctx)` est défini. La tâche de normalisation le définit quand elle analyse de nouveau un payload enregistré, qui n’a plus l’URL d’origine ni l’en-tête `Authorization`.
+   - Utilisez le schéma avec lequel le fournisseur signe ; `internal/providers/webhookauth` propose Standard Webhooks, des fonctions HMAC et des comparaisons en temps constant. Si le fournisseur ne signe pas, enregistrez le webhook avec une authentification Basic ou un jeton bearer portant `Config.WebhookSecret`, qui voyage dans `Authorization` et n’est jamais enregistré.
+   - Bornez l’horodatage signé : cinq minutes avec `webhookauth.Fresh`, ou une fenêtre qui couvre les nouvelles tentatives du fournisseur avec `webhookauth.Within`.
+   - Convertissez chaque événement utile à la livraison en `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` ou `unsubscribe`. Gardez le type du fournisseur dans `OriginalType`, son code dans `OriginalCode` (découpez-le avec `bounce.Split`), le reste dans `Diagnostic`, et définissez `BounceClass` avec `bounce.Classify`. Mettez le destinataire en minuscules, gardez le JSON brut dans `Raw`, et ne renvoyez aucun événement pour ce qui n’est pas un résultat (envoyé, traité, réponses automatiques, pings de test).
+   - N’excluez pas sur une supposition : un échec permanent causé par l’expéditeur (un blocage pour spam ou réputation, des tentatives épuisées) est un rebond temporaire. Seul un problème d’adresse est un rebond définitif, car les rebonds définitifs et les plaintes vont sur la [liste de suppression](/fr/audience/suppressions/) partagée.
+
+8. Testez avec la suite de contrat. Chaque adaptateur passe `internal/providers/contracttest`, qui vérifie l’enregistrement, les capacités, un envoi, un refus permanent, une panne et des identifiants refusés avec votre fausse API, ainsi que chaque webhook enregistré : vérifié, normalisé, analysé de nouveau avec un contexte vérifié, et refusé une fois altéré. Son sous-test `Texts` vérifie le texte destiné aux personnes : un adaptateur intégré de type `api`, `smtp`, `self_hosted` ou `http` garde un catalogue, chaque texte qu’il déclare a un message dont l’anglais est ce texte, et chaque message est traduit dans chaque langue de l’application. `contracttest.CheckText` vérifie un texte que l’adaptateur écrit à l’exécution.
+
+   ```go title="internal/providers/example/example_test.go"
+   func TestContract(t *testing.T) {
+   	contracttest.Run(t, contracttest.Suite{
+   		Adapter: example.Adapter,
+   		API:     fakeAPI, // reads env.Mode(): "", contracttest.ModeOutage, contracttest.ModeAuth
+   		New:     newProvider,
+   		Delivered: func(t *testing.T, env *contracttest.Env, msgs []providers.Message, res []providers.SendResult) {
+   			// check env.Requests(): headers, the echoed message id, tracking off
+   		},
+   		Webhooks: []contracttest.Webhook{{
+   			Name:    "HardBounce",
+   			Request: signed("testdata/bounce.json"), // signed at test time with a test key
+   			Want:    []providers.Event{{Type: providers.EventHardBounce, Recipient: "john@example.com", OriginalCode: "550 5.1.1", BounceClass: "mailbox_unknown"}},
+   		}},
+   		// Tamper defaults to flipping a body byte; override it when the
+   		// signature doesn't cover the body or auth is a header.
+   	})
+   }
+   ```
+
+   Les tests n’utilisent pas le réseau : faites tourner une fausse API du fournisseur, enregistrez comme fixtures des payloads de webhook tirés de la documentation du fournisseur, et signez-les dans le test avec une clé de test. Si le fournisseur publie un vecteur de test de signature, testez avec. Testez les interfaces facultatives, la correspondance des erreurs et chaque particularité que vous contournez dans le code (des ID supérieurs à 2^53, un champ qui est tantôt une chaîne tantôt un tableau, un 400 qui porte des résultats par message).
+
+9. Enregistrez l’adaptateur dans le build :
+   - Ajoutez un import vide du paquet dans `internal/app/wire_adapters.go`. Enregistrer deux fois la même clé provoque un panic au démarrage.
+   - Ajoutez la clé à `adapterOrder` dans `internal/providers/manage/adapters.go` (l’ordre de l’onglet Adaptateurs) et à `catalogOrder` dans `internal/connect/catalog.go` (l’ordre du catalogue de configuration).
+   - Si vous le souhaitez, donnez ses textes à l’assistant de connexion dans `copyTable` de `internal/connect/copy.go`, avec les textes sous forme de messages `adapter.<key>.*` dans `internal/connect/messages/en.json` et `vi.json` ; sans entrée, l’assistant utilise le nom et les champs du descripteur.
+   - Les adaptateurs intégrés portent la version de ReputeCast (`version.Version`) et le mainteneur « HostRepute ».
+
+</Steps>
+
+## Vérifier le résultat
+
+1. Lancez les tests de l’adaptateur et le linter :
+
+   ```sh title="Terminal"
+   go test ./internal/providers/example/
+   golangci-lint run ./internal/providers/...
+   ```
+
+   `make test` lance tous les tests Go et web, sur le Postgres de développement s’il tourne ; `make lint` lance tous les linters.
+
+2. Démarrez l’application avec `make dev`, connectez-vous et ouvrez <UiPath path="nav.providers > providers.tabAdapters" />. L’adaptateur figure parmi les adaptateurs intégrés avec la version `dev` et le mainteneur HostRepute, et <UiPath path="nav.providers > providers.overview.addProvider" /> le propose dans le catalogue.
+
+## Dépannage
+
+- **Le serveur part en panic avec `providers: duplicate adapter <key>` :** un autre adaptateur enregistre déjà cette clé. Choisissez une clé `Adapter` unique.
+- **La suite de contrat échoue sur un champ de connexion :** sa clé ressemble à un secret (`password`, `token`, `secret`, `…api_key`). Définissez `Secret: true`.
+- **Le test `Texts` de la suite de contrat indique que l’adaptateur « keeps no catalog » :** le descripteur ne charge pas ses messages. Intégrez `messages/*.json`, chargez-les avec `i18n.MustLoad`, et terminez `Descriptor()` par `.WithMessages(msgs)`.
+- **`Texts` indique qu’un texte « has no message » ou que le catalogue « isn't translated into Tiếng Việt » :** ajoutez la clé à `messages/en.json` avec l’anglais qu’utilise l’adaptateur, ou sa traduction à `messages/vi.json`.
+- **Un webhook altéré passe, ou un webhook refusé est enregistré comme vérifié :** `VerifyWebhook` a renvoyé une erreur qui n’enveloppe pas `providers.ErrBadSignature`.
+- **Les webhooks enregistrés échouent à la normalisation :** `ParseWebhook` vérifie de nouveau alors que `providers.SignatureVerified(ctx)` est défini ; la requête enregistrée n’a pas d’en-tête `Authorization`.
+- **Les événements ne correspondent pas à leurs messages :** le fournisseur ne renvoie pas l’ID du message ReputeCast. Passez-le dans les métadonnées, les tags ou les custom args du fournisseur, et envoyez l’en-tête `X-ReputeCast-Message`.
+- **Les ouvertures ou les clics sont comptés deux fois :** le fournisseur suit toujours. Désactivez son suivi sur chaque message, ou implémentez `TrackingManager` pour le désactiver pour le compte.
+
+## Voir aussi
+
+- [Adaptateurs de fournisseurs](/fr/adapters/overview/) explique les trois types d’adaptateurs et comment en choisir un.
+- [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/) décrit les événements normalisés que produit votre adaptateur.
+- [Écrire un adaptateur communautaire](/fr/adapters/community/) crée plutôt un adaptateur qui s’exécute dans son propre processus.
+- [Exécuter ReputeCast depuis les sources](/fr/developers/contributing/) couvre `make deps`, `make dev`, `make test` et `make lint`.

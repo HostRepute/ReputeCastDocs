@@ -1,0 +1,227 @@
+---
+title: Zustand und Ausfälle von Anbietern
+description: 'Was ReputeCast beim Ausfall des E-Mail-Anbieters tut: Zustandsprüfungen, Status Ausgefallen oder Beeinträchtigt, geprüftes Failover und Zurückschalten.'
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Ausfall des E-Mail-Anbieters
+sources:
+  - internal/providers/manage/health.go
+  - internal/providers/manage/record.go
+  - internal/opsmetrics/opsmetrics.go
+  - internal/providers/manage/review_health.go
+  - internal/providers/manage/actions.go
+  - internal/providers/manage/usage.go
+  - internal/providers/state/state.go
+  - internal/providers/state/vet.go
+  - internal/providers/state/messages/en.json
+  - internal/routing/routing.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/routeerrors.go
+  - web/src/features/providers/messages.ts
+  - web/src/features/providers/overview.messages.ts
+  - web/src/features/providers/incidents.messages.ts
+sidebar:
+  order: 18
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast prüft jeden verbundenen Versandanbieter im Hintergrund und gibt ihm einen Status. Beginnt ein
+Ausfall des E-Mail-Anbieters, wechseln E-Mails, die weiter hinausgehen müssen, zu einem Ersatzanbieter, der seine
+Prüfungen besteht, der Anteil einer Kampagne beim ausgefallenen Anbieter wartet auf Ihre Entscheidung, und der Verkehr
+schaltet zurück, sobald der Anbieter 10 Minuten lang fehlerfrei war.
+
+## Was die Status bedeuten
+
+<UiPath path="nav.providers > providers.tabProviders" /> zeigt je Anbieter eine Karte mit seinem Status, den Streams,
+die er übernimmt, seinen Versand-IPs, der Aktualität seiner Webhooks, seiner API-Fehlerrate, Kontingent und Senderate,
+seinen Kosten in diesem Monat und seinen Fähigkeiten.
+
+<Screenshot
+  id="providers-list"
+  alt="Die Anbieterseite: 3 Anbieter verbunden, 2 fehlerfrei und 1 im Warm-up. Die Karten von Amazon SES und Postmark sind fehlerfrei, jeweils mit den übernommenen Streams, ihren Versand-IPs, Webhooks, der API-Fehlerrate über 7 Tage, Bounce- und Beschwerderate im Vergleich zu ihren Grenzen, Kontingent, Senderate, Kosten und Chips mit den Fähigkeiten."
+/>
+
+<TableScroll label="Status von Anbietern">
+
+| Status                                                                                       | Bedeutung                                                                                                                                                                 | Nimmt neue E-Mails an                                        |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| <UiPath path="providers.statusHealthy" />                                                    | Die letzten Prüfungen wurden bestanden.                                                                                                                                   | Ja                                                           |
+| <UiPath path="providers.statusWarmingUp" /> · Tag N von M                                    | Ein [Warm-up-Plan](/de/providers/warm-up/) läuft; sein Tageslimit gilt für Massenversand.                                                                                 | Ja, bis zum Limit von heute                                  |
+| <UiPath path="providers.statusSandbox" />                                                    | Das Konto kann nur an verifizierte Adressen senden, etwa in der Sandbox von Amazon SES.                                                                                   | Nur an diese Adressen                                        |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.webhooksSilent" /> | Der Anbieter nimmt E-Mails an, meldet aber keine Zustellungs-, Bounce- oder Beschwerdeereignisse. Siehe [stumme Webhooks](#stumme-webhooks).                           | Nein: Massenversand wartet, andere Streams nutzen ihren Ersatzanbieter |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.rejecting" />    | Der Anbieter lehnt einen ungewöhnlich hohen Anteil der übergebenen Nachrichten ab, zum Beispiel wegen eines nicht verifizierten Absenders oder eines gesperrten Kontos. Siehe [abgelehnte Nachrichten](#abgelehnte-nachrichten). | Ja; die abgelehnten Nachrichten wurden nicht gesendet |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.mailboxFailing" /> | Das [Bounce-Postfach](/de/reference/glossary/#bounce-mailbox) eines SMTP-Servers lässt sich nicht lesen, daher erreichen seine Bounces die Sperrliste nicht.          | Ja                                                           |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.queueFailing" /> | Die Ereigniswarteschlange von Amazon SES lässt sich nicht lesen; ihre Ereignisse warten dort.                                                                             | Ja                                                           |
+| <UiPath path="providers.statusDown" />                                                       | Aufrufe schlagen fehl, oder der Anbieter hat die Zugangsdaten abgelehnt (<UiPath path="providers.health.downAuth" />).                                                    | Nein                                                         |
+| <UiPath path="providers.statusPaused" />                                                     | Der Anbieter ist pausiert.                                                                                                                                                | Nein                                                         |
+
+</TableScroll>
+
+Bounce- und Beschwerderate auf einer Karte umfassen die letzten 7 Tage (oder sind die eigenen Zahlen des Anbieters,
+sofern er sie meldet). Sie werden im Vergleich zu den Grenzen des Anbieterkontos angezeigt, etwa den Prüf- und
+Pausierungsschwellen von Amazon SES, damit Sie sehen, wie nah Ihr Konto daran ist. Die angezeigten Grenzen können Sie in
+den <UiPath path="providers.overview.settings" /> des Anbieters ändern. Sie dienen nur zur Orientierung: Die
+Schwellenwerte, die einen Versand pausieren, sind die
+[Versandstandards für den Arbeitsbereich](/de/providers/workspace-defaults/) und die
+[Traffic-Regeln](/de/providers/traffic-rules/).
+
+Eine Rate ohne Daten wird nie als 0 % angezeigt:
+
+- Die Beschwerderate zählt nur E-Mails, die an [Postfachanbieter](/de/reference/glossary/#mailbox-provider) zugestellt
+  wurden, die Beschwerden melden. Gmail und iCloud tun das nie, daher zeigt ein Anbieter, dessen E-Mails nur dorthin
+  gingen, „k. A.“ mit dem Grund „Gmail und iCloud melden keine Beschwerden“.
+- Wurde in den letzten 7 Tagen nichts zugestellt, zeigen die Raten ebenfalls „k. A.“.
+- Die API-Fehlerrate eines Anbieters ohne Aufrufe zeigt <UiPath path="providers.overview.errorRateNoCalls" />.
+
+## Wie der Zustand geprüft wird
+
+1. Alle 5 Minuten macht ReputeCast einen reinen Leseaufruf bei jedem Anbieter (zum Beispiel `GetAccount` bei Amazon SES
+   oder `GET /server` bei Postmark) und speichert das Ergebnis sowie das gemeldete Kontingent und die Senderate. Solange
+   ein Anbieter ausgefallen oder beeinträchtigt ist, prüft es jede Minute.
+2. Echte Versände zählen ebenfalls: Jeder API-Aufruf während eines Versands wird erfasst.
+3. Ein Anbieter wird als **Ausgefallen** markiert nach 2 fehlgeschlagenen Prüfungen in Folge oder wenn mindestens die
+   Hälfte von mindestens 5 Aufrufen in den letzten 3 Minuten fehlgeschlagen ist. Eine Antwort `401` oder eine ähnliche
+   Antwort „Zugangsdaten abgelehnt“ markiert ihn sofort als ausgefallen.
+4. Ein Anbieter wird als **Beeinträchtigt** markiert, wenn seine Webhooks verstummen, wenn er beginnt, Nachrichten
+   abzulehnen, oder wenn ReputeCast sein Bounce-Postfach oder seine Ereigniswarteschlange nicht lesen kann. Jeder dieser
+   Fälle eröffnet eine Störung und benachrichtigt die Personen, die Versandanbieter verwalten.
+5. Ein ausgefallener Anbieter gilt als wiederhergestellt, sobald Aufrufe 10 Minuten lang wieder gelingen (weniger als 1
+   von 10 schlägt fehl). Nachdem Sie abgelehnte Zugangsdaten ersetzt haben, ist er mit der nächsten erfolgreichen
+   Prüfung wiederhergestellt.
+
+Das Ausfallbanner hat einen Button, mit dem Sie den Anbieter sofort erneut prüfen, statt auf die nächste Prüfung zu
+warten.
+
+## Was bei einem Ausfall passiert
+
+Fällt ein Anbieter aus, behandelt ReputeCast jeden Stream, der E-Mails über ihn leitet, nach der
+[Failover-Richtlinie](/de/providers/routing/) des Streams. E-Mails wechseln nur zu einem Ersatzanbieter, der zuerst jede
+Prüfung besteht: verfügbar, seine Bedingungen erlauben Massen-E-Mails (bei Massenversand), nicht in der Sandbox, die
+Domain des Absenders dort verifiziert, genug Kontingent für die E-Mails, die wechseln würden, und aufgewärmt. Ein
+Anbieter im Warm-up übernimmt Failover-E-Mails nur bei der automatischen Richtlinie und innerhalb des Limits von heute.
+
+- **Automationen, System und Transaktional** schalten automatisch auf den Ersatzanbieter des Streams um, wenn er seine
+  Prüfungen besteht. Das Banner sagt, wie viele E-Mails umgeleitet wurden. Besteht der Ersatzanbieter eine Prüfung
+  nicht, versucht ReputeCast es weiter beim Anbieter, statt umzuschalten, und neue E-Mails für den Stream warten, bis
+  der Anbieter wieder verfügbar ist.
+- **Massenversand** folgt der Richtlinie für Massenversand. Mit der Standardeinstellung, pausieren und nachfragen, wird
+  bei jeder Kampagne, die über den Anbieter sendet, der Anteil dieses Anbieters zurückgehalten, während die anderen
+  Anteile weitersenden, und die Personen, die Kampagnen senden dürfen, werden um eine Entscheidung gebeten. Mit
+  Failover nur zu aufgewärmten Anbietern oder automatischem Failover wechselt der Anteil zum Ersatzanbieter, wenn die
+  Richtlinie es erlaubt und der Ersatzanbieter seine Prüfungen besteht.
+
+Ein zurückgehaltener Anteil durchläuft den einen Ausfallpfad der Versand-Engine, egal ob die Zustandsprüfung den Ausfall
+gefunden hat oder der Versand zuerst: Seine Aufrufe sind 3 Minuten lang fehlgeschlagen, er hat das Konto wiederholt
+gedrosselt, seine API-Fehler haben die Grenze des Versands überschritten, oder er hat den Absender abgelehnt oder sein
+Kontingent ist erschöpft. Bis jemand entscheidet, testet der Anteil den Anbieter mit einer Nachricht pro Minute und wird
+von selbst fortgesetzt, nachdem 3 in Folge durchgegangen sind. Der [Live-Monitor](/de/campaigns/live-monitor/) zeigt
+dieselbe Zurückhaltung mit der Analyse der Engine und ihren Optionen.
+
+Für einen zurückgehaltenen Anteil am Massenversand bietet das Ausfallbanner auf der Anbieterseite drei Möglichkeiten.
+Darüber steht <UiPath path="providers.incidents.checksFirst" />, und jedes Ziel listet die Prüfungen auf, die es
+bestanden hat.
+
+- **Warten** auf den Anbieter: Der Anteil wird automatisch fortgesetzt, nachdem der Anbieter 10 Minuten lang fehlerfrei
+  war. Das wird empfohlen, wenn kein Ziel alle Prüfungen bestanden hat.
+- **Verschieben** der zurückgehaltenen Empfänger zu einem anderen Anbieter. Ein Ziel, das eine Prüfung nicht bestanden
+  hat, lässt sich nicht wählen. Ist es noch im Warm-up und würde das Verschieben das Limit von heute überschreiten, sagt
+  der Button, dass es nicht empfohlen wird.
+- <UiPath path="providers.incidents.cancelSend" />: Die zurückgehaltenen Empfänger erhalten die Kampagne nicht, der Rest
+  des Versands stoppt, und was bereits gesendet wurde, bleibt gesendet. Das kann nicht rückgängig gemacht werden.
+
+Warten und Verschieben setzen den Versand fort und erfordern `campaigns:send`; Abbrechen erfordert `campaigns:pause`.
+
+Mitglieder mit `providers:manage` werden benachrichtigt, wenn ein Anbieter ausfällt. Jeder Schritt (ausgefallen,
+Failover, wartet, zurückgeschaltet, wiederhergestellt) wird in den <UiPath path="providers.incidents.timelineTitle" />
+geschrieben, und der Ausfall wird im [Audit-Protokoll](/de/team/audit-log/) festgehalten. Die
+[Webhook-Endpunkte](/de/developers/webhooks/) des Arbeitsbereichs erhalten `provider.down`, wenn der Anbieter ausfällt
+(mit dem Grund, dem Fehler und welche Streams umgeschaltet haben und welche warten), und `provider.recovered`, wenn er
+wieder da ist (mit der Zahl der Minuten, die er ausgefallen war).
+
+Serverbetreiber können dieselben Aufrufe in den [Prometheus-Metriken](/de/self-hosting/monitoring/) verfolgen:
+`reputecast_provider_calls_total` zählt die Sendeaufrufe je Adapter (ok oder error) und
+`reputecast_provider_messages_total` die übergebenen Nachrichten (accepted, rejected, deferred oder failed).
+
+### Zurückschalten
+
+Nach 10 fehlerfreien Minuten kehren Streams, die umgeschaltet haben, zu ihrem Hauptanbieter zurück, und Anteile am
+Massenversand, die auf Warten stehen, werden dort fortgesetzt, wo sie aufgehört haben.
+
+### Stumme Webhooks
+
+Die Webhooks eines Anbieters sind stumm, wenn er weiterhin E-Mails annimmt, aber kein Zustellungs-, Bounce- oder
+Beschwerdeereignis zurückkommt: Die übernommenen Nachrichten sind über eine Schonfrist hinaus überfällig, wie es die
+Zeile „Webhooks stumm“ unter [Standardwerte und Grenzen](#standardwerte-und-grenzen) festlegt. Ein Anbieter, der nie
+ein Ereignis gemeldet hat, wird markiert, sobald E-Mails an ihn überfällig sind, damit ein Webhook, der nie funktioniert
+hat, nicht für immer „noch keine Ereignisse“ anzeigt. SMTP-Server sind ausgenommen, weil ihre Bounces aus einem
+Postfach kommen.
+
+Solange Webhooks stumm sind, funktioniert das Senden, aber der Status neuer Nachrichten ist unbekannt, sodass der
+Bounce-Schutz für diese Route blind ist. Der Anbieter wird als beeinträchtigt markiert. ReputeCast schaltet nicht allein
+wegen Stille um: Massenversand über den Anbieter wartet, bis Ereignisse eintreffen oder Sie entscheiden, und andere
+Streams nutzen ihren Ersatzanbieter, wenn sie einen haben. Das Banner zeigt, was ReputeCast geprüft hat (die API, ob der
+Webhook beim Anbieter noch registriert ist, ob seine Webhook-Adresse öffentlich ist und wann der Anbieter sie zuletzt
+erreicht hat), die wahrscheinlichen Ursachen und die Auswirkungen: überfällige Nachrichten und solche, die noch in der
+Schonfrist von 30 Minuten liegen, die betroffenen Kampagnen und die noch nicht gesperrten Bounces. Von dort können Sie
+<UiPath path="providers.incidents.sendTestEvent" /> wählen (der Anbieter sendet eines an den Webhook, und sein
+Eintreffen beweist, dass die Adresse funktioniert), <UiPath path="providers.incidents.reregister" /> oder, wenn die API
+des Anbieters frühere Nachrichten aufbewahrt, <UiPath path="providers.incidents.checkNow" />, um den Status der
+überfälligen Nachrichten zu lesen. Das Banner verschwindet, sobald Ereignisse eintreffen. Wie Ereignisse ReputeCast
+erreichen, steht unter [Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/).
+
+### Abgelehnte Nachrichten
+
+Ein Anbieter, der übergebene Nachrichten ablehnt, zum Beispiel weil der Absender dort nicht verifiziert oder das Konto
+gesperrt ist, wird als <UiPath path="providers.health.rejecting" /> markiert, sobald die Ablehnungen die Zeile „Lehnt
+Nachrichten ab“ unter [Standardwerte und Grenzen](#standardwerte-und-grenzen) überschreiten. Die abgelehnten
+Nachrichten wurden nicht gesendet. Die Störung zeigt, wie viele er abgelehnt hat, und seine letzte Antwort; prüfen Sie
+die Domain des Absenders und das Konto beim Anbieter. Der Status verschwindet, sobald er wieder Nachrichten annimmt.
+Während einer Kampagne hält ein Anbieter, der den Absender ablehnt, seinen Anteil zurück, statt jede Nachricht scheitern
+zu lassen: Nichts wird als fehlgeschlagen markiert, und die Nachrichten warten, bis Sie den Absender korrigieren, sie
+verschieben oder abbrechen.
+
+### Abgelehnte Zugangsdaten
+
+Antwortet ein Anbieter, dass die Zugangsdaten nicht mehr gültig sind, zum Beispiel weil jemand den API-Schlüssel beim
+Anbieter rotiert hat, wird er sofort als ausgefallen markiert, und seine Streams schalten wie oben beschrieben um.
+Ersetzen Sie die Zugangsdaten in den <UiPath path="providers.overview.settings" /> des Anbieters: ReputeCast prüft die
+neuen beim Anbieter, bevor es sie speichert.
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="providers" />
+
+## Wann Sie sie ändern sollten
+
+- **Geben Sie jedem Stream einen Ersatzanbieter, der seine E-Mails übernehmen kann.** Ein zweiter Anbieter mit
+  verifizierter Absender-Domain und genug Kontingent macht aus einem Ausfall ein kurzes Failover für E-Mails aus
+  Automationen, System und Transaktional. Lesen Sie [E-Mails über mehrere Anbieter routen](/de/providers/routing/).
+- **Wählen Sie die Richtlinie für Massenversand bewusst.** Pausieren und nachfragen ist die sichere Standardeinstellung.
+  Schalten Sie automatisch und nur zu einem aufgewärmten Anbieter um, wenn Sie Kampagnen lieber weiterlaufen lassen
+  möchten und Ihr Ersatzanbieter eine Versandhistorie hat.
+- **Stellen Sie sicher, dass die Webhooks Sie erreichen.** Stumme Webhooks gehen meist auf einen Reverse Proxy, eine
+  Firewall oder ein Problem mit der öffentlichen URL zurück. Lesen Sie
+  [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/) und [Fehlerbehebung](/de/self-hosting/troubleshooting/).
+
+<Aside type="tip">
+Den Kontozustand eines Anbieters über die eigenen Prüfungen von ReputeCast hinaus, etwa Blocklisten und die Reputation
+bei Postfachanbietern, finden Sie auf den Seiten zur Zustellbarkeit. Lesen Sie
+[Zustand von Domains und Anbietern überwachen](/de/deliverability/health/).
+</Aside>
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="E-Mails über mehrere Anbieter routen" href="/de/providers/routing/" />
+  <LinkCard title="Versand überwachen und automatisch pausieren" href="/de/campaigns/live-monitor/" />
+  <LinkCard title="Zustellereignisse und Sperrlisten-Synchronisierung" href="/de/providers/events-and-sync/" />
+  <LinkCard title="Benachrichtigungen" href="/de/team/notifications/" />
+</CardGrid>

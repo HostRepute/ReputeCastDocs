@@ -1,0 +1,140 @@
+---
+title: 'Gmail 550 5.7.26: correo sin autenticar bloqueado'
+description: Gmail 550 5.7.26 bloquea el correo que no supera SPF ni DKIM o la política DMARC del dominio From. Por qué pasa y cómo corregir la autenticación en ReputeCast.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: Gmail 550 5.7.26
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/audience/suppressions.go
+  - internal/providers/{ses,resend,postal,smtp,postmark,sendgrid,mailjet,sparkpost,mailgun,brevo,azureacs,httpgeneric}
+  - web/src/features/senders
+sidebar:
+  label: Gmail 550 5.7.26
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 550 5.7.26 es un rechazo permanente: el mensaje no superó la autenticación del correo, así que Gmail lo bloqueó.
+La solución está en tus registros DNS, no en tu lista. Esta página muestra cómo leer la respuesta y conseguir que SPF,
+DKIM y DMARC sean correctos para todos los proveedores de envío que usas.
+
+## Qué quiere decir Gmail
+
+Gmail envía el código con uno de tres textos:
+
+> This email has been blocked because the sender is unauthenticated. Gmail requires all senders to authenticate with
+> either SPF or DKIM. Authentication results: DKIM = did not pass SPF [_domain-name_] with ip: [_ip-address_] = did not
+> pass.
+
+> The (E)MAIL FROM domain [_domain-name_] has an SPF record with a hard fail policy (-all) but it fails to pass SPF checks
+> with the ip: [_ip-address_]. To best protect our users from spam and phishing, the message has been blocked.
+
+> Unauthenticated email from _domain-name_ is not accepted due to domain's DMARC policy. Contact the administrator of
+> _domain-name_ domain if this was legitimate email.
+
+Gmail también tiene versiones temporales: 421 4.7.26 limita la velocidad del correo sin autenticar en lugar de
+bloquearlo, y 451 4.7.26 significa que unos fallos temporales de DNS impidieron la comprobación DMARC. Fuente:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Ayuda de Google Workspace. Comprobado en octubre de 2026.
+
+## Por qué ocurre
+
+- **Ni SPF ni DKIM fueron correctos.** Los registros DKIM del proveedor de envío no están publicados, o SPF no incluye
+  al proveedor de envío.
+- **SPF falló de forma estricta.** Tu registro SPF termina en `-all` y no incluye el servidor que envió el mensaje, por
+  ejemplo un proveedor de envío que añadiste más tarde a una [ruta](/es/reference/glossary/#route).
+- **DMARC falló.** Tu política DMARC es `quarantine` o `reject`, y ni SPF ni DKIM están
+  [alineados](/es/reference/glossary/#alignment) con el dominio From. Esto pasa cuando el proveedor de envío firma DKIM
+  con su propio dominio y usa su propio return path.
+
+## Cómo lo clasifica ReputeCast
+
+- [Clase de rebote](/es/reference/glossary/#bounce-class): `policy_block` para el primer y el tercer texto. El texto del
+  fallo estricto de SPF menciona el spam, así que es `spam_block`. El código solo, sin texto, es `policy_block`.
+- Fila del informe: <UiPath path="reports.bounceType.blocked" />.
+- Supresión: el rechazo se refiere a tu dominio, no a la dirección, así que la dirección no se suprime, tanto si el
+  proveedor de envío registra un rebote temporal como uno permanente (consulta
+  [cuándo suprime ReputeCast una dirección](/es/smtp-errors/#cuándo-suprime-reputecast-una-dirección)). En el informe
+  de la campaña, <UiPath path="reports.investigate" /> en esa fila muestra lo que dijo cada proveedor de envío, y
+  <UiPath path="reports.retryTitle" /> vuelve a preparar la edición en borrador para esas direcciones cuando hayas
+  corregido la causa.
+- Durante un envío: uno permanente cuenta para el umbral de rebotes por bloqueo o política de Gmail, que pausa Gmail
+  por defecto; consulta los
+  [valores predeterminados de la pausa automática](/es/campaigns/live-monitor/#valores-predeterminados-y-límites) y las
+  [reglas de tráfico](/es/providers/traffic-rules/).
+
+La revisión previa comprueba los mismos registros antes de cada campaña. En su grupo
+<UiPath path="review.groupAuthentication" />, un registro SPF que falta, un registro SPF que no autoriza a uno de los
+proveedores de envío de la campaña, un DKIM sin verificar o un registro DMARC que falta o no es válido bloquean el
+envío. Menos del 90 % del correo alineado con DMARC en los últimos 7 días es un aviso.
+
+## Antes de empezar
+
+- `domains:manage` para ver y comprobar los registros DNS de un dominio de envío.
+- Acceso al proveedor de DNS de tu dominio.
+- `providers:view` para leer el registro de eventos.
+
+## Corregir la autenticación
+
+<Steps>
+
+1. Lee el texto de Gmail. Abre <UiPath path="nav.providers > providers.tabEvents" />, filtra
+   <UiPath path="providers.events.typeFilter" /> por <UiPath path="providers.events.optionSoftBounce" /> o
+   <UiPath path="providers.events.optionHardBounce" /> y busca un destinatario de Gmail.
+   <UiPath path="providers.events.colCode" /> muestra qué comprobación falló y, en el primer texto, el dominio y la
+   dirección IP que comprobó Gmail.
+2. Abre <UiPath path="nav.settings > settings.senders" /> y el dominio de envío. Su página de registros enumera los
+   registros DNS exactos que cada proveedor de envío necesita para el dominio, cada uno con un estado
+   (<UiPath path="connect.domain.statusVerified" />, <UiPath path="connect.domain.statusPending" /> o
+   <UiPath path="connect.domain.statusMissing" />), y los comprueba cada 30 segundos mientras está abierta.
+3. Publica los registros que faltan o son incorrectos en tu proveedor de DNS. Un nombre de dominio solo puede tener un
+   registro SPF ([RFC 7208, sección 3.2](https://www.rfc-editor.org/rfc/rfc7208#section-3.2), comprobado en octubre de
+   2026), así que combina lo que pide la página de registros con el registro existente. Sigue
+   [configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/) para ver los pasos exactos.
+4. Si el proveedor de envío admite un dominio MAIL FROM (return path) personalizado, configúralo para que SPF se alinee
+   con tu dominio From igual que DKIM.
+5. Espera a que los registros muestren <UiPath path="connect.domain.statusVerified" />. ReputeCast también comprueba el
+   DNS cada 30 minutos, y un cambio aparece en la revisión previa en menos de una hora. Después abre
+   <UiPath path="composer.reviewSend" /> de la siguiente campaña: el grupo
+   <UiPath path="review.groupAuthentication" /> de la [revisión previa](/es/campaigns/send-readiness/) debe ser
+   correcto.
+
+</Steps>
+
+## Comprobar que funciona
+
+- Todos los registros de la página del dominio de envío muestran <UiPath path="connect.domain.statusVerified" />.
+- El grupo <UiPath path="review.groupAuthentication" /> de la revisión previa es correcto para la campaña.
+- El informe de la siguiente campaña no tiene ningún 550 5.7.26 en <UiPath path="reports.colCodes" />.
+
+## Solución de problemas
+
+- **Solo lo provoca un proveedor de envío.** Faltan sus registros DKIM o su `include:` de SPF. Las rutas reparten el
+  correo entre proveedores, así que revisa todos los proveedores de envío de la ruta de la campaña.
+- **DMARC es correcto para una parte del correo y falla para el resto.** Lee los
+  [informes agregados de DMARC](/es/deliverability/dmarc-reports/) para encontrar los orígenes que no se alinean.
+- **Una versión anterior suprimió direcciones por este rebote.** Después de corregir la autenticación, puedes quitarlas
+  de <UiPath path="nav.audience > audience.tabSuppressions" /> con
+  <UiPath path="audience.suppressions.removeButton" />.
+
+<Aside type="caution">
+Un contacto que se quita de la lista de supresión después de un rebote permanente vuelve al consentimiento pendiente.
+Solo vuelve a recibir correo después de una nueva alta.
+</Aside>
+
+## Relacionado
+
+- [Códigos de error SMTP](/es/smtp-errors/)
+- [Outlook 550 5.7.515](/es/smtp-errors/outlook-550-5-7-515/), el requisito de autenticación de Microsoft
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Añadir dominios de envío y remitentes](/es/providers/senders-and-domains/)

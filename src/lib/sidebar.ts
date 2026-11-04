@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { StarlightUserConfig } from '@astrojs/starlight/types'
 import type { StarlightSidebarTopicsUserConfig } from 'starlight-sidebar-topics'
+import { PREFIXED_LOCALES } from './locales.ts'
 import { topics, type SidebarSpec } from './topics.ts'
 
 type SidebarItem = NonNullable<StarlightUserConfig['sidebar']>[number]
@@ -18,7 +19,7 @@ function toItems(spec: SidebarSpec, apiGroup: SidebarItem | undefined): SidebarI
       return [
         {
           label: spec.label.en,
-          translations: { vi: spec.label.vi },
+          translations: Object.fromEntries(PREFIXED_LOCALES.map((l) => [l, spec.label[l]])),
           collapsed: spec.collapsed,
           items: [{ autogenerate: { directory: spec.directory } }],
         },
@@ -31,7 +32,7 @@ function toItems(spec: SidebarSpec, apiGroup: SidebarItem | undefined): SidebarI
       return [
         {
           label: spec.label.en,
-          translations: { vi: spec.label.vi },
+          translations: Object.fromEntries(PREFIXED_LOCALES.map((l) => [l, spec.label[l]])),
           collapsed: spec.collapsed,
           items: slugs.map((slug) => ({ slug })),
         },

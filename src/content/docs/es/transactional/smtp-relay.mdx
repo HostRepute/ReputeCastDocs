@@ -1,0 +1,171 @@
+---
+title: Enviar por el SMTP relay
+description: Activa el SMTP relay para correo transaccional en aplicaciones que solo hablan SMTP, publica los puertos 587 y 465 y envía con credenciales solo de envío.
+type: how-to
+audience: [operator, admin, developer]
+permissions: ['apikeys:manage']
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance > transactional.relayAdmin.title'
+primaryKeyword: SMTP relay para correo transaccional
+sources:
+  - internal/smtprelay
+  - internal/app/wire_smtprelay.go
+  - internal/apikeys/transactional.go
+  - web/src/features/transactional/RelayAdminCard.tsx
+  - web/src/features/transactional/setup.messages.ts
+  - deploy/docker-compose.yml
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+El SMTP relay para correo transaccional permite que las aplicaciones que no pueden llamar a una API HTTP envíen a
+través de ReputeCast: se conectan al puerto 587 (STARTTLS) o 465 (TLS), se autentican con una credencial solo de
+envío, y el mensaje pasa por la ruta Transaccional, las supresiones y el
+[registro de mensajes](/es/transactional/message-log/) del espacio de trabajo. Quien administra la instancia lo activa
+una vez por instancia; después, cada espacio de trabajo crea sus propias credenciales.
+
+## Antes de empezar
+
+- Administras la instancia y puedes cambiar el firewall del servidor y el archivo de Docker Compose.
+- Un nombre de host para el relay, como `smtp.example.com`, con un registro `A`/`AAAA` que apunte al servidor. Se
+  sugiere el host de la URL pública de la instancia.
+- En el espacio de trabajo: `apikeys:manage` para crear credenciales SMTP, y un remitente Transaccional verificado.
+  La dirección `From` de cada mensaje debe ser un remitente Transaccional verificado (consulta
+  [añadir dominios de envío y remitentes](/es/providers/senders-and-domains/)).
+- Los procesos con el rol `web` ejecutan los listeners del relay. Si separas los roles, consulta
+  [escalar con los roles web, ingest y worker](/es/self-hosting/scaling/).
+
+## Publicar los puertos
+
+ReputeCast escucha en los puertos del relay dentro del contenedor, pero Docker Compose solo publica lo que indicas. El
+`deploy/docker-compose.yml` predeterminado solo publica el puerto 8080, así que añade tú los dos puertos del relay al
+servicio `app`:
+
+```yaml title="docker-compose.yml"
+services:
+  app:
+    ports:
+      - "${REPUTECAST_PORT:-8080}:8080"
+      - "587:587" # SMTP relay, STARTTLS
+      - "465:465" # SMTP relay, implicit TLS
+```
+
+Aplícalo con `docker compose up -d` y abre ambos puertos en el firewall del servidor. SMTP no es HTTP, así que los
+puertos del relay van directamente a la aplicación, nunca a través de tu proxy inverso. Si cambias los puertos en la
+configuración del relay, publica esos en su lugar.
+
+## Activar el relay
+
+<Steps>
+
+1. Abre <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> desde el menú de la cuenta y busca la sección
+   <UiPath path="transactional.relayAdmin.title" />.
+
+2. Define el **Nombre de host**, el **Puerto STARTTLS** (587) y el **Puerto TLS** (465). Los dos puertos deben ser
+   distintos.
+
+3. Elige el **Certificado**:
+   - **Let's Encrypt**: ReputeCast obtiene y renueva el certificado por sí mismo. Let's Encrypt valida el nombre de
+     host por HTTP, así que `http://<hostname>/.well-known/acme-challenge/` debe llegar a un proceso web de
+     ReputeCast, por ejemplo a través de tu [proxy inverso](/es/self-hosting/reverse-proxy/). Todos los nodos web
+     comparten el certificado.
+   - **Archivos de certificado y clave**: sube una **Cadena de certificados (PEM)** y una **Clave privada (PEM)**. La
+     clave es de solo escritura: se sella y no se vuelve a mostrar.
+
+4. Elige <UiPath path="transactional.relayAdmin.turnOn" /> y después <UiPath path="transactional.relayAdmin.runChecks" />.
+   ReputeCast comprueba que el nombre de host se resuelve, que ambos puertos son accesibles desde internet y que el
+   certificado es válido. Las comprobaciones también se ejecutan cada 10 minutos; quienes administran la instancia
+   reciben un aviso cuando un puerto deja de responder.
+
+</Steps>
+
+## Crear una credencial SMTP
+
+<Steps>
+
+1. En el espacio de trabajo, abre <UiPath path="nav.transactional > transactional.common.tabSetup" /> y elige
+   <UiPath path="transactional.setup.createCredential" />.
+
+2. Ponle el nombre de la aplicación, elige el modo **Real** o **Prueba** y, si quieres, limita las plantillas y las
+   categorías que puede enviar y cuándo caduca. El modo de prueba solo entrega a los miembros del espacio de trabajo y
+   a las direcciones de prueba que permitas.
+
+3. Copia la contraseña ahora: solo se muestra una vez. El **usuario** es el ID de clave de la credencial; la
+   **contraseña** es su secreto, que empieza por `rc_smtp_`. La credencial solo tiene `transactional:send`, y nunca
+   más de lo que tienes tú ahora: deja de autenticar cuando sales del espacio de trabajo, te desactivan o dejas de
+   tener `transactional:send`.
+
+</Steps>
+
+<Screenshot
+  id="transactional-setup"
+  alt="Integración de Transaccional: la tarjeta de la API HTTP, las claves que pueden enviar, entre ellas una credencial SMTP del servicio de facturación, y la tarjeta del SMTP relay en Activado."
+/>
+
+## Configurar tu aplicación
+
+| Parámetro  | Valor                                                    |
+| ---------- | -------------------------------------------------------- |
+| Host       | El nombre de host del relay, como `smtp.example.com`     |
+| Puerto     | `587` con STARTTLS, o `465` con TLS                      |
+| Autenticación | `PLAIN` o `LOGIN`                                     |
+| Usuario    | El ID de clave de la credencial                          |
+| Contraseña | El secreto de la credencial (`rc_smtp_…`)                |
+| From       | Una dirección de un remitente Transaccional verificado   |
+
+Dos cabeceras opcionales etiquetan el mensaje en ReputeCast; el relay las lee y no las transmite:
+
+```text title="Cabeceras opcionales"
+X-ReputeCast-Tags: invoice, eu
+X-ReputeCast-Category: Billing
+```
+
+`X-ReputeCast-Tags` va separada por comas. `X-ReputeCast-Category` acepta el nombre o el ID de una categoría; sin
+ella, una credencial limitada a una sola categoría usa esa. Quien desactivó una categoría opcional no recibe su
+correo.
+
+## Límites
+
+<LimitsTable area="smtp-relay" />
+
+## Comprobar que funciona
+
+Envía un mensaje desde tu aplicación y abre <UiPath path="nav.transactional > transactional.common.tabMessages" />. El
+mensaje muestra **Sin procesar (SMTP)** en lugar de una plantilla, con su cronología de entrega.
+
+## Solución de problemas
+
+- **La comprobación dice que un puerto no es accesible** → el puerto no está publicado en Compose, o un firewall
+  delante del servidor lo bloquea.
+- **La comprobación dice que el nombre de host no se resuelve** → añade el registro `A`/`AAAA`, espera al DNS y vuelve
+  a ejecutar las comprobaciones.
+- **Let's Encrypt falla** → el puerto 80 del nombre de host no llega a un proceso web de ReputeCast. Enruta
+  `/.well-known/acme-challenge/` hacia él, o sube archivos de certificado.
+- **La autenticación falla** → usa como usuario el ID de clave, no el nombre de la credencial, y comprueba que la
+  credencial no esté revocada ni caducada, y que el miembro que la creó siga activo y tenga `transactional:send`. La
+  respuesta `535` indica cuál es el caso.
+- **El mensaje se rechaza con un error de tamaño** → el relay acepta hasta 40 MiB, pero los proveedores de envío de
+  la ruta pueden aceptar menos; la respuesta lo indica.
+- **Las aplicaciones reciben una conexión rechazada** → el relay está desactivado. La API HTTP sigue funcionando en
+  cualquier caso.
+- **Las aplicaciones reciben `421 4.7.0 Too many connections`** → esa dirección IP, o todo el nodo web, tiene tantas
+  conexiones abiertas como permiten los [límites](#límites). Reutiliza las conexiones o envía menos a la vez.
+- **Los inicios de sesión reciben `454 4.7.0 Too many failed logins`** → esa dirección IP falló al iniciar sesión
+  demasiadas veces y está bloqueada durante un tiempo (consulta los [límites](#límites)). Corrige el usuario y la
+  contraseña, y vuelve a intentarlo pasados los minutos que indica la respuesta.
+
+<Aside type="note">
+El relay es solo para el correo transaccional de tus propias aplicaciones. Para enviar campañas o automatizaciones,
+usa la aplicación; para enviar desde código con plantillas, usa la API HTTP (consulta
+[enviar correo transaccional con la API](/es/developers/transactional-api/)).
+</Aside>
+
+## Relacionado
+
+- [Correo transaccional en ReputeCast](/es/transactional/overview/)
+- [Instalar con Docker Compose](/es/self-hosting/docker/)
+- [Autenticación y claves de API](/es/developers/api-authentication/)

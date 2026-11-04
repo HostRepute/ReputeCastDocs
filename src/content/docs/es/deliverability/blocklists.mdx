@@ -1,0 +1,224 @@
+---
+title: Comprobar y resolver inclusiones en listas de bloqueo
+description: "Revisa las listas de bloqueo de correo para tus dominios de envío e IP dedicadas: qué encontró cada una de las ocho listas integradas y cómo pedir la exclusión."
+type: how-to
+audience: [publisher, admin]
+permissions: ['deliverability:view']
+uiPath: 'nav.deliverability > placement.health'
+primaryKeyword: listas de bloqueo de correo
+sources:
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/deliverability/checks.go
+  - internal/deliverability/blocklists.go
+  - internal/readiness/assemble.go
+  - internal/readiness/gather.go
+  - internal/contentcheck/contentcheck.go
+  - internal/contentcheck/blocklist.go
+  - internal/app/wire_approvals.go
+  - internal/config/config.go
+  - web/src/features/deliverability
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast consulta las listas de bloqueo de correo para tus [dominios de envío](/es/reference/glossary/#sending-domain)
+y tus [IP dedicadas](/es/reference/glossary/#dedicated-ip) una vez al día, muestra los resultados en
+<UiPath path="nav.deliverability > placement.health" /> y convierte una inclusión en un resultado de la
+[revisión previa](/es/reference/glossary/#send-readiness) antes de que salga tu próxima campaña. Esta guía muestra cómo
+ejecutar la comprobación cuando quieras, leer lo que encontró y conseguir que te excluyan de una lista.
+
+## Las listas que comprueba ReputeCast
+
+Sin [HostRepute](/es/reference/glossary/#hostrepute), ReputeCast consulta por sí mismo ocho
+[listas de bloqueo](/es/reference/glossary/#blocklist) públicas (DNSBL). Las listas de IP se consultan para tus IP
+dedicadas, y las listas de dominios para tus dominios de envío. El correo enviado a través del grupo de IP compartido de
+un proveedor de envío, como Amazon SES sin IP dedicadas, solo se comprueba a nivel de dominio, porque esas IP las
+gestiona el proveedor de envío.
+
+<TableScroll label="Listas de bloqueo integradas">
+
+| Lista          | Comprueba | Impacto | Página de exclusión                                                              |
+| -------------- | --------- | ------- | -------------------------------------------------------------------------------- |
+| Spamhaus ZEN   | IP        | Alto    | [check.spamhaus.org](https://check.spamhaus.org/)                                |
+| Spamhaus DBL   | Dominios  | Alto    | [check.spamhaus.org](https://check.spamhaus.org/)                                |
+| SURBL          | Dominios  | Alto    | [surbl.org](https://surbl.org/surbl-analysis)                                    |
+| URIBL          | Dominios  | Alto    | [admin.uribl.com](https://admin.uribl.com/)                                      |
+| Barracuda BRBL | IP        | Alto    | [barracudacentral.org](https://www.barracudacentral.org/rbl/removal-request)     |
+| SpamCop        | IP        | Medio   | [spamcop.net](https://www.spamcop.net/bl.shtml)                                  |
+| Mailspike      | IP        | Medio   | [mailspike.org](https://mailspike.org/anubis/lookup.html)                        |
+| PSBL           | IP        | Bajo    | [psbl.org](https://psbl.org/)                                                    |
+
+</TableScroll>
+
+El impacto decide qué hace el grupo <UiPath path="review.groupReputation" /> de la revisión previa con una inclusión
+del dominio o de las IP desde los que envía una campaña: una inclusión en una lista de impacto alto es un
+<UiPath path="review.statusBlock" />, y una inclusión en una lista de impacto medio o bajo es un
+<UiPath path="review.statusWarn" />. Una IP dedicada a la que estas comprobaciones aún no han llegado, como una añadida
+después de la última ejecución diaria, aparece ahí como <UiPath path="review.statusUnknown" /> hasta que lleguen: lo no
+comprobado nunca cuenta como limpio.
+
+### Dominios que se consultan en tiempo real
+
+Algunos dominios se consultan en tiempo real en Spamhaus DBL y SURBL, con el mismo resolvedor DNS, en lugar de esperar
+a la comprobación diaria:
+
+- **Dominios de los enlaces.** El editor consulta los dominios a los que enlaza tu correo mientras escribes, y la
+  revisión previa vuelve a consultarlos en cada ejecución. Una campaña que enlaza a un dominio incluido en una lista
+  queda bloqueada (consulta [Corregir los avisos de contenido antes de enviar](/es/campaigns/content-checks/)).
+- **Los dominios de los que depende un envío y que esta página no comprueba:** el dominio padre del dominio de envío
+  (`acme.io` para `news.acme.io`), los dominios de return-path (MAIL FROM) de los proveedores de envío que llevan el
+  envío y el dominio de seguimiento de la URL pública de la instancia. La revisión previa los consulta en cada
+  ejecución; los proveedores de buzón también juzgan un subdominio por su dominio padre, así que un dominio padre
+  incluido en una lista bloquea el envío.
+
+Las respuestas se guardan y las comparten todos los espacios de trabajo de la instancia, así que un dominio solo se
+vuelve a consultar cuando su respuesta se ha quedado antigua. Una consulta que falla, porque el DNS no respondió a
+tiempo o las listas rechazaron el resolvedor, es desconocida, nunca limpia: la revisión previa la muestra como
+<UiPath path="review.statusUnknown" /> y vuelve a consultarla en la nueva comprobación del momento del envío.
+
+Cuando HostRepute está conectado, comprueba en su lugar 84 fuentes cada hora, y la comprobación integrada se omite
+mientras esa conexión funciona bien. Si no se puede contactar con HostRepute, la comprobación integrada se ejecuta como
+respaldo. Consulta [Conectar HostRepute](/es/deliverability/hostrepute/).
+
+### Cuándo se ejecutan las comprobaciones
+
+<LimitsTable area="deliverability" />
+
+## Antes de empezar
+
+- Necesitas `deliverability:view` para abrir la página y ejecutar comprobaciones. Lo tienen los roles Propietario,
+  Administrador, Editor y Lector.
+- Conecta primero un [proveedor de envío](/es/providers/connect/) y [añade un dominio de envío](/es/providers/senders-and-domains/).
+  Hasta entonces no hay nada que comprobar.
+- Si administras el servidor: la instancia necesita un resolvedor DNS al que respondan las listas de bloqueo.
+  Configúralo antes de fiarte de los resultados.
+
+<Aside type="caution" title="Los resolvedores DNS públicos son rechazados">
+Spamhaus rechaza las consultas DNSBL que llegan a través de un resolvedor público o abierto, como 1.1.1.1 u 8.8.8.8, y
+responde con el código de error `127.255.255.254` en lugar de una inclusión
+([Spamhaus, "Using our public mirrors? Check your return codes now"](https://www.spamhaus.org/resource-hub/dnsbl/using-our-public-mirrors-check-your-return-codes-now/),
+comprobado en octubre de 2026). SURBL y URIBL los rechazan del mismo modo con `127.0.0.1`. ReputeCast nunca cuenta
+estas respuestas como incluido ni como limpio: la consulta aparece como desconocida. Apunta
+[`dns.servers`](/es/reference/configuration/#dns) a un resolvedor recursivo que administres tú.
+</Aside>
+
+```yaml title="config.yaml"
+dns:
+  servers:
+    - 10.0.0.53
+    - 10.0.0.54:53
+```
+
+Como variable de entorno, separa los servidores con comas:
+
+```sh title="Environment"
+REPUTECAST_DNS__SERVERS=10.0.0.53,10.0.0.54:53
+```
+
+Si `dns.servers` está vacío, se usan los resolvedores del sistema de `/etc/resolv.conf`. Si tu host o tu contenedor
+reenvía el DNS a un resolvedor público, las consultas a Spamhaus y URIBL fallan aunque las comprobaciones de
+autenticación (SPF, DKIM, DMARC) sigan funcionando.
+
+## Ejecutar una comprobación de listas de bloqueo
+
+<Steps>
+
+1. Abre <UiPath path="nav.deliverability > placement.health" />.
+
+2. Selecciona <UiPath path="deliverability.runChecks" />. Cuando HostRepute está conectado, el botón dice
+   <UiPath path="deliverability.runAll" /> y también pide a HostRepute que vuelva a comprobar.
+
+   Una línea de progreso muestra cuántas fuentes han respondido. Una ejecución iniciada menos de un minuto después de la
+   anterior devuelve esa ejecución en lugar de empezar otra.
+
+3. Cuando termine la ejecución, lee la tabla de listas de bloqueo. Cada lista muestra qué comprobó, su estado
+   (<UiPath path="deliverability.listed" /> o <UiPath path="deliverability.clean" />), desde cuándo está incluido un
+   recurso y, si hay una inclusión, la <UiPath path="deliverability.delistingPage" /> de la lista.
+
+4. Para guardar una copia para una incidencia o una hoja de cálculo, selecciona
+   <UiPath path="deliverability.exportReport" />: una fila CSV por comprobación.
+
+</Steps>
+
+<Screenshot
+  id="deliverability"
+  alt="Estado de Entregabilidad con HostRepute conectado: tarjetas de dominios e IP arriba, el estado de la cuenta de cada proveedor en el centro y una tabla de listas de bloqueo en la que 203.0.113.25 está incluida en UCEPROTECT Level 3."
+>
+  1. El estado de cada dominio de envío e IP dedicada, con el número de listas que incluyen a cada uno.
+  2. El estado de la cuenta de cada proveedor de envío, medido frente a los propios límites de cada proveedor.
+  3. La tabla de listas de bloqueo: primero las fuentes con inclusiones, después las limpias, con enlaces de exclusión.
+</Screenshot>
+
+Una inclusión nueva que detecta la comprobación integrada también aparece en la cronología de incidentes de la misma
+página y en las notificaciones de todos los miembros que pueden ver Entregabilidad, con la página de exclusión de la
+lista. Una inclusión en una lista de impacto alto se marca como grave.
+
+## Conseguir que te excluyan de una lista
+
+<Steps>
+
+1. Averigua por qué se incluyó el recurso. Abre la <UiPath path="deliverability.delistingPage" /> de la lista y busca
+   ahí el recurso. Las causas habituales son el correo a direcciones antiguas o compradas que se han convertido en
+   [trampas de spam](/es/reference/glossary/#spam-trap) y un salto repentino de volumen desde una IP nueva.
+
+2. Corrige la causa antes de pedir la exclusión. Quita las direcciones que la provocaron (consulta
+   [Mantener sana tu lista](/es/audience/list-health/) y [La lista de supresión](/es/audience/suppressions/)),
+   frena una IP nueva con un [plan de calentamiento](/es/providers/warm-up/) y revisa los
+   [registros SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/) del dominio de envío.
+
+3. Solicita la exclusión en la página de la propia lista; cada lista describe ahí su proceso. Con HostRepute conectado,
+   <UiPath path="deliverability.requestDelisting" /> presenta la solicitud desde ReputeCast y HostRepute le hace el
+   seguimiento.
+
+4. Si la IP incluida pertenece a tu proveedor de envío y no a ti, contacta con el proveedor de envío, que controla esa
+   IP y sus envíos. Mientras tanto, enruta el flujo afectado a través de otro proveedor
+   ([Enrutar el correo entre proveedores](/es/providers/routing/)).
+
+5. Vuelve a ejecutar la comprobación cuando la lista indique que la inclusión ha desaparecido.
+
+</Steps>
+
+## Comprobar que funciona
+
+- La lista muestra <UiPath path="deliverability.clean" /> para el recurso después de la siguiente ejecución.
+- El grupo de reputación de la revisión previa es correcto para el dominio de envío de la campaña, su dominio padre, sus
+  dominios de return-path y de seguimiento y sus IP dedicadas
+  ([Revisión previa: comprobar antes de enviar](/es/campaigns/send-readiness/)).
+
+## Solución de problemas
+
+- **La ejecución indica que algunas consultas no respondieron.** Esas consultas aparecen como desconocidas, no como
+  limpias. La causa habitual es un resolvedor DNS público: define `dns.servers` como se muestra en
+  [Antes de empezar](#antes-de-empezar). Los resolvedores lentos también pueden agotar el tiempo de espera; el tiempo
+  de espera de cada consulta es `dns.timeout` (4 s por defecto).
+- **La revisión previa indica que no se pudo comprobar un dominio en Spamhaus DBL y SURBL.** La consulta en tiempo real
+  no respondió o fue rechazada. La solución es la misma: tu propio resolvedor. Después selecciona
+  <UiPath path="review.rerun" /> en Revisar y enviar.
+- **La revisión previa indica que una IP dedicada aún no se ha comprobado en las listas de bloqueo de IP.** La IP es
+  nueva para estas comprobaciones. Selecciona aquí <UiPath path="deliverability.runChecks" /> y vuelve a ejecutar la
+  revisión previa.
+- **Spamhaus ZEN o DBL nunca aparecen en la tabla.** Spamhaus rechazó todas las consultas, así que no se guardó ningún
+  resultado. La solución es la misma: tu propio resolvedor.
+- **El botón no hace nada nuevo.** Se muestra una ejecución que ya está en curso, o una iniciada hace menos de un
+  minuto, en lugar de una nueva. Espera a que termine.
+- **Aparece "Conecta antes un proveedor de envío".** Todavía no existe ningún dominio de envío ni ninguna IP dedicada.
+  Termina de [conectar un proveedor de envío](/es/providers/connect/).
+- **Una IP de un grupo compartido está incluida en otra lista.** ReputeCast no comprueba las IP compartidas; las
+  supervisa tu proveedor de envío. Pregunta al proveedor de envío, o pasa el flujo a un proveedor con un grupo limpio.
+- **La inclusión vuelve después de la exclusión.** La causa sigue ahí. Revisa los rebotes y las quejas por proveedor de
+  buzón en tus [informes de campaña](/es/campaigns/reports/) y deja de enviar a los contactos que nunca interactúan.
+
+## Relacionado
+
+- [Conectar HostRepute](/es/deliverability/hostrepute/) para comprobar 84 fuentes cada hora y solicitar exclusiones
+  desde ReputeCast
+- [Supervisar el estado de los dominios y los proveedores](/es/deliverability/health/)
+- [Rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/)
+- [Referencia de configuración](/es/reference/configuration/#dns)

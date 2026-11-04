@@ -1,0 +1,95 @@
+---
+title: Migrer depuis MailerLite
+description: "Migrer depuis MailerLite avec un jeton d’API : les groupes deviennent des listes, champs et dates d’opt-in sont repris, rebonds et indésirables restent exclus."
+type: how-to
+audience: [publisher, admin]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: migrer depuis MailerLite
+sources:
+  - internal/imports/mailerlite.go
+  - internal/imports/consent.go
+  - internal/imports/run.go
+  - internal/imports/sources.go
+  - web/src/features/imports
+sidebar:
+  order: 4
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Pour migrer depuis MailerLite, vous connectez ReputeCast à votre compte MailerLite avec un jeton d’API et importez chaque groupe dans une liste ReputeCast, avec les champs, les dates d’opt-in et les statuts de ses abonnés. ReputeCast se contente de lire l’API de MailerLite ; rien ne change dans MailerLite.
+
+## Avant de commencer
+
+- Il vous faut l’autorisation `subscribers:import` (les rôles Propriétaire, Admin et Éditeur l’ont).
+- Créez un jeton d’API MailerLite. Dans MailerLite, ouvrez **Integrations**, choisissez **MailerLite API** et cliquez sur **Generate new token**. Copiez-le immédiatement : MailerLite ne l’affiche qu’une fois. Un jeton appartient à l’utilisateur qui l’a créé et cesse de fonctionner si cet utilisateur est retiré du compte. Source : [MailerLite developers, Getting started](https://developers.mailerlite.com/getting-started) (vérifié en octobre 2026).
+- L’outil d’import lit l’API de MailerLite sur `connect.mailerlite.com`. Les comptes MailerLite Classic utilisent une API plus ancienne, que l’outil d’import ne prend pas en charge ; exportez-en plutôt un fichier CSV et [importez le fichier](/fr/audience/import/).
+- Lisez [comment une migration transmet le consentement](/fr/migrate/overview/) s’il s’agit de votre premier import.
+
+## Importer vos groupes MailerLite
+
+<Steps>
+
+1. Ouvrez <UiPath path="shell.importContacts" /> et choisissez **MailerLite**. L’assistant renvoie vers la page de l’API de MailerLite s’il vous faut encore un jeton.
+
+2. Collez le jeton et sélectionnez <UiPath path="imports.connect" />. L’assistant liste vos groupes avec leurs nombres d’abonnés actifs, désabonnés, nettoyés (en rebond) et en attente.
+
+3. Cochez les groupes à importer et choisissez la liste ReputeCast de destination de chacun. Gardez activée la récupération des suppressions depuis vos fournisseurs d’envoi, puis passez à la correspondance des champs.
+
+4. Associez les champs. `email` est obligatoire ; les champs MailerLite comme `name` et `last_name` sont associés d’après leur nom et des valeurs d’exemple, et de nouveaux champs personnalisés sont créés pour les autres.
+
+5. À l’étape du consentement, vérifiez ce que devient chaque statut (voir la section suivante). La date et l’IP d’opt-in de MailerLite sont conservées comme preuve de consentement, sauf si vous choisissez <UiPath path="imports.repermission" />.
+
+6. Lancez l’aperçu et démarrez l’import.
+
+</Steps>
+
+## Ce qui migre depuis MailerLite
+
+- Les **groupes** deviennent les listes ReputeCast que vous avez choisies. Les abonnés qui ne sont dans aucun groupe ne sont pas lus : ajoutez-les à un groupe dans MailerLite avant l’import, ou exportez-les dans un fichier CSV.
+- Les **champs** deviennent des champs de contact.
+- **Preuves d’opt-in :** la date et l’adresse IP d’opt-in sont stockées comme preuve de consentement, et la date d’abonnement devient la date de création du contact.
+
+| Statut MailerLite | Devient dans ReputeCast                                                               |
+| ----------------- | ------------------------------------------------------------------------------------- |
+| `active`          | Abonné · confirmé, avec la date et l’IP d’opt-in comme preuve (ou en attente, ou Ignorer) |
+| `unconfirmed`     | Abonné · en attente, avec un e-mail de redemande de consentement (ou Ignorer)         |
+| `bounced`         | Exclu · rebond définitif, tous les flux (verrouillé)                                  |
+| `junk`            | Exclu · plainte, tous les flux (verrouillé)                                           |
+| `unsubscribed`, ou tout autre statut | Exclu · désabonné : ni Diffusions ni Automatisations, e-mails Système autorisés (verrouillé) |
+
+Les nouvelles suppressions conservent le motif de MailerLite, comme « nettoyé dans MailerLite » pour un abonné en rebond. Une fois les lignes importées, l’import les envoie toutes, désabonnements compris, à chaque fournisseur d’envoi connecté dont la liste de suppression accepte de nouvelles entrées ; ensuite, la [synchronisation de la liste de suppression](/fr/providers/events-and-sync/) habituelle n’envoie plus que les rebonds définitifs et les plaintes qui s’appliquent à tous les e-mails.
+
+### Ce qui reste dans MailerLite
+
+Les campagnes et leurs rapports, les automatisations, les segments, les formulaires, les pages d’atterrissage et les modèles ne sont pas importés. Recréez-les avec les [segments](/fr/audience/segments/), les [automatisations](/fr/automations/overview/), les [formulaires d’inscription](/fr/forms/signup-forms/) et l’[éditeur](/fr/campaigns/composer/).
+
+## Limites de débit
+
+L’API de MailerLite autorise 120 requêtes par minute et répond 429 Too Many Attempts au-delà, avec un en-tête `Retry-After`. Source : [MailerLite developers, Getting started](https://developers.mailerlite.com/getting-started) (vérifié en octobre 2026). ReputeCast lit 1 000 abonnés par requête, une requête à la fois, attend le délai `Retry-After` quand MailerLite le lui demande et met l’import en pause quand la source continue de refuser :
+
+<LimitsTable area="imports" />
+
+<UiPath path="imports.slowDown" /> envoie au plus 3 requêtes par seconde, ce qui reste au-dessus de la moyenne de 2 par seconde de MailerLite : un compte volumineux peut donc encore se mettre en pause de temps en temps. Chaque pause reprend d’elle-même.
+
+## Vérifier le résultat
+
+- Le résumé indique combien de contacts ont été importés, fusionnés, exclus, laissés en attente et ignorés, et combien chaque liste en compte désormais. <UiPath path="imports.downloadReport" /> liste chaque ligne avec ce qui lui est arrivé.
+- Ouvrez <UiPath path="nav.audience > audience.tabSuppressions" /> : les abonnés en rebond, indésirables et désabonnés s’y trouvent avec le motif de MailerLite.
+
+## Dépannage
+
+- **« MailerLite a refusé la clé API »** : le jeton a été supprimé, ou l’utilisateur qui l’a créé a quitté le compte. Générez un nouveau jeton et collez-le.
+- **Un groupe manque** : l’outil d’import liste tous les groupes du compte auquel appartient le jeton. Vérifiez que vous avez créé le jeton dans le bon compte MailerLite.
+- **Des abonnés manquent dans l’import** : ils ne sont dans aucun groupe, ou leur statut en a fait une suppression. Les abonnés non confirmés arrivent en attente et ne reçoivent aucun e-mail marketing tant qu’ils n’ont pas confirmé.
+- **« MailerLite limite le débit de nos requêtes (429) ; en pause »** : une autre intégration utilise la limite du même compte. Attendez la reprise automatique ou sélectionnez <UiPath path="imports.resumeNow" />.
+
+## Voir aussi
+
+- [Migrer vers ReputeCast sans perdre le consentement](/fr/migrate/overview/)
+- [Importer des contacts depuis un fichier CSV ou XLSX](/fr/audience/import/)
+- [Listes, consentement et double opt-in](/fr/audience/lists-and-consent/)
+- [La liste de suppression](/fr/audience/suppressions/)

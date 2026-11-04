@@ -1,0 +1,296 @@
+---
+title: Conectar agentes de IA con MCP
+description: "Conecta Claude Code, Cursor o VS Code a un servidor MCP para email marketing bajo tu control: tokens por agente, permisos, auditoría y propuestas de envío."
+type: how-to
+audience: [developer, admin]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: servidor MCP para email marketing
+sources:
+  - internal/mcpserver/mcpserver.go
+  - internal/mcpserver/server.go
+  - internal/mcpserver/tools.go
+  - internal/mcpserver/tools_reports.go
+  - internal/mcpserver/transactional.go
+  - internal/mcpserver/tools_m46.go
+  - internal/mcpserver/resources.go
+  - internal/app/wire_mcpserver.go
+  - internal/authz/permissions.go
+  - internal/campaigns/agent.go
+  - web/src/features/keys/McpPage.tsx
+  - web/src/features/keys/CreateKeyDialog.tsx
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast incluye un servidor de [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), para que un
+asistente de IA pueda leer informes, consultar la revisión previa, redactar campañas o pausar un envío en tu espacio de
+trabajo: un servidor MCP para email marketing que tu equipo controla. Cada
+[agente MCP](/es/reference/glossary/#mcp-agent) recibe su propio token y sus permisos, nunca más que la persona que lo
+creó, y todo lo que enviaría correo llega a una persona como propuesta en lugar de ejecutarse.
+
+## Antes de empezar
+
+- Necesitas `mcp:manage` en el espacio de trabajo (un [permiso delicado](/es/reference/glossary/#sensitive-permission)).
+  Solo puedes dar a un agente permisos que tienes tú.
+- Tu instancia necesita una URL pública a la que tu cliente MCP pueda llegar por HTTPS. El endpoint es
+  `<public URL>/mcp`, servido por el rol web.
+- Si ReputeCast funciona detrás de un proxy inverso, `/mcp` debe transmitir las respuestas sin búfer. Consulta
+  [proxy inverso y TLS](/es/self-hosting/reverse-proxy/).
+
+## Crear un agente
+
+<Steps>
+
+1. Abre <UiPath path="nav.settings > settings.keys" />. La tarjeta MCP de arriba muestra el endpoint, por ejemplo
+   `https://reputecast.example.com/mcp`.
+
+2. Selecciona <UiPath path="keys.addAgent" />. Ponle al agente un nombre que diga quién lo usa, como
+   "Claude: analytics".
+
+3. Elige sus permisos. Empieza con acceso de lectura, como `reports:view` y `deliverability:view`, y añade más
+   adelante. Un permiso que no tienes está bloqueado. Los agentes nunca pueden tener `subscribers:verify`,
+   `placement:run`, `placement:manage`, `integrations:manage`, `ai:use` ni los permisos de agencia.
+
+4. Si quieres, limita el agente a algunas listas y define una caducidad; después, créalo.
+
+5. Copia el token, `rc_agent_…`. Se muestra una vez; ReputeCast solo guarda su hash SHA-256.
+
+</Steps>
+
+<Screenshot
+  id="settings-mcp"
+  alt="Configuración, Claves y MCP: la tarjeta MCP con el endpoint y un fragmento de configuración del cliente, y la matriz de agentes. Un agente puede leer informes y contactos; un agente de operaciones lee el estado de los proveedores y puede pausar envíos, pero nunca iniciarlos."
+/>
+
+La matriz de agentes muestra lo que puede hacer cada agente, según sus permisos:
+
+<TableScroll label="Capacidades de los agentes">
+
+| Columna                    | Permitir cuando el agente tiene                                    | Notas                                                                    |
+| -------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Leer informes y contactos  | `reports:view` o `subscribers:view`                                | Muestra "Permitir · estado de los proveedores" o "Permitir · entregabilidad" para un acceso de lectura más limitado. |
+| Redactar campañas          | `campaigns:edit`                                                   | Solo borradores; no se envía nada.                                       |
+| Editar la audiencia        | `subscribers:edit`, `segments:edit` o `lists:manage`               |                                                                          |
+| Programar o enviar         | `campaigns:send` muestra "Aprobar"; `campaigns:pause` solo muestra "Solo pausar · nunca iniciar" | Programar siempre necesita una persona. Consulta las [propuestas](#propuestas-para-todo-lo-que-envía). |
+| Cambiar el enrutamiento    | `providers:manage`                                                 |                                                                          |
+
+</TableScroll>
+
+## Conectar tu cliente MCP
+
+El servidor habla el transporte **Streamable HTTP** de MCP. Cada solicitud lleva el token del agente como token
+bearer:
+
+```http title="Cabeceras de la solicitud"
+Authorization: Bearer rc_agent_…
+```
+
+Aquí ReputeCast solo acepta tokens de agente: una clave de API (`rc_live_…`) o una cookie de sesión se rechazan. Elige
+tu cliente abajo. Los ejemplos leen el token de la variable de entorno `REPUTECAST_AGENT_TOKEN`; sustituye
+`reputecast.example.com` por tu URL pública.
+
+<Tabs syncKey="mcp-client">
+<TabItem label="Claude Code">
+
+```sh title="Terminal"
+claude mcp add --transport http reputecast https://reputecast.example.com/mcp \
+  --header "Authorization: Bearer $REPUTECAST_AGENT_TOKEN"
+```
+
+Para compartir el servidor con un proyecto, añádelo en su lugar a `.mcp.json` en la raíz del proyecto. Claude Code
+necesita `"type": "http"` en un servidor con `url`; una entrada sin `type` se lee como un comando local y se omite:
+
+```json title=".mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Ejecuta `claude mcp get reputecast` para comprobar la conexión. Fuente:
+[documentación de MCP de Claude Code](https://code.claude.com/docs/en/mcp), comprobado en octubre de 2026.
+
+</TabItem>
+<TabItem label="Cursor">
+
+Añade el servidor a `~/.cursor/mcp.json` (todos los proyectos) o a `.cursor/mcp.json` (un proyecto):
+
+```json title="~/.cursor/mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:REPUTECAST_AGENT_TOKEN}" }
+    }
+  }
+}
+```
+
+Cursor rellena `${env:NAME}` a partir de tu entorno. Fuente:
+[documentación de MCP de Cursor](https://cursor.com/docs/context/mcp), comprobado en octubre de 2026.
+
+</TabItem>
+<TabItem label="VS Code">
+
+Añade el servidor a `.vscode/mcp.json` en tu espacio de trabajo. VS Code pide el token una vez y lo guarda de forma
+segura:
+
+```json title=".vscode/mcp.json"
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "reputecast-agent-token",
+      "description": "ReputeCast agent token (rc_agent_…)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "reputecast": {
+      "type": "http",
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${input:reputecast-agent-token}" }
+    }
+  }
+}
+```
+
+Fuente: [referencia de configuración de MCP de VS Code](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration),
+comprobado en octubre de 2026.
+
+</TabItem>
+<TabItem label="Otros clientes">
+
+Sirve cualquier cliente que se conecte a un servidor MCP remoto por URL y te deje definir una cabecera de solicitud.
+La mayoría usan esta forma; consulta la documentación de tu cliente para saber el nombre del archivo y si también
+necesita `"type": "http"`:
+
+```json title="mcp.json"
+{
+  "mcpServers": {
+    "reputecast": {
+      "url": "https://reputecast.example.com/mcp",
+      "headers": { "Authorization": "Bearer rc_agent_…" }
+    }
+  }
+}
+```
+
+Un cliente que solo arranca servidores locales (stdio) necesita un puente local hacia un servidor HTTP remoto;
+ReputeCast no incluye ninguno.
+
+</TabItem>
+</Tabs>
+
+<Aside type="danger" title="Trata el token como una contraseña">
+Cualquiera que tenga el token puede actuar como el agente. Mantenlo fuera de los repositorios compartidos: usa una
+variable de entorno o la petición de secretos de tu cliente, como arriba. Si se filtra, revoca el agente en
+<UiPath path="nav.settings > settings.keys" />.
+</Aside>
+
+## Qué puede hacer un agente
+
+El servidor ofrece 61 herramientas, 3 recursos y 2 prompts. Cada herramienta comprueba un permiso, exactamente igual
+que una clave de API, y las campañas se pueden indicar por su nombre o por su ID. La lista completa, con el permiso y el
+efecto de cada herramienta, está en [herramientas, recursos y prompts de MCP](/es/reference/mcp-tools/).
+
+- **Leer**: listas e informes de campañas, la revisión previa, estadísticas de envío en tiempo real, estado de los
+  proveedores, enrutamiento, entregabilidad, pruebas de ubicación, un contacto por ID o dirección, listas,
+  formularios de suscripción, automatizaciones con las cifras de su pestaña
+  <UiPath path="automations.flow.tabStats" />, la cola de aprobaciones, boletines periódicos, votaciones,
+  crecimiento, ingresos, ofertas y contenido del sitio web.
+- **Cambiar**: crear borradores de campañas, SMS, push, WhatsApp y artículos del sitio web; actualizar el contenido de
+  una campaña; crear segmentos; añadir direcciones a la lista de supresión; cambiar los pesos del enrutamiento; pausar y
+  reanudar envíos; crear enlaces de solo lectura a informes que caducan, con `share_campaign_report` (necesita
+  `reports:share`).
+- **Borradores como los del editor**: un borrador de campaña que un agente crea o cambia se guarda igual que el
+  [editor](/es/campaigns/composer/#qué-comprueba-el-servidor) guarda el de una persona. El servidor compila el MJML (un
+  error de MJML se rechaza), lo comprueba, guarda el asunto y el preencabezado en el head del MJML y guarda cada cambio
+  como una versión nueva en el historial, marcada como hecha por una clave de API o un agente. Un cambio nunca cancela
+  la aprobación o la solicitud pendiente de una persona: la llamada falla con `409 approval_would_cancel`.
+- **Enviar una prueba**: `send_test_email` envía una prueba de una campaña solo a miembros del espacio de trabajo, por
+  el flujo Sistema.
+- **Correo transaccional**: solo lectura. Los agentes listan y renderizan plantillas y buscan en el registro de
+  mensajes, pero nunca envían mensajes transaccionales.
+- **Recursos**: el MJML de una campaña, un informe en CSV y las 100 entradas más recientes del registro de auditoría.
+
+`get_campaign_report` devuelve el informe que muestra la aplicación, generado por el mismo código: aperturas humanas,
+protegidas por privacidad y de escáneres por separado, la tasa de apertura medible, las quejas solo donde los
+proveedores de buzón las comunican, los enlaces (por variante en una prueba de contenido) y la decisión A/B con su
+confianza. Un agente responde a partir de esas cifras, tal como las presentan los
+[informes de campaña](/es/campaigns/reports/).
+
+Los permisos de un agente se vuelven a comprobar en cada llamada frente al rol actual de quien lo creó. Cuando quien
+lo creó pierde un permiso, el agente también lo pierde; cuando quien lo creó sale del espacio de trabajo o se
+desactiva, el agente no puede hacer nada.
+
+## Propuestas para todo lo que envía
+
+Los agentes no inician envíos.
+
+- `schedule_campaign` nunca programa. Registra una propuesta para el primer miembro que tiene `campaigns:send`, que
+  recibe una notificación («Claude: analytics propone programar la campaña “Weekly Digest #142”») con un enlace a la
+  campaña. Esa persona la programa en ReputeCast, donde la revisión previa y las aprobaciones se aplican como siempre.
+  `propose_send` hace lo mismo con un borrador de SMS, push o WhatsApp, para enviarlo ahora o a la hora que indiques.
+- Una llamada para la que el agente no tiene permiso se deniega. El agente recibe un error que nombra el permiso que
+  falta, la denegación queda en el registro de auditoría y una propuesta va al primer miembro que lo tiene.
+- La notificación indica cuándo caduca la propuesta: 2 horas por defecto, de 1 a 168 horas en
+  <UiPath path="keys.changeLimits" />. ReputeCast nunca ejecuta una propuesta por sí mismo, así que la caducidad le dice
+  a la persona durante cuánto tiempo sigue vigente la solicitud; cuando pasa, no ocurre nada.
+- `pause_campaign` necesita `campaigns:pause` y pausa al momento. `resume_campaign` necesita `campaigns:send` y
+  reanuda al momento: da `campaigns:send` a un agente solo si puede reiniciar un envío en pausa.
+
+## Auditoría y límites
+
+Cada llamada a una herramienta queda en el registro de auditoría con el agente como actor, el nombre de la herramienta
+y el resultado, incluidas las llamadas denegadas. <UiPath path="keys.recentAgentActions" /> en la misma página muestra
+las últimas llamadas; abre el [registro de auditoría](/es/team/audit-log/) para ver el resto.
+
+<UiPath path="keys.changeLimits" /> define las llamadas por minuto por agente y la caducidad de las propuestas del
+espacio de trabajo, y desactiva el servidor MCP. Mientras está desactivado, se rechazan todos los tokens de agente. Un
+agente por encima de su límite recibe `429` con `Retry-After: 60`.
+
+<LimitsTable area="mcp" />
+
+## Comprobar que funciona
+
+- Pide a tu asistente que liste las herramientas del servidor `reputecast`, o que llame a `list_campaigns`. Debería
+  listar tus campañas.
+- En <UiPath path="nav.settings > settings.keys" />, la última llamada del agente aparece en la matriz de agentes y en
+  <UiPath path="keys.recentAgentActions" />.
+
+## Solución de problemas
+
+- **401 "use an MCP agent token (rc_agent_…)"**: el cliente envía una clave de API o ninguna cabecera. Crea un agente
+  y usa su token.
+- **401 "this agent was revoked" o "… expired"**: crea un agente nuevo o rota su token en
+  <UiPath path="nav.settings > settings.keys" />.
+- **401 "the MCP server is off"**: actívalo en <UiPath path="keys.changeLimits" />.
+- **El cliente se conecta pero se deniegan todas las herramientas**: el agente no tiene el permiso, o quien lo creó ya
+  no lo tiene. El error nombra el permiso.
+- **Claude Code omite el servidor**: la entrada de `.mcp.json` tiene `url` pero no `"type": "http"`.
+- **Las llamadas se quedan colgadas o agotan el tiempo detrás de un proxy**: el proxy pone en búfer las respuestas de
+  `/mcp`. Desactiva el búfer para esa ruta.
+- **Errores 429**: el agente hizo más llamadas por minuto de las que permite el espacio de trabajo. Sube el límite o
+  reduce el ritmo del agente.
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Herramientas, recursos y prompts de MCP" href="/es/reference/mcp-tools/" description="Todas las herramientas con su permiso y su efecto." />
+  <LinkCard title="Roles y permisos" href="/es/team/roles-and-permissions/" description="El modelo de permisos que los agentes comparten con los miembros y las claves." />
+  <LinkCard title="Autenticación y claves de API" href="/es/developers/api-authentication/" description="Claves para scripts y servicios que llaman a la API REST." />
+  <LinkCard title="Usar el asistente de IA con tu propio modelo" href="/es/integrations/ai-assistant/" description="El asistente integrado en el editor, para personas." />
+</CardGrid>

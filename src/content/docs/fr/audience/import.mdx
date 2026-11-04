@@ -1,0 +1,245 @@
+---
+title: Importer des contacts depuis un fichier CSV ou XLSX
+description: 'Importer une liste de contacts CSV ou XLSX dans ReputeCast en gardant le consentement : associez les champs, traitez les adresses à risque, puis importez.'
+type: how-to
+audience: [publisher]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: importer une liste de contacts CSV
+sources:
+  - internal/imports
+  - internal/emailaddr/emailaddr.go
+  - internal/verification/imports.go
+  - internal/audience/optin.go
+  - internal/audience/retention.go
+  - internal/store/queries/imports.sql
+  - web/src/features/imports
+  - web/src/features/verification/ImportCheck.tsx
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Importer une liste de contacts CSV ou XLSX se fait en cinq étapes (Source, Associer les champs, Consentement, Aperçu,
+Import), suivies d’un récapitulatif. Chaque ligne conserve son [consentement](/fr/reference/glossary/#consent) : les
+adresses qui se sont désabonnées, ont rebondi ou se sont plaintes dans l’ancien outil vont directement dans la
+[liste de suppression](/fr/audience/suppressions/), et aucun import ne peut plus jamais les réabonner.
+
+Les écrans sont les mêmes pour un fichier et pour une source par API comme Mailchimp ou Brevo ; les captures
+ci-dessous montrent des imports par API. Pour faire venir des contacts depuis l’API d’une autre plateforme, consultez
+[Passer à ReputeCast sans perdre le consentement](/fr/migrate/overview/).
+
+## Avant de commencer
+
+- Il vous faut `subscribers:import`. Les rôles Propriétaire, Admin et Éditeur l’ont ; un Observateur ne l’a pas.
+- Préparez un fichier `.csv` ou `.xlsx`. La première ligne non vide doit contenir les en-têtes. Les fichiers XLSX ne
+  sont lus que sur leur première feuille ; les fichiers `.xls` ne sont pas pris en charge : enregistrez-les d’abord en
+  XLSX ou en CSV.
+- Connectez d’abord vos [fournisseurs d’envoi](/fr/providers/connect/) si vous le pouvez. L’import récupère alors les
+  rebonds, les plaintes et les désabonnements qu’ils bloquent déjà, avant d’ajouter qui que ce soit.
+- Facultatif : connectez un [service de vérification](/fr/audience/verification/) d’adresses pour vérifier les
+  nouvelles adresses dans l’aperçu.
+
+<LimitsTable area="imports" />
+
+### Comment ReputeCast lit le fichier
+
+- **Délimiteur** : virgule, point-virgule, tabulation ou barre verticale, selon celui qui apparaît le plus dans la
+  première ligne.
+- **Encodage** : UTF-8 (une marque d’ordre des octets est ignorée) ; tout ce qui n’est pas de l’UTF-8 valide est lu
+  comme du Latin-1.
+- **Colonne de l’e-mail** : un en-tête nommé `email`, `e-mail`, `email address` ou `mail`. À défaut, ReputeCast choisit
+  la colonne qui contient le plus d’adresses valides parmi ses 20 premières valeurs.
+- **Colonne de statut** : un en-tête nommé `status`, `consent`, `subscribed`, `subscription status`, `opt-in status` ou
+  `email status`. Ses valeurs décident de ce que devient chaque ligne à l’étape Consentement (consultez le tableau de
+  cette étape).
+- **Colonne des tags** : un en-tête nommé `tags`, `tag`, `labels` ou `label`. Les valeurs sont séparées sur les
+  virgules, les points-virgules ou les barres verticales, et mises en minuscules.
+
+<Aside type="caution">
+  Dans une colonne de statut, toute valeur que ReputeCast ne reconnaît pas compte comme **désabonné** : cette ligne est
+  donc exclue. Vérifiez les nombres à l’étape Consentement avant de continuer, et renommez la colonne si elle ne contient
+  pas un statut d’abonnement.
+</Aside>
+
+## Importer le fichier
+
+<Steps>
+
+1. Sélectionnez <UiPath path="shell.importContacts" /> dans la barre latérale, ou
+   <UiPath path="nav.audience > audience.tabContacts > audience.contacts.import" />. Sous
+   <UiPath path="imports.stepSource" />, déposez le fichier sur la page ou sélectionnez
+   <UiPath path="imports.chooseFile" />.
+
+   <Screenshot
+     id="import-source"
+     alt="Étape 1 sur 5, Source : des tuiles pour Brevo, Mailchimp, MailerLite, listmonk, Keila, Notifuse et CSV ou XLSX, avec un tableau qui envoie chaque liste source vers une liste ReputeCast."
+   />
+
+   Si une ligne CSV n’a pas le même nombre de colonnes que l’en-tête (en général à cause d’une virgule non protégée par
+   des guillemets dans une valeur), la page indique la ligne. Ignorez ces lignes, téléchargez-les, ou importez un
+   fichier corrigé.
+
+2. Dans <UiPath path="imports.chooseTitle" />, choisissez sous <UiPath path="imports.intoList" /> la liste qui reçoit
+   le fichier : une liste existante, ou une nouvelle liste nommée d’après le fichier. Laissez
+   <UiPath path="imports.pullSuppressions" /> activé, puis sélectionnez <UiPath path="imports.continueFields" />.
+
+3. Sous <UiPath path="imports.stepFields" />, vérifiez les suggestions. Chaque colonne est associée à un champ intégré
+   (prénom, nom, nom complet, entreprise, pays, fuseau horaire, langue, téléphone, consentement SMS), à un champ
+   personnalisé existant, à un nouveau champ personnalisé (texte, nombre, date ou booléen), ou à **Ignorer**. Une seule
+   colonne doit être associée à l’e-mail.
+
+   <Screenshot
+     id="import-fields"
+     alt="Associer les champs : chaque champ Mailchimp avec des exemples de valeurs, le champ ReputeCast associé, son type et un badge Associé ou Nouveau champ, sous des puces qui comptent 10 champs associés, 2 nouveaux champs et 2 ignorés."
+   />
+
+   Une colonne de langue est convertie en codes de langue (« Spanish », « español » et « ES » deviennent `es`). Les
+   valeurs qui ne sont pas des langues restent vides et sont comptées sous la colonne. Sélectionnez
+   <UiPath path="imports.continueConsent" />.
+
+4. Sous <UiPath path="imports.stepConsent" />, vérifiez ce que devient chaque statut. Les lignes désabonnées, nettoyées
+   (en rebond) et en plainte sont verrouillées : elles deviennent des exclusions.
+
+   <TableScroll label="Ce que devient chaque statut du fichier">
+
+   | Valeur dans la colonne de statut | Devient | Effet |
+   | --- | --- | --- |
+   | Vide, `subscribed`, `active`, `yes`, `true`, `1`, `confirmed`, `opted in`, `opt-in`, `enabled` | Abonné (vous pouvez choisir en attente ou Ignorer à la place) | Reçoit immédiatement les Diffusions et les Automatisations |
+   | `pending`, `unconfirmed`, `not confirmed` | En attente, avec un e-mail de redemande de consentement, ou Ignorer | Aucun e-mail marketing tant qu’il n’a pas confirmé |
+   | `bounced`, `cleaned`, `hard bounce`, `invalid`, `undeliverable` | Exclu comme rebond définitif (verrouillé) | Tous les flux bloqués |
+   | `complained`, `spam`, `abuse`, `junk` | Exclu comme plainte (verrouillé) | Tous les flux bloqués |
+   | `transactional` | Ignorer, ou Abonné · en attente | Non importé, ou en attente |
+   | Toute autre valeur | Exclu comme désabonné (verrouillé) | Diffusions et Automatisations bloquées ; e-mails Système autorisés |
+
+   </TableScroll>
+
+   Sous <UiPath path="imports.evidenceTitle" />, choisissez une option :
+
+   - Se fier à l’opt-in du fichier : uniquement si chaque contact s’est inscrit lui-même. Les contacts sont abonnés avec
+     un consentement en opt-in simple.
+   - <UiPath path="imports.repermission" /> : les contacts sont importés en attente et reçoivent un e-mail de
+     confirmation par le flux Système après l’import. C’est l’e-mail aux couleurs de vos formulaires, dans la langue du
+     contact, qui nomme les listes pour lesquelles il est en attente. Quel que soit l’expéditeur, une adresse reçoit au
+     plus un e-mail de confirmation toutes les 10 minutes et cinq par jour (consultez
+     [double opt-in](/fr/audience/lists-and-consent/)). C’est l’option la plus sûre pour les listes anciennes ou en
+     opt-in simple. Les contacts qui n’ont pas confirmé au bout de 14 jours sont exclus des Diffusions et des
+     Automatisations (consultez la note ci-dessous).
+
+   Laissez <UiPath path="imports.pullBefore" /> et <UiPath path="imports.recordHistory" /> activés. Pour retrouver ces
+   contacts plus tard, saisissez un tag sous <UiPath path="imports.importTag" /> : il est ajouté à chaque contact que
+   l’import ajoute ou fusionne. Sélectionnez ensuite <UiPath path="imports.continuePreview" />.
+
+   <Screenshot
+     id="import-consent"
+     alt="Consentement : chaque statut source avec son nombre de contacts et ce qu’il devient ; les lignes désabonnées et nettoyées sont verrouillées comme exclusions, avec le choix de redemande de consentement en dessous."
+   />
+
+5. Sous <UiPath path="imports.stepPreview" />, lisez la simulation. Rien n’est encore écrit. Les tuiles comptent les
+   lignes qui seront importées, fusionnées avec des contacts existants, exclues, ignorées comme non valides, et à
+   risque.
+
+   <Screenshot
+     id="import-preview"
+     alt="La simulation pour 13 739 lignes vérifiées : des tuiles pour 10 958 à importer, 318 fusionnées, 1 259 exclues, 449 non valides et 755 à risque, puis les groupes d’adresses à risque avec une action pour chacun."
+   />
+
+   Choisissez une action pour chaque groupe à risque :
+
+   <TableScroll label="Groupes d’adresses à risque">
+
+   | Groupe | Ce qu’il détecte | Action par défaut |
+   | --- | --- | --- |
+   | Adresses génériques | `info@`, `sales@`, `support@`, `noreply@` et similaires | Importer, exclues automatiquement des Diffusions |
+   | Domaines jetables | Domaines de boîtes de réception jetables | Ignorer |
+   | Fautes de frappe probables | À une lettre de gmail.com, outlook.com, hotmail.com, yahoo.com, icloud.com et d’autres | Corriger le domaine et importer, avec le tag `review-typo` |
+   | Motifs de pièges à spam connus | Parties locales comme `spamtrap` ou `honeypot` | Ignorer (recommandé) |
+
+   </TableScroll>
+
+   Les doublons sont détectés sur l’e-mail, sans tenir compte de la casse. Sous <UiPath path="imports.onConflict" />,
+   gardez <UiPath path="imports.conflictFill" /> pour ne remplir que les champs vides, ou écrasez ou conservez les
+   valeurs de ReputeCast. Une fusion ajoute la liste et les tags ; elle ne modifie jamais le consentement d’un contact.
+   Les lignes non valides (sans domaine, sans enregistrement MX, qui ne sont pas des adresses) sont ignorées ;
+   <UiPath path="imports.downloadThese" /> vous en donne la liste.
+
+   Avec un service de vérification connecté, vous pouvez d’abord vérifier les nouvelles adresses, avec le coût affiché,
+   ou sélectionner <UiPath path="verification.importWithout" />.
+
+6. Sélectionnez **Importer _N_ contacts**. L’import s’exécute en arrière-plan par lots de 500 lignes. Sélectionnez
+   <UiPath path="imports.leaveRunning" /> pour utiliser l’application en attendant ; les contacts déjà importés sont
+   utilisables immédiatement, et vous recevez une notification avec le rapport à la fin.
+   <UiPath path="imports.stopImport" /> conserve les lignes déjà importées ; un import arrêté ne peut pas être repris,
+   mais vous pouvez en lancer un nouveau.
+
+7. Lisez le récapitulatif. Il compte les lignes importées, fusionnées, exclues, en attente et ignorées, explique chaque
+   groupe ignoré ou modifié, et propose deux téléchargements :
+
+   - **Télécharger les lignes ignorées · CSV** : `row,value,source_status,reason`.
+   - <UiPath path="imports.downloadReport" /> : `row,email,source_status,outcome,reason` pour chaque ligne.
+
+   Les deux fichiers listent chaque adresse lue par l’import : ReputeCast ne les conserve donc que pendant la durée
+   indiquée dans le tableau ci-dessus ; le récapitulatif indique jusqu’à quand. Ensuite, les boutons sont désactivés et
+   un téléchargement répond `410`. [Effacer définitivement un contact](/fr/audience/contacts/) retire ses lignes des
+   fichiers encore conservés.
+
+   <Screenshot
+     id="import-report"
+     alt="Le récapitulatif de l’import : 39 402 contacts importés, 1 033 exclus, 6 716 en attente de redemande de consentement et 214 ignorés, puis les deux téléchargements avec les fichiers conservés jusqu’au 8 nov. 2026 et la raison de chaque groupe ignoré ou modifié."
+   />
+
+   Les nouvelles exclusions sont transmises aux fournisseurs d’envoi qui les acceptent : la prochaine campagne ne peut
+   donc atteindre ces adresses chez aucun fournisseur.
+
+</Steps>
+
+## Vérifier le résultat
+
+- <UiPath path="imports.viewImported" />, sur le récapitulatif, ouvre <UiPath path="nav.audience > audience.tabContacts" />
+  filtré sur les contacts ajoutés par l’import
+  (<UiPath path="audience.contacts.moreFilters > audience.contacts.fromImport" />) ; les contacts fusionnés portent le
+  tag de l’import, si vous en avez défini un. Filtrez <UiPath path="audience.contacts.consent" /> sur
+  <UiPath path="audience.consentPendingFilter" /> pour voir qui doit encore confirmer.
+- Chaque liste nommée dans le récapitulatif affiche son nouveau nombre de contacts.
+- <UiPath path="nav.audience > audience.tabSuppressions" /> affiche les exclusions importées regroupées sous l’import,
+  avec <UiPath path="audience.suppressions.viewRows" /> pour les ouvrir.
+
+## Dépannage
+
+- **« La ligne _N_ a _X_ colonnes, l’en-tête en a _Y_ »** → une valeur contient une virgule non protégée par des
+  guillemets. Ignorez les lignes ou mettez la valeur entre guillemets et importez de nouveau.
+- **« Ce fichier dépasse 100 Mo »** → divisez le fichier, ou importez depuis l’API de la source.
+- **La mauvaise colonne a été utilisée pour l’e-mail** → renommez l’en-tête de cette colonne en `email` et importez de
+  nouveau.
+- **Beaucoup de lignes ont été exclues** → la colonne de statut contient des valeurs que ReputeCast ne reconnaît pas.
+  Renommez la colonne pour qu’elle ne soit pas lue comme un statut, ou remplacez les valeurs par `subscribed`.
+- **Les contacts en attente n’ont jamais reçu d’e-mail de confirmation** → aucun fournisseur Système n’est connecté.
+  Connectez-en un dans le [routage](/fr/providers/routing/), puis sélectionnez
+  <UiPath path="audience.contacts.resendOptin" /> pour ces contacts dans Contacts.
+- **Des tags manquent** → seule une colonne intitulée `tags`, `tag`, `labels` ou `label` est lue comme des tags.
+- **« Cet import a déjà commencé. »** → l’import a été lancé deux fois, depuis un second onglet ou par un double clic.
+  ReputeCast refuse le second lancement (`409`) : les lignes ne sont donc importées qu’une fois.
+- **Le journal de l’import indique « Le fichier importé a été supprimé, car il mentionnait un contact effacé
+  définitivement. »** → un contact du fichier a été effacé avant la fin de l’import. Importez de nouveau le fichier pour
+  continuer.
+
+<Aside type="note">
+  Un contact en redemande de consentement qui n’a pas confirmé 14 jours après son dernier e-mail de confirmation est
+  exclu des Diffusions et des Automatisations, comme un désabonnement, avec la source
+  <UiPath path="audience.suppressionSource.repermission" /> sur la [liste de suppression](/fr/audience/suppressions/).
+  Un renvoi par votre équipe relance les 14 jours, et une confirmation ultérieure, depuis le même e-mail ou par une
+  nouvelle inscription, lève l’exclusion. La tâche horaire qui s’en charge enregistre une entrée `suppression.add` par
+  System dans le [journal d’audit](/fr/team/audit-log/).
+</Aside>
+
+## Voir aussi
+
+- [Listes, consentement et double opt-in](/fr/audience/lists-and-consent/)
+- [La liste de suppression](/fr/audience/suppressions/)
+- [Vérifier les adresses e-mail](/fr/audience/verification/)
+- [Migrer depuis Mailchimp](/fr/migrate/mailchimp/) et les autres [guides de migration](/fr/migrate/overview/)

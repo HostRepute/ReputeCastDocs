@@ -1,0 +1,210 @@
+---
+title: Rebotes, quejas y límites de los proveedores
+description: Qué hace ReputeCast con cada rebote y cada queja, qué suprime al momento y qué umbral de tasa de rebote aplican los proveedores de envío y el propio ReputeCast.
+type: explanation
+audience: [publisher, admin]
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: umbral de tasa de rebote
+sources:
+  - internal/providers/provider.go
+  - internal/providers/bounce/bounce.go
+  - internal/providers/ses/sns.go
+  - internal/ingest/normalize.go
+  - internal/suppressions/sync.go
+  - internal/reports/bounces.go
+  - internal/providers/state/state.go
+  - internal/providers/manage/usage.go
+  - internal/connect/connection.go
+  - internal/deliverability/providers.go
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/watch.go
+  - internal/mailbox/mailbox.go
+  - internal/counters/counters.go
+  - web/src/features/reports/messages.ts
+  - web/src/features/traffic/traffic.messages.ts
+sidebar:
+  order: 8
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Un [rebote](/es/reference/glossary/#bounce) es un mensaje que rechazó el servidor de correo receptor; una
+[queja](/es/reference/glossary/#complaint) es un lector que marca tu correo como spam. Ambos cuentan para el
+umbral de tasa de rebote y los límites de quejas que los proveedores de envío aplican a tu cuenta, y para los umbrales
+que ReputeCast aplica mientras se envía una campaña. Esta página explica cómo se registra cada tipo, qué direcciones
+se suprimen al momento y dónde están esos límites.
+
+## Rebotes permanentes, rebotes temporales y quejas
+
+- Un [rebote permanente](/es/reference/glossary/#hard-bounce) es un fallo definitivo: la dirección no existe, el dominio
+  no tiene servidor de correo o el receptor rechazó el mensaje para siempre. Las respuestas SMTP de estos casos empiezan
+  por 5 (por ejemplo, `550 5.1.1`).
+- Un [rebote temporal](/es/reference/glossary/#soft-bounce) es un fallo pasajero, como un buzón lleno o un receptor que
+  pide volver a intentarlo más tarde. Las respuestas empiezan por 4 (por ejemplo, `452 4.2.2`). El proveedor de envío
+  reintenta; un mensaje que al final no puede entregar se notifica como rebote temporal.
+- Un [aplazamiento](/es/reference/glossary/#deferral) es un intento retrasado que el proveedor de envío volverá a
+  intentar. Muchos aplazamientos en un mismo proveedor de buzón suelen significar que está limitando la velocidad de tu
+  correo. Un mensaje cuenta como aplazado una sola vez, por muchos intentos que se hayan aplazado.
+- Una queja te llega a través de un [bucle de retroalimentación](/es/reference/glossary/#feedback-loop): el
+  [proveedor de buzón](/es/reference/glossary/#mailbox-provider) notifica un clic en "Marcar como spam" a tu
+  [proveedor de envío](/es/reference/glossary/#sending-provider), que te lo transmite.
+- Un mensaje rechazado es uno que el proveedor de envío rechazó antes de enviarlo, por ejemplo porque la dirección está
+  en la lista de supresión del propio proveedor o porque se marcó el contenido.
+
+El proveedor de envío decide si un rebote es permanente o temporal. ReputeCast conserva esa decisión, junto con el tipo
+de evento y el código originales del proveedor.
+
+## Cómo gestiona ReputeCast cada evento
+
+1. El proveedor de envío notifica el evento al webhook de ReputeCast o, en el caso de un servidor SMTP, ReputeCast lo
+   lee del [buzón de rebotes](/es/reference/glossary/#bounce-mailbox). El payload sin procesar se guarda antes de que
+   ocurra nada más.
+2. ReputeCast lo asigna a un tipo de [evento normalizado](/es/reference/glossary/#normalized-event): `delivered`,
+   `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` o `unsubscribe`. El tipo original
+   ("Bounce · Permanent · General") y el código ("550 5.1.1") se conservan con él.
+3. Un rebote recibe además una [clase de rebote](/es/reference/glossary/#bounce-class), deducida del código de estado
+   ampliado y del texto de diagnóstico, para que la misma respuesta signifique lo mismo en todos los proveedores de
+   envío.
+4. Un rebote permanente, una queja y una baja notificados por el proveedor ponen la dirección en la
+   [lista de supresión compartida](/es/reference/glossary/#suppression-list) al momento, y el estado del contacto pasa a
+   rebotado o con queja. Después, la [sincronización de supresiones](/es/reference/glossary/#suppression-sync) envía la
+   dirección a todos los proveedores de envío conectados que aceptan supresiones, así que un solo rebote detiene el
+   correo en todas partes.
+5. Un bloqueo por la reputación o la política del remitente (`policy_block`, `spam_block`, `reputation`) nunca suprime
+   la dirección, aunque el proveedor de envío lo considere permanente: la dirección es válida y vuelve a recibir correo
+   en cuanto se resuelve el bloqueo.
+6. Un rebote temporal o un aplazamiento no suprime por sí solo una dirección. Cuentan en los informes y en el
+   [monitor en tiempo real](/es/campaigns/live-monitor/). El correo transaccional añade una regla: cuando un mensaje
+   Transaccional rebota temporalmente y la dirección ya ha tenido 3 rebotes temporales en 7 días, la dirección se
+   suprime.
+7. Los rebotes por tipo, los aplazamientos y las quejas alimentan el [envío protegido](/es/reference/glossary/#guarded-sending):
+   cuando las tasas de una campaña superan los [umbrales de pausa automática](#umbrales-de-pausa-automática),
+   ReputeCast ralentiza o retiene la parte afectada.
+
+Las copias que una [prueba de ubicación](/es/deliverability/placement-tests/) envía a tus propios buzones de prueba son
+la única excepción: sus rebotes y quejas nunca suprimen el buzón de prueba.
+
+Cada evento sin procesar y su forma normalizada aparecen uno al lado del otro en
+<UiPath path="nav.providers > providers.tabEvents" />.
+
+<Screenshot
+  id="providers-events"
+  alt="El registro de eventos en Eventos y sincronización: cada evento sin procesar del proveedor, como un Bounce · Permanent · General de Amazon SES, junto a su tipo normalizado, el código y el diagnóstico originales, el destinatario y su origen, como una campaña, un paso de una automatización o la API transaccional."
+/>
+
+### Clases de rebote
+
+Los informes de campaña agrupan los rebotes por clase en su tabla de rebotes, con los códigos originales de cada
+proveedor de envío, e indican qué pasó con las direcciones.
+
+<TableScroll label="Clases de rebote">
+
+| Clase             | Qué dijo el receptor                                       | Fila en el informe                    | Qué ocurre                                         |
+| ----------------- | ---------------------------------------------------------- | ------------------------------------- | -------------------------------------------------- |
+| `mailbox_unknown` | La dirección no existe (`5.1.1`, "user unknown")           | Permanente · usuario desconocido      | Se suprime automáticamente                         |
+| `domain_invalid`  | El dominio no existe o no tiene servidor de correo         | Permanente · dominio no encontrado    | Se suprime automáticamente                         |
+| `mailbox_full`    | El buzón ha superado su cuota (`4.2.2`, `5.2.2`)           | Temporal · buzón lleno                | Se reintenta en el próximo envío                   |
+| `temporary`       | Un fallo temporal que nunca se resolvió                    | Temporal · aplazamiento caducado      | Se reintenta en el próximo envío                   |
+| `policy_block`    | Rechazado por política, a menudo de autenticación (`5.7.1`, `5.7.26`) | Bloqueado · política o reputación | Nunca se suprime; investiga y corrige la causa |
+| `spam_block`      | Rechazado como spam, o por una inclusión en una lista de bloqueo | Bloqueado · política o reputación | Nunca se suprime; investiga y corrige la causa   |
+| `reputation`      | Rechazado o limitado por la reputación del remitente       | Bloqueado · política o reputación     | Nunca se suprime; investiga y corrige la causa     |
+| `other`           | Ningún código que ReputeCast pueda clasificar              | Otro                                  | Lo revisas tú                                      |
+
+</TableScroll>
+
+Los rebotes bloqueados apuntan a tu configuración de envío, no a la dirección, así que ReputeCast nunca los suprime,
+aunque el proveedor de envío los haya notificado como permanentes. En la tabla de rebotes del informe, la fila de
+bloqueados ofrece <UiPath path="reports.investigate" />, que muestra lo que dijo cada proveedor de envío, y
+<UiPath path="reports.retryTitle" /> vuelve a preparar la edición en borrador para las direcciones bloqueadas que
+siguen en tu lista, una vez cada una, para enviarla desde Revisar y enviar cuando hayas corregido la causa. Revisa
+[SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/) y las [inclusiones en listas de bloqueo](/es/deliverability/blocklists/),
+y busca el código en [Códigos de error SMTP](/es/smtp-errors/).
+
+### Quejas: dónde se notifican
+
+La mayoría de los proveedores de buzón envían un informe por cada queja a tu proveedor de envío, que ReputeCast recibe
+como evento `complaint`: Outlook, Yahoo y muchos de los proveedores de Otros. Gmail e iCloud nunca notifican quejas
+individuales. Por eso ReputeCast calcula las tasas de quejas solo sobre el correo entregado a los proveedores de buzón
+que las notifican, y muestra las tasas de quejas propias de Gmail e iCloud como "n/d" con el motivo, nunca como 0 %. Lo
+desconocido no es cero: una campaña que solo fue a Gmail no tiene tasa de quejas, no una perfecta. El proveedor de buzón
+de cada destinatario se deduce de los registros MX del dominio, así que las direcciones de Google Workspace cuentan
+como Gmail y las de Microsoft 365 como Outlook.
+
+Gmail funciona de otra manera: su bucle de retroalimentación notifica tasas de spam agregadas por identificador en
+Google Postmaster Tools, a partir de una cabecera `Feedback-ID` del mensaje
+([Ayuda de Gmail, "Feedback Loop"](https://support.google.com/mail/answer/6254652), comprobado en octubre de 2026).
+ReputeCast añade esa cabecera al correo de Envíos masivos, Automatizaciones y Transaccional:
+
+```text title="Feedback-ID header"
+Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
+```
+
+Los identificadores agrupan los datos de Gmail por campaña, por espacio de trabajo y por flujo. Con
+[HostRepute](/es/deliverability/hostrepute/) conectado, las cifras de Postmaster Tools, incluidas las campañas
+señaladas, aparecen en Entregabilidad, y la vigilancia de quejas posterior a un envío puede leer la tasa de spam diaria
+de Gmail (consulta [Definir las reglas de tráfico](/es/providers/traffic-rules/)).
+
+Las quejas siguen llegando durante días después de la entrega. Cada una sigue suprimiendo la dirección y cuenta en el
+informe de la campaña, y durante las 72 horas posteriores a un envío (por defecto) ReputeCast avisa a las personas que
+pueden reanudar envíos cuando un proveedor de buzón supera su límite de quejas.
+
+## Límites de cuenta de los proveedores de envío
+
+Los proveedores de envío vigilan las tasas de rebote y de quejas de tu cuenta y pueden impedirte enviar cuando son
+demasiado altas. Amazon SES, por ejemplo, publica dos niveles para cada tasa
+([Amazon SES sending review process FAQs](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), comprobado
+en octubre de 2026):
+
+| Tasa             | Cuenta en revisión | Los envíos pueden pausarse |
+| ---------------- | ------------------ | -------------------------- |
+| Tasa de rebote   | 5 % o más          | 10 % o más                 |
+| Tasa de quejas   | 0,1 % o más        | 0,5 % o más                |
+
+Amazon SES solo cuenta los rebotes permanentes hacia dominios que no has verificado, y las quejas solo de los
+proveedores de buzón que envían notificaciones, medidas sobre un "volumen representativo" de tu correo y no sobre un
+periodo fijo. Su consejo es mantenerse por debajo del 2 % de rebotes y del 0,1 % de quejas.
+
+ReputeCast guarda los dos niveles de Amazon SES con cada conexión de SES y muestra la tasa de rebote y de quejas de cada
+proveedor de envío de los últimos 7 días en [Supervisar el estado de los dominios y los proveedores](/es/deliverability/health/),
+junto al límite que aplica a ese proveedor. La tasa de quejas solo cuenta el correo entregado donde se notifican las
+quejas. La barra avisa a partir de la mitad del primer límite, una vez que ReputeCast ha contado 500 mensajes en los 7
+días. Los servidores autoalojados, como Postal o un servidor SMTP, no tienen límites de cuenta; la línea que se muestra
+ahí es el umbral de protección que fija ReputeCast, o la protección del calentamiento mientras el servidor está
+[en calentamiento](/es/providers/warm-up/).
+
+## Umbrales de pausa automática
+
+Los umbrales propios de ReputeCast se aplican durante cada campaña, por proveedor de buzón y por proveedor de envío.
+Están en los niveles que hacen que se revise una cuenta de Amazon SES o por debajo de ellos, para que un envío malo se
+detenga antes de dañar la cuenta. Cada tipo de rebote tiene su propio umbral: los rebotes por bloqueo o política por
+proveedor de buzón, los usuarios desconocidos sobre todo el envío en dos niveles (avisar y después pausar), y los
+rebotes temporales y los aplazamientos por proveedor de buzón durante 10 minutos en dos niveles (ralentizar y después
+pausar). Las quejas y los rebotes por bloqueo o política claramente por encima del límite se activan en un envío de
+cualquier tamaño. Defínelos en las [reglas de tráfico](/es/providers/traffic-rules/).
+
+<LimitsTable area="auto-pause" />
+
+## Cuándo cambiarlos
+
+- Mantén los valores predeterminados mientras calientas un dominio o una IP nuevos, o después de una migración:
+  detectan una lista mala antes de que lo haga un proveedor de envío.
+- Sube un umbral para una sola campaña en [Revisar y enviar](/es/reference/glossary/#review-and-send) solo cuando sepas
+  por qué la tasa será alta, por ejemplo en una campaña de reconfirmación a una lista antigua, y envíala primero a un
+  segmento pequeño.
+- Baja el umbral de rebotes si el límite propio de un proveedor de envío es más estricto que el valor predeterminado de
+  ReputeCast.
+
+Consulta [Supervisar un envío y la pausa automática](/es/campaigns/live-monitor/) para saber qué ocurre cuando se
+activa un umbral, y [Valores predeterminados de envío del espacio de trabajo](/es/providers/workspace-defaults/) para
+saber dónde están los valores predeterminados del espacio de trabajo.
+
+## Relacionado
+
+- [Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)
+- [La lista de supresión](/es/audience/suppressions/)
+- [Leer los informes de campaña](/es/campaigns/reports/)
+- [Códigos de error SMTP](/es/smtp-errors/)

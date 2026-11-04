@@ -1,0 +1,203 @@
+---
+title: Abmeldung mit einem Klick (RFC 8058)
+description: Wie ReputeCast die Abmeldung mit einem Klick nach RFC 8058 umsetzt, mit den genauen List-Unsubscribe-Headern, dem POST-Endpunkt und einem Test mit curl.
+type: explanation
+audience: [publisher, admin, developer]
+primaryKeyword: Abmeldung mit einem Klick nach RFC 8058
+sources:
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/automation.go
+  - internal/providers/provider.go
+  - internal/publicurl/publicurl.go
+  - internal/publicpages/publicpages.go
+  - internal/publicpages/tokens.go
+  - internal/publicpages/notifications.go
+  - internal/audience/signup.go
+  - internal/linktoken/linktoken.go
+  - internal/app/wire_forms.go
+  - internal/transactional/send.go
+  - internal/readiness/assemble.go
+  - internal/providers/brevo/brevo.go
+  - internal/providers/azureacs/azureacs.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Mit der [Abmeldung mit einem Klick](/de/reference/glossary/#one-click-unsubscribe) verlässt jemand Ihren Newsletter
+über den Abmelde-Button, den das E-Mail-Programm neben dem Absender zeigt, ohne eine Webseite zu öffnen. RFC 8058
+legt fest, wie das funktioniert: zwei Header in der Nachricht und ein HTTPS-POST. ReputeCast fügt die Header für die
+Abmeldung mit einem Klick nach RFC 8058 jeder Nachricht in den Streams Massenversand und Automationen hinzu und
+beantwortet den POST selbst, sodass Sie nichts konfigurieren müssen; diese Seite erklärt, was gesendet wird und wie Sie
+es testen.
+
+## Die Header, die ReputeCast hinzufügt
+
+Jede Nachricht in den Streams Massenversand und Automationen trägt diese Header (`TOKEN` steht für das signierte Token
+eines Empfängers):
+
+```txt title="Headers of a Broadcast message"
+List-Unsubscribe: <https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN>, <mailto:digest@news.acme.io?subject=unsubscribe%20TOKEN>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Feedback-ID: 0199ab12:acme-newsletter:broadcast:reputecast
+```
+
+- **Die HTTPS-Adresse** ist die öffentliche URL Ihrer Instanz, gefolgt von `/p/<workspace>/unsubscribe/<token>`. Sie
+  nutzt immer die öffentliche URL der Instanz, auch wenn die öffentlichen Seiten des Arbeitsbereichs auf einer
+  [eigenen Domain](/de/forms/branding-and-domain/) laufen.
+- **Das Token** identifiziert den Arbeitsbereich, die Nachricht und den Kontakt. Es ist mit einem HMAC signiert, der
+  aus dem geheimen Schlüssel der Instanz abgeleitet wird, enthält keine personenbezogenen Daten im Klartext und läuft
+  nicht ab. Wenn Sie [den geheimen Schlüssel rotieren](/de/self-hosting/security/#schlüssel-rotieren), funktionieren
+  Tokens in bereits gesendeten E-Mails weiter, solange der alte Schlüssel in `secrets.previous_keys` bleibt.
+- **Die `mailto:`-Adresse** ist die Reply-To-Adresse der Kampagne, sonst die Reply-To-Adresse des Absenders, sonst die
+  From-Adresse, mit dem Betreff `unsubscribe <token>`. Sie ist für E-Mail-Programme gedacht, die den POST nicht senden
+  können. ReputeCast liest keine E-Mails, die an diese Adresse gehen: Solche Anfragen landen in diesem Postfach, und Sie
+  melden den Kontakt unter [Kontakte verwalten](/de/audience/contacts/) von Hand ab.
+- **`Feedback-ID`** dient dem Feedback-Loop von Gmail: der Anfang der Kampagnen-ID, der Arbeitsbereich, der Stream und
+  `reputecast`.
+
+RFC 8058 verlangt genau eine HTTPS-URI in `List-Unsubscribe`, den exakten Wert `List-Unsubscribe=One-Click` in
+`List-Unsubscribe-Post` und eine DKIM-Signatur, die beide Header abdeckt
+([RFC 8058, Abschnitte 3.1 und 4](https://www.rfc-editor.org/rfc/rfc8058#section-3.1), geprüft im Oktober 2026). Die
+DKIM-Signatur kommt von Ihrem Versandanbieter, hängt also davon ab, dass
+[DKIM eingerichtet ist](/de/deliverability/spf-dkim-dmarc/).
+
+### Welche Nachrichten sie tragen
+
+<TableScroll label="Header für die Abmeldung mit einem Klick je Stream">
+
+| Nachrichten                                                     | Header                                                                                               |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Massenversand (Kampagnen)                                       | `List-Unsubscribe` mit der HTTPS-Adresse und `mailto:` sowie `List-Unsubscribe-Post`                 |
+| Automationen                                                    | Dieselben                                                                                            |
+| Transaktions-E-Mails in einer Kategorie Optional                | `List-Unsubscribe` nur mit der HTTPS-Adresse sowie `List-Unsubscribe-Post`                           |
+| Transaktions-E-Mails in einer Kategorie Notwendig               | Keine. Diese lassen sich nicht abbestellen; ihr Abmeldelink öffnet das Präferenzcenter               |
+| System-E-Mails: Bestätigungen, Passwort-Zurücksetzungen, Testversände | Keine                                                                                          |
+| Kopien von Platzierungstests                                    | Die Header des Massenversands, aber eine Abmeldung aus einer Kopie ändert nichts                     |
+
+</TableScroll>
+
+Gmail und Yahoo verlangen die Abmeldung mit einem Klick nur für Marketing-E-Mails; Transaktionsnachrichten sind
+ausgenommen ([Google, Email sender guidelines FAQ](https://support.google.com/a/answer/14229414), geprüft im Oktober
+2026). Die Kategorien erklärt [Transaktions-E-Mails in ReputeCast](/de/transactional/overview/).
+
+Zwei Versandanbieter ändern das:
+
+- **Brevo** entfernt die beiden Header von ReputeCast und setzt eigene, sodass Abmeldungen mit einem Klick bei Brevo
+  ankommen, das sie über seinen Abmelde-Webhook an ReputeCast meldet. ReputeCast setzt die Adresse dann auf die
+  Sperrliste. Siehe [Mit Brevo senden](/de/providers/brevo/).
+- **Azure Communication Services** deckt `List-Unsubscribe` nicht mit seiner DKIM-Signatur ab, daher ist auf die
+  Abmeldung mit einem Klick bei Gmail und Yahoo dort kein Verlass. Die Versandbereitschaft warnt in ihrer Gruppe
+  Compliance, wenn dieser Anbieter einen Teil eines Versands übernimmt. Siehe
+  [Mit Azure Communication Services senden](/de/providers/azure-communication-services/).
+
+## Wie eine Abmeldung mit einem Klick abläuft
+
+1. Beim Versand signiert ReputeCast für jeden Empfänger ein Token und setzt die Adresse in die Header und in den Link
+   `{{ unsubscribe_url }}` der Fußzeile.
+2. Das E-Mail-Programm zeigt seinen Abmelde-Button. Gmail zeigt ihn nur bei Nachrichten, die seine eigenen
+   Prüfungen bestehen, auch wenn die Header korrekt sind ([FAQ](https://support.google.com/a/answer/14229414), geprüft
+   im Oktober 2026).
+3. Wenn die Person bestätigt, sendet das E-Mail-Programm einen HTTPS-POST mit dem Body `List-Unsubscribe=One-Click`,
+   ohne Cookies oder Anmeldung.
+4. ReputeCast prüft das Token und meldet den Kontakt in derselben Anfrage ab, dann antwortet es mit `200` und dem Text
+   `Abgemeldet.` Die Antwort nutzt die Sprache der öffentlichen Seiten: die, die der Header `Accept-Language` der
+   Anfrage wählt, wenn die Seiten sie anbieten, sonst die Standardsprache der Seiten (`Unsubscribed.` auf Englisch).
+5. Ab dann überspringen Massenversand und Automationen die Adresse.
+
+```http title="The request a mail app sends"
+POST /p/acme-newsletter/unsubscribe/TOKEN HTTP/1.1
+Host: reputecast.acme.io
+Content-Type: application/x-www-form-urlencoded
+
+List-Unsubscribe=One-Click
+```
+
+| Antwort | Wann                                                                                                                  |
+| ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `200`   | `Abgemeldet.` Der Kontakt ist abgemeldet oder war es schon. Eine Wiederholung der Anfrage ändert nichts.              |
+| `400`   | Der Body konnte nicht gelesen werden.                                                                                 |
+| `404`   | Das Token ist ungültig, beschädigt, mit einem Schlüssel signiert, den die Instanz nicht mehr hat, oder gehört zu einem anderen Arbeitsbereich. |
+| `500`   | Die Datenbank ist ausgefallen: „Abmelden ist gerade nicht möglich; versuchen Sie es in einer Minute erneut.“          |
+
+Der Endpunkt liest das Feld nur aus dem Body, gesendet als `application/x-www-form-urlencoded` oder
+`multipart/form-data`, und leitet einen POST für die Abmeldung mit einem Klick nie weiter. Ein `GET` auf dieselbe
+Adresse öffnet die Abmeldeseite (mit dem optionalen Angebot „weniger E-Mails“ und der Frage nach dem Grund) und ändert
+nichts, bis die Person dort bestätigt. Auch eine `HEAD`-Anfrage, wie sie Link-Scanner senden, ändert nichts.
+
+## Was eine Abmeldung ändert
+
+- **Listen:** Der Kontakt verlässt jede Liste des Arbeitsbereichs, nicht nur die Liste der Kampagne, und sein Status
+  wird abgemeldet.
+- **Sperrliste:** Die Adresse wird mit dem Grund Abgemeldet und dem Geltungsbereich
+  <UiPath path="audience.suppressions.marketingOnly" /> hinzugefügt: Massenversand und Automationen stoppen, während
+  System-E-Mails (etwa Passwort-Zurücksetzungen) und Transaktions-E-Mails weiter ankommen. Der Eintrag bleibt in
+  ReputeCast: Die [Sperrlisten-Synchronisierung](/de/providers/events-and-sync/) überträgt eine Abmeldung nie auf die
+  eigene Sperrliste eines Versandanbieters, denn das würde jede Nachricht stoppen, auch eine Passwort-Zurücksetzung.
+  Siehe [Die Sperrliste](/de/audience/suppressions/).
+- **Einwilligungshistorie:** ein Ereignis je verlassener Liste, mit der Quelle One-Click, der IP-Adresse und dem
+  Browser oder E-Mail-Programm.
+- **Berichte:** Die Abmeldung zählt für die Kampagne, aus der die Nachricht kam, oder für den Schritt der
+  Automations-E-Mail. Abmeldungen mit einem Klick haben keinen Grund.
+- **Transaktions-E-Mails:** Eine Abmeldung mit einem Klick aus einer Kategorie Optional schaltet nur diese Kategorie ab.
+
+## Voraussetzungen
+
+- **Eine öffentliche HTTPS-URL.** E-Mail-Programme senden den POST nur an eine HTTPS-Adresse. Wenn die öffentliche URL
+  der Instanz nicht mit `https://` beginnt, warnt die Versandbereitschaft in ihrer Gruppe Compliance: „Abmeldung mit
+  einem Klick braucht eine HTTPS-Adresse“. Legen Sie die öffentliche URL fest, wie unter
+  [ReputeCast konfigurieren](/de/self-hosting/configuration/) beschrieben.
+- **Ein Reverse Proxy, der POST-Anfragen** an `/p/`-Pfade unverändert weitergibt
+  ([Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)).
+- **DKIM beim Versandanbieter**, das die Header abdeckt, wie RFC 8058 es verlangt.
+- **Ein sichtbarer Abmeldelink** zusätzlich im Text der E-Mail. Die Header ersetzen ihn nicht: Die Versandbereitschaft
+  blockiert eine Kampagne, deren Text keinen Abmeldelink oder keine Postanschrift enthält
+  ([Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)).
+
+## Abmeldung mit einem Klick testen
+
+<Aside type="caution">
+Ein erfolgreicher Test meldet den Kontakt tatsächlich ab. Nutzen Sie einen Kontakt mit Ihrer eigenen Adresse auf einer
+Testliste.
+</Aside>
+
+<Steps>
+
+1. Senden Sie eine Kampagne an eine Liste, die nur Ihre eigene Adresse enthält. Testversände aus dem Editor gehen als
+   System-E-Mails raus und tragen keinen `List-Unsubscribe`-Header.
+
+2. Öffnen Sie in Ihrem E-Mail-Programm den Quelltext der Nachricht und kopieren Sie die HTTPS-Adresse aus dem Header
+   `List-Unsubscribe`.
+
+3. Senden Sie die Anfrage für die Abmeldung mit einem Klick:
+
+   ```sh title="Terminal"
+   curl -i -X POST 'https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data 'List-Unsubscribe=One-Click'
+   ```
+
+4. Prüfen Sie die Antwort: Status `200`, `Content-Type: text/plain; charset=utf-8` und der Body `Abgemeldet.`
+   (`Unsubscribed.`, wenn die Standardsprache der Seiten Englisch ist). Die Statuszeile lautet je nach Proxy
+   `HTTP/1.1 200 OK` oder `HTTP/2 200`.
+
+5. Öffnen Sie den Kontakt unter <UiPath path="nav.audience" />: Das Profil zeigt den Kontakt von jeder Liste
+   abgemeldet, und die Sperrliste enthält die Adresse mit dem Geltungsbereich
+   <UiPath path="audience.suppressions.marketingOnly" />. Um den Test rückgängig zu machen, öffnen Sie die HTTPS-Adresse
+   im Browser und melden Sie sich auf der Seite wieder an.
+
+</Steps>
+
+Um zu testen, ohne jemanden abzumelden, nutzen Sie die Adresse aus einer Kopie eines
+[Platzierungstests](/de/deliverability/placement-tests/): Derselbe POST antwortet mit `200` und „Dies ist die Kopie
+eines Platzierungstests. Niemand wurde abgemeldet.“
+
+## Verwandte Themen
+
+- [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)
+- [Anmeldeseite, Präferenzcenter und Abmeldeseite](/de/forms/public-pages/)
+- [Die Sperrliste](/de/audience/suppressions/)
+- [Öffentliche URLs und Endpunkte](/de/reference/public-urls/)

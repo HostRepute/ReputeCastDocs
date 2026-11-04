@@ -1,0 +1,228 @@
+---
+title: E-Mails über mehrere Anbieter routen
+description: Jeden Stream über den passenden Versandanbieter leiten, nach Gewicht aufteilen, E-Mail-Failover mit mehreren Anbietern einrichten und eine Adresse testen.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabRouting'
+primaryKeyword: E-Mail-Failover mit mehreren Anbietern
+sources:
+  - internal/routing
+  - internal/mailbox
+  - internal/providers/state/vet.go
+  - internal/sending/engine/audience.go
+  - internal/providers/manage/health.go
+  - internal/connect/streams.go
+  - web/src/features/providers/RoutingPage.tsx
+  - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing-model.ts
+  - web/src/features/providers/routing.messages.ts
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Das Routing entscheidet, welcher [Versandanbieter](/de/reference/glossary/#sending-provider) jede E-Mail zustellt: je
+Stream, nach Liste, Absender-Domain oder Postfachanbieter des Empfängers, mit gewichteten Aufteilungen und einem
+Ersatzanbieter. Diese Seite richtet Routen und E-Mail-Failover mit mehreren Anbietern ein und prüft das Ergebnis mit dem
+[Routentester](/de/reference/glossary/#route-tester), bevor Sie speichern.
+
+## Bevor Sie beginnen
+
+- Verbinden Sie mindestens einen Anbieter; Failover und Aufteilungen brauchen zwei. Lesen Sie
+  [Versandanbieter verbinden](/de/providers/connect/).
+- Um das Routing zu ändern, brauchen Sie `providers:manage`. Mit `providers:view` können Sie die Seite öffnen und den
+  Routentester nutzen.
+
+## Wie eine Route entscheidet
+
+Jede E-Mail gehört zu einem von vier [Streams](/de/reference/glossary/#stream): Massenversand (Kampagnen), Automationen,
+System (Double-Opt-in-Bestätigungen, Links zu den Einstellungen, Team-Einladungen) und Transaktional (E-Mails aus Ihrem
+Produkt). Für jeden Empfänger geht ReputeCast so vor:
+
+1. Es nimmt die Regeln des Streams.
+2. Es prüft die Bedingungen des Streams der Reihe nach. Die erste, die zutrifft, entscheidet: Sie sendet an einen
+   Anbieter oder über eine eigene gewichtete Aufteilung.
+3. Trifft keine Bedingung zu, nutzt es die Standardroute des Streams: den Hauptanbieter oder eine
+   [fest zugeordnete Aufteilung](/de/reference/glossary/#sticky-split). Jeder Anbieter der Aufteilung bewertet die Adresse mit
+   einem Hash aus Adresse und Anbieter, skaliert mit seinem Gewicht, und die höchste Bewertung gewinnt. So behält
+   derselbe Empfänger von Versand zu Versand denselben Anbieter, die Reihenfolge der Aufteilung ändert nichts, und wenn
+   Sie das Gewicht eines Anbieters erhöhen, wechselt nur etwa die Differenz zu ihm; sonst wechselt niemand den Anbieter.
+4. Es prüft die gemeinsame Sperrliste. Eine gesperrte Adresse erhält nichts, egal zu welchem Anbieter sie geleitet
+   wurde.
+5. Ist der Anbieter [im Warm-up](/de/providers/warm-up/), wendet es dessen Plan an: die Engagement-Stufen und das Limit
+   des Tages, wobei das, was darüber liegt, über einen aufgewärmten Anbieter der Route geht oder auf das Limit des
+   nächsten Tages wartet.
+6. Kann der gewählte Anbieter keine E-Mails annehmen, wendet es die Failover-Richtlinie des Streams an. E-Mails wechseln
+   nur zu einem Ersatzanbieter, der seine Prüfungen besteht: verfügbar, Bedingungen, die die E-Mails des Streams
+   erlauben, eine verifizierte Versand-Domain, genug Kontingent und nicht in der Sandbox. Ein Ersatzanbieter, der noch im
+   Warm-up ist, übernimmt E-Mails nur, wenn die Richtlinie das zulässt.
+
+Der [Postfachanbieter](/de/reference/glossary/#mailbox-provider) (Gmail, Outlook, Yahoo, iCloud oder Andere) ergibt
+sich aus der Domain der Adresse. Domains für Privatkunden wie `gmail.com` sind namentlich bekannt; die eigene Domain
+eines Unternehmens wird anhand ihrer MX-Einträge eingeordnet: Google Workspace zählt als Gmail, Microsoft 365 als
+Outlook, bei Yahoo gehostete Domains als Yahoo und eigene iCloud-Domains als iCloud, und das Hosting wird als Detail
+festgehalten. Ein Hintergrunddurchlauf schlägt die Domains neuer Kontakte nach, und ein Versand schlägt nach, was noch
+aussteht, bevor er seine Zielgruppe zusammenstellt. Eine Adresse, deren Domain noch nicht nachgeschlagen wurde, zählt
+als Andere.
+
+## Routen einrichten
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.providers > providers.tabRouting" />. Es gibt eine Karte je Stream, daneben den
+   Routentester und die Einstellungen, die für alle Anbieter gelten.
+
+   <Screenshot
+     id="providers-routing"
+     alt="Routing und Failover für Massenversand: eine fest zugeordnete gewichtete Aufteilung 90/10 zwischen Amazon SES und Postal, das an Tag 9 von 21 im Warm-up ist, zwei Bedingungen (eine sendet nur an Amazon SES, die andere an eine Aufteilung 70/30) und der Routentester, der für eine Outlook-Adresse Schritt für Schritt Amazon SES ermittelt."
+   />
+
+2. Wählen Sie für Automationen, System und Transaktional den <UiPath path="providers.routing.primary" /> und, wenn Sie
+   einen zweiten Anbieter haben, den <UiPath path="providers.routing.fallback" />. Der Ersatzanbieter übernimmt, wenn
+   der Hauptanbieter keine E-Mails annehmen kann.
+
+3. Legen Sie für Massenversand die <UiPath path="providers.routing.weightedSplit" /> fest. Jede Zeile ist ein Anbieter
+   mit seinem Anteil in Prozent; die Anteile müssen zusammen 100 % ergeben, bevor Sie speichern können.
+   <UiPath path="providers.routing.addToSplit" /> fügt einen verbundenen Anbieter hinzu; ein Anbieter mit 0 % kann die
+   Aufteilung verlassen. Ziehen Sie eine Zeile oder nutzen Sie mit der Tastatur ihre Pfeile nach oben und unten, um die
+   Reihenfolge zu ändern: Die Reihenfolge ändert nur, wie der Balken aussieht, und niemand wechselt den Anbieter.
+   Solange ein Anbieter der Aufteilung [aufgewärmt wird](/de/providers/warm-up/), erhöht der Warm-up-Planer seinen
+   Anteil nach Plan, und die Karte listet die geplanten Schritte auf.
+
+4. Fügen Sie Bedingungen hinzu, wenn eine Art von E-Mail immer bestimmte Anbieter nutzen soll:
+   <UiPath path="providers.routing.addCondition" />. Massenversand und Automationen können nach Liste, Absender-Domain
+   oder Postfachanbieter des Empfängers unterscheiden; Transaktional nach Transaktionskategorie oder Postfachanbieter.
+   E-Mails aus System haben keine Bedingungen. Wählen Sie unter dem Anbieter der Bedingung
+   <UiPath path="providers.routing.thenOne" /> oder <UiPath path="providers.routing.thenSplit" /> mit einem Anteil je
+   Anbieter (ebenfalls fest zugeordnet). Was Sie unter <UiPath path="providers.routing.why" /> eingeben, wird
+   neben der Bedingung angezeigt, zum Beispiel „Outlook ist streng bei neuen IPs“.
+
+5. Legen Sie die <UiPath path="providers.routing.failoverPolicy" /> für Massenversand fest. Die Karte nennt den
+   Auslöser, den die Zustandsprüfung tatsächlich nutzt: Mindestens die Hälfte der Aufrufe an den Anbieter schlägt über 3
+   Minuten fehl (5 Aufrufe oder mehr), oder 2 Zustandsprüfungen in Folge schlagen fehl. Stumme Webhooks allein lösen
+   einen Alarm aus, kein Failover. Wählen Sie den <UiPath path="providers.routing.fallback" /> und dann, was beim
+   Auslösen geschieht (<UiPath path="providers.routing.whenTriggerFires" />):
+   - <UiPath path="providers.routing.pauseAndAsk" />: Die verbleibenden Empfänger werden zurückgehalten, und Sie werden
+     gefragt. Einen Massenversand zu einem nicht aufgewärmten Anbieter zu verschieben, kann dessen Reputation schaden.
+   - <UiPath path="providers.routing.warmOnly" />: Der Versand wechselt von selbst, sobald der Ersatzanbieter sein
+     Warm-up abgeschlossen hat; bis dahin verhält er sich wie pausieren und nachfragen.
+   - <UiPath path="providers.routing.automatic" />.
+
+   Unter der Richtlinie listet die Karte die Prüfungen auf, die der Ersatzanbieter vor jedem Failover bestehen muss,
+   jeweils mit einer Markierung: verfügbar, Bedingungen erlauben Massenversand, Versand-Domain verifiziert, Kontingent
+   oder Warm-up-Limit von heute übrig, aufgewärmt und nicht in der Sandbox. Schlägt eine Prüfung fehl, pausiert
+   Massenversand stattdessen und fragt nach.
+
+6. E-Mails aus Automationen, System und Transaktional schalten automatisch auf ihren Ersatzanbieter um, weil sie
+   weiter hinausgehen müssen; jede Karte nennt ihren Auslöser, und der Verkehr kehrt nach 10 fehlerfreien Minuten zum
+   Hauptanbieter zurück. Bevor der Ersatzanbieter übernimmt, durchläuft er dieselben Prüfungen. Schlägt eine Prüfung
+   fehl, versucht ReputeCast es weiter beim Hauptanbieter und warnt Sie, statt umzuschalten. Ohne Ersatzanbieter warten
+   die E-Mails, bis der Anbieter wieder verfügbar ist.
+
+7. Bei Transaktional sorgt <UiPath path="providers.routing.firstInLine" /> dafür, dass Transaktionsnachrichten bei einem
+   Anbieter, der gleichzeitig eine Kampagne sendet, innerhalb der Rate des Anbieters zuerst gehen.
+
+8. Prüfen Sie Ihre Änderungen vor dem Speichern. Sobald Sie etwas ändern, bleibt unten auf der Seite eine Leiste unter
+   <UiPath path="providers.routing.unsavedTitle" /> stehen. Sie sagt, was das Speichern für jeden Stream ändert, zum
+   Beispiel „Aufteilung Massenversand 90/10 → 85/15 · etwa 1.600 Empfänger im Massenversand wechseln von SES zu Postal;
+   sonst wechselt niemand den Anbieter“, und für die anderen Streams den Anteil ihrer Adressen (aus den letzten 30
+   Tagen), der wechseln würde. Jede geänderte Stream-Karte trägt ein Kennzeichen „Ungespeicherte Änderung“.
+
+9. Wählen Sie <UiPath path="providers.routing.saveRouting" /> oder <UiPath path="providers.routing.discard" />, um zum
+   gespeicherten Routing zurückzukehren. Nur die geänderten Streams werden gespeichert. Neue Versände nutzen das Routing
+   sofort; bereits laufende Versände behalten ihre Route.
+
+</Steps>
+
+Auf einem Smartphone werden die Stream-Karten untereinander angeordnet, und der Routentester folgt darunter:
+
+<Screenshot
+  id="providers-routing-mobile"
+  alt="Die Routing-Seite auf einem Smartphone: die Karte für Massenversand mit ihrer fest zugeordneten gewichteten Aufteilung, dem Anteil jedes Anbieters mit Pfeilen nach oben und unten, den geplanten Warm-up-Schritten für Postal und der ersten Bedingung."
+/>
+
+<Aside type="caution">
+Vor dem Speichern prüft ReputeCast, ob die Bedingungen jedes Anbieters für Massenversand Massenmarketing erlauben. Ist
+das bei einem nicht der Fall, zeigt es die Änderung mit ihrer Warnung und bietet eine Lösung an (einen
+Postmark-Broadcast-Stream anlegen, einen anderen Anbieter verwenden oder ohne Ersatzanbieter speichern); Ihre übrigen
+Änderungen bleiben erhalten, während Sie das beheben. Wenn Sie die Einstellung trotzdem beibehalten, wird das im
+Audit-Protokoll festgehalten, und die [Versandbereitschaft](/de/campaigns/send-readiness/) blockiert jeden
+Massenversand, bis sich die Route ändert. Lesen Sie
+[Versandanbieter auswählen](/de/providers/choose/#bedingungen-für-massenmarketing).
+</Aside>
+
+## Route testen
+
+Der <UiPath path="providers.routing.testerTitle" /> testet das gespeicherte Routing und sagt, solange Sie ungespeicherte
+Änderungen haben, was diese ändern würden.
+
+- **<UiPath path="providers.routing.tabRecipient" />**: Wählen Sie den Stream, eine Liste und eine Absender-Domain
+  (oder eine Transaktionsvorlage) und geben Sie eine Adresse ein. Die Antwort nennt den Anbieter, den Postfachanbieter
+  und den MX-Host, über den er ermittelt wurde, den DKIM-Selektor, die Kosten einer Nachricht, jeden Schritt der
+  Entscheidung (die zutreffende Bedingung oder den Bucket, in den die Adresse bei einer Aufteilung auf zwei Anbieter
+  fällt) und was geschieht, wenn der Anbieter ausfällt. Bei einer ungespeicherten Aufteilung gibt sie zusätzlich an, ob
+  diese Adresse bei ihrem Anbieter bleibt oder wechselt.
+- **<UiPath path="providers.routing.tabCampaign" />**: Spielt die Zielgruppe des nächsten Massenversands (des nächsten
+  geplanten oder des zuletzt bearbeiteten Entwurfs) am Versandtag durch das Routing. Sie zeigt die Empfänger je
+  Anbieter, die zutreffenden Bedingungen, die ausgelassenen auslaufenden Kontakte und was der Versand tun würde:
+  Empfänger außerhalb der Engagement-Stufen eines Anbieters im Warm-up oder über seinem Limit gehen über einen
+  aufgewärmten Anbieter, Empfänger werden durch das Limit bis zum Limit des nächsten Tages oder während der Plan
+  pausiert ist zurückgehalten, und wohin ein Anbieter, der gerade nicht senden kann, seinen Anteil geben würde. Mit
+  ungespeicherten Änderungen sagt sie, wie viele Empfänger wechseln. Eine große Zielgruppe wird anhand ihrer ersten
+  Empfänger geschätzt und hochgerechnet.
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="routing" />
+
+## Prüfen, ob es funktioniert hat
+
+- Der Seitenkopf zeigt, wann und von wem das Routing gespeichert wurde.
+- <UiPath path="nav.providers > providers.tabProviders" /> zeigt das Routing je Stream als Balken mit dem Anteil jedes
+  Anbieters, dem Ersatzanbieter und der Failover-Richtlinie.
+- Der Routentester liefert den erwarteten Anbieter für eine Adresse auf jeder Liste und bei jedem Postfachanbieter mit
+  einer Bedingung, und sein Tab Kampagne zeigt die geplante Aufteilung.
+- Während eines Versands zeigt der [Live-Monitor](/de/campaigns/live-monitor/) den Anteil jedes Anbieters an der
+  Kampagne.
+
+## Fehlerbehebung
+
+- **„Die Gewichte ergeben 95 %. Stellen Sie 100 % ein, um zu speichern.“**: Ändern Sie einen Anteil, sodass die Summe
+  100 ergibt. Dieselbe Regel gilt für die Aufteilung einer Bedingung.
+- **„Massenversand wurde während Ihrer Bearbeitung geändert“**: Seit Sie die Seite geöffnet haben, hat jemand das
+  Routing gespeichert, oder der Warm-up-Planer hat einen Anteil erhöht. Nichts wurde gespeichert, und Ihre Änderungen
+  sind noch da. Wählen Sie <UiPath path="providers.routing.conflictShowLatest" />, um mit dem aktuellen Routing neu zu
+  beginnen, oder <UiPath path="providers.routing.conflictKeepMine" />. Eine Änderung an einem anderen Stream blockiert
+  Ihr Speichern nie. Über die [API-Operation save-routing](/api/operations/save-routing/) wird jeder Stream mit der Version gespeichert, in der er gelesen wurde, und eine veraltete wird mit `409` und dem Code
+  `routing_changed` abgelehnt.
+- **„Routing konnte nicht aktualisiert werden“**: Eine Aktualisierung im Hintergrund ist fehlgeschlagen. Ihre Änderungen
+  bleiben auf der Seite, und E-Mails gehen weiter über das gespeicherte Routing hinaus.
+- **„Der Stream Massenversand hat keinen Hauptanbieter.“**: Jeder Stream außer Transaktional braucht einen
+  Hauptanbieter. Transaktional kann ohne Route bleiben, solange Ihr Produkt keine E-Mails sendet.
+- **Eine Stream-Karte sagt, dass ein Anbieter „gerade keine E-Mails annehmen“ kann**: Ein Anbieter, den die Route nutzt,
+  ist ausgefallen, pausiert, oder seine Webhooks sind stumm. Seine E-Mails schalten um oder warten, wie es die
+  Richtlinie vorsieht; ist er der Ersatzanbieter, hat der Stream keinen funktionierenden Ersatz, bis er wieder da ist.
+  Lesen Sie [Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/).
+- **Eine Warnung, dass der Ersatzanbieter im Warm-up ist**: Der Warm-up-Schutz blockiert ein Failover zu ihm bis zu dem
+  Tag, den die Warnung nennt. Mit der
+  Richtlinie nur zu aufgewärmten Anbietern pausiert Massenversand so lange und fragt nach.
+- **Der Tester sagt, dass die E-Mail warten würde**: Der Anbieter ist ausgefallen, oder seine Webhooks sind stumm, daher
+  wartet sein Anteil auf ihn oder auf den Ersatzanbieter.
+- **Der Tester sagt, dass die Adresse gesperrt ist**: Ihr wird bei keinem Anbieter etwas gesendet. Lesen Sie
+  [Die Sperrliste](/de/audience/suppressions/).
+- **Eine Adresse bei Google Workspace oder Microsoft 365 erscheint als Andere**: Ihre Domain wurde noch nicht
+  nachgeschlagen, oder der Server erreicht kein DNS. Lesen Sie [Systemanforderungen](/de/self-hosting/requirements/).
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="Zustand und Ausfälle von Anbietern" href="/de/providers/health-and-outages/" />
+  <LinkCard title="Neuen Anbieter oder neue IP aufwärmen" href="/de/providers/warm-up/" />
+  <LinkCard title="Versand überwachen und automatisch pausieren" href="/de/campaigns/live-monitor/" />
+  <LinkCard title="Wie ReputeCast funktioniert" href="/de/getting-started/concepts/" />
+</CardGrid>

@@ -1,0 +1,343 @@
+---
+title: Instanzverwaltung
+description: Die Instanzverwaltung in ReputeCast umfasst Konten, Arbeitsbereiche, Anmelderichtlinie, öffentliche URL, Updates, Bot-Filter, Jobs und das Audit-Protokoll.
+type: how-to
+audience: [operator, admin]
+primaryKeyword: Instanzverwaltung
+uiPath: 'shell.userMenuInstanceAdmin'
+sources:
+  - internal/instance
+  - internal/auditlog/instance.go
+  - internal/accounts/setup.go
+  - internal/tracking/{agents,networks,classify}.go
+  - internal/useragent
+  - internal/proxycheck
+  - migrations/03201_r05_bot_clicks.sql
+  - migrations/03340_m40_tracking_user_agents.sql
+  - web/src/features/admin
+  - web/src/features/settings/messages.ts
+  - web/src/features/settings/SettingsTabs.ts
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Die Instanzverwaltung umfasst alles, was für den ganzen Server gilt statt für einen Arbeitsbereich: wer ein Konto hat,
+welche Arbeitsbereiche es gibt, wie sich Personen anmelden, die öffentliche URL, Updates, den Bot-Filter, der die
+Öffnungen und Klicks von Maschinen aus den Zahlen jedes Arbeitsbereichs heraushält, sowie die Hintergrundjobs und den
+Speicher. Sie befindet sich unter <UiPath path="shell.userMenuInstanceAdmin" />, das nur
+[Instanz-Admins](/de/reference/glossary/#instance-admin) öffnen können.
+
+## Bevor Sie beginnen
+
+- Sie brauchen die Kennzeichnung als Instanz-Admin. Der erste Inhaber, der bei der Installation angelegt wird, hat sie;
+  ein Instanz-Admin kann sie anderen geben (siehe [Konten verwalten](#konten-verwalten)), und
+  `reputecast user make-admin` vergibt sie vom Server aus
+  ([Zugriff über die Kommandozeile wiederherstellen](/de/self-hosting/account-recovery/)).
+- Die Kennzeichnung ist von den Rollen in Arbeitsbereichen unabhängig: Wer zum Instanz-Admin gemacht wird, behält seine
+  Rollen in Arbeitsbereichen und wird keinem Arbeitsbereich hinzugefügt. Wer die Seite ohne die Kennzeichnung öffnet,
+  sieht „Nur Instanz-Admins können die Instanzverwaltung öffnen“.
+- Öffnen Sie sie über das Kontomenü oben rechts: <UiPath path="shell.userMenuInstanceAdmin" />. Sie hat acht Tabs:
+  <UiPath path="admin.users" />, <UiPath path="admin.workspaces" />, <UiPath path="admin.authentication" />,
+  <UiPath path="admin.sso" />, <UiPath path="admin.instance" />, <UiPath path="admin.botFilter" />,
+  <UiPath path="admin.system" /> und <UiPath path="admin.audit" />.
+
+## Konten verwalten
+
+<Screenshot
+  id="instance-users"
+  alt="Der Tab Konten listet sieben Konten mit ihren Arbeitsbereichen und Rollen, Anmeldemethoden, 2FA-Status, letzter Anmeldung und Status, eines davon deaktiviert; darunter die Übersicht der Anmelderichtlinie und die letzten Anmeldeereignisse."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" /> listet jedes Konto der Instanz auf, mit Filtern für
+Arbeitsbereich, Status und 2FA-Status. Unter der Liste verlinken eine Zusammenfassung der Anmelderichtlinie und die
+letzten Anmeldeereignisse auf die anderen Tabs. Das Menü **⋯** jeder Zeile enthält diese Aktionen:
+
+<TableScroll label="Aktionen für Konten">
+
+| Aktion                                     | Was sie bewirkt |
+| ------------------------------------------ | --------------- |
+| <UiPath path="admin.forceSignOut" />       | Beendet jede Sitzung des Kontos. |
+| <UiPath path="admin.resetTwoFactor" />     | Entfernt die Authenticator-App und die Wiederherstellungscodes der Person; Passkeys bleiben. Fragt nach einem Grund (wird ins Audit-Protokoll geschrieben) und nach Ihrem Passwort, startet die Schonfrist der Richtlinie neu, meldet die Person ab und benachrichtigt sie. Nur für Konten mit einer Authenticator-App. |
+| <UiPath path="admin.sendPasswordReset" />  | Sendet über den Stream System einen Einmal-Link per E-Mail, der 15 Minuten gilt. <UiPath path="admin.showCliReset" /> zeigt `reputecast user reset-password --email …` für den Fall, dass kein Anbieter für den Stream System existiert. |
+| <UiPath path="admin.unlockSignIn" />       | Wird angezeigt, solange das Konto nach fehlgeschlagenen Anmeldungen gesperrt ist; hebt die Sperre sofort auf. |
+| <UiPath path="admin.makeInstanceAdmin" />, <UiPath path="admin.removeInstanceAdmin" /> | Vergibt oder entzieht die Kennzeichnung als Instanz-Admin. Der letzte Instanz-Admin kann nicht entfernt werden. |
+| <UiPath path="admin.deactivateAccount" />  | Meldet die Person von jedem Arbeitsbereich ab und sperrt die Anmeldung. Fragt nach einem Grund; widerruft standardmäßig auch die API-Schlüssel und Agenten, die die Person erstellt hat. Ihr Verlauf, ihre Kampagnen und Audit-Einträge bleiben erhalten. |
+| <UiPath path="admin.reactivateAccount" />  | Lässt eine deaktivierte Person sich wieder anmelden und stellt die Mitgliedschaften in Arbeitsbereichen wieder her, die mit dem Konto deaktiviert wurden. |
+
+</TableScroll>
+
+Schutzregeln: Sie können weder Ihr eigenes Konto deaktivieren noch den letzten Instanz-Admin oder den einzigen Inhaber
+eines Arbeitsbereichs (übertragen Sie zuerst die Inhaberschaft in den Einstellungen dieses Arbeitsbereichs). ReputeCast
+bietet hier keine Möglichkeit, ein Konto zu löschen oder seine E-Mail-Adresse zu ändern; Personen ändern ihre eigene
+E-Mail-Adresse unter <UiPath path="shell.userMenuAccount" />.
+
+## Arbeitsbereiche verwalten
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.workspaces" /> listet jeden Arbeitsbereich mit seinen Mitgliedern,
+Kontakten, Versandanbietern und seinem Erstellungsdatum auf. Dieselbe Liste steht auch unten unter
+<UiPath path="admin.instance" />.
+
+<Steps>
+
+1. Um einen hinzuzufügen, wählen Sie <UiPath path="admin.createWorkspace" /> und geben dann einen Namen ein (bis zu
+   80 Zeichen), wählen den Inhaber (ein beliebiges aktives Konto) und die Zeitzone. Der Inhaber lädt alle anderen ein.
+
+2. Um einen zu löschen, wählen Sie in seiner Zeile <UiPath path="admin.deleteWorkspace" /> und geben seinen Namen ein.
+   Geplante Versände stoppen sofort, und die API-Schlüssel und MCP-Agenten des Arbeitsbereichs funktionieren nicht mehr.
+   Exportieren Sie den Arbeitsbereich vorher, wenn Sie seine Daten brauchen; der Dialog verlinkt für Mitglieder des
+   Arbeitsbereichs auf den Export.
+
+3. Um einen gelöschten Arbeitsbereich zurückzuholen, wählen Sie innerhalb von 7 Tagen
+   <UiPath path="admin.restoreWorkspace" />. Danach ist er endgültig gelöscht. Die gemeinsame Sperrliste, das
+   Audit-Protokoll und die Konten der Mitglieder bleiben in jedem Fall erhalten.
+
+</Steps>
+
+Aus dieser Liste können Sie die Einstellungen eines Arbeitsbereichs nur öffnen, wenn Sie selbst Mitglied darin sind.
+Unter [Arbeitsbereiche](/de/team/workspaces/) steht, was jeder Arbeitsbereich enthält.
+
+## Anmelderichtlinie festlegen
+
+<Screenshot
+  id="instance-auth"
+  alt="Der Tab Authentifizierung: die erlaubten Anmeldemethoden (Passwort, Passkeys, Google, Microsoft ausgeschaltet, GitHub auf eine Organisation beschränkt und Single Sign-on mit 2 Anbietern), die Passwortrichtlinie, die Erzwingung der Zwei-Faktor-Authentifizierung sowie die Einstellungen für Sitzungen und Anmeldesperren."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> enthält die Richtlinie für alle Konten. Nichts
+davon gilt, bevor Sie <UiPath path="admin.savePolicies" /> wählen.
+
+- Unter <UiPath path="admin.signInMethods" /> schalten Sie <UiPath path="admin.methodPassword" />,
+  <UiPath path="admin.methodPasskeys" />, Google, Microsoft, GitHub und <UiPath path="admin.methodSso" /> ein oder aus.
+  ReputeCast unterstützt weder SAML noch SCIM. Siehe
+  [Anmeldung über Google, Microsoft und GitHub](/de/self-hosting/social-sign-in/) und
+  [Single Sign-on mit OIDC](/de/self-hosting/sso/).
+- Unter <UiPath path="admin.passwordPolicy" /> legen Sie die Mindestlänge, die Wiederverwendung kürzlich genutzter
+  Passwörter und die Prüfung auf bekannte Datenlecks fest.
+- Unter <UiPath path="admin.twoFactorEnforcement" /> verlangen Sie die Zwei-Faktor-Authentifizierung von allen, von
+  Mitgliedern mit einer [sensiblen Berechtigung](/de/reference/glossary/#sensitive-permission) oder von niemandem und
+  legen die Schonfrist für die Einrichtung fest.
+- Unter <UiPath path="admin.sessionsLockout" /> legen Sie die Sitzungsdauer, das Inaktivitäts-Timeout und die
+  Anmeldesperre nach falschen Passwörtern fest.
+- Unter <UiPath path="admin.domainAllowlist" /> tragen Sie die E-Mail-Domains ein, die über SSO automatisch ein Konto
+  erhalten dürfen.
+
+ReputeCast lehnt eine Richtlinie ab, die Sie aussperren würde („Damit hätten Sie keine Möglichkeit mehr, sich
+anzumelden. Fügen Sie einen Passkey hinzu oder verknüpfen Sie eine Anmeldung, die eingeschaltet bleibt, und speichern
+Sie dann erneut.“), eine, bei der jede Methode ausgeschaltet ist, und das Ausschalten von Single Sign-on, solange ein
+Anbieter für eine Domain erzwungen wird. Eine neue Sitzungsdauer gilt für Sitzungen, die nach der Änderung beginnen; ein
+kürzeres Inaktivitäts-Timeout erreicht bestehende Sitzungen innerhalb von etwa 30 Sekunden.
+
+<LimitsTable area="authentication" />
+
+## Name, öffentliche URL und Standardwerte der Instanz festlegen
+
+<Screenshot
+  id="instance-settings"
+  alt="Der Tab Instanz & Updates: die Karte Instanz mit Name, Standardzeitzone, Sprache, Regionsformat und öffentlicher URL mit ihrer Prüfung von DNS, TLS und Erreichbarkeit, daneben die Karte Version & Updates."
+/>
+
+Unter <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> legt die Karte <UiPath path="admin.instanceCard" />
+Folgendes fest:
+
+- Den Namen und das Logo der Instanz, angezeigt auf der Anmeldeseite und in E-Mails an das Team.
+- Die Standardzeitzone, die Standardsprache und das Standard-Regionsformat, verwendet auf der Anmeldeseite, für
+  Einladungen und für Mitglieder, die keine eigenen gewählt haben ([Sprache und Region](/de/team/language-and-region/)).
+- Die <UiPath path="admin.publicUrl" />, verwendet für die Webhooks der Anbieter, SSO-Umleitungs-URIs, öffentliche
+  Seiten und Links in E-Mails. <UiPath path="admin.publicUrlCheck" /> testet drei Dinge: DNS (der Host wird aufgelöst),
+  TLS (ein gültiges Zertifikat, mit einer Warnung unter 14 Tagen oder bei reinem `http://`) und die Erreichbarkeit
+  (`/healthz` antwortet von außen).
+
+<Aside type="caution" title="Öffentliche URL ändern">
+  Wenn Sie eine neue Adresse speichern, wird der Webhook bei jedem Versandanbieter neu registriert, der das unterstützt,
+  und die Anbieter werden aufgelistet, bei denen Sie die neue Adresse selbst eintragen. Setzen Sie außerdem
+  `REPUTECAST_PUBLIC_URL` auf dieselbe Adresse und starten Sie neu: Cookies nur über HTTPS und HSTS richten sich nach der
+  Einstellung des Servers, nicht nach dem gespeicherten Wert.
+</Aside>
+
+Die anderen Karten auf diesem Tab:
+
+- Die Karte <UiPath path="admin.versionCard" /> zeigt die installierte und die neueste Version, den Befehl für das
+  Upgrade und die tägliche Release-Prüfung. Siehe [ReputeCast aktualisieren](/de/self-hosting/upgrades/).
+- Die Karte <UiPath path="transactional.relayAdmin.title" /> schaltet das Relay für Apps ein, die per SMTP senden.
+  Siehe [Über das SMTP-Relay senden](/de/transactional/smtp-relay/).
+- Die Karte <UiPath path="agency.adminTitle" /> schaltet den Agenturmodus ein. Siehe
+  [Kunden-Arbeitsbereiche als Agentur betreiben](/de/team/agencies/).
+
+<LimitsTable area="instance" />
+
+## Bot-Filter bearbeiten
+
+<Screenshot
+  id="bot-filter"
+  alt="Der Tab Bot-Filter der Instanzverwaltung: Nur Öffnungen und Klicks von Personen zählen; Netzwerke · 12 mit Netzwerk hinzufügen, noch kein hinzugefügtes und 12 integrierte Netzwerke; User-Agents · 28 mit User-Agent hinzufügen und 28 integrierten, CUBOT-Smartphones als Personen eingetragen; und Wie der Filter entscheidet für Öffnungen, Klicks, Regeln und Änderungen."
+/>
+
+Der [Bot-Filter](/de/reference/glossary/#bot-filter) entscheidet, welche Öffnungen und Klicks von Maschinen stammen
+(E-Mail-Scanner, Skripte, Link-Vorschauen) oder datenschutzgeschützt sind (ein Datenschutz-Proxy wie Apple Mail Privacy
+Protection). Berichte, Segmente, Automationen und Scores in jedem Arbeitsbereich lassen sie weg. Integrierte Einträge
+kommen mit den Releases von ReputeCast und lassen sich nicht entfernen; unter
+<UiPath path="shell.userMenuInstanceAdmin > admin.botFilter" /> fügen Sie die hinzu, durch die die E-Mails Ihrer
+Empfänger laufen, etwa das E-Mail-Gateway eines Unternehmens oder einen neuen Link-Prüfer.
+
+So fügen Sie ein Netzwerk hinzu:
+
+<Steps>
+
+1. Wählen Sie unter <UiPath path="admin.botfilter.networksTitle" /> den Button
+   <UiPath path="admin.botfilter.addNetwork" />.
+
+2. Geben Sie unter <UiPath path="admin.botfilter.cidrLabel" /> eine Adresse oder ein Netzwerk ein, etwa
+   `203.0.113.0/24` oder `2001:db8::/48`.
+
+3. Geben Sie unter <UiPath path="admin.botfilter.runByLabel" /> an, wer es betreibt, zum Beispiel „Unser
+   E-Mail-Gateway“.
+
+4. Wählen Sie unter <UiPath path="admin.botfilter.kindLegend" /> entweder <UiPath path="admin.botfilter.netScanner" />
+   (seine Öffnungen und Klicks beim Eintreffen der E-Mail stammen von einer Maschine; spätere können von Personen hinter
+   dem Gateway kommen und zählen) oder <UiPath path="admin.botfilter.netPrivacy" /> (es ruft Bilder beim Eintreffen der
+   E-Mail ab, ob jemand liest oder nicht, daher sind seine Öffnungen datenschutzgeschützt), und wählen Sie dann
+   <UiPath path="admin.botfilter.addNetwork" />.
+
+</Steps>
+
+So fügen Sie einen User-Agent hinzu:
+
+<Steps>
+
+1. Wählen Sie unter <UiPath path="admin.botfilter.agentsTitle" /> den Button <UiPath path="admin.botfilter.addAgent" />.
+
+2. Wählen Sie unter <UiPath path="admin.botfilter.itIsLegend" /> entweder <UiPath path="admin.botfilter.aMachine" />
+   (ein Scanner, Link-Prüfer oder Skript: Seine Öffnungen und Klicks werden überall weggelassen, wo der Text im
+   User-Agent steht) oder <UiPath path="admin.botfilter.aPerson" /> (ein Gerät oder eine App, deren User-Agent ein Wort
+   enthält, das die Regeln einer Maschine zuordnen, etwa eines, das auf „bot“ endet: Ihre Öffnungen und Klicks zählen
+   als die von Personen).
+
+3. Geben Sie <UiPath path="admin.botfilter.patternLabel" /> ein. Groß- und Kleinschreibung spielt keine Rolle; das Gerät
+   einer Person ist ein Wort aus Buchstaben und Ziffern. ReputeCast lehnt Text ab, der in den User-Agents von Browsern
+   und E-Mail-Programmen vorkommt, mit denen Menschen E-Mails lesen.
+
+4. Füllen Sie <UiPath path="admin.botfilter.whoLabel" /> aus und wählen Sie <UiPath path="admin.botfilter.addAgent" />.
+
+</Steps>
+
+Um einen Eintrag zu entfernen, den ein Admin hinzugefügt hat, wählen Sie in seiner Zeile
+<UiPath path="admin.botfilter.remove" /> und bestätigen. Eine Änderung gilt innerhalb von Minuten für neue Öffnungen und
+Klicks in jedem Arbeitsbereich; bereits gezählte bleiben, wie sie sind. Jede Änderung steht im Audit-Protokoll der
+Instanz. <UiPath path="admin.botfilter.rulesTitle" /> unten auf dem Tab fasst die Regeln zusammen;
+[Kampagnenberichte lesen](/de/campaigns/reports/#wie-klicks-gezählt-werden) erklärt sie anhand der Zahlen des Berichts.
+
+<LimitsTable area="tracking" />
+
+## Anfragen über einen nicht vertrauenswürdigen Proxy beheben
+
+Hinter einem Reverse Proxy oder Load Balancer, den `http.trusted_proxies` nicht aufführt, trägt jede Öffnung und jeder
+Klick die Adresse des Proxys statt der des Empfängers. Der Bot-Filter kann dann ein Scanner-Netzwerk oder den
+Datenschutz-Proxy von Apple nicht von einer Person unterscheiden, und die Ratenlimits behandeln alle Empfänger wie
+einen einzigen. ReputeCast bemerkt Anfragen, die Weiterleitungs-Header (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) von einer
+Adresse tragen, der es nicht vertraut, und informiert jeden Instanz-Admin mit einer Benachrichtigung, die auf
+<UiPath path="admin.instance" /> verlinkt:
+
+- „Anfragen kommen über einen Proxy, dem ReputeCast nicht vertraut“ nennt eine private Adresse, die sich wie Ihr Proxy
+  verhalten hat. Tragen Sie sie in `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) ein und starten Sie
+  ReputeCast neu.
+- „Die meisten Anfragen tragen Weiterleitungs-Header von einer öffentlichen Adresse“ nennt eine öffentliche Adresse.
+  Gehört sie zu Ihrem CDN oder Load Balancer, tragen Sie die Adressbereiche ein, die dessen Anbieter veröffentlicht,
+  nicht die Adresse selbst. Erkennen Sie sie nicht, ändern Sie nichts: Jeder kann diese Header senden, und eine
+  vertrauenswürdige Adresse kann die Adressen von Empfängern erfinden.
+
+Eine kurze Häufung weitergeleiteter Anfragen löst nie einen Hinweis aus. Der Hinweis kommt wieder, solange der Proxy
+weiter Anfragen weiterleitet, und ein Proxy, der vertrauenswürdig wird oder verstummt, wird vergessen. Die Einstellung
+finden Sie unter
+[Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/#öffentliche-url-und-vertrauenswürdige-proxys-festlegen); die
+Zeitangaben stehen in der Tabelle zur Instanz oben.
+
+## Jobs, Warteschlangen und Speicher prüfen
+
+<Screenshot
+  id="instance-system"
+  alt="Instanzverwaltung, System: Kacheln für wartende, laufende und in den letzten 7 Tagen fehlgeschlagene Jobs, die Datenbank und den Dateiordner; Fehlgeschlagene Jobs, hier leer; jede Warteschlange mit dem, was dort läuft, ihren wartenden, geplanten und laufenden Jobs und der Wartezeit ihres ältesten fälligen Jobs; und der Anfang von Größte Tabellen und Dateiordner."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.system" /> zeigt den Zustand der Hintergrundarbeit und des Speichers
+des Servers, beim Öffnen aus der Datenbank gelesen. Die Kacheln oben zählen die wartenden Jobs (und wie lange der
+älteste fällige schon wartet), die laufenden und die in den letzten 7 Tagen fehlgeschlagenen, und sie zeigen die
+PostgreSQL-Version mit den belegten Verbindungen sowie die Größe des Dateiordners.
+
+- <UiPath path="admin.system.failedTitle" /> listet die Jobs auf, die fehlgeschlagen sind und auf einen erneuten
+  Versuch warten, sowie die, deren Versuche aufgebraucht sind (7 Tage aufbewahrt), mit ihrem Arbeitsbereich, ihren
+  Versuchen und dem letzten Fehler. Bei einem Job, der erneut versucht wird, führt ihn
+  <UiPath path="admin.system.retryNow" /> sofort aus und <UiPath path="admin.system.cancel" /> stoppt ihn; bei einem
+  aufgegebenen Job führt ihn <UiPath path="admin.system.retry" /> erneut aus und <UiPath path="admin.system.delete" />
+  nimmt ihn von der Liste. Ein erneuter Versuch behält die bisherigen Versuche bei; nach einem Abbruch oder Löschen
+  bleibt ungetan, was der Job tun sollte. Jede Aktion steht im Audit-Protokoll der Instanz.
+- <UiPath path="admin.system.queuesTitle" /> zeigt die wartenden, geplanten und laufenden Jobs jeder Warteschlange und
+  wie lange ihr ältester fälliger Job schon wartet. Richten Sie für diese Verzögerung einen Alarm mit
+  `reputecast_job_queue_lag_seconds` ein
+  ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/#metriken)).
+- <UiPath path="admin.system.tablesTitle" /> zeigt die Größe der Datenbank, ihre Schemaversion und ob Migrationen
+  ausstehen, sowie die 10 größten Tabellen mit ihren Zeilen, ihrer Größe und der Größe ihrer Indizes (Partitionen
+  zusammengerechnet).
+- <UiPath path="admin.system.filesTitle" /> zeigt den Pfad des Ordners und wie viele Dateien und Bytes er enthält,
+  alle 5 Minuten gezählt. Sichern Sie ihn zusammen mit der Datenbank
+  ([Sichern und wiederherstellen](/de/self-hosting/backups/)).
+
+## Audit-Protokoll der Instanz prüfen
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> zeigt Anmeldungen, SSO, Änderungen an Richtlinien und
+Konten sowie die Ereignisse jedes Arbeitsbereichs. Filtern Sie nach Arbeitsbereich, Akteurtyp, Ergebnis und Datum;
+exportieren Sie mit <UiPath path="audit.exportCsv" /> oder <UiPath path="audit.exportJson" />. Abgelehnte Anmeldungen
+tragen die Referenz-ID, die Personen auf der Fehlerseite sehen.
+
+- <UiPath path="admin.auditRetention" />: Einträge auf Instanzebene werden standardmäßig 365 Tage aufbewahrt (90 Tage
+  bis 10 Jahre); jeder Arbeitsbereich bewahrt seine eigenen Einträge für seinen eigenen Zeitraum auf. Eine stündliche
+  Bereinigung entfernt ältere.
+- <UiPath path="admin.streamInstanceEvents" />: sendet Einträge auf Instanzebene in Batches von bis zu 500 an Ihr SIEM
+  oder Data Warehouse, signiert mit HMAC-SHA256 wie [ausgehende Webhooks](/de/developers/webhooks/). Der
+  Signaturschlüssel wird einmal angezeigt.
+
+Unter [Audit-Protokoll](/de/team/audit-log/) steht, was jeder Eintrag erfasst.
+
+## Prüfen, ob es funktioniert hat
+
+- Änderungen an Richtlinien zeigen die Meldung „Richtlinien gespeichert“ und gelten ab der nächsten Anmeldung.
+- Jede Aktion auf dieser Seite erscheint unter <UiPath path="admin.audit" /> mit Ihnen als Akteur.
+
+## Fehlerbehebung
+
+- **„Sie können Ihr eigenes Konto nicht deaktivieren.“**: Fragen Sie einen anderen Instanz-Admin.
+- **Der letzte Instanz-Admin kann nicht entfernt oder deaktiviert werden**: Machen Sie zuerst jemand anderen zum
+  Instanz-Admin.
+- **„… ist alleiniger Inhaber von …“** beim Deaktivieren: Übertragen Sie zuerst die Inhaberschaft dieser
+  Arbeitsbereiche.
+- **Ein gelöschter Arbeitsbereich hat keinen Button** <UiPath path="admin.restoreWorkspace" />: Die Frist von 7 Tagen
+  ist abgelaufen, und der Arbeitsbereich ist endgültig gelöscht.
+- **Die Prüfung der öffentlichen URL meldet ein Problem bei Erreichbar**: Die Adresse antwortet nicht von außen. Prüfen
+  Sie DNS, die Firewall und Ihren [Reverse Proxy](/de/self-hosting/reverse-proxy/).
+- **„Ein so großes Netzwerk würde echte Personen als Maschinen einstufen.“**: Fügen Sie ein kleineres Netzwerk hinzu,
+  innerhalb des Limits in der Tabelle zum Bot-Filter.
+- **„… kommt in den User-Agents von Browsern und E-Mail-Programmen vor, mit denen Menschen E-Mails lesen“**: Geben Sie
+  ein Wort ein, das nur der User-Agent der Maschine enthält.
+- **Ein integriertes Netzwerk oder ein integrierter User-Agent hat keinen Button**
+  <UiPath path="admin.botfilter.remove" />: Integrierte Einträge kommen mit den Releases von ReputeCast und bleiben.
+  <UiPath path="admin.botfilter.aPerson" /> überschreibt die Regeln (ein Wort, das auf „bot“, „crawler“ und Ähnliches
+  endet), nicht den User-Agent einer Maschine auf der Liste.
+- **Jede Öffnung und jeder Klick im Live-Monitor kommt von einer Adresse**: ReputeCast vertraut Ihrem Proxy nicht.
+  Siehe
+  [Anfragen über einen nicht vertrauenswürdigen Proxy beheben](#anfragen-über-einen-nicht-vertrauenswürdigen-proxy-beheben).
+- **„Dieser Job existiert nicht mehr“** oder **„… ist kein fehlgeschlagener Job mehr“** bei einer Aktion für einen
+  Job: Er wurde ausgeführt, oder jemand anderes hat ihn erneut versucht oder gelöscht, seit die Liste geladen wurde.
+  Laden Sie die Liste neu.
+
+## Verwandte Themen
+
+- [Zugriff über die Kommandozeile wiederherstellen](/de/self-hosting/account-recovery/)
+- [Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/): dieselben Warteschlangen in Prometheus.
+- [Sicherheit und Härtung](/de/self-hosting/security/)
+- [Rollen und Berechtigungen](/de/team/roles-and-permissions/): was Rollen in Arbeitsbereichen erlauben, im Unterschied
+  zur Kennzeichnung als Instanz-Admin.

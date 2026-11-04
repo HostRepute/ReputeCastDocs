@@ -1,0 +1,236 @@
+---
+title: Community-Adapter schreiben
+description: 'Einen E-Mail-Adapter entwickeln mit dem TypeScript-SDK und der Vorlage: Versandanbieter anbinden, die Contract-Suite bestehen, installieren und prüfen.'
+type: tutorial
+audience: [developer, operator]
+uiPath: 'nav.providers > providers.tabAdapters > providers.adapters.communityTitle'
+primaryKeyword: E-Mail-Adapter entwickeln
+sources:
+  - sdk/adapter-template
+  - sdk/adapter-sdk
+  - internal/cli/adapter.go
+  - internal/providers/remote
+  - internal/providers/manage/adapters.go
+  - docs/adapters.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps, FileTree, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+In diesem Tutorial nutzen Sie die Vorlage von ReputeCast, um einen E-Mail-Adapter zu entwickeln, und zwar für einen [Versandanbieter](/de/reference/glossary/#sending-provider) ohne integrierten Adapter. Sie führen die Contract-Suite dagegen aus, installieren den Adapter auf einer Testinstanz und prüfen, ob ReputeCast ihn aufrufen kann. Das dauert etwa 30 Minuten.
+
+Ein [Community-Adapter](/de/reference/glossary/#community-adapter) ist ein kleiner Prozess, der das [Adapter-Protokoll](/de/adapters/protocol/) spricht: ReputeCast schickt ihm signierte JSON-Anfragen (diese Nachrichten senden, diesen Webhook verifizieren), und er ruft die API des Anbieters auf. Die Vorlage ist ein funktionierender Adapter für Example ESP, einen fiktiven Anbieter mit einer typischen API, geschrieben mit dem TypeScript-SDK `@reputecast/adapter-sdk`.
+
+## Bevor Sie beginnen
+
+- Node.js 24.11 oder neuer, pnpm und Git.
+- Eine ReputeCast-Testinstanz auf demselben Rechner, auf der Sie die CLI `reputecast` ausführen können. Ein installierter Adapter gilt für jeden Arbeitsbereich der Instanz, probieren Sie das also nicht auf einer Produktionsinstanz aus.
+- `providers.allow_private_networks: true` auf dieser Instanz, für den Server und für die CLI (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Der Adapter lauscht auf `127.0.0.1`, und ohne diese Einstellung lehnt ReputeCast Loopback-Adressen ab.
+
+## Adapter erstellen und installieren
+
+<Steps>
+
+1. Kopieren Sie die Vorlage aus dem ReputeCast-Repository:
+
+   ```sh title="Terminal"
+   git clone https://github.com/hostrepute/reputecast.git
+   cp -r reputecast/sdk/adapter-template my-esp-adapter
+   cd my-esp-adapter
+   ```
+
+   <FileTree>
+   - my-esp-adapter/
+     - src/
+       - adapter.ts der Adapter: `defineAdapter({ id, capabilities, terms, send, … })`
+       - main.ts startet den Protokollserver
+     - test/
+       - adapter.test.ts Unit-Tests
+       - contract.test.ts
+       - fake-api.ts eine Fake-Version der API von Example ESP
+       - fixtures/
+         - webhooks.json aufgezeichnete Webhooks und die Ereignisse, die sie erzeugen müssen
+     - manifest.json was ReputeCast bei der Installation liest
+     - reputecast.contract.ts die Einrichtung der Contract-Suite
+     - .env.example
+     - Dockerfile
+     - package.json
+   </FileTree>
+
+2. Installieren Sie die Abhängigkeiten:
+
+   ```sh title="Terminal"
+   pnpm install
+   ```
+
+   Damit wird `@reputecast/adapter-sdk` (Node 24, TypeScript 6, keine Laufzeitabhängigkeiten) aus npm installiert.
+
+   <Aside type="note">
+     Meldet pnpm, dass `@reputecast/adapter-sdk` nicht in der npm-Registry ist, arbeiten Sie stattdessen im Repository: Führen Sie `pnpm install` in `reputecast/sdk/` aus und verwenden Sie dann `reputecast/sdk/adapter-template`. Im Repository ist die Vorlage mit der Kopie des SDK im Workspace verknüpft, die bei der Installation gebaut wird.
+   </Aside>
+
+3. Führen Sie die Tests aus:
+
+   ```sh title="Terminal"
+   pnpm test
+   ```
+
+   `pnpm test` führt die Unit-Tests mit Vitest aus und danach die Contract-Suite (`reputecast-adapter test`). Die Contract-Suite startet den Adapter, ruft ihn über das Protokoll gegen die Fake-API in `test/fake-api.ts` auf und führt dieselben Szenarien aus, die die Go-Suite von ReputeCast gegen integrierte Adapter ausführt:
+
+   ```txt title="Ausgabe"
+   Contract suite for example-esp (adapter protocol 1)
+   ✓ Registration (40 ms)
+   ✓ Health (90 ms)
+   ✓ Authentication (56 ms)
+   ✓ Send (29 ms)
+   ✓ SendRejected (17 ms)
+   ✓ SendOutage (17 ms)
+   ✓ SendAuth (33 ms)
+   ✓ SendIdempotent (36 ms)
+   ✓ Verify (81 ms)
+   ✓ Quota (8 ms)
+   ✓ SuppressionsPull (26 ms)
+   ✓ Webhook/Delivered (54 ms)
+   ✓ Webhook/HardBounce (63 ms)
+   ✓ Webhook/SoftBounce (42 ms)
+   ✓ Webhook/Batch (24 ms)
+
+   15 passed, 0 failed, 0 skipped
+   ```
+
+   Die Suite prüft das Manifest gegen den Code, signierte Health- und Authentifizierungsaufrufe, einen Versand, eine dauerhafte Ablehnung (die Fake-API lehnt `rejected@contract.test` ab), einen Ausfall, abgelehnte Zugangsdaten, einen idempotenten erneuten Versuch und jeden aufgezeichneten Webhook: gültig, bereits verifiziert und manipuliert.
+
+4. Sehen Sie sich an, wie der Adapter deklariert ist. `src/adapter.ts` bildet die API von Example ESP ab:
+
+   ```ts title="src/adapter.ts (Auszug)"
+   export default defineAdapter<ExampleEvent>({
+     id: 'example-esp',
+     capabilities: { webhooks: true, batch: 100, suppressionSync: 'pull', quotaDiscovery: true },
+     terms: { bulkMarketing: 'allowed' },
+     http: {
+       name: 'Example ESP',
+       baseUrl: () => process.env['EXAMPLE_ESP_API_URL'] ?? API_URL,
+       headers: (ctx) => ({ authorization: `Bearer ${String(ctx.credentials['api_key'] ?? '')}` }),
+     },
+
+     async send(msg, ctx) {
+       const r = await ctx.http.post<{ id: string }>('/v1/messages', toPayload(msg))
+       return { providerMessageId: r.data.id }
+     },
+
+     verifyWebhook(req, ctx) {
+       /* checks X-Example-Signature with verifyTimestampedHmac */
+     },
+
+     normalizeEvent(raw) {
+       /* maps one Example ESP event to a ReputeCast event */
+     },
+   })
+   ```
+
+   Jede deklarierte Fähigkeit braucht ihren Hook (`webhooks` braucht `verifyWebhook` und `normalizeEvent`, `quotaDiscovery` braucht `discoverQuota`, eine `pull`-Synchronisierung braucht `syncSuppressions`), und `defineAdapter` beendet den Prozess beim Start, wenn einer fehlt. `manifest.json` muss dieselbe ID, dieselben Fähigkeiten und dieselben Bedingungen deklarieren; der Server startet nicht, wenn sie abweichen. `ctx.http` erreicht nur die Hosts in `permissions.network` des Manifests und ordnet die Antworten des Anbieters Protokollfehlern zu: 401 und 403 werden zu `provider_auth`, 429 zu `provider_throttled`, 5xx und Timeouts zu `provider_unavailable` und jedes andere 4xx zu einer Ablehnung genau dieser Nachricht.
+
+5. Installieren Sie den Adapter auf dem Rechner, auf dem ReputeCast läuft, aus seinem Manifest und geben Sie die Adresse an, auf der der Prozess lauschen wird:
+
+   ```sh title="Terminal"
+   reputecast adapter install ./manifest.json --url http://127.0.0.1:4600
+   ```
+
+   ```txt title="Ausgabe"
+   Installed Example ESP 0.1.0 as community:example-esp.
+
+   Signing secret (shown once):
+
+     rcas_…
+
+   Set it on the adapter process as REPUTECAST_ADAPTER_SECRET.
+   Then check it: reputecast adapter check example-esp
+   ```
+
+   Kopieren Sie den Signaturschlüssel jetzt: ReputeCast speichert ihn versiegelt und zeigt ihn nie wieder an. Wenn Sie ihn verlieren, stellt `reputecast adapter secret example-esp` einen neuen aus.
+
+   <Aside type="note">
+     Läuft ReputeCast in Docker Compose, läuft die CLI im App-Container (`docker compose exec app /usr/local/bin/reputecast …`), wo es Ihre `./manifest.json` und `127.0.0.1` nicht gibt. Führen Sie den Adapter als Container im selben Netzwerk aus (Schritt 9) und installieren Sie ihn von der `https://`-URL des Manifests mit `--url http://example-esp:4600`.
+   </Aside>
+
+6. Geben Sie dem Adapter seinen Schlüssel und starten Sie ihn:
+
+   ```sh title="Terminal"
+   cp .env.example .env
+   ```
+
+   Setzen Sie `REPUTECAST_ADAPTER_SECRET` in `.env` auf den Schlüssel aus Schritt 5 (`PORT=4600` und `HOST=127.0.0.1` stehen schon dort) und starten Sie dann den Prozess:
+
+   ```sh title="Terminal"
+   pnpm dev
+   ```
+
+   ```txt title="Ausgabe"
+   {"time":"2026-10-22T12:20:56.017Z","level":"info","msg":"adapter listening","adapter":"example-esp","url":"http://127.0.0.1:4600","protocol":1}
+   ```
+
+   `pnpm dev` startet den Prozess neu, wenn sich der Code ändert. Ohne Schlüssel startet er nicht, sondern fordert Sie auf, `REPUTECAST_ADAPTER_SECRET` zu setzen. `GET /healthz` antwortet `{"ok":true}` für Health-Checks von Containern, und jede andere Anfrage muss von ReputeCast signiert sein:
+
+   ```sh title="Terminal"
+   curl -s -X POST http://127.0.0.1:4600/v1/health -d '{}'
+   ```
+
+   ```json title="Ausgabe"
+   {"protocol":1,"idempotencyKey":"","error":{"code":"unauthenticated","message":"Refused: the request is not signed, or its timestamp is more than 5 minutes off."}}
+   ```
+
+7. Prüfen Sie, ob ReputeCast den Adapter mit seinem Schlüssel erreicht:
+
+   ```sh title="Terminal"
+   reputecast adapter check example-esp
+   ```
+
+   ```txt title="Ausgabe"
+   community:example-esp: Answered as example-esp 0.1.0, protocol 1.
+   ```
+
+   `reputecast adapter check` ruft die signierte Operation `health` auf und speichert das Ergebnis. `reputecast adapter list` zeigt jeden installierten Adapter mit seiner Adresse, dem Ausstellungszeitpunkt seines Schlüssels, seiner letzten Prüfung und der Zahl der Anbieter, die ihn nutzen. Innerhalb von 15 Sekunden übernimmt jeder ReputeCast-Prozess den Adapter, und Example ESP erscheint unter <UiPath path="providers.adapters.communityTitle" /> auf <UiPath path="nav.providers > providers.tabAdapters" /> und in <UiPath path="providers.overview.addProvider" /> in jedem Arbeitsbereich.
+
+8. Bilden Sie Ihren eigenen Anbieter ab. Stoppen Sie `pnpm dev`, und dann:
+   - Ändern Sie `id` in `src/adapter.ts` und `manifest.json` sowie `name`, `maintainer` und die Links. Die ID (2 bis 40 Zeichen: `a-z`, `0-9` und `-`, beginnend mit einem Buchstaben) wird zu `community:<id>` und erscheint in Webhook-URLs, halten Sie sie also über Versionen hinweg stabil.
+   - Schreiben Sie `send` (oder `sendBatch` für eine Batch-API), `verifyWebhook` und `normalizeEvent` für die API Ihres Anbieters neu, mit den Helfern `verifyHmac`, `verifyTimestampedHmac`, `verifyBasicAuth` und `classifyBounce`. Senden Sie jeden Header in `msg.headers` mit und geben Sie `msg.id` in Ereignissen zurück.
+   - Deklarieren Sie in `manifest.json` die Fähigkeiten und Bedingungen, die Preise des Anbieters unter `pricing` (erforderlich), das Verbindungsformular unter `config` (markieren Sie Schlüssel und Tokens mit `"secret": true`) und die Hosts des Anbieters unter `permissions.network`. Die [Protokollreferenz](/de/adapters/protocol/) listet auf, was ReputeCast bei jeder Fähigkeit aufruft.
+   - Die Texte des Manifests (`name`, `description`, `terms.note`, `pricing`, `dedicatedIps`, die Beschriftungen und Hilfetexte unter `config`) erscheinen so, wie sie geschrieben sind, für alle auf Englisch: Ein Community-Adapter hat keinen Textkatalog. Die Badges, die Wörter im Tab Adapter und die Fehler der Laufzeit stammen von ReputeCast und erscheinen in der Sprache der jeweiligen Person.
+   - Zeichnen Sie einige echte Webhooks ohne personenbezogene Daten in `test/fixtures/webhooks.json` auf, zusammen mit den Ereignissen, die sie erzeugen müssen, und passen Sie `test/fake-api.ts` an.
+
+   Führen Sie `pnpm test` und `pnpm typecheck` aus, bis beide bestehen. Installieren Sie das Manifest dann erneut mit `reputecast adapter install ./manifest.json --url http://127.0.0.1:4600`. Eine neue ID ist eine neue Installation: Sie gibt einen neuen Schlüssel für `.env` aus, und `reputecast adapter remove example-esp` deinstalliert den Adapter der Vorlage. Dieselbe ID aktualisiert das installierte Manifest und behält den Schlüssel. Starten Sie `pnpm dev` erneut.
+
+9. Liefern Sie den Adapter als Container aus:
+
+   ```sh title="Terminal"
+   pnpm build && pnpm start
+   docker build -t example-esp-adapter .
+   docker run -d --name example-esp -p 127.0.0.1:4600:4600 \
+     -e REPUTECAST_ADAPTER_SECRET=rcas_… example-esp-adapter
+   ```
+
+   `pnpm start` führt den Build mit dem Berechtigungsmodell von Node aus. Das Image der Vorlage läuft als Nicht-Root-Benutzer `node`, liest nur seine eigenen Dateien, kann keine Kindprozesse oder Worker starten und beantwortet seinen `HEALTHCHECK` unter `/healthz`. Es installiert mit `pnpm install --frozen-lockfile`, committen Sie also die `pnpm-lock.yaml`, die in Schritt 2 entstanden ist. Beschränken Sie den ausgehenden Netzwerkverkehr des Containers auf die API des Anbieters, wo Ihre Plattform das erlaubt.
+
+   Veröffentlichen Sie das Image und `manifest.json` unter einer `https://`-URL. Serverbetreiber installieren den Adapter mit `reputecast adapter install <manifest URL> --url <where it runs>` oder mit <UiPath path="providers.adapters.installFromRegistry" /> im Tab Adapter; der Tab zeigt keinen Schlüssel an, daher stellen sie mit `reputecast adapter secret <id>` einen aus und setzen die Adresse mit `reputecast adapter set-url <id> <url>`.
+
+</Steps>
+
+<Aside type="tip">
+  Um den Signaturschlüssel ohne Ausfallzeit zu rotieren, führen Sie `reputecast adapter secret <id>` aus und setzen beide Schlüssel auf dem Prozess, den neuen zuerst: `REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old`. Der bisherige Schlüssel funktioniert in ReputeCast noch 24 Stunden.
+</Aside>
+
+## Was Sie erstellt haben
+
+Sie haben einen Adapterprozess, der dieselben Contract-Szenarien besteht wie die integrierten Adapter von ReputeCast, auf Ihrer Instanz für jeden Arbeitsbereich installiert ist und in beide Richtungen mit einem eigenen Schlüssel signiert. Sobald er mit Ihrem echten Anbieter spricht, verbindet ihn jeder Admin eines Arbeitsbereichs unter <UiPath path="providers.overview.addProvider" /> wie einen integrierten Adapter: Die eingegebenen Zugangsdaten werden in ReputeCast versiegelt gespeichert und mit jedem Aufruf mitgesendet, und der Adapter speichert sie nie.
+
+`reputecast adapter remove <id>` deinstalliert ihn wieder; ReputeCast verweigert das, solange ein verbundener Anbieter ihn nutzt. Die [CLI-Referenz](/de/reference/cli/#adapter) listet jeden `adapter`-Befehl auf.
+
+## Nächste Schritte
+
+<CardGrid>
+  <LinkCard title="Adapter-Protokoll v1" description="Jeder Header, jede Operation, jeder Datentyp und jeder Fehlercode, den Ihr Adapter beantwortet." href="/de/adapters/protocol/" />
+  <LinkCard title="Versandanbieter verbinden" description="Der Assistent, mit dem ein Admin eines Arbeitsbereichs einen Anbieter über Ihren Adapter verbindet." href="/de/providers/connect/" />
+  <LinkCard title="Referenz zum generischen HTTP-Adapter" description="Eine einfache HTTP-API mit einer JSON-Zuordnung abbilden, statt einen Prozess zu betreiben." href="/de/adapters/generic-http/" />
+</CardGrid>

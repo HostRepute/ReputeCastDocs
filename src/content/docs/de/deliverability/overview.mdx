@@ -1,0 +1,156 @@
+---
+title: E-Mail-Zustellbarkeit für selbst gehostete Absender
+description: E-Mail-Zustellbarkeit für selbst gehostete Absender. Was die Platzierung im Posteingang bestimmt, wie ReputeCast sie vor, während und nach dem Versand prüft.
+type: explanation
+audience: [publisher, admin]
+primaryKeyword: E-Mail-Zustellbarkeit
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - internal/readiness/types.go
+  - internal/readiness/assemble.go
+  - internal/approvals/jobs.go
+  - internal/sending/engine/engine.go
+  - internal/deliverability
+  - internal/placement
+sidebar:
+  order: 1
+---
+
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+E-Mail-Zustellbarkeit beschreibt, ob Ihre E-Mails im Posteingang landen statt im Spam-Ordner oder als Bounce.
+Postfachanbieter wie Gmail, Yahoo und Outlook.com entscheiden das für jede Nachricht anhand der Signale unten. Wenn Sie
+selbst hosten, wählen Sie die Versandanbieter und verwalten das DNS selbst, daher liegen diese Signale in Ihrer Hand;
+ReputeCast prüft sie vor, während und nach jedem Versand.
+
+ReputeCast erkennt, welcher [Postfachanbieter](/de/reference/glossary/#mailbox-provider) die E-Mails einer Adresse
+filtert, anhand der MX-Einträge ihrer Domain, nicht nur anhand ihres Namens: Eine Firmendomain bei Google Workspace zählt
+als Gmail, eine bei Microsoft 365 als Outlook. Routing, Warm-up, abgesicherter Versand, Versandbereitschaft und Berichte
+nutzen alle diese eine Antwort.
+
+## Was über die Platzierung im Posteingang entscheidet
+
+<TableScroll label="Signale, die über die Platzierung im Posteingang entscheiden">
+
+| Signal               | Worauf Postfachanbieter achten                                                                     | Wo Sie daran arbeiten                                                                                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Authentifizierung    | SPF, DKIM und DMARC, ausgerichtet mit der Domain der From-Adresse                                  | [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/)                                                          |
+| Reputation           | Die Historie Ihrer Versand-Domains und IPs, Blocklisten-Einträge, Bounce- und Beschwerderaten      | [Zustand von Domains und Anbietern überwachen](/de/deliverability/health/), [Warm-up](/de/providers/warm-up/)                 |
+| Interaktion          | Wie Empfänger reagieren: öffnen, antworten, ungelesen löschen, als Spam melden                     | [Die Liste gesund halten](/de/audience/list-health/)                                                                         |
+| Inhalt               | Größe, Links, Bilder, ein Textteil, ein Betreff, der nicht nach Spam aussieht                      | [Inhaltswarnungen vor dem Versand beheben](/de/campaigns/content-checks/)                                                     |
+| Listenqualität       | Adressen mit Bounces, Spamfallen, Rollenadressen, Kontakte, die sich nie angemeldet haben          | [Die Sperrliste](/de/audience/suppressions/), [Adressen prüfen](/de/audience/verification/)                                   |
+| Compliance           | Einwilligung, eine funktionierende Abmeldung, eine Postanschrift, die Regeln für Massenabsender    | [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)                      |
+
+</TableScroll>
+
+## Was ReputeCast vor, während und nach dem Versand tut
+
+<SendFlowDiagram />
+
+Die Versandbereitschaft prüft eine Kampagne vor dem Start, das Routing übergibt jeden Empfänger an einen
+Versandanbieter, Zustellereignisse kommen von den Versandanbietern zurück, und Schwellenwerte entscheiden, ob der
+Versand weiterläuft oder pausiert.
+
+1. **Vor dem Versand.** Domaineinträge werden live geprüft, während Sie sie veröffentlichen, und danach alle 30 Minuten.
+   Die [Versandbereitschaft](/de/reference/glossary/#send-readiness) prüft jede Kampagne in bis zu 11 Gruppen:
+   Absenderreputation (die Versand-Domain, ihre übergeordnete Domain, Return-Path- und Tracking-Domains und dedizierte
+   IPs), Authentifizierung, Inhalt, Sprachen, Barrierefreiheit, bedingte Inhalte, Links, Compliance, Qualität der
+   Zielgruppe, Routing und die eigenen [Versandregeln](/de/campaigns/sending-rules/) Ihres Arbeitsbereichs. Ihr Ergebnis
+   ist Bereit, Bereit mit Warnungen oder Blockiert, und eine Blockierung verhindert den Start des Versands. Eine
+   Prüfung, die nicht laufen konnte, etwa wegen einer fehlgeschlagenen DNS-Abfrage, ergibt
+   <UiPath path="review.statusUnknown" />, nie <UiPath path="review.statusBlock" />. Die Prüfung läuft, wenn Sie
+   <UiPath path="composer.reviewSend" /> öffnen, erneut 15 Minuten vor einem geplanten Versand und beim Start des
+   Versands. Bei dieser erneuten Prüfung hält eine Blockierung, eine nicht bestätigte Warnung, eine große Änderung der
+   Zielgruppe oder eine Bearbeitung nach dem Planen den Versand zurück
+   ([zurückgehaltener Versand](/de/reference/glossary/#send-time-hold)), bis jemand ihn prüft. Ein
+   [Platzierungstest](/de/deliverability/placement-tests/) zeigt je Postfachanbieter, wo echte Kopien in
+   Testpostfächern landen.
+2. **Während des Versands.** Ein Versand kann mit einem [Canary](/de/reference/glossary/#canary) beginnen: Die
+   aktivsten Empfänger und Ihre Testpostfächer erhalten die E-Mail zuerst, alle anderen warten, bis er besteht.
+   Danach beobachtet der [abgesicherte Versand](/de/reference/glossary/#guarded-sending) alle 2 Sekunden Bounces nach
+   Typ, Beschwerden und Zurückstellungen je Postfachanbieter und je Versandanbieter, bremst einen Postfachanbieter bei
+   Zurückstellungen, bevor er ihn pausiert, und [pausiert automatisch](/de/campaigns/live-monitor/) nur den Teil, der
+   einen Schwellenwert überschritten hat. Beschwerderaten zählen nur E-Mails, die an Postfachanbieter zugestellt wurden,
+   die Beschwerden melden: Gmail und iCloud tun das nicht, daher zeigen ihre Raten
+   <UiPath path="live.model.notAvailable" />. Die Schwellenwerte, die Raten je Postfachanbieter und Antwortregeln wie
+   `TSS04` von Yahoo legen Sie in den [Traffic-Regeln](/de/providers/traffic-rules/) fest. Fällt ein Versandanbieter
+   aus, entscheidet die Failover-Richtlinie der Route, ob sein Anteil zu einem fehlerfreien Anbieter wechselt oder auf
+   Sie wartet.
+3. **Nach dem Versand.** Zustellereignisse aller Versandanbieter werden normalisiert, und Bounces und Beschwerden landen
+   auf einer einzigen [Sperrliste](/de/reference/glossary/#suppression-list), die für jeden Versandanbieter gilt. Eine
+   Beschwerdeüberwachung zählt Beschwerden auch nach dem Ende des Versands weiter und benachrichtigt die Personen, die
+   Versände fortsetzen dürfen, wenn ein Postfachanbieter oder der ganze Versand sein Beschwerdelimit überschreitet.
+   [Kampagnenberichte](/de/campaigns/reports/) teilen Öffnungen in menschliche,
+   [datenschutzgeschützte](/de/reference/glossary/#privacy-protected-open) und maschinelle Öffnungen auf, und der
+   [Zustand der Zustellbarkeit](/de/deliverability/health/) behält Ihre Domains, IPs, Konten bei Versandanbietern,
+   Blocklisten, DMARC-Berichte und Störungen weiter im Blick.
+
+## Standardwerte und Grenzen
+
+Diese Zeiten und Schwellenwerte der Versandbereitschaft gelten für jede Kampagne:
+
+<LimitsTable area="send-readiness" />
+
+## Wann Sie sie ändern sollten
+
+Die Grenzen der Versandbereitschaft sind fest. Sie entscheiden, wie Sie auf jedes Ergebnis reagieren: Beheben Sie eine
+Blockierung, und beheben oder bestätigen Sie jede Warnung vor dem Versand. Die Schwellenwerte, die einen Versand
+vorzeitig beenden, stellen Sie selbst ein: die Raten für Auto-Pause je Arbeitsbereich und je Kampagne
+([Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/)) und die Bounce- und Beschwerdelimits jedes
+Versandanbieters ([Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/)). Senken Sie sie, wenn ein
+Postfachanbieter beginnt, Ihre E-Mails zurückzustellen oder zu filtern; höhere Werte lassen nur mehr Schaden zu, bevor
+der Versand pausiert.
+
+## Checkliste für die Zustellbarkeit
+
+### Einmal einrichten
+
+1. Veröffentlichen Sie SPF, DKIM und DMARC für jede Versand-Domain:
+   [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/).
+2. Sammeln Sie DMARC-Berichte und wechseln Sie zu einer durchgesetzten Richtlinie:
+   [DMARC-Sammelberichte lesen](/de/deliverability/dmarc-reports/).
+3. Prüfen Sie die Regeln der großen Postfachanbieter:
+   [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/).
+4. Stellen Sie sicher, dass die Abmeldung mit einem Klick funktioniert; sie braucht eine öffentliche HTTPS-URL:
+   [Abmeldung mit einem Klick (RFC 8058)](/de/deliverability/one-click-unsubscribe/).
+5. Holen Sie Einwilligungen mit Nachweis ein und führen Sie eine Postanschrift in der Fußzeile:
+   [Einwilligung und Anti-Spam-Recht: die Grundlagen](/de/deliverability/compliance/).
+6. Holen Sie Amazon SES vor der ersten Kampagne aus der Sandbox:
+   [Amazon SES aus der Sandbox holen](/de/deliverability/amazon-ses-production-access/).
+7. Wärmen Sie einen neuen Versandanbieter oder eine neue IP vor dem vollen Volumen auf:
+   [Neuen Anbieter oder neue IP aufwärmen](/de/providers/warm-up/).
+8. Optional: Zeigen Sie Ihr Logo mit [BIMI](/de/deliverability/bimi/) und
+   [verbinden Sie HostRepute](/de/deliverability/hostrepute/) für stündliche Blocklisten-Prüfungen, Postmaster Tools,
+   SNDS und das Sammeln von DMARC-Berichten.
+
+### Vor jedem Versand
+
+9. Beheben Sie jede Blockierung und lesen Sie jede Warnung in der
+   [Versandbereitschaft](/de/campaigns/send-readiness/).
+10. Führen Sie bei wichtigen Versänden vorher einen [Platzierungstest](/de/deliverability/placement-tests/) durch.
+
+### Laufend beobachten
+
+11. Öffnen Sie regelmäßig den [Zustand der Zustellbarkeit](/de/deliverability/health/) und handeln Sie bei gelben und
+    roten Karten.
+12. Lassen Sie Einträge schnell entfernen: [Blocklisten-Einträge prüfen und beheben](/de/deliverability/blocklists/).
+13. Bleiben Sie unter den Limits jedes Versandanbieters:
+    [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/).
+14. Senden Sie nicht mehr an Kontakte, die nie interagieren: [Die Liste gesund halten](/de/audience/list-health/) und
+    [Die Sperrliste](/de/audience/suppressions/).
+
+### Wenn E-Mails bouncen
+
+15. Schlagen Sie den Code nach, den ein Postfachanbieter zurückgegeben hat: [SMTP-Fehlercodes](/de/smtp-errors/).
+16. Sehen Sie in den [Kampagnenberichten](/de/campaigns/reports/), welche Postfachanbieter und Versandanbieter
+    betroffen sind.
+
+## Verwandte Themen
+
+- [So funktioniert ReputeCast](/de/getting-started/concepts/)
+- [Versandbereitschaft: vor dem Senden prüfen](/de/campaigns/send-readiness/)
+- [Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/)
+- [Glossar](/de/reference/glossary/)

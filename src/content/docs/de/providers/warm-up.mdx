@@ -1,0 +1,197 @@
+---
+title: Neuen Anbieter oder neue IP aufwärmen
+description: 'Einen IP-Warm-up-Zeitplan in ReputeCast nutzen: Tageslimit beim Versand durchgesetzt, aktivste Kontakte zuerst und automatisch langsamer bei mehr Bounces.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabWarmup'
+primaryKeyword: IP-Warm-up-Zeitplan
+sources:
+  - internal/warmup
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/audience.go
+  - internal/sending/engine/automation.go
+  - internal/sending/engine/transactional.go
+  - internal/automations/engine.go
+  - internal/routing/routing.go
+  - web/src/features/providers/WarmupPage.tsx
+  - web/src/features/providers/warmup-model.ts
+  - web/src/features/providers/warmup.messages.ts
+  - web/src/features/live/States.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Eine neue [dedizierte IP](/de/reference/glossary/#dedicated-ip), ein neuer Versandanbieter oder Ihr eigener
+Postal-Server hat keine Versandhistorie, daher begegnen Postfachanbieter einer plötzlichen Flut von E-Mails daraus mit
+Misstrauen. Ein Plan für das [Warm-up](/de/reference/glossary/#warm-up) gibt ihr einen IP-Warm-up-Zeitplan: ein
+Tageslimit, das über einige Wochen steigt und beim Versand durchgesetzt wird, E-Mails zuerst an Ihre aktivsten Kontakte
+und eine automatische Verlangsamung, wenn Bounces oder Beschwerden steigen.
+
+## Bevor Sie beginnen
+
+- Verbinden Sie den Anbieter. Lesen Sie [Versandanbieter verbinden](/de/providers/connect/).
+- Damit sein Anteil am Massenversand nach Plan steigt, setzen Sie ihn auf der Route Massenversand in eine gewichtete
+  Aufteilung neben einen bereits aufgewärmten Anbieter, zum Beispiel 90 % Amazon SES und 10 % Postal. Das richten Sie
+  im Schritt Streams des Verbindungsassistenten ein (Rolle Gewichtete Aufteilung) oder auf der Routing-Seite. Lesen Sie
+  [E-Mails über mehrere Anbieter routen](/de/providers/routing/).
+- Sie brauchen die Berechtigung `providers:manage`. Mit `providers:view` können Sie einen Plan verfolgen.
+- Die Engagement-Stufen stammen aus der [Listenqualität](/de/audience/list-health/): Aktiv, Nachlassend, Gefährdet und
+  Auslaufend.
+
+## Plan starten
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.providers > providers.tabWarmup" /> und wählen Sie
+   <UiPath path="providers.warmup.newPlan" />.
+
+2. Wählen Sie den <UiPath path="providers.warmup.provider" /> und die <UiPath path="providers.warmup.length" />. Geben
+   Sie seine <UiPath path="providers.warmup.dedicatedIp" /> ein, falls er eine hat; lassen Sie das Feld leer, um den
+   gemeinsamen Pool des Anbieters für Ihre Domain aufzuwärmen.
+
+3. Wählen Sie <UiPath path="providers.warmup.startWarmup" />. Der Status des Anbieters wechselt auf Im Warm-up · Tag 1
+   von N, sein Limit am ersten Tag beträgt 200 E-Mails, und sein Anteil am Massenversand beginnt bei 10 %. Ein neuer
+   Plan sendet zuerst an aktive Kontakte, begrenzt jeden Postfachanbieter einzeln und sendet, was über dem Limit liegt,
+   über einen aufgewärmten Anbieter. Jeder Anbieter kann jeweils nur einen Plan haben.
+
+4. Passen Sie bei Bedarf die <UiPath path="providers.warmup.settingsTitle" /> an und wählen Sie dann
+   <UiPath path="providers.warmup.savePlan" />. Das Limit von heute bleibt, wie es ist; die Änderungen gelten für die
+   kommenden Tage.
+   - <UiPath path="providers.warmup.length" />: 14 gezählte Tage (schnell), 21 (empfohlen für eine neue dedizierte IP)
+     oder 30 (vorsichtig). Eine neue Dauer baut die kommenden Tage vom Limit von heute bis zum selben Endvolumen neu
+     auf, sodass das Limit von heute nie springt. Ein Plan kann nicht kürzer sein als die Tage, die er bereits gezählt
+     hat.
+   - <UiPath path="providers.warmup.ordering" />: <UiPath path="providers.warmup.orderEngaged" /> oder
+     <UiPath path="providers.warmup.orderRandom" />, die ab dem ersten Tag an jede Engagement-Stufe sendet.
+   - <UiPath path="providers.warmup.slowIfBounces" /> eine Bounce-Rate,
+     <UiPath path="providers.warmup.orComplaints" /> eine Beschwerderate.
+   - <UiPath path="providers.warmup.whenTrips" />: das Limit halten, bis 2 fehlerfreie Tage in Folge erreicht sind (der
+     Standard), <UiPath path="providers.warmup.actionStepBack" /> oder <UiPath path="providers.warmup.actionPause" />.
+   - <UiPath path="providers.warmup.spread" />.
+
+</Steps>
+
+<Screenshot
+  id="providers-warmup"
+  alt="Eine dedizierte IP von Postal an Tag 9 von 21 mit 8 von 21 gezählten Tagen: das Feld, das erklärt, wie der Plan voranschreitet, Limit heute 6.000 ohne Versand an einem Tag ohne Massenversand, daher wird Tag 9 morgen wiederholt, die Bounce- und Beschwerderate über 7 Tage unter ihren Schutzgrenzen, eine Verlangsamung, die tägliche Volumensteigerung und die Limits von heute je Postfachanbieter."
+/>
+
+## Wie der Zeitplan funktioniert
+
+1. **Die Steigerung.** Tag 1 umfasst 200 E-Mails. Das Limit wächst jeden Tag um denselben Faktor, bis der letzte Tag
+   das Ziel erreicht: die bisher größte Zielgruppe Ihrer Kampagnen oder 48.000, wenn der Arbeitsbereich noch keine
+   Kampagne gesendet hat. Das Ratenlimit des Tages verteilt das Limit auf etwa eine Stunde und überschreitet nie die
+   eigene Höchstrate des Anbieters.
+2. **Das Limit wird beim Versand durchgesetzt.** Jeder Stream, der über den Anbieter gesendet wird, zählt für das
+   Tageslimit, in der Zeitzone des Arbeitsbereichs. Mit Limits je Postfachanbieter erhält jeder seinen Teil des Limits,
+   sodass strenge Postfachanbieter niedrigere Limits bekommen; Gmail umfasst Empfänger bei Google Workspace und
+   Outlook solche bei Microsoft 365, ermittelt aus den MX-Einträgen.
+3. **Wer zuerst E-Mails erhält.** Bei der Reihenfolge mit den aktivsten Kontakten zuerst gehen im ersten Viertel der
+   Tage nur E-Mails an aktive Kontakte, bis zur Hälfte kommen nachlassende Kontakte hinzu, danach gefährdete Kontakte,
+   und am letzten Tag wird an jede Stufe gesendet. Ein Empfänger im Massenversand außerhalb der Stufen des Tages geht
+   über den größten aufgewärmten Anteil derselben Route oder andernfalls über den Ersatzanbieter der Route.
+4. **Was über dem Limit liegt.** Das hängt vom Stream ab:
+   - **Massenversand** geht über einen aufgewärmten Anbieter der Route, wenn der Plan das, was über dem Limit liegt,
+     dorthin sendet (Überlauf). Ohne Überlauf oder ohne aufgewärmten Anbieter wird der Anteil des Anbieters am Versand
+     beim Limit zurückgehalten: eine [zurückgehaltene Route](/de/reference/glossary/#held-route), die mit dem Limit des
+     nächsten Tages von selbst weiterläuft. Die Seite des Plans und der [Live-Monitor](/de/campaigns/live-monitor/)
+     zeigen die wartende Kampagne mit drei Möglichkeiten: <UiPath path="providers.warmup.holdWait" /> auf das nächste
+     Limit, die zurückgehaltenen Empfänger zu einem Anbieter verschieben, der die Failover-Prüfungen besteht, oder
+     <UiPath path="providers.warmup.holdCancel" /> dieses Anteils. Warten und Verschieben erfordern `campaigns:send`;
+     Abbrechen erfordert `campaigns:pause`.
+   - **Automationen** warten beim Limit und solange der Plan pausiert ist, oder sie gehen über den aufgewärmten
+     Ersatzanbieter des Streams, wenn der Plan Überlauf erlaubt. Nichts wird verworfen, und eine Verzweigung, die auf
+     eine Öffnung oder einen Klick einer zurückgehaltenen E-Mail wartet, startet ihr Zeitfenster erst, wenn die E-Mail
+     hinausgeht.
+   - **Transaktional** wartet nie: Solche E-Mails gehen über einen aufgewärmten Anbieter ihrer Route oder werden
+     gesendet und für den Tag über dem Limit gezählt. Die Karte der Limits zeigt, wie viele darüber lagen.
+5. **Der Anteil am Massenversand.** Ist der Anbieter mit einem anderen Anbieter in einer gewichteten Aufteilung für
+   Massenversand, steigt sein Anteil im Verlauf des Plans von 10 % auf 15 %, 25 % und schließlich 40 %; der Anteil
+   kommt vom größten anderen Anbieter der Aufteilung. Die Aufteilung ist fest zugeordnet, daher bleiben Empfänger, die
+   bereits zum Anbieter im Warm-up gewechselt sind, dort.
+6. **Gezählte Tage.** Ein Plan hat gezählte Tage, keine Kalendertage. ReputeCast prüft jeden laufenden Plan stündlich.
+   Wenn ein Tag endet, zählt er, wenn mindestens 80 % seines Limits hinausgegangen sind und die Schutzgrenzen gehalten
+   haben; andernfalls wird derselbe Tag am nächsten Tag wiederholt. Die Schutzgrenzen bewerten einen Tag erst, wenn er
+   500 Nachrichten gesendet hat, damit eine Beschwerde von 200 die Steigerung nie aufhält. Die Bounce-Rate ist die Zahl
+   der Bounces pro gesendeter Nachricht; die Beschwerderate zählt nur Postfachanbieter, die Beschwerden melden, denn
+   Gmail und iCloud tun das nicht.
+7. **Verlangsamungen.** Liegt die Bounce- oder Beschwerderate eines bewerteten Tages über ihrer Schutzgrenze, zählt der
+   Tag nicht, und der Plan tut, was Sie gewählt haben. Beim Halten bleibt das Limit, bis 2 fehlerfreie Tage in Folge
+   erreicht sind, während der Plan auf seinem Tag bleibt; dann setzt die Steigerung eine Stufe über dem gehaltenen Limit
+   fort. Beim Zurückgehen geht das Limit zuerst einen Tag zurück, hält auf dieselbe Weise, und die Steigerung setzt dann
+   an dem Tag fort, der ausgelöst hat. Beim Pausieren wartet der Plan, bis jemand ihn fortsetzt. Jeder Schritt wird im <UiPath path="providers.warmup.logTitle" /> festgehalten.
+8. **Das Ende.** Nach dem letzten gezählten Tag ist der Plan abgeschlossen, der Status des Anbieters kehrt auf
+   Fehlerfrei zurück, und er kann bei der Richtlinie nur zu aufgewärmten Anbietern Failover für Massenversand
+   übernehmen.
+
+### Plan lesen
+
+Die Überschrift zeigt den Tag („Tag 9 von 21“), die bisher gezählten Tage und wann der Plan frühestens endet. Unter
+<UiPath path="providers.warmup.howTitle" /> steht, was den heutigen Tag zählen lässt, zum Beispiel „Heute zählt, sobald
+4.800 gesendet sind; bisher 1.200“, oder dass der Tag morgen wiederholt wird, weil zu wenig hinausgegangen ist. Danach
+folgen das Limit von heute und was heute gesendet wurde, alles, was während des Warm-ups gesendet wurde, die Bounce- und
+Beschwerderate über 7 Tage neben ihren Schutzgrenzen, die bisherigen Verlangsamungen und das Ratenlimit von heute.
+
+Das Diagramm <UiPath path="providers.warmup.rampTitle" /> und die Tabelle darunter zeigen für jeden Tag das Limit
+(gehaltene Limits sind gekennzeichnet), was gesendet wurde, seine Bounce- und Beschwerderate, die Stufen, an die er
+gesendet hat, und ob er gezählt hat: <UiPath path="providers.warmup.badgeCounted" />,
+<UiPath path="providers.warmup.badgeNotCounted" /> mit dem Grund, <UiPath path="providers.warmup.badgeHeld" /> (ein
+fehlerfreier Tag, während eine Verlangsamung das Limit hält), Heute, Geplant oder Pausiert.
+<UiPath path="providers.warmup.capsTitle" /> listet das Limit von heute und was je Postfachanbieter gesendet wurde, mit
+dem Schalter <UiPath path="providers.warmup.overflowLabelNone" /> und den Transaktions-E-Mails, die heute über dem Limit
+gesendet wurden.
+
+Um die Steigerung eine Weile anzuhalten, wählen Sie <UiPath path="providers.warmup.pause" />. Das Pausieren friert den
+Plan ein: Der Anbieter sendet nichts, Massenversand geht über einen aufgewärmten Anbieter der Route oder wartet,
+Automationen warten, Transaktions-E-Mails gehen an einen aufgewärmten Anbieter oder zählen über dem Limit, und die
+pausierten Tage zählen nicht. <UiPath path="providers.warmup.resume" /> setzt den Plan an dem Tag fort, an dem er
+angehalten wurde.
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="warm-up" />
+
+## Prüfen, ob es funktioniert hat
+
+- <UiPath path="nav.providers > providers.tabProviders" /> zeigt den Anbieter als Im Warm-up · Tag N von M, mit dem
+  Warm-up-Limit von heute.
+- <UiPath path="nav.providers > providers.tabRouting" /> zeigt unter der gewichteten Aufteilung die geplanten
+  Erhöhungen des Anteils, und der Tab Kampagne des Routentesters zeigt, was der nächste Massenversand über den Anbieter
+  im Warm-up sendet, was über seinem Limit liegt und was zurückgehalten wird.
+- Nach dem ersten vollständigen Tag enthält das Warm-up-Protokoll einen Eintrag „Tag 1 gezählt“ mit dem Gesendeten und
+  der Bounce-Rate oder nennt den Grund, warum der Tag wiederholt wurde.
+
+## Fehlerbehebung
+
+- **„Jeder verbundene Anbieter hat bereits einen Warm-up-Plan.“**: Jeder Anbieter hat jeweils einen Plan. Ändern Sie
+  stattdessen die Einstellungen des laufenden Plans.
+- **Der Plan bleibt auf demselben Tag**: Weniger als 80 % des Tageslimits sind hinausgegangen, zum Beispiel an einem Tag
+  ohne Massenversand. Der Tag wird wiederholt, bis genug E-Mails hinausgehen; die Tabelle und das Protokoll nennen die
+  Tage, die nicht gezählt haben.
+- **Eine Kampagne wartet beim Warm-up-Limit**: Kein aufgewärmter Anbieter teilt sich die Route Massenversand, oder der
+  Überlauf ist aus. Wählen Sie auf der Seite des Plans oder im Live-Monitor Warten, Verschieben oder Rest abbrechen,
+  oder schalten Sie den Überlauf ein und fügen Sie der Aufteilung einen aufgewärmten Anbieter hinzu.
+- **Der Anteil am Massenversand steigt nicht**: Der Anbieter muss in der gewichteten Aufteilung für Massenversand mit
+  mindestens einem anderen Anbieter sein, dessen Anteil die Differenz abgeben kann. Ein Anteil, den Sie von Hand über den
+  geplanten Wert angehoben haben, bleibt, wie er ist.
+- **Eine Verlangsamung an den ersten Tagen**: Bounces auf einer neuen IP bedeuten meist alte oder nicht verifizierte
+  Adressen. Prüfen Sie die [Listenqualität](/de/audience/list-health/) und die Bounce-Codes im
+  [Ereignisprotokoll](/de/providers/events-and-sync/).
+- **Der Plan hat sich selbst pausiert**: Die Schutzgrenze hat ausgelöst, und der Plan ist so eingestellt, dass er
+  pausiert, bis Sie ihn fortsetzen. Lesen Sie im Warm-up-Protokoll den Tag und den Postfachanbieter mit den meisten
+  Bounces, beheben Sie die Ursache und wählen Sie dann <UiPath path="providers.warmup.resume" />.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="E-Mails über mehrere Anbieter routen" href="/de/providers/routing/" />
+  <LinkCard title="Liste in gutem Zustand halten" href="/de/audience/list-health/" />
+  <LinkCard title="Mit Ihrem eigenen Postal-Server senden" href="/de/providers/postal/" />
+  <LinkCard title="Versand überwachen und automatisch pausieren" href="/de/campaigns/live-monitor/" />
+</CardGrid>

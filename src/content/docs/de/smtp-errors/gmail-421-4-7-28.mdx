@@ -1,0 +1,152 @@
+---
+title: 'Gmail 421 4.7.28: ungewöhnliche Menge an E-Mails'
+description: Gmail 421 4.7.28 heißt, dass Gmail ungewöhnlich viele E-Mails von Ihnen sieht und sie vorerst begrenzt. Warum das passiert und wie Sie es in ReputeCast beheben.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Gmail 421 4.7.28
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
+  - internal/sending/engine/analysis.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  label: Gmail 421 4.7.28
+  order: 1
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 421 4.7.28 ist eine vorübergehende Ablehnung: Gmail hat eine ungewöhnliche Menge an E-Mails, oft unerwünschten,
+von Ihrer IP-Adresse, Ihrer Domain oder einer Link-Domain in Ihren Nachrichten festgestellt und bremst diese E-Mails, bis
+die Menge wieder normal aussieht. Diese Seite erklärt die Antwort und wie Sie Ihren Versand wieder auf ein Tempo bringen,
+das Gmail akzeptiert.
+
+## Was Gmail damit meint
+
+Gmail sendet den Code mit einem von mehreren Texten. Der häufigste nennt die sendende IP-Adresse:
+
+> Gmail has detected an unusual rate of email originating from your IP address _ip-address_. To protect our users from
+> spam, email sent from your IP address has been temporarily rate limited.
+
+Das heißt: Gmail hat ungewöhnlich viele E-Mails von Ihrer IP-Adresse festgestellt und begrenzt E-Mails von dieser
+IP-Adresse vorübergehend, um seine Nutzer vor Spam zu schützen.
+
+Die anderen Varianten nennen, was Gmail begrenzt:
+
+- Ihren IP-Netzblock („unusual rate of unsolicited email originating from your IP Netblock“)
+- Ihre DKIM-Domain oder Ihre SPF-Domain („unusual rate of unsolicited email originating from your DKIM domain“)
+- eine Link-Domain („unusual rate of unsolicited email containing one of your URL domains“)
+- Ihre IP-Adresse, vorerst blockiert statt begrenzt („an unusual amount of unsolicited email originating from your IP
+  address“)
+- wiederholte Message-IDs („this sender exceeded the quota for sending messages that have the same Message-ID“)
+
+Jede Variante verweist auf die [Richtlinien für E-Mail-Absender](https://support.google.com/mail/answer/81126) von
+Google. Quelle:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Google Workspace Help. Geprüft im Oktober 2026.
+
+## Warum es passiert
+
+Gmail begrenzt, wenn Ihr Volumen oder der Anteil Ihrer E-Mails, den seine Nutzer nicht wollen, schneller wächst, als
+Ihre [Absenderreputation](/de/reference/glossary/#sender-reputation) es trägt. Häufige Ursachen:
+
+- Ein Volumensprung von einer IP-Adresse, einer Domain oder einem Versandanbieter ohne
+  [Warm-up](/de/providers/warm-up/).
+- E-Mails an Personen, die sie nicht angefordert oder nicht mehr gelesen haben, was die Spamrate erhöht. Google bittet
+  Absender, die in Postmaster Tools gemeldete Spamrate unter 0,3 % zu halten
+  ([Richtlinien für E-Mail-Absender](https://support.google.com/mail/answer/81126), geprüft im Oktober 2026).
+- Eine Link-Domain in Ihren Inhalten, die Gmail in vielen unerwünschten E-Mails sieht (die URL-Domain-Variante).
+
+## Wie ReputeCast den Code einordnet
+
+- Solange der Versandanbieter es erneut versucht, kommt jeder abgelehnte Versuch als
+  [Zurückstellung](/de/reference/glossary/#deferral) an: ein Ereignis <UiPath path="providers.events.optionDeferred" />
+  im Ereignisprotokoll. Zurückstellungen erscheinen nicht in der Bounce-Tabelle des Kampagnenberichts.
+- Jeder Arbeitsbereich startet mit einer [Antwortregel](/de/reference/glossary/#reply-rule) für diesen Code: Wenn
+  innerhalb von 10 Minuten 5 Antworten von Gmail `421-4.7.28` enthalten, drosselt ReputeCast Gmail für 30 Minuten auf
+  die halbe Rate, noch vor jedem Ratenschwellenwert. Die anderen Postfachanbieter behalten ihr Tempo. Die Regel findet
+  diesen Text überall in der Antwort; zeigt Ihr Ereignisprotokoll den Code anders geschrieben, etwa `421 4.7.28`, fügen
+  Sie in den [Traffic-Regeln](/de/providers/traffic-rules/) eine Regel für `4.7.28` hinzu.
+- Zurückstellungen und Soft Bounces zählen außerdem zu den Zurückstellungs-Schwellenwerten von Gmail, jede Nachricht
+  einmal, über die letzten 10 Minuten. Bei 15 % der an Gmail gesendeten E-Mails drosselt ReputeCast Gmail auf die halbe
+  Rate; bei 40 % [pausiert](/de/reference/glossary/#auto-pause) es den Gmail-Anteil der Kampagne automatisch, oder die
+  ganze Kampagne, wenn der Pausierungsbereich auf die Kampagne gesetzt ist. Jede Stufe wartet auf 500 Nachrichten an
+  Gmail in diesem Zeitraum und mindestens 5 Zurückstellungen.
+- Gibt der Versandanbieter die Versuche auf, meldet er einen Bounce. Der Text von Gmail enthält das Wort „spam“, daher
+  ist die [Bounce-Klasse](/de/reference/glossary/#bounce-class) `spam_block` und die Zeile im Bericht
+  <UiPath path="reports.bounceType.blocked" />. Eine Blockierung wegen der Reputation des Absenders sperrt die Adresse
+  nie, auch wenn der Versandanbieter sie als dauerhaft einstuft (siehe
+  [Wann ReputeCast eine Adresse sperrt](/de/smtp-errors/#wann-reputecast-eine-adresse-sperrt)). Eine dauerhafte zählt
+  zum Schwellenwert für Block- und Richtlinien-Bounces von Gmail.
+- Die Message-ID-Variante oder der bloße Code ohne den Text von Gmail ist `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+[SMTP-Fehlercodes](/de/smtp-errors/#wie-reputecast-eine-bounce-klasse-bestimmt) erklärt die Einordnung.
+
+## Bevor Sie beginnen
+
+- `providers:view`, um das Ereignisprotokoll zu lesen.
+- `providers:manage`, um die Drosselung unter <UiPath path="nav.settings > settings.providers" /> und die
+  Antwortregeln unter <UiPath path="nav.providers > providers.tabTraffic" /> zu ändern.
+- `campaigns:send`, um einen automatisch pausierten Versand fortzusetzen oder seine Raten zu ändern.
+
+## Die Ratenbegrenzung überwinden
+
+<Steps>
+
+1. Finden Sie die Variante. Öffnen Sie <UiPath path="nav.providers > providers.tabEvents" />, setzen Sie
+   <UiPath path="providers.events.typeFilter" /> auf <UiPath path="providers.events.optionDeferred" /> und suchen Sie
+   nach einem Gmail-Empfänger. <UiPath path="providers.events.colCode" /> zeigt den Text von Gmail, der sagt, ob Gmail
+   eine IP-Adresse, eine Domain oder einen Link begrenzt.
+2. Senden Sie langsamer an Gmail. Standardmäßig gibt es für Gmail keine Drosselung. Legen Sie unter
+   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" /> eine Rate für Gmail in
+   Nachrichten pro Sekunde fest. Senken Sie während eines Versands die Rate für Gmail mit
+   <UiPath path="live.adjustRates" /> im [Live-Monitor](/de/campaigns/live-monitor/). Ist ein Versand bereits automatisch
+   pausiert, empfiehlt der Live-Monitor eine niedrigere Rate für den Gmail-Anteil; setzen Sie mit dieser Änderung fort.
+3. Senden Sie zuerst an aktive Leser. Kontakte, die nicht mehr öffnen, erhöhen den Anteil unerwünschter E-Mails. Nutzen
+   Sie die [Stufen der Listenqualität](/de/audience/list-health/) und lassen Sie die Versandbereitschaft Kontakte ohne
+   Interaktion ausschließen, wenn sie davor warnt.
+4. Ist die IP-Adresse, die Domain oder der Versandanbieter neu, folgen Sie einem [Warm-up-Plan](/de/providers/warm-up/),
+   statt die ganze Liste auf einmal anzuschreiben.
+5. Prüfen Sie bei der URL-Domain-Variante die Links der Kampagne. Die [Inhaltsprüfungen](/de/campaigns/content-checks/)
+   markieren gekürzte und gelistete Links; verlinken Sie auf Ihre eigene Domain statt über einen öffentlichen
+   URL-Kürzer.
+6. Beobachten Sie bei den Varianten DKIM-Domain und SPF-Domain die Spamrate Ihrer Domain in Google Postmaster Tools.
+   ReputeCast zeigt Postmaster-Daten unter <UiPath path="nav.deliverability > placement.health" />, sobald es sie
+   erhält; siehe [Zustand von Domains und Anbietern überwachen](/de/deliverability/health/).
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Beim nächsten Versand bleibt die Zurückstellungsrate für Gmail im Live-Monitor niedrig, der Versand wird weder
+  gedrosselt noch automatisch pausiert, und seine Zeile <UiPath path="live.model.thresholdReplies" /> zeigt die Regel
+  `421-4.7.28` deutlich unter ihrer Anzahl.
+- Das Ereignisprotokoll zeigt für Gmail-Empfänger Zustellereignisse statt neuer Zurückstellungen mit 421 4.7.28.
+
+## Fehlerbehebung
+
+- **Die Zurückstellungen halten tagelang an.** Senken Sie die Drosselung für Gmail weiter und senden Sie nur an Ihre
+  aktivsten Kontakte, bis die Zurückstellungen aufhören; erhöhen Sie dann das Volumen schrittweise.
+- **Das Ereignisprotokoll zeigt den Code ohne den Text von Gmail.** Manche Versandanbieter melden nur den Code. Die
+  Klasse ist dann `temporary`; die Lösung ist dieselbe.
+- **Auch die Beschwerden sind hoch.** Lesen Sie [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/)
+  und prüfen Sie, ob jede Nachricht die [Abmeldung mit einem Klick](/de/deliverability/one-click-unsubscribe/) enthält.
+
+## Verwandte Themen
+
+- [SMTP-Fehlercodes](/de/smtp-errors/)
+- [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)
+- [Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/)
+- [Yahoo 421 4.7.0 \[TSS04\]](/de/smtp-errors/yahoo-421-4-7-0-tss04/), die vorübergehende Zurückstellung von Yahoo

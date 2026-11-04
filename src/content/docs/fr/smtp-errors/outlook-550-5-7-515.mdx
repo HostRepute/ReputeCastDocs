@@ -1,0 +1,132 @@
+---
+title: 'Outlook 550 5.7.515 : niveau d’authentification non atteint'
+description: L’erreur Outlook 550 5.7.515 signifie que votre domaine From ne respecte pas les règles d’authentification Microsoft. Corrigez SPF, DKIM et DMARC pour livrer.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: erreur Outlook 550 5.7.515
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/routing/routing.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/senders
+  - web/src/features/connect/domain.messages.ts
+sidebar:
+  label: Outlook 550 5.7.515
+  order: 6
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+L’erreur Outlook 550 5.7.515 est un refus permanent des services de messagerie grand public de Microsoft (Outlook.com,
+Hotmail, Live.com, MSN) : votre domaine From envoie assez d’e-mails pour être considéré comme expéditeur de gros
+volumes, mais ne réussit pas l’authentification que Microsoft exige de ces expéditeurs. La correction se trouve dans vos
+enregistrements DNS. Cette page liste les exigences de Microsoft et l’endroit où ReputeCast vérifie chacune d’elles.
+
+## Ce que veut dire Microsoft
+
+L’erreur complète est :
+
+> 550 5.7.515 Access denied, sending domain `<domain>` does not meet the required authentication level.
+
+> The sender's domain in the 5322.From address doesn't meet the authentication requirements defined for the sender.
+
+Microsoft considère un domaine comme expéditeur de gros volumes quand il envoie 5 000 messages ou plus aux services de
+messagerie grand public de Microsoft, tous avec le même domaine dans l’adresse From. Dès lors, les e-mails de ce domaine
+doivent respecter toutes ces exigences :
+
+1. Des enregistrements SPF et DKIM sont publiés pour le domaine, et les contrôles SPF et DKIM réussissent tous les deux.
+2. Un enregistrement DMARC est publié pour le domaine, au moins `v=DMARC1; p=none`.
+3. Le message réussit DMARC : SPF ou DKIM, au moins l’un des deux, est aligné sur le domaine de l’adresse From.
+
+Source : [Fix NDR error "550 5.7.515" in Outlook.com](https://support.microsoft.com/en-us/outlook/fix-ndr-error-550-5-7-515-in-outlook-com),
+assistance Microsoft. Vérifié en octobre 2026.
+
+## Pourquoi cela arrive
+
+- Un fournisseur d’envoi de votre route signe DKIM avec son propre domaine au lieu du vôtre : DKIM n’est donc pas aligné.
+- SPF échoue pour le domaine de return-path, par exemple après l’ajout d’un fournisseur d’envoi sans publication de ses
+  enregistrements.
+- Le domaine n’a pas d’enregistrement DMARC.
+
+## Comment ReputeCast la classe
+
+- [Classe de rebond](/fr/reference/glossary/#bounce-class) : `policy_block`, d’après les mots « Access denied ». Quand
+  un fournisseur d’envoi ne transmet que le code, sans le texte de Microsoft, la classe est `other`.
+- Ligne du rapport : <UiPath path="reports.bounceType.blocked" />, ou <UiPath path="reports.bounceType.other" /> pour le
+  code seul.
+- Exclusion : le refus concerne votre domaine, pas l’adresse : l’adresse n’est donc pas exclue, que le fournisseur
+  d’envoi enregistre un rebond temporaire ou définitif (voir
+  [quand ReputeCast exclut une adresse](/fr/smtp-errors/#quand-reputecast-exclut-une-adresse)). Dans le rapport de
+  campagne, <UiPath path="reports.investigate" /> sur cette ligne montre ce qu’a dit chaque fournisseur d’envoi, et
+  <UiPath path="reports.retryTitle" /> crée de nouveau un brouillon du numéro pour ces adresses une fois la cause
+  corrigée.
+- Pendant un envoi : un rebond définitif compte dans le seuil de rebonds de blocage/politique d’Outlook, qui met Outlook
+  en pause par défaut ; voir les [valeurs par défaut de la pause automatique](/fr/campaigns/live-monitor/#valeurs-par-défaut-et-limites)
+  et les [règles de trafic](/fr/providers/traffic-rules/).
+- ReputeCast compte outlook.com, hotmail.com, live.com et msn.com, ainsi que leurs domaines nationaux, comme le
+  fournisseur de messagerie Outlook, de même que les domaines dont les enregistrements MX pointent vers Microsoft 365.
+  Le suivi en direct et le rapport affichent ces rebonds sous Outlook.
+
+## Où ReputeCast vérifie les exigences de Microsoft
+
+| Microsoft exige                              | Contrôle avant envoi, groupe <UiPath path="review.groupAuthentication" />                                 |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| SPF réussit                                  | Bloque l’envoi quand le domaine n’a pas d’enregistrement SPF ou que SPF n’autorise pas un fournisseur d’envoi |
+| DKIM réussit                                 | Bloque l’envoi quand DKIM n’est pas vérifié pour un fournisseur d’envoi                                   |
+| Un enregistrement DMARC, au moins `p=none`   | Bloque l’envoi quand l’enregistrement DMARC est manquant ou non valide                                    |
+| DMARC réussit, avec SPF ou DKIM aligné       | Avertit quand moins de 90 % des e-mails sont alignés sur DMARC au cours des 7 derniers jours              |
+
+## Avant de commencer
+
+- `domains:manage` pour voir et vérifier les enregistrements DNS d’un domaine d’envoi.
+- Un accès à l’hébergeur DNS de votre domaine.
+- `providers:view` pour lire le journal des événements.
+
+## Respecter les exigences de Microsoft
+
+<Steps>
+
+1. Confirmez l’erreur. Ouvrez <UiPath path="nav.providers > providers.tabEvents" />, recherchez un destinataire
+   Outlook.com ou Hotmail et lisez <UiPath path="providers.events.colCode" />.
+2. Ouvrez <UiPath path="nav.settings > settings.senders" /> puis le domaine de votre adresse From. Sa page
+   d’enregistrements liste les enregistrements DNS dont chaque fournisseur d’envoi a besoin, chacun avec un état.
+3. Publiez chaque enregistrement qui affiche <UiPath path="connect.domain.statusMissing" /> ou
+   <UiPath path="connect.domain.statusPending" /> : les enregistrements DKIM de chaque fournisseur d’envoi de vos
+   routes, l’enregistrement SPF et un enregistrement DMARC.
+   [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/) donne les étapes pour les hébergeurs DNS
+   courants.
+4. Quand le fournisseur d’envoi prend en charge un domaine MAIL FROM (return-path) personnalisé, configurez-le pour que
+   SPF soit aligné lui aussi.
+5. Ouvrez <UiPath path="composer.reviewSend" /> pour la campagne suivante et vérifiez que le groupe
+   <UiPath path="review.groupAuthentication" /> du [contrôle avant envoi](/fr/campaigns/send-readiness/) réussit.
+
+</Steps>
+
+## Vérifier le résultat
+
+- Chaque enregistrement de la page du domaine affiche <UiPath path="connect.domain.statusVerified" />.
+- Le rapport de la campagne suivante ne contient aucun 550 5.7.515 dans <UiPath path="reports.colCodes" />.
+
+## Dépannage
+
+- **Seuls les e-mails passant par un fournisseur d’envoi sont refusés.** Les enregistrements DKIM ou l’entrée SPF de ce
+  fournisseur manquent. Vérifiez la page d’enregistrements du domaine pour ce fournisseur.
+- **DMARC réussit dans certains rapports et échoue dans d’autres.** Lisez vos
+  [rapports agrégés DMARC](/fr/deliverability/dmarc-reports/) pour trouver les sources qui ne sont pas alignées.
+- **ReputeCast envoie moins de 5 000 messages à Microsoft.** Microsoft compte les messages par domaine From : les
+  e-mails que d’autres systèmes envoient avec le même domaine From comptent donc aussi.
+
+## Voir aussi
+
+- [Codes d’erreur SMTP](/fr/smtp-errors/)
+- [Gmail 550 5.7.26](/fr/smtp-errors/gmail-550-5-7-26/), le blocage d’authentification de Gmail
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)
+- [Ajouter des domaines d’envoi et des expéditeurs](/fr/providers/senders-and-domains/)

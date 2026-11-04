@@ -2,8 +2,14 @@
 // Loaded as content collections in src/content.config.ts; rendered by the components in src/components/.
 import { z } from 'astro/zod'
 
-/** Localized text: English required, Vietnamese optional (components fall back to English). */
-export const loc = z.object({ en: z.string(), vi: z.string().optional() })
+/** Localized text: English required, the other locales optional (components fall back to English). */
+export const loc = z.object({
+  en: z.string(),
+  de: z.string().optional(),
+  es: z.string().optional(),
+  fr: z.string().optional(),
+  vi: z.string().optional(),
+})
 export type Loc = z.infer<typeof loc>
 
 export const cliSchema = z.object({
@@ -86,6 +92,9 @@ export const glossarySchema = z.object({
 export const uiLabelSchema = z.object({
   id: z.string(), // 'nav.settings', 'settings.keys', '<feature>.<key>'
   en: z.string(),
+  de: z.string().optional(),
+  es: z.string().optional(),
+  fr: z.string().optional(),
   vi: z.string().optional(),
   source: z.string(), // upstream file holding the English literal
 })

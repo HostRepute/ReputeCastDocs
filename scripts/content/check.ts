@@ -14,6 +14,7 @@ import {
   type Issue,
   type Page,
 } from './lib.ts'
+import { LOCALES } from '../../src/lib/locales.ts'
 import { topics } from '../../src/lib/topics.ts'
 
 const root = new URL('../../', import.meta.url).pathname
@@ -54,7 +55,7 @@ function shotFiles(locale: string): Set<string> {
 /** Marker counts of every screenshot that has a marker file, keyed `<locale>/<id>`. */
 function shotMarkers(): Map<string, number> {
   const counts = new Map<string, number>()
-  for (const locale of ['en', 'vi']) {
+  for (const locale of LOCALES) {
     const dir = join(root, 'src/assets/screenshots', locale)
     if (!existsSync(dir)) continue
     for (const f of readdirSync(dir).filter((name) => name.endsWith('.json'))) {

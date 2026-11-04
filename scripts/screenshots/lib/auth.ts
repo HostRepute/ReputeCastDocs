@@ -6,6 +6,7 @@
  */
 import { createHmac } from 'node:crypto'
 import type { APIRequestContext } from '@playwright/test'
+import type { Lang } from '../../../src/lib/locales.ts'
 
 export const DEMO_PASSWORD = 'reputecast-demo'
 export const DEMO_TOTP = 'JBSWY3DPEHPK3PXP'
@@ -52,7 +53,7 @@ export async function signIn(
   return (await r2.json()) as SignInResult
 }
 
-export type AppLocale = 'en' | 'vi' | 'default'
+export type AppLocale = Lang | 'default'
 
 /** Sets the signed-in member's app language (PUT /api/v1/me/language); formats follow the language. */
 export async function setLanguage(request: APIRequestContext, app: string, language: AppLocale): Promise<void> {

@@ -1,0 +1,175 @@
+---
+title: Connecter Stripe
+description: "Connecter Stripe à ReputeCast : clé restreinte Stripe à 13 autorisations, webhook abonné à 16 événements, puis clés de test et de production."
+type: how-to
+audience: [admin, publisher]
+permissions: ['payments:manage']
+uiPath: 'nav.earn > earn.overview.connectAction'
+primaryKeyword: clé restreinte Stripe
+sources:
+  - internal/payments/stripe/stripe.go
+  - internal/payments/payments.go
+  - internal/earn/connections.go
+  - internal/earn/webhook.go
+  - internal/earn/jobs.go
+  - web/src/features/earn/ConnectWizard.tsx
+  - web/src/features/earn/connect.messages.ts
+  - web/src/features/earn/PaymentsTab.tsx
+sidebar:
+  order: 2
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Connectez votre compte Stripe à ReputeCast avec une clé restreinte Stripe, pour que les lecteurs puissent payer des
+formules, des cadeaux et des produits numériques. Une [clé restreinte](/fr/reference/glossary/#restricted-key) ne peut
+faire que ce dont ReputeCast a besoin ; les clés secrètes (`sk_live_…`, `sk_test_…`) sont refusées, car elles donnent
+un accès complet à votre compte Stripe, virements compris.
+
+## Avant de commencer
+
+- Il vous faut l’autorisation `payments:manage` (sensible). Voyez quels rôles la détiennent dans
+  [autorisations et rôles](/fr/reference/permissions/).
+- Il vous faut un compte Stripe et l’accès à son tableau de bord (Developers › API keys).
+- L’URL publique de votre instance doit être joignable depuis Internet en HTTPS, car Stripe envoie les événements à
+  `https://<your public URL>/hooks/stripe/<token>`. Voir [reverse proxy et TLS](/fr/self-hosting/reverse-proxy/).
+
+## Les 13 autorisations dont la clé a besoin
+
+Créez la clé dans Stripe sous Developers › API keys › Create restricted key. Réglez ces ressources et laissez tout le
+reste sur None. L’assistant affiche le même tableau, avec un bouton **Copier la liste**.
+
+<TableScroll label="Autorisations de la clé restreinte Stripe">
+
+| Ressource Stripe  | Accès    | Pourquoi                                                   |
+| ----------------- | -------- | ---------------------------------------------------------- |
+| Customers         | Écriture | Créer et retrouver les clients au paiement                 |
+| Checkout Sessions | Écriture | Ouvrir le paiement des formules et des cadeaux             |
+| Customer portal   | Écriture | Gérer la facturation, et l’étape de résiliation            |
+| Products          | Écriture | Un produit par formule                                     |
+| Prices            | Écriture | Prix des formules et des cadeaux                           |
+| Coupons           | Écriture | Offres                                                     |
+| Promotion codes   | Écriture | Codes d’offre et récompenses de parrainage                 |
+| Subscriptions     | Écriture | Lire le statut ; résilier à la demande d’un membre de l’équipe |
+| Invoices          | Lecture  | Paiements, échecs et valeur vie client                     |
+| Charges           | Lecture  | Remboursements et litiges                                  |
+| Webhook endpoints | Écriture | Enregistrer le webhook de ReputeCast                       |
+| Events            | Lecture  | Récupérer les événements qu’un webhook a manqués           |
+| Tax settings      | Lecture  | Indiquer si Stripe Tax est activé                          |
+
+</TableScroll>
+
+## Connecter le compte
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.earn" /> et sélectionnez <UiPath path="earn.overview.connectAction" />. L’assistant compte
+   six étapes : Prestataire, Clé restreinte, Vérification, Webhook, Paramètres et Terminé.
+
+   <Screenshot
+     id="earn-connect"
+     alt="Étape 1 sur 6, Choisissez un prestataire de paiement : les six étapes à gauche, avec 13 autorisations à vérifier et 16 événements pour le webhook ; Stripe est disponible avec abonnements, paiements uniques, essais, coupons, portail client, taxes et mode test ; Paddle et Lemon Squeezy affichent Pas encore disponible."
+   />
+
+2. Choisissez **Stripe** et sélectionnez **Continuer avec Stripe**.
+
+3. Collez la clé restreinte. Une clé qui commence par `rk_test_` connecte le mode test ; `rk_live_` connecte le mode
+   production. Commencez avec une clé de test : le paiement fonctionne alors avec les cartes de test de Stripe et aucun
+   montant n’est débité. La clé est en écriture seule : elle est scellée à l’enregistrement et ne s’affiche plus
+   jamais.
+
+4. Sélectionnez **Vérifier la clé**. ReputeCast fait un appel sans effet par autorisation et affiche le nom du compte,
+   le pays, la devise, le mode et si Stripe Tax est activé. Rien n’est encore créé dans Stripe. S’il manque une
+   autorisation, modifiez la clé dans Stripe et sélectionnez **Revérifier**.
+
+5. Sélectionnez **Enregistrer le webhook**. ReputeCast crée l’endpoint dans votre compte Stripe, l’abonne à
+   16 événements et stocke le secret de signature, scellé comme la clé. Vous n’avez pas besoin d’attendre le premier
+   événement pour continuer.
+
+6. Choisissez les paramètres de paiement : la devise (figée dès qu’une formule a des prix), si les prix incluent les
+   taxes ou si Stripe Tax les ajoute au moment du paiement, et ce que les lecteurs peuvent faire dans le portail client
+   de Stripe. Vous pourrez les modifier plus tard dans
+   <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabPayments" />.
+
+7. Terminez l’assistant. Pour accepter de vrais paiements plus tard, ajoutez la clé de production de la même façon. La
+   clé de test reste en place pour les paiements de test, et les pages publiques passent à la clé de production dès
+   qu’elle est connectée. Chaque clé a son propre webhook.
+
+</Steps>
+
+### Les 16 événements du webhook
+
+```text title="Événements Stripe auxquels ReputeCast s’abonne"
+checkout.session.completed
+checkout.session.async_payment_succeeded
+checkout.session.async_payment_failed
+customer.subscription.created
+customer.subscription.updated
+customer.subscription.deleted
+customer.subscription.trial_will_end
+invoice.paid
+invoice.payment_failed
+invoice.upcoming
+charge.refunded
+charge.dispute.created
+charge.dispute.updated
+charge.dispute.closed
+customer.updated
+customer.deleted
+```
+
+La signature de chaque événement est vérifiée, l’événement brut est stocké, Stripe reçoit immédiatement un `200` et
+l’événement est appliqué juste après. Toutes les heures, ReputeCast demande aussi à Stripe les événements que le
+webhook a manqués : une courte panne de votre serveur ne fait donc perdre aucun paiement. Quand une mise à niveau de
+ReputeCast prend en charge davantage d’événements, ce même contrôle horaire les ajoute au webhook qu’il a enregistré
+et inscrit `payments.webhook_events_added` au [journal d’audit](/fr/team/audit-log/) : vous n’avez donc jamais à
+l’enregistrer de nouveau.
+
+### Le journal des événements de paiement
+
+<UiPath path="nav.earn > earn.tabSettings > earn.settings.tabPayments" /> se termine par le
+<UiPath path="earn.settings.logTitle" /> : chaque événement Stripe à côté de ce que ReputeCast en a fait, des
+24 dernières heures jusqu’aux 90 derniers jours. <UiPath path="lib.download.exportCsv" /> télécharge les événements
+qu’affichent sa recherche et ses filtres. Il faut l’autorisation `subscribers:export`, et chaque export est inscrit au
+journal d’audit.
+
+## Vérifier le résultat
+
+- La pastille à côté du titre de la Monétisation affiche **Stripe**, le nom de votre compte Stripe et **Production** ou
+  **Test**.
+- À l’étape Webhook de l’assistant, **Premier événement reçu** apparaît après le prochain paiement, renouvellement ou
+  paiement de test. Sélectionnez **Essayez un paiement de test pour en envoyer un maintenant** pour en envoyer un
+  vous-même.
+- Dans Stripe › Developers › Webhooks, un endpoint pour votre URL publique liste 16 événements.
+
+## Dépannage
+
+- **« Ceci est une clé secrète »** → vous avez collé une clé `sk_…`. Créez une clé restreinte avec les
+  13 autorisations ci-dessus.
+- **Une autorisation apparaît comme manquante** → modifiez la clé dans Stripe, donnez à cette ressource l’accès indiqué
+  dans le tableau, puis sélectionnez **Revérifier**.
+- **« Stripe n’a pas pu livrer un événement de test »** → Stripe ne parvient pas à joindre votre URL publique.
+  Vérifiez le DNS, le TLS et votre proxy, puis sélectionnez **Revérifier l’adresse**. Vous pouvez aussi ajouter le
+  webhook à la main : dans Stripe › Developers › Webhooks, ajoutez un endpoint à l’adresse qu’affiche l’assistant,
+  sélectionnez les 16 événements et collez son secret de signature dans l’assistant.
+- **La Monétisation signale que le webhook est silencieux** → aucun événement Stripe n’est arrivé depuis 24 heures
+  alors que 50 abonnements ou plus sont actifs. Utilisez **Enregistrer de nouveau** dans
+  <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabPayments" /> pour recréer le webhook. Le contrôle
+  horaire tient les statuts payants à jour en attendant.
+
+<Aside type="danger">
+  Traitez la clé restreinte comme un mot de passe. Si elle fuite, renouvelez-la dans Stripe et collez la nouvelle clé
+  dans <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabPayments" />. Sauvegardez la clé secrète de votre
+  instance, sinon les identifiants Stripe stockés ne pourront pas être lus après une restauration
+  ([sauvegarder et restaurer](/fr/self-hosting/backups/)).
+</Aside>
+
+## Voir aussi
+
+- [Monétiser votre newsletter](/fr/earn/overview/)
+- [Vendre des abonnements payants](/fr/earn/paid-subscriptions/)
+- [Vendre des produits numériques](/fr/earn/digital-products/)
+- [Limites et valeurs par défaut](/fr/reference/limits-and-defaults/)

@@ -1,0 +1,141 @@
+---
+title: 'Yahoo 421 4.7.0 [TSS04]: mensajes aplazados temporalmente'
+description: Yahoo TSS04 (421 4.7.0) indica que Yahoo aplazó tus mensajes por quejas, contenido, reputación de la IP o tráfico inusual. Cómo reducir el ritmo y recuperarte.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Yahoo TSS04
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
+  - internal/sending/engine/analysis.go
+  - internal/ingest/normalize.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+sidebar:
+  label: Yahoo 421 4.7.0 TSS04
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Yahoo TSS04 es un aplazamiento temporal: los servidores de Yahoo responden `421 4.7.0` con la etiqueta `[TSS04]` cuando
+quieren recibir menos correo tuyo por ahora, casi siempre por quejas de usuarios de Yahoo o por un aumento repentino del
+volumen. Tu proveedor de envío vuelve a intentarlo más tarde. Esta página explica en qué se fija Yahoo y cómo reducir
+los aplazamientos.
+
+## Qué quiere decir Yahoo
+
+Los servidores de Yahoo responden con una línea como esta:
+
+```text title="SMTP reply"
+421 4.7.0 [TSS04] Messages from 203.0.113.25 temporarily deferred due to unexpected volume or user complaints - 4.16.55.1; see https://postmaster.yahooinc.com/error-codes
+```
+
+El Sender Hub de Yahoo describe estos errores "TS" como mensaje aplazado temporalmente (traducido del inglés):
+
+> Es un error temporal y tu servidor de correo puede volver a intentar enviar el correo automáticamente más tarde. Es
+> posible que tu mensaje se haya aplazado por uno o varios de estos motivos:
+>
+> - Los correos de tu servidor de correo están generando muchas quejas de usuarios de Yahoo.
+> - El mensaje tenía contenido inaceptable o mostraba características propias del spam.
+> - La IP (`x.x.x.x` o su subred, es decir, .255) tiene mala reputación.
+> - Estamos viendo patrones de tráfico inusuales desde tus servidores de correo.
+
+Fuente: [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yahoo Sender Hub. Comprobado en octubre de
+2026.
+
+## Por qué ocurre
+
+- Los usuarios de Yahoo marcan tu correo como spam. Yahoo pide a todos los remitentes que mantengan la tasa de spam por
+  debajo del 0,3 % ([Sender Requirements & Recommendations](https://senders.yahooinc.com/best-practices/), comprobado en
+  octubre de 2026).
+- El volumen se dispara, por ejemplo en la primera campaña grande desde una dirección IP o un proveedor de envío nuevos.
+- La dirección IP de envío, o su rango, tiene mala reputación.
+- El contenido parece spam.
+
+## Cómo lo clasifica ReputeCast
+
+- Mientras el proveedor de envío reintenta, cada intento rechazado es un
+  [aplazamiento](/es/reference/glossary/#deferral): un evento <UiPath path="providers.events.optionDeferred" /> en el
+  registro de eventos. Los aplazamientos no aparecen en la tabla de rebotes del informe de la campaña.
+- Todos los espacios de trabajo empiezan con una [regla de respuesta](/es/reference/glossary/#reply-rule) para este
+  código: cuando 10 respuestas de Yahoo contienen `TSS04` en 10 minutos, ReputeCast pausa Yahoo durante 2 horas en
+  todas las rutas, antes que cualquier umbral de tasas. Una segunda regla predeterminada hace lo mismo con el antiguo
+  `TS04`. El resto del envío continúa, y Yahoo se reanuda solo al cabo de las 2 horas. Cambia o desactiva las reglas
+  en las [reglas de tráfico](/es/providers/traffic-rules/).
+- Los aplazamientos y los rebotes temporales también cuentan para los umbrales de aplazamientos de Yahoo, cada mensaje
+  una vez, durante los últimos 10 minutos. Al 15 % del correo enviado a Yahoo, ReputeCast reduce Yahoo a la mitad de
+  velocidad; al 40 %, [pausa automáticamente](/es/reference/glossary/#auto-pause) la parte de Yahoo de la campaña, o la
+  campaña entera cuando el ámbito de la pausa es la campaña. Cada nivel espera a que haya 500 mensajes a Yahoo en ese
+  tiempo y al menos 5 aplazamientos.
+- Si el proveedor de envío deja de reintentar, la [clase de rebote](/es/reference/glossary/#bounce-class) es
+  `reputation`, por la etiqueta `TSS04`, y la fila del informe es <UiPath path="reports.bounceType.blocked" />. Un
+  bloqueo por la reputación del remitente nunca suprime la dirección, aunque el proveedor de envío lo considere
+  permanente (consulta
+  [cuándo suprime ReputeCast una dirección](/es/smtp-errors/#cuándo-suprime-reputecast-una-dirección)).
+- Cuando un proveedor de envío solo transmite `421 4.7.0` sin la etiqueta, la clase es `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+## Antes de empezar
+
+- `providers:view` para leer el registro de eventos.
+- `providers:manage` para cambiar los límites de velocidad en <UiPath path="nav.settings > settings.providers" /> y las
+  reglas de respuesta en <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` para reanudar un envío en pausa automática o cambiar sus velocidades.
+
+## Reducir los aplazamientos
+
+<Steps>
+
+1. Confirma el código. Abre <UiPath path="nav.providers > providers.tabEvents" />, pon
+   <UiPath path="providers.events.typeFilter" /> en <UiPath path="providers.events.optionDeferred" /> y busca un
+   destinatario de Yahoo. <UiPath path="providers.events.colCode" /> muestra la etiqueta `[TSS04]` y la dirección IP que
+   aplazó Yahoo.
+2. Reduce el ritmo hacia Yahoo. Por defecto, ReputeCast limita Yahoo a 4 mensajes por segundo en todas las rutas;
+   bájalo en <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />. Durante un envío,
+   baja la velocidad de Yahoo con <UiPath path="live.adjustRates" /> en el
+   [monitor en tiempo real](/es/campaigns/live-monitor/). Después de una pausa automática, el monitor en tiempo real
+   recomienda una velocidad menor para la parte de Yahoo; reanuda con ese cambio.
+3. Reduce las quejas. Envía solo a contactos que pidieron tu correo, excluye a los que dejaron de abrir
+   ([mantener sana tu lista](/es/audience/list-health/)) y mantén la
+   [baja con un clic](/es/deliverability/one-click-unsubscribe/) funcionando para que los lectores se den de baja en
+   lugar de marcar spam.
+4. Si la dirección IP o el proveedor de envío son nuevos, sigue un [plan de calentamiento](/es/providers/warm-up/).
+5. Si los aplazamientos duran mucho tiempo, el Sender Hub de Yahoo sugiere una
+   [Sender Support Request](https://senders.yahooinc.com/contact/#sender-support-request) con los códigos de error y de
+   diagnóstico de tus registros. La exportación CSV del registro de eventos los incluye.
+
+</Steps>
+
+## Comprobar que funciona
+
+- La tasa de aplazamientos de Yahoo en el monitor en tiempo real se mantiene baja durante el siguiente envío, y su fila
+  <UiPath path="live.model.thresholdReplies" /> muestra la regla de `TSS04` muy por debajo de su recuento.
+- El registro de eventos muestra eventos de entrega para los destinatarios de Yahoo en lugar de nuevos aplazamientos
+  `[TSS04]`.
+
+## Solución de problemas
+
+- **El envío se sigue pausando en Yahoo.** Si lo pausó la regla de `TSS04`, deja que Yahoo se reanude solo al cabo de 2
+  horas, o reanúdalo con una velocidad menor con <UiPath path="live.adjustRates" />. Baja el límite de velocidad de
+  Yahoo para los envíos futuros.
+- **Las quejas de Yahoo son altas.** Lee [rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/);
+  por defecto, un envío en curso pausa automáticamente Yahoo cuando su tasa de quejas supera el 0,10 %.
+- **Envías desde una dirección IP compartida.** El Sender Hub de Yahoo indica que, en una dirección IP compartida, el
+  correo de otros dominios puede perjudicar la reputación de tu IP, y sugiere pedir a tu proveedor direcciones IP
+  dedicadas. Una dirección IP dedicada nueva necesita un plan de calentamiento.
+
+## Relacionado
+
+- [Códigos de error SMTP](/es/smtp-errors/)
+- [Gmail 421 4.7.28](/es/smtp-errors/gmail-421-4-7-28/), el límite de velocidad temporal de Gmail
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Supervisar un envío y la pausa automática](/es/campaigns/live-monitor/)

@@ -1,0 +1,230 @@
+---
+title: Sécurité et durcissement
+description: 'Comment ReputeCast assure la sécurité de l’e-mail auto-hébergé : identifiants chiffrés, renouvellement de clé, protection de la connexion, réseau et en-têtes.'
+type: explanation
+audience: [operator]
+primaryKeyword: sécurité de l’e-mail auto-hébergé
+sources:
+  - README.md
+  - internal/secrets/secrets.go
+  - internal/sealed/sealed.go
+  - internal/cli/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/linktoken/linktoken.go
+  - internal/netguard/netguard.go
+  - internal/server/middleware.go
+  - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/authn/password.go
+  - internal/authn/breached.go
+  - internal/accounts/service.go
+  - migrations/00002_workspaces.sql
+  - internal/media/decode.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
+  - web/src/features/composer/inert.ts
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+La sécurité de l’e-mail auto-hébergé signifie que vous détenez les clés : ReputeCast stocke chaque identifiant chiffré
+avec une clé que seul votre serveur possède, vérifie chaque action selon le même modèle d’autorisations et refuse les
+requêtes sortantes vers votre réseau privé, sauf si vous les autorisez. Cette page explique chaque protection, les
+paramètres qui la modifient, et la seule tâche que vous devez planifier vous-même : conserver et renouveler la clé
+secrète.
+
+## Comment ReputeCast protège vos données
+
+1. **Les identifiants sont chiffrés au repos.** Les identifiants des fournisseurs d’envoi, des SMS, des paiements et
+   de l’IA, les secrets client OIDC et de connexion sociale, les jetons HostRepute, les secrets de signature des
+   webhooks, les identifiants des boîtes témoins et les graines des applications d’authentification (TOTP) sont
+   scellés avec AES-256-GCM. Chaque valeur est liée à sa ligne et à son champ, elle ne peut donc pas être copiée sur
+   un autre enregistrement. Ils sont en écriture seule : l’API et l’application ne les renvoient jamais.
+2. **Les mots de passe et les jetons sont hachés.** Les mots de passe utilisent argon2id. Les sessions et les clés API
+   sont des jetons aléatoires de 256 bits, et la base de données n’en stocke que les empreintes SHA-256 ; une clé
+   n’est affichée qu’une fois, à sa création.
+3. **La connexion est difficile à attaquer.** La connexion demande d’abord l’adresse e-mail et répond par des erreurs
+   génériques, pour que personne n’apprenne quelles adresses ont un compte. Les mots de passe erronés bloquent
+   l’adresse e-mail pendant un moment (10 tentatives la bloquent 15 minutes par défaut), et `/api/v1/auth/*` accepte
+   30 requêtes par minute et par adresse IP. L’authentification à deux facteurs avec une application
+   d’authentification, des clés d’accès et des [codes de récupération](/fr/reference/glossary/#recovery-code) à usage
+   unique est obligatoire par défaut pour toute personne qui détient une
+   [autorisation sensible](/fr/reference/glossary/#sensitive-permission).
+4. **Les cookies de session restent dans le navigateur.** Le cookie de session est `HttpOnly` et `SameSite=Lax`, et
+   `Secure` quand `http.public_url` commence par `https://` (ou, hors développement, tant que `auth.cookie_secure` vaut
+   `true`, la valeur par défaut).
+5. **Chaque action passe par un seul contrôle d’autorisation.** Les personnes, les clés API et les agents MCP passent
+   par le même contrôle ; les clés et les agents n’ont jamais plus de droits que la personne qui les a créés, et
+   agissent en leur propre nom, jamais au nom de cette personne. Une action refusée indique qui peut aider au lieu de
+   nommer une clé d’autorisation ; les clients de l’API lisent la clé dans le champ `permission` de l’erreur. Consultez
+   [rôles et autorisations](/fr/team/roles-and-permissions/).
+6. **Le journal d’audit n’est pas modifiable.** Chaque modification et chaque tentative refusée est enregistrée avec
+   l’acteur, l’adresse IP, l’user agent et l’ID de requête. Un trigger de la base de données rejette les modifications
+   des entrées d’audit ; seul le nettoyage lié à la durée de conservation supprime les anciennes.
+7. **Les requêtes sortantes ne peuvent pas atteindre votre réseau.** Les adresses que les personnes saisissent dans
+   l’application (URL des fournisseurs, endpoints de webhooks, outils d’import, flux, serveurs de modèles d’IA, boîtes
+   témoins, import depuis un site web du kit de marque et autres) sont vérifiées avant que ReputeCast ne se connecte,
+   puis de nouveau au moment de la connexion, après la résolution DNS. Les redirections ne sont pas suivies.
+8. **Les navigateurs reçoivent des en-têtes stricts.** Chaque réponse porte une Content Security Policy,
+   `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+   `Cross-Origin-Opener-Policy: same-origin` et une `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
+   est ajouté quand `http.public_url` est en `https://`. Les requêtes intersites des navigateurs qui modifient quelque
+   chose sont rejetées, sauf les webhooks des fournisseurs (`POST /hooks/…`) et les envois de formulaires publics
+   (`POST /p/…`), qui sont vérifiés autrement. Les routes `/api` n’envoient aucun en-tête CORS.
+9. **Les segments SQL ne peuvent que lire.** Le SQL écrit par les utilisateurs s’exécute dans une transaction en
+   lecture seule avec un délai d’expiration des requêtes, sous un rôle qui ne peut lire que les contacts d’un seul
+   espace de travail. Consultez [PostgreSQL](/fr/self-hosting/postgres/#segments-sql).
+10. **Les images sont décodées dans un budget mémoire.** Quelques centaines d’octets d’en-tête d’image peuvent
+    réclamer des gigaoctets de mémoire. Avant que ReputeCast décode un fichier importé, une image générée par l’IA,
+    une image de récapitulatif ou un avatar, il calcule à partir de l’en-tête ce que demande le décodage, JPEG
+    progressifs compris, et décode une image à la fois sur l’ensemble de l’instance. Un avatar, une image d’IA ou de
+    récapitulatif qui dépasse le budget est refusé ; un fichier importé qui le dépasse est stocké tel quel, seulement
+    débarrassé de ses métadonnées.
+11. **Le HTML que l’éditeur n’a pas écrit ne peut pas s’exécuter.** Le HTML collé et le HTML modifié en mode
+    Rédaction sont lus dans un document inerte, et les scripts, les frames, les gestionnaires d’événements et les
+    liens `javascript:` sont supprimés avant que le HTML ne s’affiche dans l’application. Le serveur compile lui-même
+    le MJML et conserve son propre HTML quand le HTML qu’on lui envoie ne correspond pas.
+
+La Content Security Policy de l’application :
+
+```txt title="Content-Security-Policy"
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; object-src 'none'
+```
+
+## La clé secrète
+
+Une seule clé de 32 octets protège toutes les valeurs scellées. ReputeCast la lit dans `secrets.key`
+(`REPUTECAST_SECRETS__KEY`, en base64) ou, quand celle-ci est vide, dans le fichier indiqué par `secrets.key_file`. Si
+le fichier n’existe pas, ReputeCast le crée avec une nouvelle clé, lisible uniquement par son propriétaire (mode
+`0600`), et journalise `generated a new secret key; back it up together with the database`.
+
+La même clé signe aussi les liens de vos e-mails : désabonnement, centre de préférences, version en ligne,
+confirmation, et suivi des ouvertures et des clics. Sauvegardez-la avec la base de données
+([sauvegarder et restaurer](/fr/self-hosting/backups/)), et gardez-la hors des fichiers de dump.
+
+### Renouveler la clé
+
+Renouvelez la clé quand elle a pu fuiter, ou par routine. Les valeurs scellées avec une ancienne clé continuent de
+s’ouvrir tant que cette clé figure dans `secrets.previous_keys`, de même que les liens des e-mails envoyés avant le
+renouvellement ; les nouvelles valeurs et les nouveaux liens utilisent la nouvelle clé. `reputecast secrets reseal`
+transfère ensuite toutes les valeurs stockées vers la nouvelle clé.
+
+<Steps>
+
+1. Affichez une nouvelle clé :
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets generate-key
+   ```
+
+2. Retrouvez la clé actuelle : la valeur de `REPUTECAST_SECRETS__KEY`, ou le contenu du fichier de clé
+   (`/var/lib/reputecast/secret.key` dans Docker).
+
+3. Définissez la nouvelle clé dans `REPUTECAST_SECRETS__KEY` et l’ancienne dans `REPUTECAST_SECRETS__PREVIOUS_KEYS`
+   (séparées par des virgules s’il y en a plusieurs). Avec Docker Compose, transmettez les deux au conteneur de
+   l’application, par exemple dans un `docker-compose.override.yml` à côté de `docker-compose.yml`, avec les valeurs
+   dans `.env` :
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     app:
+       environment:
+         REPUTECAST_SECRETS__KEY: ${REPUTECAST_SECRETS__KEY}
+         REPUTECAST_SECRETS__PREVIOUS_KEYS: ${REPUTECAST_SECRETS__PREVIOUS_KEYS}
+   ```
+
+   Dès que `REPUTECAST_SECRETS__KEY` est défini, le fichier de clé n’est plus lu.
+
+4. Redémarrez chaque processus ReputeCast (`docker compose up -d`) et connectez-vous avec votre application
+   d’authentification pour vérifier que les anciennes valeurs s’ouvrent toujours.
+
+5. Rechiffrez chaque secret stocké avec la nouvelle clé :
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast secrets reseal
+   ```
+
+   Cette commande peut s’exécuter sans risque pendant que ReputeCast tourne, et être relancée. Elle liste chaque type
+   de valeur avec le nombre de valeurs qui utilisaient une ancienne clé, rescellées et illisibles, et elle est
+   enregistrée dans le journal d’audit de l’instance. `--dry-run` compte sans écrire. Elle se termine par une erreur
+   quand des valeurs s’ouvrent sans aucune clé configurée ; il ne devrait y en avoir aucune.
+
+6. Décidez combien de temps l’ancienne clé reste dans `secrets.previous_keys`. Elle ne chiffre plus rien dès que le
+   rescellement n’indique plus rien qui l’utilise, mais elle vérifie toujours les liens des e-mails déjà envoyés. Pour
+   un renouvellement de routine, gardez-la définitivement : les personnes cliquent sur les liens de désabonnement
+   d’anciens e-mails. Après une fuite, retirez-la dès que le rescellement n’indique plus rien qui l’utilise, au moins
+   un jour plus tard, car les formulaires d’inscription distribuent des jetons de courte durée scellés avec elle.
+   `reputecast doctor` avertit tant que des valeurs stockées utilisent encore une ancienne clé.
+
+</Steps>
+
+<Aside type="caution">
+  Retirer une ancienne clé casse les liens de désabonnement, de préférences et de suivi de chaque e-mail envoyé avant
+  le renouvellement. Une variable `REPUTECAST_SECRETS__PREVIOUS_KEYS` vide bloque le démarrage avec
+  `Error: previous secret key: key must be 32 bytes, got 0` : quand vous n’avez pas d’ancienne clé, supprimez la
+  variable et sa ligne dans `docker-compose.override.yml` au lieu de la laisser vide.
+</Aside>
+
+## Réseaux privés
+
+Par défaut, les requêtes sortantes vers des adresses saisies dans l’application sont refusées quand elles se résolvent
+en une adresse privée ou de loopback (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+`100.64.0.0/10`, `::1`, `fc00::/7` et quelques plages réservées), ou quand l’hôte est `localhost`, `*.localhost` ou
+`*.internal`. L’erreur indique `address not allowed: 10.0.0.5 is a private or loopback address`.
+
+Deux paramètres les autorisent, pour des services qui tournent sur votre propre réseau :
+
+| Paramètre                          | Autorise les adresses privées pour                                                                                                              |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `providers.allow_private_networks` | Les URL des fournisseurs (un serveur Postal, l’adaptateur HTTP générique), les adresses des adaptateurs communautaires (`http://` simple uniquement à cet endroit), les tests SMTP, IMAP et POP3, les outils d’import, les flux, les formulaires, les serveurs de modèles d’IA, les tests de placement et d’autres intégrations. |
+| `webhooks.allow_private_networks`  | Les webhooks sortants, les hooks d’intégration (n8n, Zapier, Make) et le flux d’audit.                                                          |
+
+Les adresses link-local et de métadonnées cloud (`169.254.0.0/16`, `fe80::/10`, `100.100.100.200`, `fd00:ec2::254`),
+le multicast et `0.0.0.0/8` restent refusés avec l’un ou l’autre paramètre.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="rate-limits" />
+
+La politique de connexion (longueur du mot de passe, réutilisation, contrôle des mots de passe compromis, obligation
+de l’authentification à deux facteurs, sessions et blocage) se trouve dans
+<UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> ; consultez
+[l’administration de l’instance](/fr/self-hosting/instance-admin/).
+
+## Quand modifier les valeurs par défaut
+
+- **Activez le contrôle des mots de passe compromis** dans <UiPath path="admin.authentication" />, sauf si le serveur
+  est hors ligne. Il est désactivé par défaut. Une fois activé, ReputeCast envoie les 5 premiers caractères de
+  l’empreinte SHA-1 d’un nouveau mot de passe à `api.pwnedpasswords.com` (k-anonymat) ; si ce service ne répond pas, le
+  mot de passe est accepté.
+- **Définissez `http.trusted_proxies`** sur l’adresse de votre reverse proxy. Sans ce paramètre, ReputeCast ignore
+  `X-Forwarded-For`, et tous les clients derrière le proxy partagent une même adresse IP dans les limites de débit, le
+  journal d’audit et le filtre anti-robots, si bien que les ouvertures et les clics ne peuvent pas être distingués.
+  ReputeCast repère une adresse privée qui transmet presque toutes ses requêtes avec des en-têtes de transfert pendant
+  10 fenêtres d’une minute, et invite les admins de l’instance à l’ajouter. Une adresse publique qui envoie la majeure
+  partie du trafic pendant une heure est aussi signalée, mais jamais comme une adresse à ajouter telle quelle : s’il
+  s’agit de votre CDN ou de votre répartiteur de charge, ajoutez les plages d’adresses que publie son fournisseur.
+  Chaque ligne `X-Forwarded-For` compte, dans l’ordre.
+- **Utilisez une URL publique en `https://`** en production, pour que les cookies soient `Secure` et que HSTS soit
+  envoyé. Consultez [reverse proxy et TLS](/fr/self-hosting/reverse-proxy/).
+- **Gardez `/metrics` privé** : il écoute sur son propre port, 9464, que vous ne devriez pas publier. Ne définissez
+  `metrics.token` que pour le collecter via l’adresse publique. Consultez
+  [vérifications de l’état, métriques et journaux](/fr/self-hosting/monitoring/).
+- **Autorisez les réseaux privés** uniquement pour les services qui en ont besoin, et uniquement avec le paramètre qui
+  les couvre.
+
+## Signaler une vulnérabilité
+
+Écrivez à security@hostrepute.com au lieu d’ouvrir une issue publique sur GitHub.
+
+## Voir aussi
+
+- [Sauvegarder et restaurer](/fr/self-hosting/backups/) : la clé et la base de données vont ensemble.
+- [Référence de la configuration](/fr/reference/configuration/) : `secrets.*`, `http.*`, `auth.*` et les paramètres
+  des réseaux privés.
+- [Journal d’audit](/fr/team/audit-log/) : ce qui est enregistré et combien de temps c’est conservé.

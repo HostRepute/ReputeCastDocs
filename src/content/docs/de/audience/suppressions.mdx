@@ -1,0 +1,160 @@
+---
+title: Die Sperrliste
+description: 'So funktioniert die E-Mail-Sperrliste von ReputeCast: eine Liste für alle Versandanbieter, was darauf landet, was ein Eintrag sperrt, wie der Sync läuft.'
+type: explanation
+audience: [publisher, admin]
+permissions: ['subscribers:edit', 'subscribers:export']
+uiPath: 'nav.audience > audience.tabSuppressions'
+primaryKeyword: E-Mail-Sperrliste
+sources:
+  - internal/audience/suppressions.go
+  - internal/suppressions/sync.go
+  - internal/ingest/normalize.go
+  - internal/texting/suppressions.go
+  - web/src/features/audience/SuppressionsPage.tsx
+  - web/src/features/audience/SuppressionDialogs.tsx
+  - web/src/features/audience/suppressions.messages.ts
+  - web/src/features/sms/Suppressions.tsx
+  - internal/providers/ses/ses.go
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Die [Sperrliste](/de/reference/glossary/#suppression-list) enthält jede Adresse, an die ReputeCast nicht senden darf.
+Es gibt eine E-Mail-Sperrliste je Arbeitsbereich, gemeinsam für jeden
+[Versandanbieter](/de/reference/glossary/#sending-provider): Eine Adresse mit Hard Bounce über Amazon SES erhält auch
+über Postmark nie eine E-Mail. Jeder Versand prüft zuerst die Liste, egal was Segment, Liste oder Route sagen.
+
+<Screenshot
+  id="suppressions"
+  alt="Sperrliste mit 2.162 Adressen: Zahlen für Hard Bounces, Beschwerden, Abgemeldet, Manuell sowie Spamfallen und ungültige, der Sync-Status von Amazon SES, Postmark und Postal, der Umschalter E-Mail und SMS mit Filtern und Zeilen, die jeden Grund mit seinem ursprünglichen SMTP-Code zeigen."
+/>
+
+## Wie Adressen auf die Liste kommen
+
+1. **Ereignisse von Versandanbietern.** Ein Hard Bounce, eine Beschwerde oder eine Abmeldung, die der Webhook eines
+   Anbieters meldet, fügt die Adresse sofort hinzu, mit dem Originalcode des Anbieters. Ein Bericht aus einem
+   SMTP-Bounce-Postfach zählt nur, wenn er eine Nachricht betrifft, die ReputeCast gesendet hat, und deren Empfänger
+   nennt. Ein Hard Bounce, der den Absender blockiert (eine Sperre wegen Richtlinie, Spam oder Reputation, etwa eine
+   IP auf einer Blockliste oder ein DMARC-Fehler), sagt nichts über die Adresse aus und fügt sie deshalb nie hinzu:
+   Die Adresse erhält den nächsten Versand, sobald die Sperre behoben ist. Soft Bounces fügen keine Adressen hinzu,
+   mit einer Ausnahme: Hat eine Transaktionsnachricht einen Soft Bounce und hatte die Adresse innerhalb von 7 Tagen 3
+   Soft Bounces, wird sie als ungültige Adresse für alle E-Mails gesperrt.
+2. **Abmeldungen.** Der Abmeldelink, die Abmeldung mit einem Klick und die Abmeldeseite fügen einen Eintrag nur für
+   Marketing hinzu.
+3. **Importe.** Kontakte, die sich im alten Tool abgemeldet, einen Bounce gehabt oder sich beschwert haben, werden zu
+   Sperren, und der Import kann abrufen, was Ihre Versandanbieter bereits sperren. Siehe
+   [Kontakte importieren](/de/audience/import/).
+4. **Adressprüfungen.** Ungültige Adressen, die ein [Prüfdienst](/de/audience/verification/) findet, werden für alle
+   E-Mails gesperrt.
+5. **Ihr Team.** Sperren Sie einen Kontakt in seinem Profil oder gesammelt, fügen Sie Adressen von Hand hinzu, laden
+   Sie eine CSV-Datei hoch oder nutzen Sie die API.
+6. **Synchronisierung mit Anbietern.** Sperren verbundener Anbieter werden abgerufen (siehe unten).
+
+## Was jeder Eintrag sperrt
+
+<TableScroll label="Sperrgründe und was sie sperren">
+
+| Grund | Gilt für | Sperrt |
+| --- | --- | --- |
+| Hard Bounce, Beschwerde, Spamfalle, Ungültige Adresse, Manuell, importierte Einträge | Alle E-Mails | Jeden Stream bei jedem Anbieter, auch Transaktional |
+| Abgemeldet, Rollenadressen | Nur Marketing | Massenversand und Automationen; E-Mails zum Zurücksetzen des Passworts, Belege und andere System- oder Transaktions-E-Mails kommen weiterhin an |
+
+</TableScroll>
+
+Die Tabelle zeigt den Grund jedes Eintrags mit dem Originalcode (zum Beispiel `550 5.1.1 user unknown`), seine Quelle
+(ein Anbieter, das Präferenzcenter, die Abmeldung mit einem Klick, ein Import, ein CSV-Upload, ein Prüfdienst, ein
+Teammitglied oder <UiPath path="audience.suppressionSource.repermission" /> für eine
+[Re-Permission-E-Mail eines Imports](/de/audience/import/), auf die innerhalb von 14 Tagen niemand reagiert hat), die
+Kampagne oder den Ablauf, der ihn ausgelöst hat, und wofür er gilt. Adressen sind auf dem Bildschirm teilweise
+maskiert. Zeilen aus einem Import und die Adressen eines CSV-Uploads samt der Person, die ihn hochgeladen hat, sind
+gruppiert, mit <UiPath path="audience.suppressions.viewRows" />. Ab 10.000 Treffern lautet die Zahl „10.000+ Adressen“.
+
+## Die Liste verwalten
+
+Hinzufügen, Hochladen, Abrufen und Entfernen erfordern `subscribers:edit` (Inhaber, Admin und Bearbeiter). Exportieren
+erfordert `subscribers:export` (sensibel). Jede Änderung steht mit Ihrem Namen im Audit-Protokoll.
+
+- <UiPath path="audience.suppressions.addAddress" />: Fügen Sie bis zu 1.000 Adressen ein, eine pro Zeile oder durch
+  Kommas getrennt, mit einer optionalen Notiz, die als Originalcode angezeigt wird. Sie werden für alle E-Mails
+  gesperrt.
+- <UiPath path="audience.suppressions.importFrom" />:
+  - **Von Ihren Versandanbietern abrufen** kopiert die Bounces, Beschwerden und Abmeldungen, die Ihre verbundenen
+    Anbieter bereits sperren. Anbieter ohne Sperrlisten-API werden übersprungen.
+  - **CSV-Datei hochladen** liest eine Spalte namens `email` oder `email address` (sonst die erste Spalte), bis zu
+    16 MB und 100.000 Adressen, zum Beispiel die aus Ihrem alten Tool exportierte Blockliste. Wählen Sie den Grund für
+    die ganze Datei. Der Upload erscheint als eine Gruppe.
+- **Entfernen** verlangt einen Grund (mindestens 3 Zeichen). Was danach passiert, hängt davon ab, warum die Adresse auf
+  der Liste stand:
+  - Hard Bounce, Beschwerde, Spamfalle oder ungültige Adresse: Der Kontakt ist wieder ausstehend und braucht ein neues
+    Opt-in, bevor er E-Mails erhält; eine fehlerhafte Adresse wird also weiterhin nicht angeschrieben.
+  - Abgemeldet: Entfernen Sie die Adresse nur, wenn die Person um eine erneute Anmeldung gebeten hat. Sie muss ihren
+    Listen trotzdem wieder beitreten, zum Beispiel über das Präferenzcenter oder ein Anmeldeformular.
+  - Manuell: Der Versand läuft bei jedem Anbieter wieder.
+- <UiPath path="audience.suppressions.removeGroup" /> bei der Gruppe eines CSV-Uploads entfernt den ganzen Upload, mit
+  einem Grund unter <UiPath path="audience.suppressions.removeGroupReason" />. Jede Adresse wird behandelt, als hätten
+  Sie sie einzeln entfernt, und das Audit-Protokoll führt einen Eintrag für den Upload.
+- <UiPath path="audience.suppressions.export" />: lädt die ganze Liste als CSV herunter, mit vollständigen Adressen und
+  den Spalten `email`, `reason`, `scope`, `source`, `source_provider`, `original_code`, `campaign_or_flow`,
+  `suppressed_at`.
+
+Es gibt keine Sperren für ganze Domains; jeder Eintrag ist eine Adresse.
+
+<Aside type="caution">
+  Entfernen Sie eine Adresse nur, wenn Sie wissen, dass sie funktioniert und die Person Ihre E-Mails möchte. Wer eine
+  Adresse mit Bounce oder Beschwerde erneut anschreibt, schadet seiner Reputation bei jedem Postfachanbieter.
+</Aside>
+
+## Mit Versandanbietern synchronisieren
+
+Die Leiste unter den Zahlen zeigt für jeden verbundenen Anbieter, wie viele Adressen von ihm abgerufen und an ihn
+übertragen wurden und wann zuletzt synchronisiert wurde. Die Synchronisierung läuft alle 15 Minuten und erneut kurz
+nachdem ein Webhook neue Bounces, Beschwerden oder Abmeldungen gemeldet hat.
+
+<TableScroll label="Sperrlisten-Synchronisierung je Versandanbieter">
+
+| Modus | Versandanbieter | Was passiert |
+| --- | --- | --- |
+| Beidseitig | Amazon SES, Postmark, Mailgun, Mailjet, Resend, SendGrid, SparkPost | Ihre Sperren werden abgerufen, und die von ReputeCast werden an sie übertragen. |
+| Nur abrufen | Brevo | Die Sperren von Brevo werden abgerufen; Brevo nimmt keine Übertragungen an. |
+| Nur lokal | SMTP, Postal, Azure Communication Services, generischer HTTP-Adapter | Ihre Bounces und Beschwerden werden hinzugefügt; ReputeCast prüft die Liste vor jedem Versand. |
+
+</TableScroll>
+
+Eine Übertragung sendet nur Hard Bounces und Beschwerden, die für alle E-Mails gelten, die ältesten zuerst, und eine
+Adresse, die Sie von der Liste entfernen, wird auch von der Liste des Anbieters entfernt. Abmeldungen und andere
+Einträge nur für Marketing werden nie übertragen, weil die Liste eines Anbieters jede Nachricht stoppt, auch E-Mails
+zum Zurücksetzen des Passworts. Eine Liste auf Kontoebene bei Amazon SES, die andere E-Mails des Kontos mitnutzen, wird
+nur gelesen; mit einem SES-Tenant synchronisiert ReputeCast mit der eigenen Liste des Tenants.
+
+ReputeCast selbst stoppt den Versand an eine neue Sperre sofort, weil jeder Versand die Liste prüft. Die Übertragung
+auf die eigene Liste des Anbieters wartet auf die nächste Synchronisierung.
+<UiPath path="audience.suppressions.syncSettings" /> öffnet <UiPath path="providers.events.syncTitle" /> auf der Seite
+der Anbieterereignisse, mit der Richtung jedes Anbieters und <UiPath path="providers.events.syncAll" /> (erfordert
+`providers:manage`). Siehe
+[Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/).
+
+## Standardwerte und Grenzen
+
+Das Sync-Intervall, die 1.000 Adressen, die Sie auf einmal einfügen können, und der CSV-Upload mit 16 MB stehen mit
+allen anderen Standardwerten unter [Grenzen und Standardwerte](/de/reference/limits-and-defaults/). Keiner dieser Werte
+lässt sich ändern.
+
+## SMS-Sperren
+
+Sobald SMS eingerichtet ist, zeigt ein Umschalter **SMS** die Telefonnummern, die keine SMS erhalten können: per SMS
+abgemeldet, Festnetz, nicht vergeben, ungültige Nummer, von Netzbetreibern gefiltert, die Abmeldeliste des Anbieters
+oder manuell. Ein STOP berührt nie die E-Mail. Nummern, die sich per SMS abgemeldet haben, lassen sich nicht entfernen;
+nur die Person selbst kann zurückkommen, indem sie START sendet. Siehe [SMS-Kampagnen senden](/de/channels/sms/).
+
+## Verwandte Themen
+
+- [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/)
+- [Listen, Einwilligung und Double-Opt-in](/de/audience/lists-and-consent/)
+- [Abmeldung mit einem Klick (RFC 8058)](/de/deliverability/one-click-unsubscribe/)
+- [Die Liste gesund halten](/de/audience/list-health/)

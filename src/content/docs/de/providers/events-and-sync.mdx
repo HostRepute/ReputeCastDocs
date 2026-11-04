@@ -1,0 +1,208 @@
+---
+title: Zustellereignisse und Sperrlisten-Synchronisierung
+description: Wie ReputeCast Bounce-Webhook-Ereignisse jedes Versandanbieters empfängt, normalisiert, den Originalcode behält und eine gemeinsame Sperrliste synchronisiert.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Bounce-Webhook-Ereignisse
+sources:
+  - internal/ingest
+  - internal/suppressions/sync.go
+  - internal/providers/eventqueue
+  - internal/providers/ses/queue.go
+  - internal/providers/smtp
+  - internal/providers/manage/review_health.go
+  - internal/providers/provider.go
+  - internal/providers/manage/health.go
+  - internal/app/wire_providers.go
+  - internal/app/wire_sending.go
+  - internal/app/wire_automations.go
+  - web/src/features/providers/EventsPage.tsx
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  order: 17
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Jeder Versandanbieter meldet in seinem eigenen Format, was mit Ihren E-Mails passiert ist: Amazon SES über
+SNS-Benachrichtigungen (an einen Webhook oder an eine SQS-Warteschlange geliefert), Postmark und Mailgun über Webhooks,
+ein SMTP-Server über Bounce-Nachrichten in einem Postfach. ReputeCast macht aus diesen
+Bounce-Webhook-Ereignissen, Zustellungen und Beschwerden ein einheitliches Modell
+[normalisierter Ereignisse](/de/reference/glossary/#normalized-event), behält den Originalcode des Anbieters daneben
+und teilt jeden Bounce und jede Beschwerde über eine gemeinsame [Sperrliste](/de/reference/glossary/#suppression-list).
+
+## Wie Ereignisse ankommen
+
+1. **Der Anbieter ruft ReputeCast auf.** Jeder verbundene Anbieter hat seine eigene Webhook-Adresse,
+   `https://<public URL>/hooks/<adapter>/<token>`. Der Verbindungsassistent registriert sie für Sie beim Anbieter oder
+   zeigt sie zum Einfügen an und weist von außen nach, dass der Anbieter sie erreichen kann. Lesen Sie
+   [Versandanbieter verbinden](/de/providers/connect/).
+2. **ReputeCast prüft die Signatur.** Jeder Adapter verifiziert die Anfrage so, wie sein Anbieter sie signiert (eine
+   SNS-Signatur bei Amazon SES, ein HMAC bei Mailgun, eine ECDSA-Signatur bei SendGrid, ein gemeinsamer
+   Signaturschlüssel bei Anbietern, die nicht signieren). Eine Anfrage, die die Prüfung nicht besteht, wird mit `401`
+   beantwortet und nie verarbeitet; ihre ersten 2 KB werden für die Diagnose aufbewahrt.
+3. **Es speichert die Roh-Payload und antwortet sofort.** Eine verifizierte Payload wird so gespeichert, wie sie
+   ankam, und der Anbieter erhält sofort `200`, damit eine langsame Verarbeitung einen Anbieter nie zu Wiederholungen
+   oder zum Aufgeben bringt. Kann ReputeCast sie nicht speichern, antwortet es mit `429` und `Retry-After: 30` statt mit
+   einem `5xx`, weil manche Anbieter Ereignisse nach einem Serverfehler verwerfen.
+4. **Ein Hintergrundjob normalisiert sie.** Aus der Payload werden ein oder mehrere normalisierte Ereignisse, die der
+   Nachricht zugeordnet werden, die ReputeCast gesendet hat. Erneut zugestellte Ereignisse werden erkannt und einmal
+   gezählt.
+5. **Das Ereignis wirkt.** Es aktualisiert den Status der Nachricht, die Zähler der Kampagne je Postfachanbieter und
+   Versandanbieter, die Zahlen des Automationsschritts, der die Nachricht gesendet hat, und die Tagesstatistik des
+   Anbieters. Hard Bounces, Beschwerden und Abmeldungen, die der Anbieter meldet, setzen die Adresse auf die gemeinsame
+   Sperrliste, und der Kontakt wird als gebounct oder mit Beschwerde markiert. Bei E-Mails aus Kampagnen und
+   Automationen gehen Zustellungen, Zurückstellungen, Bounces und Beschwerden außerdem als `email.delivered`,
+   `email.deferred`, `email.bounced` und `email.complained` an die [Webhook-Endpunkte](/de/developers/webhooks/) des
+   Arbeitsbereichs.
+
+Ereignisse, die nicht über einen Webhook kommen, nehmen ab Schritt 4 denselben Weg:
+
+- **Amazon SES mit der Option Warteschlange**: SNS liefert die Ereignisse an eine SQS-Warteschlange in Ihrem AWS-Konto,
+  und ReputeCast fragt sie mit dem eigenen Zugriff der Verbindung per Long Polling ab. Aus dem Internet muss nichts
+  ReputeCast erreichen. Lesen Sie [Mit Amazon SES senden](/de/providers/amazon-ses/).
+- **SMTP-Server**: ReputeCast liest Bounces und Spam-Meldungen jede Minute aus dem
+  [Bounce-Postfach](/de/reference/glossary/#bounce-mailbox) des Servers. Lässt sich das Postfach 15 Minuten lang nicht
+  lesen, wechselt der Anbieter auf Beeinträchtigt („Bounce-Postfach nicht erreichbar“), und das Team wird
+  benachrichtigt, weil Bounces von diesem Server die Sperrliste erst wieder erreichen, wenn das Postfach lesbar ist.
+- **Abfrage**: ReputeCast fragt die Event-API von Mailgun oder SparkPost jede Minute ab, wenn Sie im
+  Verbindungsassistenten die Abfrage gewählt haben.
+
+Ein Anbieter, dessen Ereignisse ausbleiben, während E-Mails hinausgehen, wird mit stummen Webhooks markiert, und einer,
+der nie ein Ereignis gemeldet hat, wird markiert, sobald E-Mails 30 Minuten überfällig sind;
+[Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/) erklärt, wann das geschieht und was dann mit dem
+Versand passiert.
+
+## Normalisierte Ereignisse
+
+<TableScroll label="Normalisierte Ereignistypen">
+
+| Ereignis      | Bedeutung                                                                          | Sperrt die Adresse |
+| ------------- | ---------------------------------------------------------------------------------- | ------------------ |
+| `delivered`   | Der empfangende Mailserver hat die Nachricht angenommen.                           | Nein               |
+| `deferred`    | Die Zustellung wurde mit einem vorübergehenden Fehler verzögert; der Anbieter versucht es erneut. | Nein |
+| `hard_bounce` | Die Zustellung ist endgültig fehlgeschlagen, zum Beispiel weil das Postfach nicht existiert. | Ja       |
+| `soft_bounce` | Die Zustellung ist aus einem möglicherweise vorübergehenden Grund fehlgeschlagen, etwa einem vollen Postfach. | Nein |
+| `complaint`   | Der Empfänger hat die Nachricht als Spam markiert (eine Meldung über einen Feedback-Loop). | Ja         |
+| `rejected`    | Der Anbieter hat sich geweigert, die Nachricht überhaupt zu senden.                | Nein               |
+| `open`        | Eine Öffnung, die der Anbieter erfasst hat.                                        | Nein               |
+| `click`       | Ein Klick, den der Anbieter erfasst hat.                                           | Nein               |
+| `unsubscribe` | Eine Abmeldung, die beim Anbieter eingegangen ist.                                 | Ja                 |
+
+</TableScroll>
+
+Jedes Ereignis behält den ursprünglichen Ereignistyp des Anbieters (etwa `Bounce · Permanent · General` oder
+`HardFail`), seinen Originalcode (etwa `550 5.1.1`) und den Diagnosetext. Bounces erhalten außerdem eine
+[Bounce-Klasse](/de/reference/glossary/#bounce-class): `mailbox_unknown`, `mailbox_full`, `domain_invalid`,
+`policy_block`, `spam_block`, `reputation`, `temporary` oder `other`. Die Klasse sagt Ihnen, warum eine E-Mail
+fehlgeschlagen ist, unabhängig davon, wie jeder Anbieter es formuliert; lesen Sie
+[Bounces, Beschwerden und Anbietergrenzen](/de/deliverability/bounces-and-complaints/) und die
+[SMTP-Fehlercodes](/de/smtp-errors/).
+
+SMTP-Server melden keine Zustellungen. ReputeCast zählt eine Nachricht als zugestellt (abgeleitet), sobald der Server
+sie mit seiner Antwort `250` annimmt, und fordert Zustellstatusbenachrichtigungen an (Erfolg, Fehler und Verzögerung,
+nur Header), wenn der Server DSN-Unterstützung ankündigt; Bounces und Beschwerden kommen weiterhin als Meldungen im
+Bounce-Postfach an. Lesen Sie [Über einen beliebigen SMTP-Server senden](/de/providers/smtp/).
+
+ReputeCast erfasst Öffnungen und Klicks selbst. Die eigenen Ereignisse `open` und `click` eines Anbieters zählen nur,
+wenn Sie sich entschieden haben, das Tracking dieses Anbieters zu behalten (siehe
+[Tracking-Prüfung beim Anbieter](#tracking-prüfung-beim-anbieter)). Dann werden sie wie die von ReputeCast gezählt:
+Jede Öffnung wird als die einer Person, eines Datenschutz-Proxys (etwa des Vorabrufs von Apple Mail) oder eines Scanners
+eingestuft, und ein Klick muss sich erst bestätigen, bevor er zählt, und wird dem Link der E-Mail zugeordnet.
+
+## Das Ereignisprotokoll
+
+<UiPath path="nav.providers > providers.tabEvents" /> beginnt mit dem <UiPath path="providers.events.logTitle" />: jedes
+Rohereignis eines Anbieters neben seiner normalisierten Form, seinem Originalcode und seiner Diagnose, dem maskierten
+Empfänger und der Kampagne, Automation oder System-E-Mail, zu der es gehört. Filtern Sie nach Versandanbieter oder
+Ereignistyp, oder suchen Sie nach einem Empfänger oder einer Nachrichten-ID.
+
+<Screenshot
+  id="providers-events"
+  alt="Das Ereignisprotokoll: Rohereignisse von Postmark, Amazon SES und Postal neben ihren normalisierten Typen (Zustellung, Hard Bounce, Zurückstellung, Beschwerde, Soft Bounce, abgelehnt), jeweils mit ursprünglichem SMTP-Code und Diagnose."
+/>
+
+<UiPath path="providers.events.exportCsv" /> lädt die gefilterten Ereignisse herunter. Empfänger bleiben maskiert, sofern
+Sie nicht die Berechtigung `subscribers:export` haben, und jeder Export wird im
+[Audit-Protokoll](/de/team/audit-log/) festgehalten.
+
+## Sperrlisten-Synchronisierung
+
+Ein Hard Bounce oder eine Beschwerde bei einem Anbieter stoppt E-Mails an diese Adresse bei allen Anbietern. Die Karte
+<UiPath path="providers.events.syncTitle" /> sagt, was wohin geht:
+
+- **An Anbieter übertragen**: nur Hard Bounces und Beschwerden, die für alle E-Mails gelten. Sie gehen Eintrag für
+  Eintrag hinaus, in der Reihenfolge, in der sie auf die gemeinsame Liste kamen, späte Bounces und importierte
+  Verläufe eingeschlossen.
+- **In ReputeCast behalten**: Abmeldungen und andere Sperreinträge, die nur für Marketing gelten, damit
+  Passwortzurücksetzungen und Belege weiterhin ankommen, denn die Liste eines Anbieters stoppt jede Nachricht. Manuelle
+  Einträge und andere Sperreinträge, die für alle E-Mails gelten, bleiben ebenfalls in ReputeCast, und ReputeCast
+  blockiert sie trotzdem für alle E-Mails, bevor es eine Nachricht übergibt.
+- **Entfernungen werden ebenfalls synchronisiert**: Eine Adresse, die die gemeinsame Liste verlässt, verlässt auch die
+  Liste des Anbieters.
+
+Die Zeile jedes Anbieters nennt die Liste, mit der er synchronisiert, und wie er daran teilnimmt:
+
+- **Beidseitig**: ReputeCast ruft die eigenen Sperreinträge des Anbieters in die gemeinsame Liste ab und überträgt die
+  Hard Bounces und Beschwerden zurück. Amazon SES synchronisiert mit der eigenen Tenant-Liste des Arbeitsbereichs, nie
+  mit Ihrem ganzen AWS-Konto; ohne Tenant teilen sich alle Apps im AWS-Konto die Liste auf Kontoebene von SES, daher
+  liest ReputeCast sie nur. Postmark führt eine Liste je Nachrichten-Stream, Mailgun je Versand-Domain.
+- **Nur abrufen**: Der Anbieter listet seine Sperreinträge auf, aber seine API kann keine neuen annehmen (Brevo).
+  ReputeCast ruft sie ab.
+- **Nur lokal** (angezeigt als Lokal erzwungen): Der Anbieter hat keine Sperrlisten-API (Postal, SMTP, Azure
+  Communication Services, der generische HTTP-Adapter). ReputeCast prüft vor jedem Versand die gemeinsame Liste.
+
+Die Synchronisierung läuft für jeden Anbieter alle 15 Minuten und außerdem kurz nachdem ein Ereignis neue Sperreinträge
+hinzugefügt hat. Um sie sofort auszuführen, wählen Sie <UiPath path="providers.events.syncAll" /> (erfordert
+`providers:manage`). Die Karte zeigt, was jeder Anbieter abgerufen und übertragen hat, wie viele Einträge noch ausstehen,
+die letzte Synchronisierung und gegebenenfalls einen Fehler. Lesen Sie [Die Sperrliste](/de/audience/suppressions/), um
+Adressen von Hand hinzuzufügen, hochzuladen oder zu entfernen.
+
+## Tracking-Prüfung beim Anbieter
+
+Manche Anbieter fügen ein eigenes Öffnungspixel hinzu oder schreiben Links für das Klick-Tracking um. Zusammen mit dem
+Tracking von ReputeCast werden Öffnungen dann doppelt gezählt und Links doppelt umgeschrieben. Einmal am Tag liest
+ReputeCast die Tracking-Einstellungen jedes Anbieters aus, und die Karte <UiPath path="providers.events.trackingTitle" />
+listet auf, was es gefunden hat. Bei einem Anbieter, der trackt, können Sie:
+
+- sein Tracking über die API des Anbieters ausschalten (wenn die API das zulässt),
+- das Tracking des Anbieters behalten und das von ReputeCast ignorieren oder
+- zum Tracking von ReputeCast zurückkehren.
+
+Brevo fügt standardmäßig ein eigenes Tracking hinzu; lesen Sie [Mit Brevo senden](/de/providers/brevo/).
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="providers" />
+
+## Wann Sie sie ändern sollten
+
+- **Ereignisse kommen nicht mehr an**: ReputeCast markiert einen Anbieter als beeinträchtigt, wenn seine Webhooks stumm
+  bleiben, während er E-Mails annimmt. Stumme Webhooks allein lösen einen Alarm aus, kein Failover. Lesen Sie
+  [Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/).
+- **Ihr Server kann keine Webhooks aus dem Internet annehmen**: Stellen Sie die Verbindung bei Amazon SES auf die
+  SQS-Warteschlange um.
+- **Sie haben Signaturschlüssel für Webhooks rotiert**: Anbieter, deren Webhook Sie von Hand eingerichtet haben,
+  brauchen den neuen Schlüssel, sonst werden ihre Ereignisse abgelehnt. Lesen Sie
+  [Versandstandards für den Arbeitsbereich](/de/providers/workspace-defaults/).
+- **Sie sind von einer anderen Plattform umgezogen**: Rufen Sie vor Ihrem ersten Versand die Sperreinträge Ihres alten
+  Anbieters ab. Lesen Sie [Zu ReputeCast wechseln, ohne Einwilligungen zu verlieren](/de/migrate/overview/).
+
+<Aside type="note">
+Rohe Payloads der Anbieter werden 90 Tage aufbewahrt, und das Ereignisprotokoll zeigt die Ereignisse der letzten 90 Tage.
+</Aside>
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="Die Sperrliste" href="/de/audience/suppressions/" />
+  <LinkCard title="Bounces, Beschwerden und Anbietergrenzen" href="/de/deliverability/bounces-and-complaints/" />
+  <LinkCard title="Kampagnenberichte lesen" href="/de/campaigns/reports/" />
+  <LinkCard title="Webhooks empfangen" href="/de/developers/webhooks/" />
+</CardGrid>

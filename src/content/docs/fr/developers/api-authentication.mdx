@@ -1,0 +1,145 @@
+---
+title: Authentification et clés API
+description: "Authentification par clé API dans l’API REST de ReputeCast : préfixes, en-tête Bearer, autorisations, portée, expiration, renouvellement et réponses 401."
+type: reference
+audience: [developer, admin]
+permissions: ['apikeys:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: authentification par clé API
+sources:
+  - internal/api/auth.go
+  - internal/api/api.go
+  - internal/apikeys
+  - internal/authn/tokens.go
+  - internal/authz/authz.go
+  - internal/app/app.go
+  - internal/smtprelay/relay.go
+  - web/src/features/keys
+  - internal/readiness/types.go
+  - internal/campaigns/presence.go
+sidebar:
+  order: 3
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Cette page décrit l’authentification par clé API dans l’API REST de ReputeCast : les identifiants acceptés, ce
+qu’une clé peut faire, et comment les clés sont créées, renouvelées, révoquées et refusées. Pour un premier appel,
+suivez [faire votre premier appel d’API](/fr/developers/api-quickstart/).
+
+## Envoyer la clé
+
+Envoyez la clé dans l’en-tête `Authorization` avec le schéma `Bearer`, à chaque requête :
+
+```http title="Requête"
+GET /api/v1/workspaces/acme-newsletter/campaigns HTTP/1.1
+Host: reputecast.example.com
+Authorization: Bearer rc_live_…
+```
+
+- Quand une requête porte un jeton bearer, la clé seule détermine qui appelle ; les cookies de session sont ignorés.
+- Une clé appartient à un seul [espace de travail](/fr/reference/glossary/#workspace). L’utiliser dans le chemin d’un
+  autre espace de travail répond `403` avec le détail « This key belongs to another workspace. »
+- La seule opération qui n’a pas besoin d’un espace de travail dans son chemin est
+  [`GET /api/v1/integration`](/api/operations/get-integration/) : elle répond avec le slug, le nom et les
+  autorisations de l’espace de travail de la clé appelante.
+
+## Identifiants
+
+Chaque secret est un préfixe suivi de 64 caractères hexadécimaux. ReputeCast ne l’affiche qu’une fois, à sa création
+ou à son renouvellement, et ne stocke que son hash SHA-256.
+
+| Identifiant                                                                   | Créé dans                                                                                                                                                                         | Utilisé pour                                                                                                                                         |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Clé API](/fr/reference/glossary/#api-key) <br /> `rc_live_`                | <UiPath path="nav.settings > settings.keys > keys.createApiKey" />                                                                                                                | L’API REST.                                                                                                                                          |
+| [Clé d’intégration](/fr/reference/glossary/#integration-key) <br /> `rc_live_` | <UiPath path="nav.settings > settings.integrations" />, quand vous connectez Zapier, Make, n8n ou WordPress                                                                       | L’API REST, limitée aux déclencheurs et aux actions activés pour l’intégration.                                                                      |
+| [Clé d’envoi uniquement](/fr/reference/glossary/#send-only-key) <br /> `rc_live_` | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createKey" />, ou <UiPath path="keys.presetSendOnly" /> dans la boîte de dialogue de création | L’API d’envoi transactionnel. Elle détient `transactional:send` et rien d’autre.                                                                     |
+| Clé d’envoi uniquement en mode test <br /> `rc_test_`                         | La même boîte de dialogue, avec <UiPath path="transactional.setup.mode" /> réglé sur <UiPath path="transactional.setup.modeTest" />                                               | L’API d’envoi transactionnel. Elle ne délivre qu’aux membres de l’espace de travail et aux adresses de test autorisées de la clé.                     |
+| Identifiants SMTP <br /> `rc_smtp_`                                           | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createCredential" />                                                                        | Le mot de passe du [SMTP relay](/fr/transactional/smtp-relay/) ; le nom d’utilisateur est l’ID de la clé.                                            |
+| Jeton d’[agent MCP](/fr/reference/glossary/#mcp-agent) <br /> `rc_agent_`     | <UiPath path="nav.settings > settings.keys > keys.addAgent" />                                                                                                                    | Le serveur MCP à `/mcp` (voir [connecter des agents IA avec MCP](/fr/developers/mcp/)). L’API REST l’accepte aussi, avec les autorisations de l’agent. |
+
+L’application web connecte les personnes avec le cookie `rc_session`. Les scripts et les services utilisent des clés.
+
+## Ce qu’une clé peut faire
+
+- **Autorisations.** Vous choisissez de 1 à 60 clés d’[autorisation](/fr/reference/glossary/#permission), les mêmes que
+  celles des rôles. Vous ne pouvez accorder que des autorisations que vous détenez vous-même ; en demander davantage
+  répond `403` avec le code `escalation_denied`. Les autorisations que seules des personnes peuvent détenir ne
+  parviennent jamais à une clé (voir les règles de détention dans [autorisations et rôles](/fr/reference/permissions/)).
+- **Jamais plus que son créateur.** À chaque appel, les autorisations d’une clé sont réduites à celles que détient, à
+  ce moment-là, le membre qui l’a créée. Quand le créateur perd une autorisation, la clé la perd aussi. Quand le
+  créateur quitte l’espace de travail, la clé continue de s’authentifier, mais chaque opération qui nécessite une
+  autorisation répond `403` ; une clé d’intégration répond `owner_deactivated` à la place, et une personne qui
+  dispose de `integrations:manage` peut la reprendre.
+- **Portée des listes.** Une clé peut être limitée à des listes (jusqu’à 100 ; aucune signifie toutes les listes).
+  Elle ne peut pas atteindre de listes en dehors de la portée de son créateur.
+- **Les clés d’intégration** ne fonctionnent que pour les opérations des déclencheurs et des actions activés pour leur
+  intégration ; tout autre appel répond `403` avec le code `integration_operation_denied`. Douze opérations
+  n’acceptent que la clé d’une intégration (ou d’un site WordPress).
+- **Réservé aux personnes.** Créer et renouveler des clés, approuver des envois, la sécurité du compte et
+  l’administration de l’instance nécessitent une personne connectée, tout comme les commentaires et les liens de
+  relecture de l’éditeur, ignorer un avertissement, poursuivre un envoi retenu par sa phase canari, demander à être
+  prévenu par e-mail quand les résultats d’un rapport sont définitifs, déplacer une campagne programmée à une autre
+  heure, définir le plafond marketing de l’espace de travail et envoyer le test d’un modèle transactionnel. Une clé qui
+  les appelle reçoit `403` avec le code `humans_only`. Ces opérations ne figurent pas dans la
+  [référence de l’API](/api/).
+- **Agit en son propre nom.** Une clé ou un agent MCP ne se substitue jamais à la personne qui l’a créé. Le
+  [journal d’audit](/fr/team/audit-log/) nomme la clé ou l’agent, tout comme une exécution du
+  [contrôle avant envoi](/fr/reference/glossary/#send-readiness) qu’il demande : `ranBy` et `startedBy` contiennent son
+  nom, avec `ranByType` ou `startedByType` défini sur `api_key` ou `mcp_agent`. La liste de l’éditeur qui montre les
+  personnes ayant une campagne ouverte n’affiche que des personnes ; une clé ou un agent n’y figure jamais et ne
+  compte jamais comme la présence de son créateur.
+
+L’autorisation que nécessite chaque opération est indiquée sur sa page dans la référence de l’API et dans
+`x-permission` dans le document OpenAPI.
+
+## Cycle de vie des clés
+
+La gestion des clés nécessite l’autorisation `apikeys:manage` (agents MCP : `mcp:manage`). La création et le
+renouvellement se font dans l’application, une fois connecté.
+
+<TableScroll label="Cycle de vie des clés">
+
+| Action                                | Ce qui se passe                                                                                                                                                                                                                                                                         |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Créer                                 | Le secret est affiché une fois. Le journal d’audit enregistre `apikey.created` avec les autorisations et la portée, jamais le secret.                                                                                                                                                   |
+| <UiPath path="keys.rotate" />         | Un nouveau secret avec le même nom, les mêmes autorisations et la même portée est affiché une fois. **L’ancien secret cesse de fonctionner immédiatement.** Une clé qui a une expiration reçoit de nouveau la même durée de vie, comptée à partir d’aujourd’hui. Renouveler une clé expirée la remplace. |
+| Renouveler une clé d’intégration      | Utilisez <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" /> : l’ancienne clé continue de fonctionner pendant 24 heures. La renouveler dans Clés et MCP répond `409` avec le code `managed_by_integration`.                              |
+| <UiPath path="keys.revoke" />         | La clé cesse de fonctionner immédiatement ; les appels reçoivent `401`. Vous pouvez créer une remplaçante avec les mêmes autorisations et la même portée dans la même boîte de dialogue.                                                                                               |
+| Expiration                            | Après sa date d’expiration, la clé répond `401`. Les clés expirées restent listées avec le nombre d’appels qui tentent encore de les utiliser, pour que vous trouviez ce qu’il faut mettre à jour.                                                                                     |
+| Supprimer                             | Retire de la liste une clé expirée ou révoquée. Les clés actives doivent d’abord être révoquées.                                                                                                                                                                                        |
+
+</TableScroll>
+
+La liste des clés indique quand chaque clé a été utilisée pour la dernière fois et depuis quelle adresse IP. Les
+actions d’une clé apparaissent dans le [journal d’audit](/fr/team/audit-log/) avec la clé comme acteur.
+
+## Limites
+
+<LimitsTable area="api-keys" />
+
+## Clés refusées
+
+Une clé refusée répond `401` avec le code `unauthenticated` et l’en-tête
+`WWW-Authenticate: Bearer realm="reputecast"`. Le `detail` indique pourquoi :
+
+| Situation                                        | `detail`                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------ |
+| Aucun en-tête `Authorization` et aucune session  | `Sign in to continue.`                                                   |
+| Un jeton sans préfixe de clé ReputeCast          | `Unknown API key.`                                                       |
+| Une clé inconnue ou révoquée                     | `This API key is revoked or unknown.`                                    |
+| Une clé expirée                                  | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
+
+Les clés d’intégration répondent `401` avec les codes `key_revoked` et `key_expired` à la place, et leur détail nomme
+l’intégration à reconnecter. Quand la base de données ne peut pas confirmer qui appelle, la réponse est `503` avec le
+code `unavailable` : réessayez, la clé reste valide. Tous les codes sont listés dans
+[erreurs de l’API](/fr/developers/api-errors/).
+
+## Voir aussi
+
+- [Faire votre premier appel d’API](/fr/developers/api-quickstart/)
+- [Limites de débit](/fr/developers/api-rate-limits/)
+- [Rôles et autorisations](/fr/team/roles-and-permissions/)
+- [Sécurité et durcissement](/fr/self-hosting/security/)

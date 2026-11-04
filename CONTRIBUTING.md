@@ -8,12 +8,12 @@ This is the standard every page follows. Reviewers check pull requests against i
 1. Run `pnpm dev` and open http://localhost:4321.
 2. Verify what you describe against the upstream code (`../ReputeCast`) and the running demo (`make dev`, then
    `make seed`; sign in as `linh@acme.io` / `reputecast-demo`). When sources disagree, trust them in this order:
-   code > UI message files (`web/src/**/messages.ts`, `messages.vi.ts`) > `docs/ROADMAP.md` "Done so far" notes >
+   code > UI message files (`web/src/**/messages.ts`, `messages.<code>.ts`) > `docs/ROADMAP.md` "Done so far" notes >
    `docs/spec/*` > README, landing page and `docs/integrations/hub.md`.
 3. List the upstream files the page documents in `sources` (repo-relative paths; directories and `{a,b}` braces
    are fine). `pnpm upstream:check` uses them to tell you which pages to review after upstream changes.
 4. Before you open a pull request: `pnpm lint && pnpm check && pnpm lint:prose && pnpm build`.
-5. Every English page has a Vietnamese page at the same path under `src/content/docs/vi/` (see
+5. Every English page has a translation at the same path under `src/content/docs/de/`, `es/`, `fr/` and `vi/` (see
    [TRANSLATING.md](TRANSLATING.md)). CI fails when one is missing.
 
 ## Where pages live
@@ -163,9 +163,9 @@ import UiPath from '~/components/UiPath.astro'
   the box points at. When it lands on something the reader needs, set `badge` on that marker in the manifest.
 
 - Check every marker against the captured image after `pnpm shots`: the box must surround exactly the thing its
-  legend item names, in English and Vietnamese.
+  legend item names, in every locale.
 - `alt` is required. Describe what the screen shows and why it matters on this page, not "screenshot of".
-- Vietnamese pages show the Vietnamese capture of a screenshot when one exists, else the English image with a note
+- A translated page shows the capture in its own language when one exists, else the English image with a note
   under it.
 
 ## SEO rules (checked by `pnpm check`)
@@ -174,8 +174,8 @@ import UiPath from '~/components/UiPath.astro'
 - `description` 90–160 characters, unique per locale, contains `primaryKeyword`.
 - The first paragraph uses `primaryKeyword` naturally.
 - At least three internal links to related pages; descriptive link text.
-- Internal links are root-relative with a trailing slash: `/campaigns/send-readiness/`. On Vietnamese pages,
-  prefix `/vi`: `/vi/campaigns/send-readiness/`.
+- Internal links are root-relative with a trailing slash: `/campaigns/send-readiness/`. On translated pages,
+  prefix the locale: `/vi/campaigns/send-readiness/`, `/de/campaigns/send-readiness/`.
 
 ## Facts
 

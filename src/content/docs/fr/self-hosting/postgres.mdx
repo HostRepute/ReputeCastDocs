@@ -1,0 +1,225 @@
+---
+title: PostgreSQL
+description: 'Configurer PostgreSQL pour ReputeCast : versions prises en charge, utilisateurs et rôle des segments SQL, bases managées, URL de connexion, pool et migrations.'
+type: how-to
+audience: [operator]
+primaryKeyword: configurer PostgreSQL pour ReputeCast
+sources:
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - migrations/03372_m43_contacts_search.sql
+  - migrations/03384_m47_delivery_event_keys.sql
+  - internal/segments/sqlmode.go
+  - internal/db/db.go
+  - internal/db/partition.go
+  - internal/cli/migrate.go
+  - internal/cli/doctor.go
+  - internal/config/config.go
+  - .github/workflows/ci.yml
+  - docs/deploy/partitioning.md
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Cette page explique comment configurer PostgreSQL pour ReputeCast : la base de données, ses utilisateurs, la connexion
+et les migrations du schéma. ReputeCast conserve tout dans PostgreSQL, y compris sa file de tâches, et a besoin d’une
+extension, `pg_trgm`, pour la recherche de contacts.
+
+## Avant de commencer
+
+- PostgreSQL 16, 17 ou 18, géré par vos soins ou fourni par un fournisseur cloud.
+- Un compte administrateur sur ce serveur (par exemple `postgres`) pour créer la base de données et les rôles.
+- La [pile Docker Compose](/fr/self-hosting/docker/) exécute déjà PostgreSQL 18 avec un superutilisateur
+  `reputecast`, qui crée lui-même tout ce qui suit ; cette page concerne toute autre base de données.
+
+## Créer la base de données
+
+<Steps>
+
+1. En tant qu’administrateur, créez l’utilisateur de l’application, sa base de données et le rôle sous lequel
+   s’exécutent les segments SQL :
+
+   ```sql title="setup.sql"
+   CREATE ROLE reputecast LOGIN PASSWORD 'change-me';
+   CREATE DATABASE reputecast OWNER reputecast;
+   CREATE ROLE reputecast_segments NOLOGIN;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+   Créez `reputecast_segments` dès maintenant, avant la première migration : consultez [segments SQL](#segments-sql).
+
+2. Faites pointer ReputeCast vers la base de données avec `database.url` (`REPUTECAST_DATABASE__URL`, ou
+   `DATABASE_URL`) :
+
+   ```txt
+   postgres://reputecast:change-me@db.internal:5432/reputecast?sslmode=require
+   ```
+
+   - Utilisez `sslmode=require` (ou `verify-full` avec l’autorité de certification du fournisseur) quand la base de
+     données se trouve sur une autre machine ; `sslmode=disable` uniquement sur le même hôte ou sur un réseau Docker
+     privé.
+   - Encodez en pourcentage les caractères comme `@`, `:` et `/` dans le mot de passe, ou choisissez un mot de passe
+     qui n’en contient pas.
+
+3. Exécutez les migrations et créez le premier Propriétaire avec `reputecast install` (l’image Docker fait les deux au
+   démarrage).
+
+</Steps>
+
+## PostgreSQL managé
+
+Les bases de données cloud fournissent généralement un administrateur qui n’est pas superutilisateur. ReputeCast
+fonctionne dans ce cas :
+
+- Les migrations n’ont besoin que d’être propriétaires de la base de données. La seule extension qu’elles créent,
+  `pg_trgm`, est fournie avec PostgreSQL et est de confiance, le propriétaire de la base peut donc la créer
+  ([documentation de pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html), vérifié en novembre 2026).
+- Créer `reputecast_segments` nécessite le privilège `CREATEROLE`. Si l’utilisateur de l’application ne l’a pas, créez
+  le rôle avec l’administrateur avant le premier démarrage (étape 1 ci-dessus) ; sinon, ReputeCast s’installe sans
+  problème, mais les segments SQL restent désactivés.
+
+## Dimensionner le pool de connexions
+
+Chaque processus ReputeCast ouvre son propre pool de `database.max_conns` connexions au maximum (20 par défaut). Les
+commandes de la ligne de commande en ouvrent quelques-unes de plus pendant leur exécution (`migrate` et `install` 4,
+`user` 2). Gardez le total sous le `max_connections` de PostgreSQL (100 par défaut), avec de la marge pour vos propres
+outils :
+
+| Processus                                      | Connexions au maximum |
+| ---------------------------------------------- | --------------------- |
+| Un `serve` (tous les rôles), pool par défaut   | 20                    |
+| Trois `serve --role=web,ingest` et un worker   | 4 × 20 = 80           |
+
+Réduisez `database.max_conns` par processus, ou augmentez `max_connections`, quand vous
+[ajoutez des processus](/fr/self-hosting/scaling/).
+
+Chaque connexion exécute `SET jit = off` une fois connectée : les requêtes de ReputeCast sont courtes, et les compiler
+avec JIT prenait plus de temps que de les exécuter. Ce réglage est appliqué après la connexion, et non dans le paquet
+de démarrage, pour que les poolers comme PgBouncer acceptent la connexion.
+
+## Segments SQL
+
+Les [segments SQL](/fr/audience/segments/) exécutent le `SELECT` d’un membre sous `reputecast_segments`, un rôle qui ne
+peut rien lire par lui-même, dans une transaction en lecture seule avec un délai d’expiration des requêtes. Quand le
+rôle manque, le générateur de segments indique que les segments SQL sont désactivés sur cette base de données.
+
+Les migrations configurent les segments SQL quand le rôle existe et que l’utilisateur de l’application en est membre.
+Créez-le avec les commandes qu’affiche ReputeCast, en remplaçant `<app user>` par l’utilisateur de `database.url` :
+
+```sql title="En tant qu’administrateur"
+CREATE ROLE reputecast_segments NOLOGIN;
+GRANT reputecast_segments TO <app user>;
+```
+
+- **Avant le premier démarrage** (recommandé) : exécutez-les, puis installez ReputeCast. Rien d’autre n’est
+  nécessaire.
+- **Sur une base de données déjà migrée**, ou après la restauration d’une sauvegarde sur un nouveau serveur,
+  `reputecast migrate up` seul ne suffit pas : la migration qui crée l’exécuteur de segments a déjà été enregistrée.
+  Après les deux commandes, confiez l’exécuteur au rôle avec l’environnement du serveur, puis redémarrez chaque
+  processus ReputeCast (chacun vérifie la présence de l’exécuteur une seule fois, la première fois qu’il en a besoin) :
+
+  ```sh
+  reputecast migrate segments-role
+  ```
+
+  Cette commande peut être relancée sans risque, et affiche l’état du rôle, comme le fait `reputecast doctor` sur sa
+  ligne `SQL segments role`.
+
+Le rôle est partagé par toutes les bases de données du serveur, et `pg_dump` n’inclut pas les rôles : créez-le sur un
+nouveau serveur avant de [restaurer une sauvegarde](/fr/self-hosting/backups/#restaurer).
+
+## Partitions mensuelles de delivery_events
+
+`delivery_events` contient chaque envoi, livraison, rebond, ouverture et clic, et c’est la plus grande table sur la
+plupart des instances. Depuis la 1.3.0, elle est partitionnée par mois sur `received_at`, le moment où ReputeCast a
+stocké l’événement, de sorte que les index de chaque mois restent petits et que la
+[conservation des données](/fr/team/workspaces/#définir-la-durée-de-conservation-des-données) efface en une passe les
+détails des ouvertures et des clics d’un mois.
+
+- La mise à niveau vers la 1.3.0 convertit la table (`migrate up` et `serve --auto-migrate`), sauf si
+  `reputecast migrate partition-events` l’a déjà fait. Rien n’est copié : la table existante devient
+  `delivery_events_legacy`, la partition de tout ce qui précède le premier mois, et les mois suivants ont leurs propres
+  partitions.
+- Une tâche de maintenance horaire tient prêts le mois en cours et les deux suivants ; `delivery_events_default`
+  récupère tout ce qui en sort, si bien qu’une insertion n’échoue jamais.
+- Les clés de déduplication passent dans `delivery_event_keys` et sont conservées 180 jours. La mise à niveau
+  supprime ensuite l’ancien index unique, `delivery_events_dedupe_key`, en mode concurrent.
+- La conversion détient le verrou des migrations, s’exécute pendant que ReputeCast tourne et peut reprendre après une
+  interruption. Deux étapes lisent toute la table sans bloquer les écritures ; la permutation attend au plus
+  10 secondes le verrou de la table, avec 5 tentatives. Sur un million de contacts avec 3,2 millions d’événements
+  (1,4 Go), elle a pris 5 secondes.
+
+Pour choisir le moment sur une très grande table, [sauvegardez](/fr/self-hosting/backups/), puis convertissez-la avant
+la mise à niveau, à une heure calme :
+
+```sh
+reputecast migrate partition-events
+```
+
+### Annuler la conversion
+
+La version 1.2 fonctionne aussi avec la table partitionnée, un retour à la version précédente n’en a donc pas besoin.
+Pour annuler la conversion, restaurez la sauvegarde effectuée avant celle-ci, ou exécutez ceci en tant qu’utilisateur
+de l’application dans une seule transaction :
+
+```sql title="Annuler le partitionnement"
+BEGIN;
+LOCK TABLE delivery_events IN ACCESS EXCLUSIVE MODE;
+ALTER TABLE delivery_events DETACH PARTITION delivery_events_legacy;
+ALTER TABLE delivery_events_legacy DROP CONSTRAINT delivery_events_before_partitions;
+INSERT INTO delivery_events_legacy SELECT * FROM delivery_events;  -- the newer months' rows
+DROP TABLE delivery_events;                                         -- and its monthly partitions
+ALTER TABLE delivery_events_legacy RENAME TO delivery_events;
+ALTER TABLE delivery_events DROP CONSTRAINT delivery_events_legacy_pkey;
+ALTER TABLE delivery_events ADD CONSTRAINT delivery_events_pkey PRIMARY KEY (id);
+COMMIT;
+```
+
+Renommez ensuite chaque index dont le nom se termine par `_legacy` pour retirer ce suffixe.
+
+<Aside type="caution">
+  `DROP TABLE delivery_events` supprime les partitions mensuelles : faites d’abord une sauvegarde. Une version 1.3
+  convertit de nouveau la table à son prochain `migrate up` ou démarrage avec `--auto-migrate`.
+</Aside>
+
+## Migrations
+
+Le binaire embarque toutes les migrations du schéma : celles de ReputeCast, puis celles de sa file de tâches.
+
+- `reputecast migrate up` applique ce qui est en attente et affiche `Database is up to date.` ; `reputecast install`
+  et `serve --auto-migrate` (le comportement par défaut de l’image Docker) font de même au démarrage.
+- `reputecast migrate status` liste chaque migration avec sa date d’application ou `pending`.
+- `reputecast migrate down` annule uniquement la dernière migration de ReputeCast. Elle est destinée au
+  développement : les migrations descendantes suppriment des données. Restaurez une sauvegarde pour revenir en
+  arrière.
+- Quelques migrations construisent un index en mode concurrent, hors transaction, pour que les imports, les
+  inscriptions et les envois continuent pendant la construction de l’index sur une grande table.
+- Les migrations détiennent un verrou, si bien que des processus démarrés ensemble ne migrent qu’une fois. Un
+  processus dont la base de données n’a pas encore toutes ses migrations fonctionne en lecture seule jusqu’à leur
+  application ([tant que des migrations sont en attente](/fr/self-hosting/upgrades/#tant-que-des-migrations-sont-en-attente)).
+
+## Vérifier le résultat
+
+- `/readyz` répond `ready` ; il répond `503 database unavailable` quand un ping de la base de données prend plus de
+  2 secondes.
+- `reputecast migrate status` n’affiche aucune ligne `pending`, et `reputecast doctor` affiche `ok` pour la base de
+  données, le schéma et le rôle des segments SQL.
+- Dans <UiPath path="nav.audience > audience.tabSegments" />, un segment en mode SQL compte des contacts.
+
+## Dépannage
+
+- **`connect to postgres: …` au démarrage** : hôte, mot de passe ou `sslmode` incorrect ; testez la même URL avec
+  `psql`.
+- **`FATAL: sorry, too many clients already`** : les pools dépassent `max_connections` ; réduisez
+  `database.max_conns`.
+- **Les segments SQL restent désactivés après la création du rôle** : la base de données avait déjà été migrée ;
+  exécutez `reputecast migrate segments-role` et redémarrez ReputeCast.
+
+## Voir aussi
+
+- [Sauvegarder et restaurer](/fr/self-hosting/backups/)
+- [Référence de la configuration](/fr/reference/configuration/#database) : `database.url` et `database.max_conns`.
+- [Mettre à niveau ReputeCast](/fr/self-hosting/upgrades/) : les migrations pendant les mises à niveau.

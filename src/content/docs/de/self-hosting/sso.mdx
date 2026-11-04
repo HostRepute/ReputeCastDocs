@@ -1,0 +1,230 @@
+---
+title: Single Sign-on mit OIDC
+description: 'OIDC SSO einrichten: ReputeCast mit Google Workspace, Microsoft Entra ID, Okta, Keycloak oder Authentik, mit automatischen Konten, Gruppenrollen und Erzwingung.'
+type: how-to
+audience: [operator, admin]
+primaryKeyword: OIDC SSO einrichten
+uiPath: 'shell.userMenuInstanceAdmin > admin.sso'
+sources:
+  - internal/sso
+  - internal/accounts/signin.go
+  - internal/instance/policy.go
+  - migrations/00750_instance_admin_sso.sql
+  - web/src/features/admin/sso
+  - web/src/features/admin/auth/AuthenticationPage.tsx
+  - web/src/features/auth/signin.messages.ts
+sidebar:
+  order: 14
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Wenn Sie OIDC SSO einrichten, melden sich Personen mit dem Identitätsanbieter (IdP) Ihrer Organisation bei ReputeCast
+an, erhalten ihr Konto bei der ersten Anmeldung und bekommen Rollen in Arbeitsbereichen aus ihren IdP-Gruppen.
+ReputeCast spricht OpenID Connect; SAML und SCIM unterstützt es nicht.
+
+## Bevor Sie beginnen
+
+- Sie sind [Instanz-Admin](/de/reference/glossary/#instance-admin). SSO wird einmal für die ganze Instanz eingerichtet.
+- Die öffentliche URL ist endgültig und verwendet `https://`
+  (<UiPath path="shell.userMenuInstanceAdmin > admin.instance > admin.publicUrl" />). Die Umleitungs-URI, die Sie beim
+  IdP registrieren, wird aus ihr gebildet; ändert sich die URL später, aktualisieren Sie auch die Registrierung beim
+  IdP.
+- Sie können in Ihrem IdP eine Anwendung (einen Client) anlegen, und Sie wissen, welche E-Mail-Domains in Ihrer
+  Organisation verwendet werden.
+- <UiPath path="admin.methodSso" /> ist unter <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />
+  eingeschaltet (standardmäßig ist es das).
+
+## Anbieter einrichten
+
+<Screenshot
+  id="sso-setup"
+  alt="Einrichtung von Microsoft Entra ID: Schritt 1, die Voreinstellung mit ausgewähltem Microsoft Entra ID; Schritt 2, die Verbindung mit der zu kopierenden Umleitungs-URI, der Aussteller-URL mit bestandenem Discovery-Test, der Client ID, dem gespeicherten, nicht auslesbaren Client Secret und den Scopes; darunter beginnt Schritt 3, die Claim-Zuordnung."
+/>
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> und wählen Sie
+   <UiPath path="admin.addSsoProvider" />. Wählen Sie unter <UiPath path="sso.cardPreset" /> Ihren IdP: Google
+   Workspace, Microsoft Entra ID, Okta, Keycloak, Authentik oder Generisches OIDC. ReputeCast speichert sofort einen
+   Entwurf; nichts ist live, bis Sie ihn aktivieren.
+
+2. Kopieren Sie unter <UiPath path="sso.cardConnection" /> die <UiPath path="sso.redirectUri" />. Sie hat die Form
+   `<public URL>/auth/oidc/<slug>/callback`, wobei der Slug aus der Voreinstellung stammt: `google`, `entra`, `okta`,
+   `keycloak`, `authentik` oder `oidc` (ein zweiter Anbieter mit derselben Voreinstellung erhält `-2`).
+
+3. Registrieren Sie ReputeCast bei Ihrem IdP als Webanwendung mit dem Authorization Code Flow und der Umleitungs-URI aus
+   Schritt 2. Notieren Sie die Aussteller-URL, die Client ID und das Client Secret.
+
+   <Tabs syncKey="idp">
+   <TabItem label="Google Workspace">
+
+   - Legen Sie in der Google Cloud Console (APIs & Services › Credentials) eine OAuth client ID vom Typ
+     **Web application** an und tragen Sie die Umleitungs-URI als autorisierte Umleitungs-URI ein
+     ([Google-Dokumentation zu OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect),
+     geprüft im Oktober 2026).
+   - Aussteller-URL: immer `https://accounts.google.com` (die Voreinstellung trägt sie ein).
+   - Gruppen: Google sendet über OIDC keinen Groups-Claim, daher ist keine Gruppenzuordnung möglich. Geben Sie neuen
+     Konten über automatische Konten eine Standardrolle (Schritt 7) oder weisen Sie Rollen in den
+     [Teameinstellungen](/de/team/members/) jedes Arbeitsbereichs zu.
+   - Zwei-Faktor-Authentifizierung: ReputeCast vertraut der Anmeldung bei Google als Zwei-Faktor-Anmeldung
+     (2-Step Verification in Workspace erzwungen).
+
+   </TabItem>
+   <TabItem label="Microsoft Entra ID">
+
+   - Legen Sie im Microsoft Entra Admin Center eine App-Registrierung (Plattform Web) an, tragen Sie die Umleitungs-URI
+     ein und legen Sie ein Client Secret an
+     ([Microsoft Identity Platform und OpenID Connect](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc),
+     geprüft im Oktober 2026). Client Secrets in Entra laufen ab: Tragen Sie das Ablaufdatum in ReputeCast ein, damit es
+     anzeigt, wann das Secret zu ersetzen ist.
+   - Aussteller-URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`, mit Ihrer Mandanten-ID (eine GUID) oder
+     verifizierten Domain. Die Mandanten-ID finden Sie unter Entra ID › Overview.
+   - Gruppen: Öffnen Sie in der App-Registrierung **Token configuration**, wählen Sie **Add groups claim** und nehmen
+     Sie Sicherheitsgruppen in das ID-Token auf. Entra sendet **Objekt-IDs** der Gruppen, keine Namen: Fügen Sie die ID
+     in eine Zuordnung ein und geben Sie ihr eine Bezeichnung. Wer in mehr als 200 Gruppen ist, erhält statt des Claims
+     einen Overage-Link; verwenden Sie dann App-Rollen.
+   - Die Zwei-Faktor-Authentifizierung zählt, wenn der Claim `amr` des ID-Tokens MFA angibt (zum Beispiel erzwungen
+     durch Conditional Access).
+
+   </TabItem>
+   <TabItem label="Okta">
+
+   - Legen Sie eine App-Integration für eine OIDC-Webanwendung an, mit der Umleitungs-URI als Sign-in redirect URI
+     ([Okta: customize tokens with a groups claim](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/),
+     geprüft im Oktober 2026).
+   - Aussteller-URL: Ihre Okta-Domain oder ein Authorization Server, etwa `https://acme.okta.com/oauth2/default`. Sie
+     finden sie unter Security › API › Authorization Servers.
+   - Gruppen: Fügen Sie dem Authorization Server einen Groups-Claim hinzu (Filter: Matches regex `.*`). Die
+     Voreinstellung für Okta fordert den Scope `groups` bereits an.
+   - Die Zwei-Faktor-Authentifizierung zählt, wenn der Claim `amr` des ID-Tokens MFA angibt (erzwungen durch eine
+     Sign-on Policy).
+
+   </TabItem>
+   <TabItem label="Keycloak">
+
+   - Legen Sie in Ihrem Realm einen OpenID-Connect-Client mit eingeschalteter Client-Authentifizierung und der
+     Umleitungs-URI als gültiger Redirect-URI an
+     ([Keycloak Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/#_oidc), geprüft im
+     Oktober 2026).
+   - Aussteller-URL: endet mit dem Realm, zum Beispiel `https://sso.acme.io/realms/acme`.
+   - Gruppen: Fügen Sie unter Clients › Ihr Client › Client scopes › der zugehörige dedizierte Scope einen Mapper
+     **Group Membership** hinzu, mit dem Token Claim Name `groups` und ausgeschaltetem Full group path.
+   - Die Zwei-Faktor-Authentifizierung zählt, wenn der Claim `amr` des ID-Tokens MFA angibt (OTP verlangt durch den
+     Browser-Flow des Realms).
+
+   </TabItem>
+   <TabItem label="Authentik">
+
+   - Legen Sie einen OAuth2/OpenID Provider (Confidential Client) mit der Umleitungs-URI an und eine Anwendung, die ihn
+     verwendet ([Authentik OAuth2 provider](https://docs.goauthentik.io/docs/add-secure-apps/providers/oauth2/), geprüft
+     im Oktober 2026).
+   - Aussteller-URL: endet mit dem Slug der Anwendung und einem Schrägstrich, zum Beispiel
+     `https://auth.acme.io/application/o/reputecast/`.
+   - Gruppen: Authentik sendet sie im Claim `groups` des Scopes `profile`. Behalten Sie das standardmäßige
+     Profile-Mapping in den Scope Mappings des Providers bei.
+   - Die Zwei-Faktor-Authentifizierung zählt, wenn der Claim `amr` des ID-Tokens MFA angibt (eine MFA-Stage im
+     Authentication Flow).
+
+   </TabItem>
+   </Tabs>
+
+4. Geben Sie zurück unter <UiPath path="sso.cardConnection" /> die <UiPath path="sso.issuerUrl" /> ein und wählen Sie
+   <UiPath path="sso.testDiscovery" />. ReputeCast ruft `<issuer>/.well-known/openid-configuration` und die
+   Signaturschlüssel ab; der Aussteller muss `https://` verwenden und exakt mit dem Dokument übereinstimmen. Geben Sie
+   dann die Client ID und das Client Secret ein. Das Secret wird verschlüsselt und nie wieder angezeigt; Sie können es
+   nur ersetzen.
+
+5. Scopes: `openid`, `profile` und `email` werden immer angefordert. Fügen Sie weitere nur hinzu, wenn Ihr IdP sie für
+   Gruppen braucht.
+
+6. Prüfen Sie unter <UiPath path="sso.cardClaims" />, welche Claims das Konto füllen: `email`, `email_verified`, `name`
+   und, wo die Voreinstellung Gruppen hat, `groups`. Die Standardwerte passen zu jeder Voreinstellung; ändern Sie einen
+   Namen nur, wenn Ihr IdP einen anderen verwendet. Eine E-Mail-Adresse, die der IdP als nicht verifiziert kennzeichnet,
+   wird abgelehnt. Ein fehlendes `email_verified` zählt nur für die erlaubten Domains aus Schritt 7 als verifiziert.
+
+7. Legen Sie unter <UiPath path="sso.cardAccess" /> fest, wer hineinkommt und mit welcher Rolle:
+
+   - Unter <UiPath path="sso.allowedDomains" /> (bis zu 50) werden Anmeldungen von anderen Domains abgelehnt und
+     protokolliert. Die Anmeldeseite zeigt „Weiter mit …“ für diesen Anbieter nur Personen, deren E-Mail-Adresse zu
+     einer dieser Domains gehört. Ohne Domain kann sich jede Domain anmelden, aber der Button erscheint nicht auf der
+     Anmeldeseite.
+   - Der Schalter <UiPath path="sso.jit" /> legt bei der ersten Anmeldung ein Konto an, in einem Standard-Arbeitsbereich
+     mit einer Standardrolle (Betrachter, sofern Sie keine andere wählen; nie Inhaber). Ausgeschaltet können sich nur
+     Personen anmelden, die bereits ein Konto haben. Die instanzweite <UiPath path="admin.domainAllowlist" /> unter
+     Authentifizierung begrenzt, welche Domains automatische Konten erhalten dürfen.
+   - Wählen Sie unter <UiPath path="sso.groupMapping" /> für jede IdP-Gruppe <UiPath path="sso.addMapping" /> (bis zu
+     200 Zuordnungen). Zuordnungen werden bei jeder Anmeldung erneut angewendet und überschreiben von Hand gesetzte
+     Rollen. Verlässt eine Person eine zugeordnete Gruppe, entfernt die nächste Anmeldung sie aus diesem Arbeitsbereich
+     und widerruft die API-Schlüssel und Agenten, die sie dort erstellt hat; im Standard-Arbeitsbereich automatischer
+     Konten fällt sie stattdessen auf die Standardrolle zurück. Eine Zuordnung macht nie jemanden zum Inhaber und ändert nie
+     einen Inhaber. Sie können nur eine Rolle zuordnen, deren Berechtigungen Sie in diesem Arbeitsbereich selbst haben.
+   - Der Schalter für die Erzwingung schaltet für die erlaubten Domains andere Anmeldemethoden ab: siehe
+     [SSO für Ihre Domains erzwingen](#sso-für-ihre-domains-erzwingen).
+
+8. Wählen Sie unter <UiPath path="sso.cardTest" /> den Button <UiPath path="sso.runTestSignIn" />. Ein Pop-up öffnet
+   Ihren IdP; nach der Anmeldung zeigt ReputeCast die empfangenen Claims und was eine echte Anmeldung bewirken würde
+   (neues oder bestehendes Konto, Arbeitsbereiche, Rollen, Zwei-Faktor-Authentifizierung). Dabei wird niemand
+   angemeldet und nichts geändert.
+
+9. Wählen Sie **Aktivieren** (oder <UiPath path="sso.saveDraft" />, um später fertig zu werden). Zum Aktivieren braucht
+   es einen erfolgreichen Discovery-Test, die Client ID und ein gespeichertes Client Secret.
+
+</Steps>
+
+## SSO für Ihre Domains erzwingen
+
+Die Erzwingung schaltet die Anmeldung mit Passwort, Passkey und Social Login für jedes Konto unter den erlaubten
+Domains des Anbieters ab, sodass sich Personen unter diesen Domains nur noch über den IdP anmelden können. Schalten Sie
+sie unter <UiPath path="sso.cardAccess" /> ein; der Dialog listet auf, wer sich heute und danach wie anmeldet.
+Bestätigen Sie dann mit <UiPath path="sso.turnOnEnforcement" />.
+
+- **Inhaber mit Notfallzugang** behalten die Anmeldung mit Passwort und Zwei-Faktor-Authentifizierung, damit Sie
+  hineinkommen, wenn der IdP ausgefallen ist. Wenn Sie die Erzwingung einschalten, wird jeder Inhaber unter diesen
+  Domains als Inhaber mit Notfallzugang gekennzeichnet; der erste Inhaber, den `reputecast install` angelegt hat, ist
+  ebenfalls einer. Ihre Anmeldungen mit Passwort werden als Notfallzugang protokolliert.
+- Behält kein Inhaber unter der Domain ein Passwort, warnt Sie der Dialog: Fällt der IdP aus, kann sich niemand unter
+  dieser Domain anmelden. Behalten Sie einen Instanz-Admin unter einer anderen Domain, oder siehe
+  [Zugriff über die Kommandozeile wiederherstellen](/de/self-hosting/account-recovery/).
+- Eine Domain kann nur von einem aktivierten Anbieter erzwungen werden. Wird der Anbieter deaktiviert, endet seine
+  Erzwingung.
+
+## Prüfen, ob es funktioniert hat
+
+- Öffnen Sie in einem privaten Browserfenster die Anmeldeseite und geben Sie eine E-Mail-Adresse unter einer erlaubten
+  Domain ein: „Weiter mit …“ führt Sie zum IdP und angemeldet zurück.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> zeigt die Person mit ihrer Anmeldemethode SSO und „Über
+  IdP“ in der Spalte 2FA, wenn der IdP die Zwei-Faktor-Authentifizierung bestätigt hat.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> erfasst die Anmeldung und jedes dabei angelegte Konto
+  und jede dabei vergebene Rolle.
+
+## Fehlerbehebung
+
+- **Discovery fehlgeschlagen**: Die Aussteller-URL ist falsch oder vom Server aus nicht erreichbar. Kopieren Sie sie
+  genau so, wie Ihr IdP sie anzeigt, bei Authentik mit dem Schrägstrich am Ende, und verwenden Sie für Entra ID den
+  mandantenspezifischen Aussteller. Ein bereits aktivierter Anbieter verwendet weiter seinen gespeicherten Aussteller,
+  bis ein neuer Test besteht.
+- **Der IdP meldet, dass die Umleitungs-URI nicht übereinstimmt**: Die öffentliche URL hat sich geändert, oder die URI
+  wurde mit einem Tippfehler eingefügt. Kopieren Sie die <UiPath path="sso.redirectUri" /> erneut und aktualisieren Sie
+  den IdP.
+- **„Kein Konto für …“**: Automatische Konten sind ausgeschaltet und die Person hat kein Konto, oder ihre Domain ist
+  hier oder in der Allowlist der Instanz nicht erlaubt. Laden Sie sie ein oder schalten Sie
+  <UiPath path="sso.jit" /> ein.
+- **Der Test meldet „Groups-Claim fehlt“**: Der IdP hat keine Gruppen gesendet, daher greifen die Zuordnungen nicht;
+  bestehende Rollen bleiben, und neue Konten erhalten die Standardrolle. Folgen Sie oben dem Schritt zu den Gruppen für
+  Ihren IdP und führen Sie den Test dann erneut aus.
+- **„Das Client Secret kann mit dem Schlüssel dieses Servers nicht entschlüsselt werden.“**: Der geheime Schlüssel des
+  Servers hat sich geändert, seit das Secret gespeichert wurde. Ersetzen Sie das Client Secret. Siehe
+  [Sicherheit und Härtung](/de/self-hosting/security/#der-geheime-schlüssel).
+- **Die Anmeldung hat zu lange gedauert**: Eine Anmeldung muss innerhalb von 10 Minuten vom IdP zurückkommen. Beginnen
+  Sie erneut.
+
+## Verwandte Themen
+
+- [Anmeldung über Google, Microsoft und GitHub](/de/self-hosting/social-sign-in/): Anmeldung für eingeladene Personen
+  ohne IdP.
+- [Instanzverwaltung](/de/self-hosting/instance-admin/): die Anmelderichtlinie und die Erzwingung der
+  Zwei-Faktor-Authentifizierung.
+- [Rollen und Berechtigungen](/de/team/roles-and-permissions/): was jede Rolle, die eine Zuordnung vergibt, tun kann.

@@ -1,0 +1,224 @@
+---
+title: Enrutar el correo entre proveedores
+description: Enruta cada flujo por el proveedor adecuado, reparte el tráfico por pesos y configura la conmutación por error entre varios proveedores de correo.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabRouting'
+primaryKeyword: conmutación por error entre varios proveedores de correo
+sources:
+  - internal/routing
+  - internal/mailbox
+  - internal/providers/state/vet.go
+  - internal/sending/engine/audience.go
+  - internal/providers/manage/health.go
+  - internal/connect/streams.go
+  - web/src/features/providers/RoutingPage.tsx
+  - web/src/features/providers/RouteTester.tsx
+  - web/src/features/providers/routing-model.ts
+  - web/src/features/providers/routing.messages.ts
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+El enrutamiento decide qué [proveedor de envío](/es/reference/glossary/#sending-provider) entrega cada correo: por flujo,
+por lista, por dominio del remitente o por el proveedor de buzón del destinatario, con repartos ponderados y un respaldo.
+Esta página configura las rutas y la conmutación por error entre varios proveedores de correo, y después comprueba el
+resultado con el [probador de rutas](/es/reference/glossary/#route-tester) antes de guardar.
+
+## Antes de empezar
+
+- Conecta al menos un proveedor; la conmutación por error y los repartos necesitan dos. Lee
+  [Conectar un proveedor de envío](/es/providers/connect/).
+- Necesitas `providers:manage` para cambiar el enrutamiento. Con `providers:view` puedes abrir la página y usar el
+  probador de rutas.
+
+## Cómo decide una ruta
+
+Cada correo pertenece a uno de los cuatro [flujos](/es/reference/glossary/#stream): Envíos masivos (campañas),
+Automatizaciones, Sistema (confirmaciones de doble opt-in, enlaces de preferencias, invitaciones al equipo) y
+Transaccional (correo de tu producto). Para cada destinatario, ReputeCast:
+
+1. Toma las reglas del flujo.
+2. Comprueba en orden las condiciones del flujo. La primera que se cumple decide: envía a un proveedor o a través de un
+   reparto ponderado propio.
+3. Si no se cumple ninguna condición, usa la ruta predeterminada del flujo: el proveedor principal o un
+   [reparto fijo](/es/reference/glossary/#sticky-split). Cada proveedor del reparto puntúa la dirección con un hash de la
+   dirección y del proveedor, escalado por su peso, y gana la puntuación más alta. Así, el mismo destinatario conserva el
+   mismo proveedor de un envío a otro, el orden del reparto no cambia nada, y al subir el peso de un proveedor solo se le
+   mueve aproximadamente la diferencia; nadie más cambia de proveedor.
+4. Comprueba la lista de supresión compartida. Una dirección suprimida no recibe nada, sea cual sea el proveedor al que
+   se enrutó.
+5. Si el proveedor está en [calentamiento](/es/providers/warm-up/), aplica su plan: los niveles de interacción y el
+   límite del día, y lo que lo supera pasa por un proveedor de la ruta con el calentamiento completado o espera al límite
+   del día siguiente.
+6. Si el proveedor elegido no puede aceptar correo, aplica la política de conmutación por error del flujo. El correo
+   solo pasa a un respaldo que supera sus comprobaciones: disponible, con condiciones que permiten el correo del flujo,
+   con un dominio de envío verificado, con cuota suficiente y fuera del sandbox. Un respaldo que aún está en
+   calentamiento solo acepta correo cuando la política lo permite.
+
+El [proveedor de buzón](/es/reference/glossary/#mailbox-provider) (Gmail, Outlook, Yahoo, iCloud u Otros) sale del
+dominio de la dirección. Los dominios de consumo como `gmail.com` se reconocen por su nombre; el dominio propio de una
+empresa se clasifica por sus registros MX: Google Workspace cuenta como Gmail, Microsoft 365 como Outlook, los dominios
+alojados en Yahoo como Yahoo y los dominios personalizados de iCloud como iCloud, y el alojamiento se guarda como un
+detalle. Un proceso en segundo plano consulta los dominios de los contactos nuevos, y un envío consulta lo que aún queda
+pendiente antes de formar su audiencia. Una dirección cuyo dominio aún no se ha consultado cuenta como Otros.
+
+## Configurar las rutas
+
+<Steps>
+
+1. Abre <UiPath path="nav.providers > providers.tabRouting" />. Hay una tarjeta por flujo, con el probador de rutas y
+   la configuración compartida entre proveedores al lado.
+
+   <Screenshot
+     id="providers-routing"
+     alt="Enrutamiento y conmutación por error de Envíos masivos: un reparto ponderado fijo 90/10 entre Amazon SES y Postal, que está en calentamiento en el día 9 de 21, dos condiciones (una envía solo a Amazon SES y la otra a un reparto 70/30), y el probador de rutas que responde Amazon SES para una dirección de Outlook paso a paso."
+   />
+
+2. En Automatizaciones, Sistema y Transaccional, elige el <UiPath path="providers.routing.primary" /> y, si tienes un
+   segundo proveedor, el <UiPath path="providers.routing.fallback" />. El respaldo toma el relevo cuando el principal no
+   puede aceptar correo.
+
+3. En Envíos masivos, configura el <UiPath path="providers.routing.weightedSplit" />. Cada fila es un proveedor con su
+   proporción en porcentaje; las proporciones tienen que sumar 100 % para poder guardar.
+   <UiPath path="providers.routing.addToSplit" /> añade un proveedor conectado; un proveedor al 0 % puede salir del
+   reparto. Arrastra una fila, o usa sus flechas arriba y abajo desde el teclado, para reordenarla: el orden solo cambia
+   cómo se lee la barra, y nadie cambia de proveedor. Mientras un proveedor del reparto está en
+   [calentamiento](/es/providers/warm-up/), el planificador de calentamiento aumenta su proporción según el calendario y
+   la tarjeta muestra los pasos previstos.
+
+4. Añade condiciones cuando un tipo de correo deba usar siempre ciertos proveedores:
+   <UiPath path="providers.routing.addCondition" />. Envíos masivos y Automatizaciones pueden comprobar la lista, el
+   dominio del remitente o el proveedor de buzón del destinatario; Transaccional comprueba la categoría transaccional o
+   el proveedor de buzón. El correo de Sistema no tiene condiciones. Debajo del proveedor de la condición, elige
+   <UiPath path="providers.routing.thenOne" />, o <UiPath path="providers.routing.thenSplit" /> con una proporción por
+   proveedor (también un reparto fijo). Lo que escribas en <UiPath path="providers.routing.why" /> se muestra junto a la
+   condición, por ejemplo "Outlook es estricto con las IP nuevas".
+
+5. Configura la <UiPath path="providers.routing.failoverPolicy" /> de Envíos masivos. La tarjeta indica el disparador
+   que usa realmente la comprobación de estado: al menos la mitad de las llamadas al proveedor fallan durante 3 minutos
+   (5 llamadas o más), o fallan 2 comprobaciones de estado seguidas. Los webhooks sin eventos por sí solos generan una
+   alarma, no una conmutación. Elige el <UiPath path="providers.routing.fallback" /> y, después, qué pasa cuando se
+   activa el disparador (<UiPath path="providers.routing.whenTriggerFires" />):
+   - <UiPath path="providers.routing.pauseAndAsk" />: los destinatarios restantes se retienen y se te pregunta. Pasar un
+     envío masivo a un proveedor sin calentar puede dañar su reputación.
+   - <UiPath path="providers.routing.warmOnly" />: el envío se mueve solo en cuanto el respaldo ha terminado su
+     calentamiento; hasta entonces, funciona como pausar y preguntar.
+   - <UiPath path="providers.routing.automatic" />.
+
+   Debajo de la política, la tarjeta muestra las comprobaciones que debe superar el respaldo antes de cualquier
+   conmutación, cada una con una marca: disponible, condiciones que permiten Envíos masivos, dominio de envío
+   verificado, cuota o límite de calentamiento de hoy disponible, calentamiento completado y fuera del sandbox. Si falla
+   alguna comprobación, los Envíos masivos pausan y preguntan en su lugar.
+
+6. El correo de Automatizaciones, Sistema y Transaccional conmuta automáticamente a su respaldo, porque tiene que seguir
+   saliendo; cada tarjeta indica su disparador, y el tráfico vuelve al principal tras 10 minutos sin fallos. Antes de
+   tomar el relevo, el respaldo supera las mismas comprobaciones. Si falla una, ReputeCast sigue reintentando con el
+   principal y te avisa en lugar de conmutar. Sin respaldo, el correo espera hasta que el proveedor se recupere.
+
+7. En el correo Transaccional, <UiPath path="providers.routing.firstInLine" /> hace que los mensajes transaccionales
+   salgan primero en un proveedor que también envía una campaña, dentro de la velocidad del proveedor.
+
+8. Comprueba tus cambios antes de guardar. En cuanto cambias algo, aparece una barra fija en la parte inferior de la
+   página con <UiPath path="providers.routing.unsavedTitle" />. Indica qué cambia al guardar en cada flujo, por ejemplo
+   "Reparto de Envíos masivos 90/10 → 85/15 · unos 1600 destinatarios de Envíos masivos pasan de SES a Postal; nadie más
+   cambia de proveedor", y, para los demás flujos, la proporción de sus direcciones (de los últimos 30 días) que se
+   movería. Cada tarjeta de flujo cambiada lleva la insignia Cambio sin guardar.
+
+9. Elige <UiPath path="providers.routing.saveRouting" />, o <UiPath path="providers.routing.discard" /> para volver al
+   enrutamiento guardado. Solo se guardan los flujos que cambiaste. Los envíos nuevos usan el enrutamiento de inmediato;
+   los envíos ya en curso conservan su ruta.
+
+</Steps>
+
+En un móvil, las tarjetas de los flujos se apilan y el probador de rutas aparece después:
+
+<Screenshot
+  id="providers-routing-mobile"
+  alt="La página de enrutamiento en un móvil: la tarjeta de Envíos masivos con su reparto ponderado fijo, la proporción de cada proveedor con flechas arriba y abajo, los pasos de calentamiento previstos para Postal y la primera condición."
+/>
+
+<Aside type="caution">
+Antes de guardar, ReputeCast comprueba que las condiciones de cada proveedor de Envíos masivos permitan el marketing
+masivo. Si alguna no lo permite, muestra el cambio y su aviso y ofrece una solución (crear un flujo Broadcast de
+Postmark, usar otro proveedor o guardar sin respaldo); tus demás cambios se conservan mientras lo corriges. Si aun así
+lo mantienes, queda en el registro de auditoría, y la [revisión previa](/es/campaigns/send-readiness/) bloquea todos los
+envíos masivos hasta que cambie la ruta. Lee
+[Elegir un proveedor de envío](/es/providers/choose/#condiciones-de-marketing-masivo).
+</Aside>
+
+## Probar una ruta
+
+El <UiPath path="providers.routing.testerTitle" /> prueba el enrutamiento guardado y, mientras tienes cambios sin
+guardar, indica qué cambiarían.
+
+- **<UiPath path="providers.routing.tabRecipient" />**: elige el flujo, una lista y un dominio del remitente (o una
+  plantilla transaccional) y escribe una dirección. Responde con el proveedor, el proveedor de buzón y el host MX del que
+  se obtuvo, el selector DKIM, el costo de un mensaje, cada paso de la decisión (la condición que se cumplió, o el grupo
+  en el que cae el hash de la dirección en un reparto entre dos) y qué pasa si el proveedor falla. Con un reparto sin
+  guardar, añade si esta dirección se queda en su proveedor o se mueve.
+- **<UiPath path="providers.routing.tabCampaign" />**: pasa la audiencia del próximo envío masivo (el próximo
+  programado o el último borrador editado) por el enrutamiento en su día de envío. Muestra los destinatarios por
+  proveedor, las condiciones que se cumplieron, los contactos en retirada que se dejan fuera y lo que haría el envío: los
+  destinatarios fuera de los niveles de interacción de un proveedor en calentamiento o por encima de su límite que pasan
+  por un proveedor con el calentamiento completado, los destinatarios retenidos por el límite hasta el del día siguiente
+  o mientras el plan está en pausa, y adónde llevaría su parte un proveedor que ahora no puede enviar. Con cambios sin
+  guardar, indica cuántos destinatarios se mueven. Una audiencia grande se estima a partir de sus primeros destinatarios
+  y se escala.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="routing" />
+
+## Comprobar que funciona
+
+- La cabecera de la página muestra cuándo se guardó el enrutamiento y quién lo hizo.
+- <UiPath path="nav.providers > providers.tabProviders" /> muestra el enrutamiento de cada flujo como una barra con la
+  proporción de cada proveedor, el respaldo y la política de conmutación por error.
+- El probador de rutas da el proveedor que esperas para una dirección de cada lista y de cada proveedor de buzón que
+  tiene una condición, y su pestaña Campaña muestra el reparto que planeaste.
+- Durante un envío, el [monitor en tiempo real](/es/campaigns/live-monitor/) muestra la parte de la campaña de cada
+  proveedor.
+
+## Solución de problemas
+
+- **"Los pesos suman 95 %. Haz que sumen 100 % para guardar."**: cambia una proporción para que el total sea 100. La
+  misma regla se aplica al reparto de una condición.
+- **"Envíos masivos: hubo cambios mientras editabas"**: alguien guardó el enrutamiento, o el planificador de
+  calentamiento aumentó una proporción, desde que abriste la página. No se guardó nada y tus cambios siguen ahí. Elige
+  <UiPath path="providers.routing.conflictShowLatest" /> para empezar de nuevo desde el enrutamiento más reciente, o
+  <UiPath path="providers.routing.conflictKeepMine" />. Un cambio en otro flujo nunca bloquea tu guardado. A través de la
+  [operación de la API save-routing](/api/operations/save-routing/), cada flujo se guarda con la versión con la que se
+  leyó, y uno desactualizado se rechaza con `409` y el código `routing_changed`.
+- **"No se pudo actualizar el enrutamiento"**: falló una actualización en segundo plano. Tus cambios siguen en la página
+  y el correo sigue saliendo con el enrutamiento guardado.
+- **"El flujo Envíos masivos no tiene proveedor principal"**: todos los flujos salvo Transaccional necesitan un
+  principal. Transaccional puede quedarse sin ruta mientras tu producto no envía correo.
+- **La tarjeta de un flujo indica que un proveedor "no puede aceptar correo ahora"**: un proveedor que usa la ruta está
+  caído, en pausa o sus webhooks no tienen eventos. Su correo conmuta o espera según la política; cuando es el respaldo,
+  el flujo no tiene un respaldo que funcione hasta que vuelva. Lee
+  [Estado de los proveedores y caídas](/es/providers/health-and-outages/).
+- **Un aviso de que el respaldo está en calentamiento**: la protección del calentamiento bloquea la conmutación hacia él
+  hasta el día que indica el aviso. Con la política de solo proveedores con el calentamiento completado, los Envíos
+  masivos pausan y preguntan mientras tanto.
+- **El probador indica que el correo esperaría**: el proveedor está caído o sus webhooks no tienen eventos, así que su
+  parte espera por él o por el respaldo.
+- **El probador indica que la dirección está suprimida**: no se le envía nada en ningún proveedor. Lee
+  [La lista de supresión](/es/audience/suppressions/).
+- **Una dirección de Google Workspace o Microsoft 365 aparece como Otros**: su dominio aún no se ha consultado, o el
+  servidor no puede llegar al DNS. Lee [Requisitos del sistema](/es/self-hosting/requirements/).
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Estado de los proveedores y caídas" href="/es/providers/health-and-outages/" />
+  <LinkCard title="Calentar un proveedor o una IP nuevos" href="/es/providers/warm-up/" />
+  <LinkCard title="Supervisar un envío y la pausa automática" href="/es/campaigns/live-monitor/" />
+  <LinkCard title="Cómo funciona ReputeCast" href="/es/getting-started/concepts/" />
+</CardGrid>

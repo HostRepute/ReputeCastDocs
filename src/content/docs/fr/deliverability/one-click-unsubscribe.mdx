@@ -1,0 +1,202 @@
+---
+title: Désabonnement en un clic (RFC 8058)
+description: Comment ReputeCast gère le désabonnement en un clic RFC 8058, avec les en-têtes List-Unsubscribe ajoutés, l’endpoint POST, ce qui change et un test curl.
+type: explanation
+audience: [publisher, admin, developer]
+primaryKeyword: désabonnement en un clic RFC 8058
+sources:
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/automation.go
+  - internal/providers/provider.go
+  - internal/publicurl/publicurl.go
+  - internal/publicpages/publicpages.go
+  - internal/publicpages/tokens.go
+  - internal/publicpages/notifications.go
+  - internal/audience/signup.go
+  - internal/linktoken/linktoken.go
+  - internal/app/wire_forms.go
+  - internal/transactional/send.go
+  - internal/readiness/assemble.go
+  - internal/providers/brevo/brevo.go
+  - internal/providers/azureacs/azureacs.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Le [désabonnement en un clic](/fr/reference/glossary/#one-click-unsubscribe) permet à un lecteur de quitter votre
+newsletter avec le bouton Se désabonner que son application de messagerie affiche à côté de l’expéditeur, sans ouvrir de
+page web. La RFC 8058 en définit le fonctionnement : deux en-têtes de message et un POST en HTTPS. ReputeCast ajoute les
+en-têtes du désabonnement en un clic RFC 8058 à chaque message des flux Diffusions et Automatisations et répond lui-même
+au POST : vous n’avez rien à configurer. Cette page explique ce qu’il envoie et comment le tester.
+
+## Les en-têtes ajoutés par ReputeCast
+
+Chaque message des flux Diffusions et Automatisations porte ces en-têtes (`TOKEN` représente le jeton signé d’un
+destinataire) :
+
+```txt title="En-têtes d’un message du flux Diffusions"
+List-Unsubscribe: <https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN>, <mailto:digest@news.acme.io?subject=unsubscribe%20TOKEN>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Feedback-ID: 0199ab12:acme-newsletter:broadcast:reputecast
+```
+
+- **L’adresse HTTPS** est l’URL publique de votre instance, suivie de `/p/<workspace>/unsubscribe/<token>`. Elle utilise
+  toujours l’URL publique de l’instance, même quand les pages publiques de l’espace de travail sont servies sur un
+  [domaine personnalisé](/fr/forms/branding-and-domain/).
+- **Le jeton** identifie l’espace de travail, le message et le contact. Il est signé avec un HMAC dérivé de la clé
+  secrète de l’instance, ne contient aucune donnée personnelle en clair et n’expire pas. Après un
+  [renouvellement de la clé secrète](/fr/self-hosting/security/#renouveler-la-clé), les jetons des e-mails déjà envoyés
+  continuent de fonctionner tant que l’ancienne clé reste dans `secrets.previous_keys`.
+- **L’adresse `mailto:`** est l’adresse Reply-To de la campagne, ou celle de l’expéditeur, ou à défaut l’adresse From,
+  avec l’objet `unsubscribe <token>`. Elle sert aux applications de messagerie qui ne savent pas envoyer le POST.
+  ReputeCast ne lit pas les e-mails qui y sont envoyés : ces demandes arrivent dans cette boîte de réception, et vous
+  désabonnez le contact à la main dans [Gérer les contacts](/fr/audience/contacts/).
+- **`Feedback-ID`** sert à la boucle de rétroaction de Gmail : le début de l’ID de la campagne, l’espace de travail, le
+  flux et `reputecast`.
+
+La RFC 8058 exige une URI HTTPS dans `List-Unsubscribe`, la valeur exacte `List-Unsubscribe=One-Click` dans
+`List-Unsubscribe-Post`, et une signature DKIM qui couvre les deux en-têtes
+([RFC 8058, sections 3.1 et 4](https://www.rfc-editor.org/rfc/rfc8058#section-3.1), vérifié en octobre 2026). La
+signature DKIM vient de votre fournisseur d’envoi : elle dépend donc de la
+[configuration de DKIM](/fr/deliverability/spf-dkim-dmarc/).
+
+### Les messages qui les portent
+
+<TableScroll label="En-têtes de désabonnement en un clic par flux">
+
+| Messages                                                          | En-têtes                                                                                              |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Diffusions (campagnes)                                            | `List-Unsubscribe` avec l’adresse HTTPS et `mailto:`, et `List-Unsubscribe-Post`                      |
+| Automatisations                                                   | Les mêmes                                                                                             |
+| E-mails transactionnels d’une catégorie facultative               | `List-Unsubscribe` avec l’adresse HTTPS seulement, et `List-Unsubscribe-Post`                          |
+| E-mails transactionnels d’une catégorie essentielle               | Aucun. Ils ne peuvent pas être désactivés ; leur lien de désabonnement ouvre le centre de préférences |
+| E-mails Système : confirmations, réinitialisations de mot de passe, envois de test | Aucun                                                                                |
+| Copies des tests de placement                                     | Les en-têtes des Diffusions, mais un désabonnement depuis une copie ne change rien                     |
+
+</TableScroll>
+
+Gmail et Yahoo exigent le désabonnement en un clic pour les e-mails marketing uniquement ; les messages transactionnels
+en sont exemptés ([Google, Email sender guidelines FAQ](https://support.google.com/a/answer/14229414), vérifié en
+octobre 2026). Voir [L’e-mail transactionnel dans ReputeCast](/fr/transactional/overview/) pour les catégories.
+
+Deux fournisseurs d’envoi changent cela :
+
+- **Brevo** retire les deux en-têtes de ReputeCast et place les siens : les désabonnements en un clic vont donc à Brevo,
+  qui les signale à ReputeCast par son webhook de désabonnement. ReputeCast ajoute alors l’adresse à la liste de
+  suppression. Voir [Envoyer avec Brevo](/fr/providers/brevo/).
+- **Azure Communication Services** ne couvre pas `List-Unsubscribe` avec sa signature DKIM : on ne peut donc pas s’y fier
+  pour le désabonnement en un clic de Gmail et de Yahoo. Le contrôle avant envoi affiche un avertissement dans son
+  groupe Conformité quand ce fournisseur assure une partie d’un envoi. Voir
+  [Envoyer avec Azure Communication Services](/fr/providers/azure-communication-services/).
+
+## Fonctionnement d’un désabonnement en un clic
+
+1. Au moment de l’envoi, ReputeCast signe un jeton pour chaque destinataire et place l’adresse dans les en-têtes et
+   dans le lien `{{ unsubscribe_url }}` du pied de page.
+2. L’application de messagerie affiche son bouton Se désabonner. Gmail ne l’affiche que pour les messages qui passent
+   ses propres contrôles d’éligibilité, même quand les en-têtes sont corrects
+   ([FAQ](https://support.google.com/a/answer/14229414), vérifié en octobre 2026).
+3. Quand le lecteur confirme, l’application de messagerie envoie un POST en HTTPS avec le corps
+   `List-Unsubscribe=One-Click`, sans cookies ni connexion.
+4. ReputeCast vérifie le jeton et désabonne le contact dans la même requête, puis répond `200` avec le texte
+   `Désabonnement effectué.` La réponse utilise la langue des pages publiques : celle que choisit l’en-tête
+   `Accept-Language` de la requête si les pages la proposent, sinon la langue par défaut des pages (`Unsubscribed.` en
+   anglais).
+5. Dès lors, les Diffusions et les Automatisations ignorent l’adresse.
+
+```http title="La requête envoyée par une application de messagerie"
+POST /p/acme-newsletter/unsubscribe/TOKEN HTTP/1.1
+Host: reputecast.acme.io
+Content-Type: application/x-www-form-urlencoded
+
+List-Unsubscribe=One-Click
+```
+
+| Réponse | Quand                                                                                                                      |
+| ------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `200`   | `Désabonnement effectué.` Le contact est désabonné, ou l’était déjà. Répéter la requête ne change rien.                    |
+| `400`   | Le corps n’a pas pu être lu.                                                                                               |
+| `404`   | Le jeton n’est pas valide, est endommagé, a été signé avec une clé que l’instance n’a plus, ou appartient à un autre espace de travail. |
+| `500`   | La base de données a échoué : « Impossible de vous désabonner pour le moment ; réessayez dans une minute. »                 |
+
+L’endpoint ne lit le champ que dans le corps, envoyé en `application/x-www-form-urlencoded` ou en `multipart/form-data`,
+et ne redirige jamais un POST en un clic. Un `GET` sur la même adresse ouvre la page de désabonnement (avec l’offre
+facultative « moins d’e-mails » et le motif) et ne change rien tant que le lecteur n’y a pas confirmé. Une requête
+`HEAD`, comme en envoient les analyseurs de liens, ne change rien non plus.
+
+## Ce que change un désabonnement
+
+- **Listes :** le contact quitte toutes les listes de l’espace de travail, pas seulement la liste de la campagne, et
+  l’état du contact devient désabonné.
+- **Liste de suppression :** l’adresse est ajoutée avec le motif Désabonné et la portée
+  <UiPath path="audience.suppressions.marketingOnly" /> : les Diffusions et les Automatisations s’arrêtent, tandis que
+  les e-mails Système (comme les réinitialisations de mot de passe) et les e-mails transactionnels arrivent toujours.
+  L’entrée reste dans ReputeCast : la [synchronisation de la liste de suppression](/fr/providers/events-and-sync/)
+  n’envoie jamais un désabonnement vers la liste de suppression propre à un fournisseur d’envoi, ce qui bloquerait tous
+  les messages, réinitialisation de mot de passe comprise. Voir [La liste de suppression](/fr/audience/suppressions/).
+- **Historique du consentement :** un événement par liste quittée, avec la source « en un clic », l’adresse IP et le
+  navigateur ou l’application de messagerie.
+- **Rapports :** le désabonnement compte pour la campagne d’où venait le message, ou pour l’étape de l’e-mail
+  d’automatisation. Les désabonnements en un clic n’ont pas de motif.
+- **E-mails transactionnels :** un désabonnement en un clic depuis une catégorie facultative ne désactive que cette
+  catégorie.
+
+## Exigences
+
+- **Une URL publique en HTTPS.** Les applications de messagerie n’envoient le POST qu’à une adresse HTTPS. Quand l’URL
+  publique de l’instance n’est pas en `https://`, le contrôle avant envoi affiche un avertissement dans son groupe
+  Conformité : « Le désabonnement en un clic exige une adresse HTTPS ». Définissez l’URL publique comme décrit dans
+  [Configurer ReputeCast](/fr/self-hosting/configuration/).
+- **Un reverse proxy qui transmet les requêtes POST** vers les chemins `/p/` sans les modifier
+  ([Reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)).
+- **DKIM chez le fournisseur d’envoi**, couvrant les en-têtes, comme l’exige la RFC 8058.
+- **Un lien de désabonnement visible** dans le corps de l’e-mail aussi. Les en-têtes ne le remplacent pas : le contrôle
+  avant envoi bloque une campagne dont le corps n’a ni lien de désabonnement ni adresse postale
+  ([Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)).
+
+## Tester le désabonnement en un clic
+
+<Aside type="caution">
+Un test réussi désabonne réellement le contact. Utilisez un contact avec votre propre adresse, dans une liste de test.
+</Aside>
+
+<Steps>
+
+1. Envoyez une campagne à une liste qui ne contient que votre propre adresse. Les envois de test depuis l’éditeur
+   partent comme e-mails Système et n’ont pas d’en-tête `List-Unsubscribe`.
+
+2. Dans votre application de messagerie, ouvrez la source du message et copiez l’adresse HTTPS de l’en-tête
+   `List-Unsubscribe`.
+
+3. Envoyez la requête en un clic :
+
+   ```sh title="Terminal"
+   curl -i -X POST 'https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data 'List-Unsubscribe=One-Click'
+   ```
+
+4. Vérifiez la réponse : l’état `200`, `Content-Type: text/plain; charset=utf-8`, et le corps
+   `Désabonnement effectué.` (`Unsubscribed.` si la langue par défaut des pages est l’anglais). La ligne d’état indique
+   `HTTP/1.1 200 OK` ou `HTTP/2 200`, selon votre proxy.
+
+5. Ouvrez le contact dans <UiPath path="nav.audience" /> : la fiche montre le contact désabonné de toutes les listes, et
+   la liste de suppression contient l’adresse avec la portée <UiPath path="audience.suppressions.marketingOnly" />. Pour
+   annuler le test, ouvrez l’adresse HTTPS dans un navigateur et réabonnez-vous depuis la page.
+
+</Steps>
+
+Pour tester sans désabonner personne, utilisez l’adresse d’une copie de [test de
+placement](/fr/deliverability/placement-tests/) : le même POST répond `200` avec « Ceci est une copie de test de
+placement. Personne n’a été désabonné. »
+
+## Voir aussi
+
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)
+- [Pages d’inscription, de préférences et de désabonnement](/fr/forms/public-pages/)
+- [La liste de suppression](/fr/audience/suppressions/)
+- [URL publiques et endpoints](/fr/reference/public-urls/)

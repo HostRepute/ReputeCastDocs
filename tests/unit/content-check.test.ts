@@ -146,6 +146,9 @@ describe('strict i18n parity', () => {
     const viOnly = page({ file: 'vi/x.mdx', locale: 'vi', path: 'x', data: { title: 'X', description: desc(100) } })
     expect(rules([en, viOnly])).toEqual([])
     expect(rules([en, viOnly], ctx({ strictI18n: true }))).toEqual([
+      'i18n: missing German page de/campaigns/a',
+      'i18n: missing Spanish page es/campaigns/a',
+      'i18n: missing French page fr/campaigns/a',
       'i18n: missing Vietnamese page vi/campaigns/a',
       'i18n: no English page x',
     ])
@@ -157,6 +160,8 @@ describe('parsing helpers', () => {
     expect(locateEntry('vi/campaigns/a.mdx')).toEqual({ locale: 'vi', path: 'campaigns/a' })
     expect(locateEntry('campaigns/a.mdx')).toEqual({ locale: 'en', path: 'campaigns/a' })
     expect(locateEntry('vi/index.mdx')).toEqual({ locale: 'vi', path: 'index' })
+    expect(locateEntry('de/campaigns/a.mdx')).toEqual({ locale: 'de', path: 'campaigns/a' })
+    expect(locateEntry('fr/index.mdx')).toEqual({ locale: 'fr', path: 'index' })
   })
 
   it('parses frontmatter and attributes with expressions and > inside quotes', () => {

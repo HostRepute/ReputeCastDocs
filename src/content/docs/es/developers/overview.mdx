@@ -1,0 +1,163 @@
+---
+title: Desarrollar sobre ReputeCast
+description: "La API REST de newsletter de tu propia instancia de ReputeCast: su documento OpenAPI 3.1, las claves de API, los webhooks, el servidor MCP y los adaptadores."
+type: explanation
+audience: [developer]
+primaryKeyword: API REST de newsletter
+sources:
+  - internal/api/api.go
+  - internal/api/auth.go
+  - internal/authz/messages/en.json
+  - internal/app/app.go
+  - internal/app/reference.go
+  - web/src/lib/apiReference.ts
+  - internal/cli/openapi.go
+  - internal/apikeys
+  - internal/webhooks/webhooks.go
+  - internal/mcpserver
+  - internal/integrations
+  - docs/adapters.md
+sidebar:
+  order: 1
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Cada [instancia](/es/reference/glossary/#instance) de ReputeCast ofrece una API REST de newsletter en `/api/v1` en
+su propia URL pública, descrita por un documento OpenAPI 3.1 que el servidor genera a partir de su código. Las
+personas, las [claves de API](/es/reference/glossary/#api-key) y los [agentes MCP](/es/reference/glossary/#mcp-agent)
+pasan la misma comprobación de [permisos](/es/reference/glossary/#permission), así que una clave puede hacer lo que
+permiten sus permisos y nada más. Los errores son documentos de problema RFC 9457 con un `code` estable.
+
+## Cómo funciona una solicitud
+
+1. Tu código llama a `https://<public URL>/api/v1/…` con la cabecera `Authorization: Bearer <key>`. Las operaciones
+   sobre un [espacio de trabajo](/es/reference/glossary/#workspace) llevan su slug en la ruta, por ejemplo
+   `/api/v1/workspaces/acme-newsletter/campaigns`.
+2. ReputeCast busca la clave por su hash, la rechaza con `401` cuando es desconocida, está revocada o ha caducado, y
+   limita sus permisos a los que tiene en ese momento el miembro que la creó.
+3. Se comprueba el permiso de la operación (`x-permission` en el documento OpenAPI). Si falta, la respuesta es `403`
+   con la clave del permiso en `permission` y hasta dos miembros que lo tienen en `helpers`; la frase de `detail`
+   nombra a esos miembros, no a la clave.
+4. La respuesta es JSON (`application/json`), o un documento de problema (`application/problem+json`) cuando la
+   llamada falla. Las respuestas llevan las cabeceras `X-RateLimit-*` (consulta los
+   [límites de solicitudes](/es/developers/api-rate-limits/)) y `X-ReputeCast-Version`, la versión que ejecuta el
+   servidor.
+
+[Hacer tu primera llamada a la API](/es/developers/api-quickstart/) recorre estos pasos con `curl`, y
+[autenticación y claves de API](/es/developers/api-authentication/) describe las claves en detalle.
+
+## Obtener el documento OpenAPI
+
+Tu instancia publica su documento OpenAPI sin autenticación, en cuatro formatos:
+
+| Ruta                    | Formato            |
+| ----------------------- | ------------------ |
+| `/api/openapi.json`     | OpenAPI 3.1, JSON  |
+| `/api/openapi.yaml`     | OpenAPI 3.1, YAML  |
+| `/api/openapi-3.0.json` | OpenAPI 3.0, JSON  |
+| `/api/openapi-3.0.yaml` | OpenAPI 3.0, YAML  |
+
+El comando `reputecast openapi` imprime el mismo documento sin base de datos ni archivo de configuración (`--yaml`
+para YAML), así que puedes generarlo en CI a partir de la versión que ejecutas:
+
+```sh title="Terminal"
+curl -o reputecast-openapi.json https://reputecast.example.com/api/openapi.json
+reputecast openapi --yaml > reputecast-openapi.yaml
+```
+
+Lo que conviene saber del documento:
+
+- Describe todas las operaciones del servidor, incluidas las que solo llama la aplicación web con una sesión iniciada
+  (inicio de sesión, seguridad de la cuenta, administración de la instancia). La [referencia de la API](/api/) de este
+  sitio solo muestra las operaciones que puede llamar una clave de API.
+- Cada operación tiene un `operationId` (como `list-campaigns`), una etiqueta y tres extensiones: `x-access` (quién
+  puede llamarla: `workspace`, `key`, `user`, `instance_admin` o `public`), `x-permission` (la clave del permiso que
+  necesita) y, en las operaciones que solo llaman las integraciones, `x-integration`.
+- No tiene ninguna entrada `servers`: indica a tu cliente la URL pública de tu instancia como URL base.
+- Tu instancia también ofrece su propia referencia de la API en `/api/reference`, sin autenticación: una página con
+  todas las operaciones de la versión que ejecuta, agrupadas por etiqueta, con el permiso que necesita cada una. Los
+  enlaces a la referencia de la API de la aplicación la abren. La [referencia de la API](/api/) de este sitio añade
+  los parámetros, los cuerpos y las respuestas de cada operación, para las operaciones que una clave de API puede
+  llamar en la versión que describe esta documentación.
+
+## Generar un cliente
+
+Cualquier generador de OpenAPI puede leer el documento 3.1. Usa las variantes 3.0 con los generadores que solo leen
+OpenAPI 3.0. La aplicación web de ReputeCast genera sus propios tipos de TypeScript con
+[openapi-typescript](https://openapi-ts.dev/cli) (comprobado en octubre de 2026), que lee el documento desde una URL:
+
+```sh title="Terminal"
+npx openapi-typescript https://reputecast.example.com/api/openapi.json -o reputecast.d.ts
+```
+
+La mayoría de los generadores nombran los métodos según el `operationId`, así que `list-campaigns` se convierte en un
+método `listCampaigns` o similar.
+
+## Llamar a la API desde tu servidor
+
+Las claves de API son secretas, así que llama a la API desde tu backend, una tarea programada o una herramienta de
+flujos de trabajo, nunca desde una página web. Las rutas `/api/` no envían cabeceras CORS, y el servidor rechaza las
+solicitudes de navegador entre sitios que cambian datos. Para recoger suscripciones en un sitio web, inserta un
+[formulario de suscripción](/es/forms/signup-forms/): sus endpoints aceptan solicitudes de los sitios que permitas.
+
+## Qué puedes crear
+
+<CardGrid>
+  <LinkCard
+    title="Enviar correo transaccional con la API"
+    description="Restablecimientos de contraseña, recibos y alertas de tu producto, con claves de idempotencia."
+    href="/es/developers/transactional-api/"
+  />
+  <LinkCard
+    title="Recibir webhooks"
+    description="Eventos firmados de contactos, campañas, entrega de correo y más."
+    href="/es/developers/webhooks/"
+  />
+  <LinkCard
+    title="Conectar agentes de IA con MCP"
+    description="Un servidor MCP en /mcp con sus propios tokens de agente y permisos."
+    href="/es/developers/mcp/"
+  />
+  <LinkCard
+    title="Crear una integración"
+    description="Claves de integración, REST hooks y acciones que respetan el consentimiento."
+    href="/es/developers/integration-api/"
+  />
+  <LinkCard
+    title="Registrar eventos y conversiones"
+    description="Inicia automatizaciones desde tu producto y atribuye ingresos a las campañas."
+    href="/es/developers/events-and-conversions/"
+  />
+  <LinkCard
+    title="Adaptadores de proveedores"
+    description="Conecta un servicio de correo que no tiene adaptador integrado."
+    href="/es/adapters/overview/"
+  />
+</CardGrid>
+
+Si quieres conectar una herramienta sin escribir código, Zapier, Make, n8n y WordPress tienen
+[integraciones](/es/integrations/overview/) ya preparadas.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="api" />
+
+Los límites de solicitudes tienen su propia página: [límites de solicitudes](/es/developers/api-rate-limits/). Cómo
+pagina sus resultados cada operación de lista está en [paginación](/es/developers/api-pagination/).
+
+## Cuándo cambiarlos
+
+Estos límites son fijos. Recorre las listas largas con los parámetros de paginación de cada operación, usa las
+operaciones por lotes para el trabajo masivo y envía los archivos con las operaciones de subida en lugar de en un
+cuerpo JSON. Los operadores del servidor pueden cambiar el número de solicitudes por minuto que puede hacer una clave
+con `http.rate_limit_api` (consulta la [referencia de configuración](/es/reference/configuration/)).
+
+## Relacionado
+
+- [Hacer tu primera llamada a la API](/es/developers/api-quickstart/)
+- [Autenticación y claves de API](/es/developers/api-authentication/)
+- [Errores](/es/developers/api-errors/)
+- [Permisos y roles](/es/reference/permissions/)
+- [Referencia de la API](/api/)

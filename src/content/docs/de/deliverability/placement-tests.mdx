@@ -1,0 +1,254 @@
+---
+title: Platzierung im Posteingang mit Testpostfächern testen
+description: Platzierungstest mit Testpostfächern bei Gmail, Outlook, Yahoo und anderen ausführen und sehen, ob jede Kopie im Posteingang, in einem Tab oder im Spam landet.
+type: how-to
+audience: [publisher, admin]
+permissions: ['placement:run', 'placement:manage']
+uiPath: 'nav.deliverability > placement.placementTests'
+primaryKeyword: Platzierungstest
+sources:
+  - internal/placement
+  - internal/placement/seedbox
+  - internal/ingest/normalize.go
+  - docs/integrations/seed-mailboxes.md
+  - internal/app/wire_canary.go
+  - internal/sending/engine/canary.go
+  - web/src/features/placement
+sidebar:
+  order: 10
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Ein Platzierungstest sendet eine Kopie einer E-Mail an jedes Ihrer [Testpostfächer](/de/reference/glossary/#seed-mailbox),
+meldet sich dann bei diesen Postfächern an und berichtet, wo jede Kopie gelandet ist: im Posteingang, in einem Tab wie
+Promotions, im Spam-Ordner oder nirgends, gezählt je Postfachanbieter. Damit vergleichen Sie E-Mails und
+Versandanbieter, bevor eine Kampagne an Ihre Liste geht. Tests laufen, wenn jemand einen startet oder wenn der
+[Canary](/de/reference/glossary/#canary) eines Versands die Testpostfächer einschließt; nach Zeitplan läuft nichts.
+
+## Bevor Sie beginnen
+
+- Zum Hinzufügen, Neuverbinden und Entfernen von Testpostfächern brauchen Sie `placement:manage`, eine sensible
+  Berechtigung, weil das Passwort oder Token eines Testpostfachs das ganze Postfach lesen kann. Zum Ausführen eines Tests
+  brauchen Sie `placement:run`. Nur Menschen können Tests starten und Testpostfächer verwalten: API-Schlüssel können
+  Testergebnisse lesen, und KI-Agenten können keine der beiden Berechtigungen erhalten.
+- Nutzen Sie Postfächer, die nur für Tests existieren. ReputeCast sucht nur nach Nachrichten mit einem Test-Token und
+  öffnet nur den Posteingang, den Spam-Ordner und die Tabs von Gmail, aber die Zugangsdaten geben Zugriff auf alles im
+  Postfach.
+- Der getestete Inhalt braucht einen verifizierten Absender für den Stream, den er nutzt
+  ([Versand-Domains und Absender hinzufügen](/de/providers/senders-and-domains/)).
+- Um Testpostfächer bei Gmail, Google Workspace, Outlook.com oder Microsoft 365 per OAuth zu verbinden, fügt ein
+  [Instanz-Admin](/de/reference/glossary/#instance-admin) zuerst eine Weiterleitungs-URI zu den Anmelde-Apps der Instanz
+  hinzu (siehe
+  [Anmelde-Apps für OAuth-Testpostfächer einrichten](#anmelde-apps-für-oauth-testpostfächer-einrichten)).
+
+## Wie sich jedes Testpostfach verbindet
+
+| Postfachanbieter           | Verbinden über                                  | Hinweise                                                                                                         |
+| -------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Gmail                      | IMAP-App-Passwort (empfohlen) oder OAuth        | Tabs (Primary, Promotions, Updates, Social, Forums) werden aus den Labels von Gmail gelesen.                     |
+| Google Workspace           | OAuth oder IMAP-App-Passwort                    | OAuth über eine App derselben Workspace-Organisation umgeht die Limits von Google für nicht verifizierte Apps.   |
+| Outlook.com, Microsoft 365 | OAuth                                           | Gelesen über Microsoft Graph, das Focused von Other unterscheidet. Microsoft lehnt Passwörter über IMAP ab.      |
+| Yahoo, AOL                 | IMAP-App-Passwort                               | Erstellt in den Sicherheitseinstellungen des Kontos.                                                             |
+| iCloud                     | App-spezifisches Passwort                       | Die Apple-ID braucht die Zwei-Faktor-Authentifizierung.                                                          |
+| GMX, Web.de                | Das Kontopasswort, mit aktiviertem IMAP         | Aktivieren Sie zuerst IMAP in den Einstellungen des Postfachs.                                                   |
+
+ReputeCast trägt IMAP-Server und Port für jeden Anbieter selbst ein. Passwörter und Tokens werden mit dem geheimen
+Schlüssel der Instanz versiegelt und sind nicht auslesbar: Die API gibt sie nie zurück.
+
+Microsoft hat die Standardauthentifizierung, App-Passwörter eingeschlossen, für IMAP in Exchange Online abgeschaltet
+([Microsoft Learn, „Deprecation of Basic authentication in Exchange Online“](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online),
+geprüft im Oktober 2026), und der Dialog zum Hinzufügen in ReputeCast lehnt ein App-Passwort für Testpostfächer bei
+Outlook.com und Microsoft 365 ab.
+
+## Anmelde-Apps für OAuth-Testpostfächer einrichten
+
+OAuth-Testpostfächer nutzen die Google- und Microsoft-Anmelde-Apps der Instanz aus
+<UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; eine eigene App müssen Sie nicht registrieren.
+Jede App braucht neben der für die Anmeldung eine zweite Weiterleitungs-URI:
+
+```text title="Redirect URI for seed mailboxes"
+<public URL>/api/v1/placement/oauth/callback
+```
+
+<Steps>
+
+1. Fügen Sie in der Google-App die Weiterleitungs-URI oben hinzu und dem Zustimmungsbildschirm den Scope
+   `https://mail.google.com/`. IMAP-Zugriff mit OAuth braucht diesen Scope.
+
+2. Fügen Sie in der Microsoft-App die Weiterleitungs-URI und die delegierte Microsoft-Graph-Berechtigung
+   `Mail.ReadWrite` (mit `offline_access`) hinzu. Erlauben Sie neben Geschäftskonten auch private Microsoft-Konten,
+   sonst können sich Testpostfächer bei Outlook.com nicht anmelden.
+
+3. Richten Sie die Apps selbst ein, wie unter [Anmeldung über Google, Microsoft und GitHub](/de/self-hosting/social-sign-in/)
+   beschrieben.
+
+</Steps>
+
+<Aside type="note" title="Die Limits von Google für nicht verifizierte Apps">
+`https://mail.google.com/` ist ein eingeschränkter Scope. Solange der Zustimmungsbildschirm einer Google-App den
+Nutzertyp „External“ und den Veröffentlichungsstatus „Testing“ hat, stellt Google Aktualisierungstokens aus, die nach
+7 Tagen ablaufen ([Google, „Using OAuth 2.0 to access Google APIs“](https://developers.google.com/identity/protocols/oauth2),
+geprüft im Oktober 2026), sodass ein solches Testpostfach jede Woche als abgemeldet erscheint. Verbinden Sie
+gmail.com-Testpostfächer stattdessen mit einem App-Passwort. Apps, die nur innerhalb einer Google-Workspace-Organisation
+genutzt werden (Nutzertyp „Internal“), brauchen keine Verifizierung
+([Google Cloud Help, „Unverified apps“](https://support.google.com/cloud/answer/7454865), geprüft im Oktober 2026),
+daher kann ein Google-Workspace-Testpostfach in dieser Organisation OAuth ohne diese Limits nutzen.
+</Aside>
+
+## Testpostfächer hinzufügen
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.deliverability > placement.placementTests" /> und wählen Sie
+   <UiPath path="placement.pillSeeds" />.
+
+2. Wählen Sie <UiPath path="placement.addSeed" /> und den Postfachanbieter.
+
+3. Wählen Sie unter <UiPath path="placement.connectWith" /> die Option <UiPath path="placement.viaImap" /> oder
+   <UiPath path="placement.viaOAuth" />, wenn der Anbieter beides anbietet.
+
+   - **App-Passwort:** Geben Sie die Adresse und das Passwort ein und wählen Sie dann
+     <UiPath path="placement.checkAndAdd" />. ReputeCast meldet sich an und listet die gefundenen Ordner auf, etwa den
+     Posteingang, die Tabs und den Spam-Ordner.
+   - **OAuth:** Melden Sie sich bei Google oder Microsoft beim Testpostfach an und erlauben Sie ReputeCast, seine
+     E-Mails zu lesen und zu ändern. Schließen Sie das innerhalb von 10 Minuten ab; der Browser kehrt dann zu
+     ReputeCast zurück, und das Testpostfach ist hinzugefügt.
+
+4. Fügen Sie bei jedem Postfachanbieter, den Ihre Leser nutzen, ein Testpostfach hinzu. Ein Test kann an bis zu 100
+   Testpostfächer senden.
+
+</Steps>
+
+<Screenshot
+  id="placement-seeds"
+  alt="Testpostfächer · 10: Testpostfächer bei Gmail, Google Workspace, Outlook.com, Microsoft 365, Yahoo, AOL und iCloud, jeweils mit den gefundenen Ordnern, IMAP-App-Passwort oder OAuth, Status und letzter Nutzung. Ein Banner meldet, dass die Anmeldung des iCloud-Testpostfachs fehlgeschlagen ist, und bietet Neu verbinden an."
+/>
+
+## Platzierungstest ausführen
+
+<Steps>
+
+1. Wählen Sie <UiPath path="placement.runTest" />. Sie können einen Test auch unter
+   [Prüfen & senden](#aus-prüfen--senden-testen) der Kampagne, im Menü <UiPath path="placement.sendTest" /> des
+   Editors oder im Warm-up-Planer starten.
+
+2. Wählen Sie, was getestet wird: eine Kampagne, eine Kampagnenvorlage, die nächste Ausgabe eines Newsletters oder eine
+   Transaktionsvorlage. Wählen Sie die Version, wenn die E-Mail A/B-Varianten, Sprachversionen oder bedingte Inhalte
+   hat.
+
+3. Wählen Sie, wie die Kopien versendet werden:
+
+   - Mit <UiPath path="placement.throughRouteTitle" /> erhält jedes Testpostfach den Versandanbieter, den die Route
+     dafür wählen würde.
+   - Mit <UiPath path="placement.throughOneTitle" /> testen Sie einen einzelnen Versandanbieter.
+   - Mit <UiPath path="placement.throughCompareTitle" /> erhält jedes Testpostfach eine Kopie je Anbieter, im Abstand
+     von 2 Minuten und mit wechselnder Reihenfolge der Anbieter. Sie können bis zu 6 Anbieter vergleichen.
+
+4. Wählen Sie den Absender und die Testpostfächer (alle verbundenen oder einige). Der Dialog zeigt die Zahl der Kopien,
+   ihre Kosten und bei einem Anbieter im Warm-up, wie viel vom heutigen Warm-up-Limit sie verbrauchen.
+
+5. Wählen Sie <UiPath path="placement.startTest" />.
+
+</Steps>
+
+Kopien sind echte Versände mit denselben Headern und demselben Link-Tracking wie die Kampagne. Ihre Öffnungen und
+Klicks werden nie gezählt, sie erscheinen nie in Berichten oder Kontakt-Zeitleisten, und Bounces oder Beschwerden eines
+Testpostfachs sperren es nie. Ein Test ändert nie einen Versand oder das Ergebnis seiner
+[Versandbereitschaft](/de/reference/glossary/#send-readiness).
+
+## Aus Prüfen & senden testen
+
+Die Seite [Prüfen & senden](/de/reference/glossary/#review-and-send) einer Kampagne hat neben den Prüfungen eine Karte
+<UiPath path="placement.entryTitle" />. Sie ist optional und ändert nie das Ergebnis der
+[Versandbereitschaft](/de/campaigns/send-readiness/).
+
+- Die Karte zeigt, wie viele Testpostfächer ein Test erreicht und bei welchen Postfachanbietern, wie viele
+  Aufmerksamkeit brauchen (ihre Anmeldung ist fehlgeschlagen oder abgelaufen, daher überspringen Tests sie) und dass ein
+  Test etwa 3 Minuten dauert.
+- <UiPath path="placement.runTest" /> öffnet den Testdialog für diese Kampagne so, wie sie geplant ist: über die Route
+  oder mit einem Vergleich der Versandanbieter, wenn die Route mehr als einen nutzt. Zum Ausführen eines Tests brauchen
+  Sie `placement:run`; ohne diese Berechtigung nennt der Button, wer den Test ausführen kann.
+- Das letzte Ergebnis der Kampagne zeigt eine Zeile je Postfachanbieter und zählt Posteingang, den eigenen Tab des
+  Anbieters für Massen-E-Mails (Promotions bei Gmail, Other bei Outlook.com) und Spam, zum Beispiel „Gmail ·
+  Posteingang 2 · Promotions 2 · Spam 0“, mit einem Balken. Wenn die Route Anbieter verglichen hat, folgt eine Zeile je
+  Versandanbieter, etwa „Über SES: Posteingang 8 · Tab 2“. <UiPath path="placement.entryViewResults" /> öffnet das
+  vollständige Ergebnis.
+
+## Platzierung in Testpostfächern während eines Canary
+
+Beginnt ein Versand mit einem Canary und schließt der Canary Testpostfächer ein, startet ReputeCast einen
+Platzierungstest der Kampagne über ihre Route an jedes verbundene Testpostfach, wie einen aus Prüfen & senden. Das
+Kriterium für die Platzierung in Testpostfächern im [Live-Monitor](/de/campaigns/live-monitor/) liest ihn je
+Postfachanbieter, sodass Kopien im Spam den Versand zurückhalten können, bevor alle die E-Mail erhalten. Der Test
+erscheint wie jeder andere in der Liste der Tests.
+
+## Ergebnis lesen
+
+<Screenshot
+  id="placement-tests"
+  alt="Platzierungstests: Ein Banner meldet, dass die Anmeldung des iCloud-Testpostfachs fehlgeschlagen ist, darunter sechs Tests mit Startzeit, Testgegenstand, Versandanbieter, startender Person und Ergebnis je Anbieter, etwa Weekly Digest #142 aus Prüfen & senden, Posteingang 8 · Tab 2 über SES und Posteingang 5 · Tab 2 · Spam 2 · Nicht angekommen 1 über Postal."
+/>
+
+Die Liste der Tests zeigt jeden Test des Arbeitsbereichs, die neuesten zuerst, mit seinem Ergebnis je Versandanbieter.
+Wählen Sie bei einem Test <UiPath path="placement.view" />, um ihn zu öffnen.
+
+Die Ergebnisse füllen sich live. ReputeCast sucht nach jeder Kopie noch 15 Minuten, nachdem die letzte Kopie an ihren
+Versandanbieter übergeben wurde; eine dann noch fehlende Kopie erscheint als
+<UiPath path="placement.legendNotArrived" />, und eine, die innerhalb der Stunde auftaucht, aktualisiert das Ergebnis.
+Wählen Sie <UiPath path="placement.stopWaiting" />, um das Warten vorzeitig zu beenden.
+
+<Screenshot
+  id="placement-result"
+  alt="Weekly Digest #142, über Amazon SES und Postal verglichen, gestartet aus Prüfen & senden: 8 von 10 Testpostfächern im Posteingang über SES und 5 von 10 über Postal, das sich an Tag 5 von 21 im Warm-up befindet, mit der Ankunftszeit (Median), den Ergebnissen für SPF, DKIM und DMARC, den Kopien je Postfachanbieter und einer Kopie, die in Junk Email von Outlook.com gelandet ist."
+/>
+
+- Die Überschrift zählt Testpostfächer, zum Beispiel „8 von 10 Testpostfächern im Posteingang“, nie einen
+  Prozentsatz: Eine Handvoll Testpostfächer ist eine Stichprobe, nicht Ihre Zielgruppe.
+- Jede Zelle zeigt, wo die Kopie gelandet ist, in den eigenen Worten des Anbieters (Posteingang, ein Tab, der
+  Spam-Ordner), wie lange sie bis zur Ankunft brauchte und die Ergebnisse für SPF, DKIM und DMARC, die der empfangende
+  Server in die Header der Kopie geschrieben hat. Öffnen Sie eine Kopie, um ihre Header und die Ereignisse des
+  Versandanbieters zu lesen.
+- Kopien in den Testpostfächern werden standardmäßig 24 Stunden nach jedem Test gelöscht. Ändern Sie das unter
+  <UiPath path="placement.deletionSettings" /> (24 Stunden nach jedem Test, wenn der Test abgeschlossen ist, oder nie;
+  erfordert `placement:manage`) oder entfernen Sie die Kopien eines Tests mit
+  <UiPath path="placement.deleteCopiesNow" />.
+
+<LimitsTable area="placement" />
+
+## Prüfen, ob es funktioniert hat
+
+- Der Status des Tests ist <UiPath path="placement.statusFinished" />, und jedes Testpostfach hat ein Ergebnis.
+- Jedes Testpostfach unter <UiPath path="placement.pillSeeds" /> zeigt <UiPath path="placement.seedConnected" /> und
+  wann es zuletzt genutzt wurde.
+
+## Fehlerbehebung
+
+- **Ein Testpostfach zeigt <UiPath path="placement.seedFailed" />.** Der Postfachanbieter hat das App-Passwort
+  abgelehnt, oft weil es widerrufen oder das Passwort des Kontos geändert wurde. Tests überspringen das Testpostfach,
+  bis Sie <UiPath path="placement.reconnect" /> wählen und ein neues App-Passwort einfügen.
+- **Ein Testpostfach zeigt <UiPath path="placement.seedExpired" />.** Der Postfachanbieter hat den OAuth-Zugriff von
+  ReputeCast beendet. Ein gmail.com-Testpostfach, das über eine App im Status „Testing“ verbunden ist, läuft alle 7 Tage
+  ab; verbinden Sie es neu mit einem App-Passwort.
+- **OAuth meldet, dass die Anmeldung mit Google oder Microsoft nicht eingerichtet ist.** Die Anmelde-App der Instanz hat
+  noch keine Client-ID und kein Secret. Ein Instanz-Admin trägt sie unter
+  <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> ein; bis dahin verbinden Sie Testpostfächer bei
+  Gmail und Google Workspace mit einem App-Passwort.
+- **Outlook.com lehnt das App-Passwort ab.** Das ist zu erwarten: Verbinden Sie Testpostfächer bei Outlook.com und
+  Microsoft 365 per OAuth.
+- **Der Test lässt sich nicht starten.** Der Dialog nennt den Grund: kein verbundenes Testpostfach, kein verifizierter
+  Absender für den Stream bei einem gewählten Anbieter, ein ausgefallener Anbieter oder ein Warm-up-Limit, das die
+  Kopien überschreiten würden.
+- **Kopien landen bei einem Postfachanbieter im Spam.** Prüfen Sie die Authentifizierungsergebnisse in den Headern der
+  Kopie, dann [SPF, DKIM und DMARC](/de/deliverability/spf-dkim-dmarc/) und
+  [Blocklisten-Einträge](/de/deliverability/blocklists/) der Versand-Domain.
+
+## Verwandte Themen
+
+- [Versandbereitschaft: vor dem Senden prüfen](/de/campaigns/send-readiness/)
+- [Neuen Anbieter oder neue IP aufwärmen](/de/providers/warm-up/)
+- [E-Mail-Zustellbarkeit für selbst gehostete Absender](/de/deliverability/overview/)
+- [Berechtigungen und Rollen](/de/reference/permissions/)

@@ -1,0 +1,105 @@
+---
+title: Migrer depuis Notifuse
+description: "Migrer depuis Notifuse vers ReputeCast avec une clé API : contacts, listes avec le statut de chaque abonnement et modèles d’e-mail en un seul import."
+type: how-to
+audience: [publisher, admin]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: migrer depuis Notifuse
+sources:
+  - internal/imports/notifuse.go
+  - internal/imports/templates.go
+  - internal/imports/connect.go
+  - internal/transactional/importer/notifuse.go
+  - internal/transactional/importer/notifuse_import.go
+  - internal/transactional/importer/liquid.go
+  - web/src/features/transactional-import/NotifuseOption.tsx
+sidebar:
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Pour migrer depuis Notifuse, vous connectez ReputeCast à votre instance Notifuse avec une clé API d’espace de travail et importez ses listes, le statut de chaque contact sur chaque liste et, si vous le souhaitez, ses modèles d’e-mail. ReputeCast se contente de lire l’API de Notifuse ; rien ne change dans Notifuse.
+
+## Avant de commencer
+
+- Il vous faut l’autorisation `subscribers:import` (les rôles Propriétaire, Admin et Éditeur l’ont).
+- Créez une clé API dans l’espace de travail Notifuse que vous migrez. Seul le propriétaire de l’espace de travail peut en créer une, et le jeton ne s’affiche qu’une fois. ReputeCast se contente de lire : une clé limitée à Contacts read et Lists read suffit, plus Templates read pour reprendre les modèles. Source : [Notifuse, Admins & API Keys](https://docs.notifuse.com/features/admins-api-keys) (vérifié en octobre 2026).
+- ReputeCast doit joindre votre instance Notifuse en HTTP ou HTTPS. Une instance située sur un réseau privé ou interne est refusée, sauf si l’instance ReputeCast active `providers.allow_private_networks` (voir la [référence de la configuration](/fr/reference/configuration/)).
+- Lisez [comment une migration transmet le consentement](/fr/migrate/overview/) s’il s’agit de votre premier import.
+
+## Importer votre espace de travail Notifuse
+
+<Steps>
+
+1. Ouvrez <UiPath path="shell.importContacts" /> et choisissez **Notifuse**.
+
+2. Saisissez l’<UiPath path="imports.serverAddress" /> de votre instance Notifuse, comme `https://notifuse.example.com`, collez la clé dans <UiPath path="imports.apiKey" /> et sélectionnez <UiPath path="imports.connect" />. ReputeCast trouve l’espace de travail auquel appartient la clé et liste ses listes avec leurs effectifs.
+
+3. Cochez les listes à importer et choisissez la liste ReputeCast de destination de chacune. Laissez <UiPath path="imports.notifuse.templatesOption" /> activé pour reprendre les modèles (voir ci-dessous). Gardez activée la récupération des suppressions depuis vos fournisseurs d’envoi, puis passez à la correspondance des champs.
+
+4. Associez les champs. `email` est obligatoire ; les autres champs de contact de Notifuse et vos champs personnalisés sont associés d’après leur nom.
+
+5. Vérifiez l’étape du consentement (voir la section suivante), lancez l’aperçu et démarrez l’import. Les modèles sont importés une fois les contacts importés.
+
+</Steps>
+
+## Ce qui migre depuis Notifuse
+
+- Les **listes** deviennent les listes ReputeCast que vous avez choisies. Le statut d’un contact est lu sur chaque liste, mais une suppression vaut pour l’adresse : un désabonnement, un rebond ou une plainte sur une seule liste Notifuse exclut l’adresse de toutes les listes ReputeCast.
+- **Champs de contact :** `first_name`, `last_name`, `full_name`, `external_id`, `phone`, `country`, `language`, `timezone`, `job_title` et les champs d’adresse.
+- Les **champs personnalisés** (`custom_string_1`, `custom_number_1`, etc.) arrivent sous le libellé que vous leur avez donné dans Notifuse, comme `plan` pour un champ libellé « Plan ». Les champs numériques et de date sont proposés avec ces types, et les champs JSON arrivent en texte JSON. Les champs libellés sont toujours proposés ; les champs sans libellé seulement quand les 100 premiers contacts d’une liste choisie les utilisent.
+- **Dates :** la date à laquelle un contact a rejoint une liste devient la date de création du contact et, pour les abonnements actifs, sa preuve de consentement.
+- Les **numéros de téléphone** peuvent être associés au téléphone du contact. Le consentement SMS n’est repris que lorsque des colonnes pour le consentement et pour sa date, sa source et son texte sont associées : un numéro Notifuse arrive donc en général sans consentement SMS.
+
+| Statut sur une liste Notifuse | Devient dans ReputeCast                                                           |
+| ----------------------------- | --------------------------------------------------------------------------------- |
+| `active`                      | Abonné · confirmé, avec la date d’abonnement comme preuve (ou en attente, ou Ignorer) |
+| `pending`                     | Abonné · en attente, avec un e-mail de redemande de consentement (ou Ignorer)     |
+| `unsubscribed`                | Exclu · désabonné : ni Diffusions ni Automatisations, e-mails Système autorisés (verrouillé) |
+| `bounced`                     | Exclu · rebond définitif, tous les flux (verrouillé)                              |
+| `complained`                  | Exclu · plainte, tous les flux (verrouillé)                                       |
+
+### Modèles
+
+Avec <UiPath path="imports.notifuse.templatesOption" /> activé, ReputeCast lit les modèles d’e-mail de l’espace de travail après les contacts :
+
+- Les **modèles transactionnels** deviennent des brouillons de [modèles transactionnels](/fr/transactional/templates/). Rien n’est publié : votre application continue donc d’envoyer les versions en ligne jusqu’à ce que quelqu’un publie un brouillon. Les champs de contact comme `contact.first_name` deviennent de simples variables (`first_name`), car les e-mails transactionnels sont envoyés à une adresse, pas à une fiche de contact.
+- Les **modèles marketing, de bienvenue et autres** deviennent des modèles enregistrés dans l’[éditeur](/fr/campaigns/templates/), avec leurs champs de contact. Un nom déjà pris reçoit un numéro, comme « Welcome (2) ».
+- Les **e-mails système propres à Notifuse** (e-mails de double opt-in, de désabonnement, de rebond et de liste de blocage) ne sont pas repris : ReputeCast envoie les siens.
+
+Les modèles créés dans l’éditeur visuel de Notifuse arrivent en MJML ; les modèles en mode code apportent leur source MJML. Le journal et le résumé de l’import indiquent combien sont arrivés et combien nécessitent une correction manuelle, comme un filtre Liquid que ReputeCast n’a pas. [Importer des modèles transactionnels](/fr/migrate/transactional-templates/) explique chaque note de conversion. Si l’étape des modèles échoue, les contacts sont importés quand même et le journal en donne la raison.
+
+### Ce qui reste dans Notifuse
+
+Les diffusions et leurs statistiques, les automatisations, les segments, l’historique des messages, les webhooks et les paramètres des fournisseurs ne sont pas importés. Recréez les segments et les automatisations avec les [segments](/fr/audience/segments/) et les [automatisations](/fr/automations/overview/).
+
+## Limites de débit
+
+ReputeCast lit 100 contacts par requête, une requête à la fois, et ralentit quand l’instance répond 429 ou une erreur 5xx :
+
+<LimitsTable area="imports" />
+
+## Vérifier le résultat
+
+- Le résumé indique combien de contacts ont été importés, fusionnés, exclus, laissés en attente et ignorés, et combien de modèles sont arrivés comme brouillons et comme modèles enregistrés.
+- Ouvrez <UiPath path="nav.transactional" /> : les modèles transactionnels importés sont listés comme brouillons.
+- Ouvrez <UiPath path="nav.audience > audience.tabSuppressions" /> : les contacts désabonnés, en rebond et ayant porté plainte s’y trouvent.
+
+## Dépannage
+
+- **« Notifuse a refusé la clé API : elle n’est rattachée à aucun espace de travail. »** : la clé a été supprimée, ou elle appartient à une autre instance. Créez une nouvelle clé dans le bon espace de travail.
+- **« Utilisez l’adresse complète, comme https://lists.example.com. »** : l’adresse n’a ni `http://` ni `https://`.
+- **« Cette adresse se trouve sur un réseau privé ou interne. »** : utilisez l’adresse publique de l’instance, ou demandez à l’exploitant d’activer `providers.allow_private_networks`.
+- **« Notifuse a refusé la clé API (…) » pendant la lecture des contacts ou des modèles** : Notifuse nomme le domaine auquel la portée de la clé ne donne pas accès (Contacts, Lists ou Templates read). Élargissez la clé sur la page Team de Notifuse, puis connectez-vous de nouveau.
+- **« Les modèles n’ont pas été importés : … »** dans le journal : les contacts sont importés. Ouvrez <UiPath path="nav.transactional > transactional.common.importTemplates" /> pour reprendre les modèles transactionnels séparément ([importer des modèles transactionnels](/fr/migrate/transactional-templates/)).
+
+## Voir aussi
+
+- [Migrer vers ReputeCast sans perdre le consentement](/fr/migrate/overview/)
+- [Importer des modèles transactionnels](/fr/migrate/transactional-templates/)
+- [Créer et publier des modèles transactionnels](/fr/transactional/templates/)
+- [Listes, consentement et double opt-in](/fr/audience/lists-and-consent/)

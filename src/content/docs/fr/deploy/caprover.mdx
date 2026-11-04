@@ -1,0 +1,175 @@
+---
+title: Déployer ReputeCast sur CapRover
+description: "Déployer ReputeCast sur CapRover : app one-click PostgreSQL, image Docker, dossier persistant, HTTPS, mises à jour en direct et premier Propriétaire."
+type: how-to
+audience: [operator]
+primaryKeyword: déployer ReputeCast sur CapRover
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/cli/serve.go
+  - internal/cli/install.go
+  - internal/cli/healthcheck.go
+  - internal/app/app.go
+  - internal/sending/engine/api.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Ce guide vous permet de déployer ReputeCast sur CapRover sous la forme de deux apps, PostgreSQL depuis les apps
+one-click de CapRover et l’image Docker de ReputeCast, avec un dossier persistant et un certificat Let's Encrypt. Il a
+été vérifié avec CapRover 1.15.5.
+
+## Avant de commencer
+
+- Un serveur CapRover configuré comme dans le guide [getting started](https://caprover.com/docs/get-started) de
+  CapRover, avec HTTPS activé sur son domaine racine : avant cela, CapRover refuse d’activer HTTPS pour une app.
+- Un domaine pour ReputeCast, comme `news.example.com`, avec un enregistrement `A` qui pointe directement vers le
+  serveur (CapRover ne prend pas officiellement en charge les proxys DNS comme celui de Cloudflare), ou l’adresse par
+  défaut de l’app, `reputecast.<root domain>`.
+- Un accès SSH au serveur, et OpenSSL ou Docker pour générer la clé secrète. Voir aussi la
+  [configuration requise](/fr/self-hosting/requirements/).
+
+## Déployer ReputeCast
+
+<Steps>
+
+1. Dans le tableau de bord, ouvrez **Apps**, cliquez sur **One-Click Apps/Databases** et choisissez **PostgreSQL**
+   (une fois que le serveur a des apps, cliquez d’abord sur **Create A New App** pour afficher ces options). Réglez
+   **App Name** sur `reputecast-db`, **Version** sur `18` (la valeur par défaut, `14.5`, est plus ancienne que les
+   versions 16, 17 ou 18 dont ReputeCast a besoin), **Username** et **Default Database** sur `reputecast`. Copiez le
+   **Password** généré (lettres et chiffres, sans risque dans une URL) et cliquez sur **Deploy**. Le modèle conserve
+   les données dans le volume `reputecast-db-data` et n’expose pas PostgreSQL sur le web.
+
+2. Dans **Apps**, cliquez sur **Create A New App**, tapez `reputecast`, cochez **Has Persistent Data** (impossible à
+   modifier ensuite) et cliquez sur **Create New App**. Ouvrez `reputecast` depuis **Your Apps**.
+
+3. Dans l’onglet **HTTP Settings**, tapez votre domaine, cliquez sur **Connect New Domain**, puis sur **Enable HTTPS**
+   dans sa ligne (pour l’adresse par défaut, le bouton **Enable HTTPS** à côté). Choisissez votre domaine sous
+   **Redirect all domains to:**, réglez **Container HTTP Port** sur `8080`, cochez
+   **Force HTTPS by redirecting all HTTP traffic to HTTPS** et cliquez sur **Save & Restart**.
+
+4. Le NGINX de CapRover met les réponses en tampon, ce qui retient les Server-Sent Events du suivi en direct et
+   l’[endpoint MCP](/fr/developers/mcp/). Dans **HTTP Settings**, cliquez sur **Edit Default Nginx Configurations**,
+   collez ce bloc sous la ligne qui commence par `set $upstream` et cliquez sur **Save & Restart** (CapRover refuse une
+   configuration qui échoue à `nginx -t`) :
+
+   ```nginx title="Sous set $upstream"
+           # ReputeCast: no buffering for the live monitor (Server-Sent Events) and MCP.
+           location ~ ^(/mcp|/api/v1/workspaces/[^/]+/campaigns/[^/]+/live/stream)$ {
+               proxy_pass $upstream;
+               proxy_set_header Host $host;
+               proxy_set_header X-Real-IP $remote_addr;
+               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+               proxy_set_header X-Forwarded-Proto $scheme;
+               proxy_buffering off;
+               proxy_cache off;
+               proxy_read_timeout 1h;
+           }
+   ```
+
+5. Générez la clé secrète et enregistrez-la dans votre gestionnaire de mots de passe : `openssl rand -base64 32` ou,
+   sur le serveur, `docker run --rm ghcr.io/hostrepute/reputecast:v1.3.1 secrets generate-key` (44 caractères se
+   terminant par `=`).
+
+6. Dans l’onglet **App Configs**, activez **Bulk Edit** à côté de **Environment Variables** et collez ces lignes avec
+   le mot de passe de votre base de données, votre domaine, votre adresse e-mail et votre clé. Sous
+   **Persistent Directories**, cliquez sur **Add Persistent Directory**, réglez **Path in App** sur
+   `/var/lib/reputecast` et **Label** sur `reputecast-data`, puis cliquez sur **Save & Restart**.
+
+   ```sh title="Environment Variables"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:PASSWORD@reputecast-db:5432/reputecast?sslmode=disable
+   REPUTECAST_PUBLIC_URL=https://news.example.com
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-5
+   ```
+
+   - Les autres apps joignent la base de données par son nom d’app, `reputecast-db` ; `srv-captain--reputecast-db`, que
+     l’app one-click affiche, fonctionne aussi. La connexion reste sur le réseau interne de CapRover.
+   - Le dossier est un volume Docker que CapRover gère : un nouveau volume vide prend le propriétaire du dossier de
+     l’image, l’uid 65532, si bien que ReputeCast peut y écrire ses fichiers importés. Avec **Set specific host path**,
+     le dossier sur le serveur doit exister et appartenir à cet utilisateur (`chown 65532:65532 /path/on/host`).
+   - CapRover ne documente pas la plage d’adresses depuis laquelle son NGINX se connecte : laissez donc
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` vide. Autres paramètres : [configuration](/fr/self-hosting/configuration/).
+
+7. Dans l’onglet **Deployment**, sous **Method 6: Deploy via ImageName**, saisissez
+   `ghcr.io/hostrepute/reputecast:v1.3.1` et cliquez sur **Deploy Now**. À son premier démarrage, ReputeCast applique
+   les migrations et crée le premier Propriétaire.
+
+8. Dans l’onglet **Logs**, tapez `Password` dans le champ de recherche. L’onglet affiche les 500 dernières lignes ; en
+   SSH, exécutez `docker service logs reputecast 2>&1 | grep -A4 "ReputeCast is installed"`.
+
+   ```txt title="Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+9. Ouvrez l’URL publique et connectez-vous. La [première connexion](/fr/self-hosting/first-run/) vous demande de
+   remplacer le mot de passe, d’ajouter une clé d’accès ou une application d’authentification, d’enregistrer les codes
+   de récupération, de confirmer les informations de base de l’instance et de créer un espace de travail.
+
+</Steps>
+
+<Aside type="caution">
+  Gardez une copie de `REPUTECAST_SECRETS__KEY` hors de CapRover : sans elle, les identifiants des fournisseurs stockés
+  dans la base de données ne peuvent pas être déchiffrés.
+</Aside>
+
+## Vérifier le résultat
+
+- `curl https://news.example.com/readyz` répond `ready`, ou 503 avec la raison, par exemple `database unavailable`
+  quand ReputeCast ne peut pas joindre PostgreSQL.
+- CapRover n’a pas de vérification HTTP de l’état qui lui soit propre : Docker Swarm utilise le `HEALTHCHECK` de
+  l’image, qui exécute `reputecast healthcheck` sur `/readyz` ([scaling](https://caprover.com/docs/scaling), vérifié en
+  novembre 2026), et remplace un conteneur qui continue d’y échouer. Une vérification que vous ajoutez dans
+  **Service Update Override** ne peut utiliser ni `curl` ni un shell : l’image n’a ni l’un ni l’autre. Pointez aussi un
+  outil de surveillance de disponibilité sur `/readyz` ([surveillance](/fr/self-hosting/monitoring/)).
+
+## Mettre à niveau
+
+1. Lisez les notes de version et [sauvegardez](/fr/self-hosting/backups/) la base de données, sur le serveur :
+
+   ```sh
+   docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast-db -q | head -n1)" \
+     pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. Dans l’onglet **Deployment**, sous **Method 6: Deploy via ImageName**, saisissez le nouveau tag, par exemple
+   `ghcr.io/hostrepute/reputecast:v1.3.1`, et cliquez sur **Deploy Now**. ReputeCast applique les nouvelles migrations
+   à son démarrage. Pour une app avec des données persistantes, CapRover arrête d’abord l’ancien conteneur : prévoyez
+   donc une courte interruption. La mise à niveau vers 1.3.0 convertit `delivery_events` en partitions mensuelles et
+   garde le verrou des migrations pendant toute l’opération
+   ([mise à niveau vers 1.3.0](/fr/self-hosting/upgrades/#mettre-à-niveau-vers-130)). Swarm remplace un conteneur qui
+   n’est pas prêt environ 3 minutes après son démarrage : sur une très grande table, convertissez-la donc d’abord comme
+   l’explique cette section.
+
+**Revert to this version** dans **Version History** rétablit l’image précédente, pas le schéma de la base de données :
+restaurez la sauvegarde pour annuler une mise à niveau
+([mettre à niveau ReputeCast](/fr/self-hosting/upgrades/#revenir-à-la-version-précédente)).
+
+## Dépannage
+
+- **Le domaine affiche la page 502 de CapRover** : **Container HTTP Port** n’est pas `8080`, ou l’app est encore en
+  cours de démarrage ou s’est arrêtée ; lisez l’onglet **Logs**.
+- **`1107 : Verification Failed.`** : l’enregistrement `A` du domaine ne pointe pas encore vers le serveur, ou un proxy
+  comme celui de Cloudflare se trouve devant. Faites pointer l’enregistrement directement vers le serveur et
+  réessayez.
+- **`Error: secret key file /var/lib/reputecast/secret.key: open /var/lib/reputecast/secret.key: permission denied`** :
+  `REPUTECAST_SECRETS__KEY` n’est pas définie et le dossier est un chemin de l’hôte qui appartient à root. Définissez la
+  clé, exécutez `chown 65532:65532` sur le dossier de l’hôte et cliquez sur **Save & Restart**.
+- **Aucun bandeau dans les journaux** : la base de données avait déjà des utilisateurs. Réinitialisez le mot de passe
+  du Propriétaire en SSH ([récupérer l’accès](/fr/self-hosting/account-recovery/)) :
+  `docker exec "$(docker ps --filter label=com.docker.swarm.service.name=reputecast -q | head -n1)" /usr/local/bin/reputecast user reset-password --email you@company.com`
+
+Documentation de la plateforme (vérifiée en octobre 2026) : [Getting started](https://caprover.com/docs/get-started),
+[One-click apps](https://caprover.com/docs/one-click-apps), [App configuration](https://caprover.com/docs/app-configuration),
+[Persistent apps](https://caprover.com/docs/persistent-apps), [Deployment methods](https://caprover.com/docs/deployment-methods),
+[Database connection](https://caprover.com/docs/database-connection), [NGINX config](https://caprover.com/docs/nginx-customization),
+[Zero downtime](https://caprover.com/docs/zero-downtime), [Troubleshooting](https://caprover.com/docs/troubleshooting).

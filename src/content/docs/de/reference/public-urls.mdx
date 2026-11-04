@@ -1,0 +1,183 @@
+---
+title: Öffentliche URLs und Endpunkte
+description: Alle Endpunkte von ReputeCast außerhalb der App-Seiten, von öffentlichen Seiten, Tracking und Webhooks bis MCP, Zustand und Metriken, mit der Serverrolle dazu.
+type: reference
+audience: [operator, developer]
+primaryKeyword: Endpunkte von ReputeCast
+sources:
+  [
+    internal/app/app.go,
+    internal/app/metrics.go,
+    internal/app/reference.go,
+    internal/app/register.go,
+    internal/app/wire_mcpserver.go,
+    internal/app/wire_media.go,
+    internal/app/wire_smtprelay.go,
+    internal/app/wire_webpush.go,
+    internal/publicpages,
+    internal/publicurl/publicurl.go,
+    internal/forms/domain.go,
+    internal/tracking/tracking.go,
+    internal/texting/links.go,
+    internal/ingest/handler.go,
+    internal/commerce/webhooks.go,
+    internal/commerce/oauth.go,
+    internal/earn/webhook.go,
+    internal/texting/ingest.go,
+    internal/whatsapp/webhook.go,
+    internal/sso/api.go,
+    internal/push/public.go,
+    internal/campaigns/review.go,
+    internal/campaigns/collab_api.go,
+    web/src/routes/review.$token.tsx,
+    internal/recommendations/server.go,
+    internal/server/spa.go,
+    web/public/robots.txt,
+  ]
+sidebar:
+  order: 7
+---
+
+import UiPath from '~/components/UiPath.astro'
+
+Diese Seite listet die Endpunkte von ReputeCast, die ein Browser, ein Versandanbieter, ein Monitoring-Tool oder ein anderer Dienst erreicht, gruppiert nach der Serverrolle, die sie ausliefert.
+
+Pfade sind relativ zu Ihrer öffentlichen URL (`http.public_url`). Ein `serve`-Prozess führt die Rollen aus `--role` aus (standardmäßig alle drei, siehe [mit den Rollen web, ingest und worker skalieren](/de/self-hosting/scaling/)): **web** liefert die API, MCP, die öffentlichen Seiten, das Tracking und die Web-App aus; **ingest** liefert `/hooks/…` aus; ein Prozess nur mit **worker** hat keinen HTTP-Listener. `<token>` steht für einen signierten Wert, den ReputeCast in den Link setzt; behandeln Sie jede URL, die einen enthält, als vertraulich.
+
+## Zustand und Metriken
+
+Ausgeliefert von jedem Prozess mit der Rolle web oder ingest und vom Metrik-Listener unter `metrics.addr` ([Konfiguration](/de/reference/configuration/)).
+
+| Pfad            | Wofür                                                                                                                                                                                                                 |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`  | Liveness: `200 ok`, solange der Prozess läuft.                                                                                                                                                                        |
+| `GET /readyz`   | Readiness: `200 ready` oder `503`, wenn die Datenbank nicht innerhalb von 2 Sekunden antwortet, das Datenbankschema hinter diesem Release zurückliegt (führen Sie `reputecast migrate up` aus) oder die Worker noch nicht gestartet sind. |
+| `GET /metrics`  | Prometheus-Metriken auf dem Metrik-Listener, ohne Authentifizierung; halten Sie diesen Port vom Internet fern. Auf dem Hauptport nur mit `metrics.token`, gesendet als `Authorization: Bearer <token>`; sonst `404`. |
+
+Ein Prozess, der nur die Rolle worker ausführt, hat keinen Haupt-Listener und öffnet daher immer den Metrik-Listener für
+`/healthz` und `/readyz`, auch wenn die Metriken ausgeschaltet sind.
+
+[Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/) listet die Metrikreihen.
+
+## API und MCP
+
+Ausgeliefert von der Rolle web.
+
+| Pfad                                     | Wofür                                                                                                                       |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `/api/v1/…`                              | Die REST-API. Siehe die [API-Referenz](/api/).                                                                              |
+| `/api/openapi.json`, `/api/openapi.yaml` | Das OpenAPI-3.1-Dokument, ohne Authentifizierung. `/api/openapi-3.0.json` und `/api/openapi-3.0.yaml` liefern OpenAPI 3.0.  |
+| `/api/reference`                         | Die eigene API-Referenz dieser Instanz: jede Operation ihres OpenAPI-Dokuments, nach Tag gruppiert, mit der Berechtigung, die sie braucht. Ohne Authentifizierung; gesendet mit `noindex`. |
+| jeder andere Pfad unter `/api/…`         | `404`-Problemdokument mit dem Code `not_found`.                                                                             |
+| `/mcp`                                   | Der MCP-Server (Streamable HTTP) für Agent-Tokens `rc_agent_…`. Siehe [MCP-Tools](/de/reference/mcp-tools/).                |
+
+## Öffentliche Seiten
+
+Ausgeliefert von der Rolle web unter `/p/<workspace>/…`, wobei `<workspace>` der URL-Pfad des Arbeitsbereichs ist. Auf einer verifizierten eigenen Domain antworten dieselben Seiten im Stammverzeichnis (siehe [eigene Domains](#eigene-domains)). Die Pfade in dieser Tabelle sind relativ zu `/p/<workspace>`.
+
+| Pfad                                                       | Wofür                                                                                                                  |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `/`                                                        | Die Startseite der Website, wenn die Newsletter-Website eingeschaltet ist; sonst eine Weiterleitung auf `/subscribe`.  |
+| `/subscribe`, `/subscribe/<form>`                          | Anmeldeseite auf ReputeCast, für das Standardformular oder ein bestimmtes Formular.                                    |
+| `/forms/<id>.js`                                           | Einbettungsskript eines Anmeldeformulars. Es ruft `/forms/<id>/session` und `/forms/<id>/submit` auf.                  |
+| `/confirm/<token>`                                         | Bestätigungsseite für das Double-Opt-in. Das Öffnen des Links zeigt den Button <UiPath path="pagelabels.confirm.ask.button" />; erst dessen `POST` bestätigt. Die Seite eines abgelaufenen Links bietet einen neuen Link an ([Grenzen und Standardwerte](/de/reference/limits-and-defaults/)). |
+| `/preferences`, `/preferences/<token>`                     | Formular „Link per E-Mail zusenden“; das Präferenzcenter.                                                               |
+| `/unsubscribe/<token>`                                     | Abmeldeseite. Ein `POST` mit dem Body `List-Unsubscribe=One-Click` ist das Ziel der Abmeldung mit einem Klick nach RFC 8058. |
+| `/view/<token>`                                            | Die E-Mail im Browser.                                                                                                 |
+| `/archive`, `/archive/<issue>`, `/archive.rss`, `/sitemap.xml` | Öffentliches Archiv, eine Ausgabe, sein RSS-Feed und die Sitemap.                                                  |
+| `/sms-terms`                                               | Seite mit den SMS-Bedingungen.                                                                                         |
+| `/poll/<token>/<answer>`, `/s/<slug>`                      | Antwortseite einer Abstimmung (die Stimme erfasst der `POST` der Seite, nicht das Öffnen des Links); Seite einer Umfrage. |
+| `/join/<code>`, `/referrals`, `/referrals/<token>`, `/leaderboard`, `/rewards/<token>` | Einladungsseite einer Weiterempfehlung, Prämienseite, Bestenliste und Downloads von Prämien. |
+| `/recommends`, `/recommends/<token>`                       | Seite mit Empfehlungen.                                                                                                |
+| `/upgrade`, `/upgrade/<tier>`, `/billing/<token>`, `/cancel/<token>` | Upgrade-Seite und Stripe Checkout, das Abrechnungsportal von Stripe und die Kündigungsseite.                 |
+| `/gift`, `/gift/redeem/<code>`                             | Ein Geschenkabo kaufen und einlösen.                                                                                   |
+| `/products`, `/products/<slug>`, `/buy/<product>`, `/d/<token>`, `/l/<token>` | Shop, Produktseite, Checkout, Download-Seite und Download eines Lead-Magneten.                      |
+| `/<slug>`                                                  | Eine veröffentlichte Landing- oder Verkaufsseite (`/<slug>/event.ics` ist ihre Kalenderdatei).                         |
+| `/posts/<slug>`, `/tag/<slug>`, `/feed`                    | Beiträge der Newsletter-Website, Tag-Seiten und der RSS-Feed der Website.                                              |
+| `/signin`, `/account`                                      | Anmeldung und Konto für Mitglieder der Website.                                                                        |
+| `/push/…`                                                  | Endpunkte, über die die Abfrage für Web-Push einen Browser an- und abmeldet.                                           |
+
+Zwei Pfade liegen außerhalb eines Arbeitsbereichs:
+
+- `/p/_/…` liefert das gemeinsame CSS, die Skripte und Schriften der Seiten aus. `GET /p/_/tls-check?domain=<host>` antwortet `200`, wenn der Host eine verifizierte eigene Domain ist, und sonst `404`, für die Einstellung `ask` des On-Demand-TLS von Caddy.
+- `/p/<code>` mit einem Partnercode (`XXXX-XXXX-XXXX`) erklärt, wie Sie den Code in eine andere ReputeCast-Instanz einfügen; das Öffnen verbraucht den Code nicht.
+
+Seiten, die über einen signierten Link erreicht werden, sind `noindex`. Eine `HEAD`-Anfrage an eine Token-Seite bewirkt nichts, daher können Link-Scanner weder bestätigen noch abmelden noch abstimmen. Die `robots.txt` der Instanz sperrt alles außer `/p/`.
+
+## Eigene Domains
+
+Ist die eigene Domain eines Arbeitsbereichs verifiziert (ein `CNAME` auf den Host der Instanz, passende `A`/`AAAA`-Einträge oder der TXT-Eintrag `_reputecast.<domain>`), antworten die öffentlichen Seiten im Stammverzeichnis dieser Domain: `https://news.acme.io/subscribe` ist dieselbe Seite wie `/p/acme-newsletter/subscribe`. ReputeCast erkennt den Arbeitsbereich am Header `Host`, daher muss Ihr Proxy ihn unverändert weitergeben.
+
+- Links auf Seiten, die von der eigenen Domain ausgeliefert werden, lassen `/p/<workspace>` weg. Skripte, Theme-Dateien und gemeinsame Assets behalten ihre Pfade `/p/<workspace>/…` und `/p/_/…`.
+- Die eigene Domain erhält eine eigene `robots.txt` und `sitemap.xml`.
+- E-Mails verlinken weiterhin auf die öffentliche URL.
+- Auf dem eigenen Host der Instanz gehören Stammpfade wie `/subscribe` zur Web-App.
+
+[Branding der Seiten festlegen und eigene Domain nutzen](/de/forms/branding-and-domain/) behandelt den DNS-Schritt, [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/#eigene-domains) die Zertifikate.
+
+## Tracking und Kurzlinks
+
+Ausgeliefert von der Rolle web.
+
+| Pfad                  | Wofür                                                                                                       |
+| --------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `/t/o/<token>`        | Tracking-Pixel für Öffnungen (ein GIF mit 1×1 Pixel).                                                       |
+| `/t/c/<token>`        | Klick-Tracking: erfasst den Klick und leitet auf den Link in der Nachricht weiter. Das Ziel steckt im signierten Token, daher lässt sich der Pfad nicht als offene Weiterleitung missbrauchen. |
+| `/t/p/<id>.<token>`   | Klick auf eine Web-Push-Benachrichtigung: leitet auf den Link der Benachrichtigung weiter.                  |
+| `/t/h/<token>`        | Der versteckte Link in einer E-Mail mit Tracking. Kein Mensch kann ihn sehen, daher wird alles, was ihm folgt, als Klick eines Bots erfasst; er antwortet `204`. |
+| `/t/s/<code>`         | SMS-Kurzlink auf dem Host der Instanz. Auf einer verifizierten Kurzlink-Domain für SMS funktioniert der sechsstellige Code im Stammverzeichnis: `/<code>`. |
+
+## Berichtslinks
+
+| Pfad          | Wofür                                                                                                              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `/r/<token>`  | Ein Ansichtslink zum Teilen eines Kampagnenberichts oder ein Sponsorenbericht. Widerrufene oder abgelaufene Links funktionieren nicht mehr. Ausgeliefert von der Rolle web. |
+
+## Prüflinks
+
+Ausgeliefert von der Rolle web. Mitglieder erstellen diese Links im Editor; siehe
+[Kommentare und Prüflinks](/de/campaigns/comments-and-review-links/).
+
+| Pfad                                    | Wofür                                                                                                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/review/<token>`                       | Ein Prüflink aus dem Editor: eine Version einer Kampagne, personalisiert für einen Beispielleser. Wer den Link hat, liest die E-Mail und kommentiert ohne Anmeldung, bis der Link abläuft oder jemand ihn widerruft. Gesendet mit `noindex`. |
+| `GET /api/v1/review/<token>`            | Die E-Mail und die Kommentare hinter dem Link, die die Seite liest. Kein API-Schlüssel; begrenzt je Client-Adresse.                                                    |
+| `POST /api/v1/review/<token>/comments`  | Ein Kommentar über den Link, unterzeichnet mit dem Namen, den die prüfende Person angibt. Kein API-Schlüssel; begrenzt je Link.                                         |
+
+Die Gültigkeitsdauer eines Prüflinks und das Kommentarlimit stehen unter [Grenzen und Standardwerte](/de/reference/limits-and-defaults/).
+
+## Webhooks
+
+Ausgeliefert von der Rolle ingest. ReputeCast zeigt die genaue URL mit ihrem Token, wenn Sie den Dienst verbinden. Ein unbekanntes Token erhält `404` und eine ungültige Signatur `401` (`400` bei Stripe).
+
+| Pfad                                                          | Wofür                                                                                                  |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `POST /hooks/<adapter>/<token>`                               | Ereignisse von Versandanbietern. `<adapter>` ist `ses`, `postmark`, `postal`, `brevo`, `resend`, `sparkpost`, `mailjet`, `mailgun`, `sendgrid`, `azureacs`, `smtp`, `httpgeneric` oder `community:<id>`. |
+| `POST /hooks/sms/<adapter>/<token>`                           | Zustellbestätigungen für SMS und eingehende SMS (`twilio`, `vonage`, `plivo`, `telnyx`, `aws_eum`).    |
+| `POST /hooks/stripe/<token>`                                  | Zahlungsereignisse von Stripe.                                                                         |
+| `POST /hooks/shopify/<token>`, `POST /hooks/woocommerce/<token>` | Ereignisse von Shops.                                                                               |
+| `GET`, `POST /hooks/whatsapp/<workspace>`                     | Der WhatsApp-Webhook von Meta: `GET` verifiziert das Abonnement, `POST` liefert Ereignisse.            |
+
+[Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/) erklärt, was mit den Ereignissen von Versandanbietern geschieht.
+
+## Anmelde-Callbacks und weitere Pfade
+
+Ausgeliefert von der Rolle web.
+
+| Pfad                                                           | Wofür                                                                                           |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `/auth/oidc/<slug>/callback`                                   | Umleitungs-URI eines OIDC-Anbieters für Single Sign-on.                                         |
+| `/auth/social/<kind>/callback`                                 | Umleitungs-URI für die Anmeldung mit Google, Microsoft und GitHub (`<kind>` = `google`, `microsoft`, `github`). |
+| `/api/v1/placement/oauth/callback`                             | Umleitungs-URI für Testpostfächer, die über OAuth verbunden sind.                               |
+| `/integrations/shopify/app`, `/integrations/shopify/callback`  | App URL und Redirect URL der Shopify-App.                                                       |
+| `/media/<id>/<file>`                                           | In die Medienbibliothek hochgeladene Bilder, die in E-Mails und Seiten verwendet werden.        |
+| `/push/v1/…`, `/rc-push-sw.js`                                 | Skript der Abfrage für Web-Push und Service Worker.                                             |
+| `/.well-known/acme-challenge/…`                                | HTTP-01-Challenge von Let's Encrypt für das Zertifikat des SMTP-Relays.                         |
+| `/partner/v1/…`                                                | Signiertes Protokoll zwischen ReputeCast-Instanzen für Partnerempfehlungen.                     |
+| alles andere                                                   | Die Web-App: `/sign-in`, `/setup`, `/invite/<token>`, `/reset-password/<token>`, `/w/<workspace>/…`. Gesendet mit `noindex`. |
+
+## Verwandte Themen
+
+- [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/) leitet diese Pfade weiter, einschließlich Streaming für `/mcp` und den Live-Monitor.
+- [Abmeldung mit einem Klick (RFC 8058)](/de/deliverability/one-click-unsubscribe/) zeigt die Header, die auf `/unsubscribe/<token>` zeigen.
+- [Anmeldeseite, Präferenzcenter und Abmeldeseite](/de/forms/public-pages/) beschreibt die öffentlichen Seiten.

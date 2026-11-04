@@ -1,0 +1,286 @@
+---
+title: Sauvegarder et restaurer
+description: Sauvegarder ReputeCast avec pg_dump, la clé secrète et le dossier des fichiers, puis restaurer les trois dans le bon ordre et tester la restauration.
+type: how-to
+audience: [operator]
+primaryKeyword: sauvegarder ReputeCast avec pg_dump
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/accounts/signin.go
+  - internal/cli/doctor.go
+  - internal/cli/migrate.go
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - migrations/00300_composer.sql
+  - web/src/features/admin/instance/InstancePage.tsx
+  - docs/deploy/backup-restore.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Sauvegarder ReputeCast avec pg_dump, c’est sauvegarder la base de données, mais aussi la clé secrète et le dossier des
+fichiers : une restauration a besoin des trois, et la base de données seule ne suffit pas.
+
+## Contenu d’une sauvegarde
+
+| Élément                | Ce qu’il contient                                                                                                                                                                             | Où il se trouve                                                                                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Base de données PostgreSQL | Tout le reste : espaces de travail, contacts, campagnes, images importées, la file des tâches, le [journal d’audit](/fr/reference/glossary/#audit-log) et chaque identifiant stocké sous forme chiffrée. | La base de données de `database.url`.                                                                                                                     |
+| Clé secrète            | La clé AES-256-GCM qui chiffre dans la base de données les identifiants des fournisseurs, les secrets client OIDC, les jetons HostRepute et les graines des applications d’authentification (TOTP). | `REPUTECAST_SECRETS__KEY` si vous la définissez ; sinon le fichier de clé `secrets.key_file` : `/var/lib/reputecast/secret.key` dans Docker, `data/secret.key` pour le binaire (relatif au répertoire dans lequel ReputeCast démarre). |
+| Dossier des fichiers   | Les fichiers des produits numériques et les cadeaux d’inscription, trop volumineux pour la base de données.                                                                                  | `files.dir` ; par défaut, un dossier `files` à côté du fichier de clé (`/var/lib/reputecast/files` dans Docker). Il apparaît dès que quelqu’un importe un fichier. |
+
+Conservez aussi votre configuration : le fichier `.env` ou les variables du shell avec lesquels vous démarrez Docker
+Compose, ou votre fichier de configuration YAML et votre fichier d’environnement pour le binaire. La
+[référence de la configuration](/fr/reference/configuration/) liste chaque paramètre.
+
+<Aside type="caution" title="La clé n’est pas facultative">
+  Si vous restaurez la base de données sans sa clé secrète, ReputeCast démarre, écrit une nouvelle clé et journalise
+  `generated a new secret key; back it up together with the database`. Chaque valeur chiffrée avec l’ancienne clé
+  devient alors illisible : la connexion avec une application d’authentification échoue avec
+  `secrets: cannot decrypt value`, et chaque espace de travail doit saisir de nouveau les identifiants de ses
+  fournisseurs. Les liens des e-mails déjà envoyés (désabonnement, centre de préférences, suivi des ouvertures et des
+  clics) cessent aussi de fonctionner, car ils sont signés avec une clé dérivée de la clé secrète. Les codes de
+  récupération et les clés d’accès fonctionnent toujours, car ils ne sont pas chiffrés avec cette clé.
+</Aside>
+
+<Aside type="danger" title="Stocker la clé à l’écart des dumps">
+  Un dump de la base de données accompagné de sa clé ouvre chaque identifiant stocké. Conservez la clé ailleurs que
+  les fichiers de dump, par exemple dans votre gestionnaire de mots de passe, et limitez les personnes qui peuvent lire
+  les deux. Les dumps contiennent aussi les données personnelles de vos contacts.
+</Aside>
+
+## Avant de commencer
+
+- Un accès shell au serveur, et le répertoire du projet Docker Compose (celui qui contient `docker-compose.yml`) ou
+  le fichier d’environnement du binaire.
+- Pour le binaire : `pg_dump`, `pg_restore` et `psql` de la même version majeure de PostgreSQL que votre serveur, ou
+  plus récente.
+- Assez d’espace disque en dehors du volume de données pour les dumps.
+
+## Sauvegarder
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+Le fichier Compose fourni nomme le projet `reputecast`, ses volumes sont donc `reputecast_pgdata` et
+`reputecast_appdata`. Le volume de l’application contient le fichier de clé et le dossier des fichiers.
+
+<Steps>
+
+1. Faites un dump de la base de données depuis le conteneur `postgres`, pour que les versions du client et du serveur
+   correspondent toujours. `-T` désactive le terminal, qui corromprait sinon le dump binaire :
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-$(date +%F).dump
+   ```
+
+   `pg_dump` prend un instantané cohérent pendant que ReputeCast continue de tourner.
+
+2. Archivez le volume de l’application (clé secrète et dossier des fichiers) avec un conteneur éphémère. N’importe
+   quelle image contenant `tar` convient :
+
+   ```sh title="Terminal"
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar czf /backup/appdata-$(date +%F).tar.gz -C /data .
+   ```
+
+   `tar` conserve le propriétaire (l’utilisateur 65532, l’utilisateur non root de l’image) et le mode `0600` de
+   `secret.key`.
+
+3. Si vous avez défini vous-même `REPUTECAST_SECRETS__KEY` au lieu d’utiliser le fichier de clé, stockez cette valeur
+   avec la sauvegarde de votre configuration.
+
+4. Copiez le dump et l’archive hors du serveur.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binaire">
+
+<Steps>
+
+1. Faites un dump de la base de données. Utilisez les informations de connexion de `REPUTECAST_DATABASE__URL` :
+
+   ```sh
+   pg_dump "postgres://reputecast:secret@localhost:5432/reputecast" -Fc -f reputecast-$(date +%F).dump
+   ```
+
+2. Copiez le fichier de clé et le dossier des fichiers. Avec les valeurs par défaut, les deux se trouvent dans le
+   dossier `data` du répertoire dans lequel tourne ReputeCast ; si vous avez défini `secrets.key_file` ou `files.dir`,
+   copiez plutôt ces chemins :
+
+   ```sh
+   tar czf reputecast-data-$(date +%F).tar.gz -C /path/to/reputecast data
+   ```
+
+3. Si vous avez défini `REPUTECAST_SECRETS__KEY` au lieu d’utiliser un fichier de clé, sauvegardez le fichier
+   d’environnement qui le contient.
+
+4. Copiez le dump et l’archive hors du serveur.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Restaurer
+
+Restaurez la base de données avant le démarrage de ReputeCast. L’image Docker tourne avec `--auto-install` : démarrée
+sur une base de données vide, elle crée un nouveau premier Propriétaire, ce que vous ne voulez pas en plus d’une
+restauration.
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Arrêtez l’application et laissez PostgreSQL tourner. Sur un nouveau serveur, démarrez uniquement PostgreSQL :
+
+   ```sh title="Terminal"
+   docker compose stop app
+   docker compose up -d --wait postgres
+   ```
+
+2. Remplacez la base de données par une base vide :
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres dropdb -U reputecast --force --if-exists reputecast
+   docker compose exec -T postgres psql -U reputecast -d postgres -c 'CREATE DATABASE reputecast'
+   ```
+
+3. Sur un nouveau serveur PostgreSQL, créez le rôle sous lequel s’exécutent les
+   [segments SQL](/fr/self-hosting/postgres/#segments-sql). `pg_dump` copie une base de données, pas les rôles du
+   serveur, et sans ce rôle la restauration s’arrête avec `role "reputecast_segments" does not exist` :
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres psql -U reputecast -d postgres \
+     -c 'CREATE ROLE reputecast_segments NOLOGIN NOINHERIT' \
+     -c 'GRANT reputecast_segments TO reputecast'
+   ```
+
+4. Restaurez le dump :
+
+   ```sh
+   docker compose exec -T postgres pg_restore -U reputecast -d reputecast --exit-on-error < reputecast-2026-10-22.dump
+   ```
+
+5. Remettez la clé secrète et les fichiers dans le volume de l’application. `docker compose create app` crée le
+   conteneur et son volume sans le démarrer :
+
+   ```sh title="Terminal"
+   docker compose create app
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar xzf /backup/appdata-2026-10-22.tar.gz -C /data
+   ```
+
+6. Démarrez ReputeCast :
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Si l’image est plus récente que la sauvegarde, elle applique les migrations en attente au démarrage.
+
+7. Vérifiez la restauration (consultez [vérifier le résultat](#vérifier-le-résultat)) :
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast doctor
+   ```
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binaire">
+
+<Steps>
+
+1. Arrêtez ReputeCast, par exemple avec `sudo systemctl stop reputecast`.
+
+2. Recréez la base de données, avec un utilisateur autorisé à créer des bases de données :
+
+   ```sh title="Terminal"
+   dropdb --force --if-exists reputecast
+   psql -d postgres -c 'CREATE DATABASE reputecast OWNER reputecast'
+   ```
+
+3. Sur un nouveau serveur PostgreSQL, créez d’abord le rôle des segments SQL et attribuez-le à l’utilisateur de
+   l’application (ici `reputecast`) :
+
+   ```sql title="segments-role.sql"
+   CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+4. Restaurez le dump en tant qu’utilisateur de l’application :
+
+   ```sh
+   pg_restore -d "postgres://reputecast:secret@localhost:5432/reputecast" --exit-on-error reputecast-2026-10-22.dump
+   ```
+
+5. Remettez le fichier de clé et le dossier des fichiers là où pointent `secrets.key_file` et `files.dir`, lisibles
+   uniquement par l’utilisateur sous lequel tourne ReputeCast :
+
+   ```sh
+   tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
+   ```
+
+6. Si le binaire est plus récent que la sauvegarde, exécutez `reputecast migrate up`. Vérifiez ensuite la restauration
+   avec `reputecast doctor` (consultez [vérifier le résultat](#vérifier-le-résultat)) et redémarrez ReputeCast.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Vérifier le résultat
+
+- `reputecast doctor` affiche `ok` pour la base de données, le schéma, la clé secrète, le dossier des fichiers et le
+  rôle des segments SQL. Il ouvre avec la clé quelques valeurs stockées de chaque type, si bien qu’une mauvaise clé
+  échoue ici plutôt que lors d’un appel à un fournisseur, et il se termine avec `1` quand un contrôle échoue :
+  - **SQL segments role** avertit sur un nouveau serveur : créez le rôle (étape 3), puis exécutez
+    `reputecast migrate segments-role` et redémarrez ReputeCast.
+  - **Previous keys** avertit tant que des valeurs stockées utilisent encore une clé de `secrets.previous_keys`
+    ([renouveler la clé secrète](/fr/self-hosting/security/#renouveler-la-clé)).
+  - **Public URL** avertit quand elle n’est pas en `https://`. Si l’adresse du serveur a changé, définissez
+    `REPUTECAST_PUBLIC_URL` ; l’enregistrer dans <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />
+    déplace aussi les webhooks des fournisseurs.
+- `curl -s http://localhost:8080/readyz` répond `ready`. Consultez
+  [vérifications de l’état, métriques et journaux](/fr/self-hosting/monitoring/).
+- Les journaux de l’application ne contiennent pas `generated a new secret key`. S’ils le contiennent, ReputeCast n’a
+  pas trouvé la clé restaurée : arrêtez-le, remettez la clé en place et redémarrez-le.
+- Connectez-vous avec votre mot de passe et votre application d’authentification, et ouvrez
+  <UiPath path="nav.providers" /> dans un espace de travail : les fournisseurs d’envoi connectés gardent leur état au
+  lieu de demander des identifiants.
+
+Testez une restauration avant d’en avoir besoin : restaurez la dernière sauvegarde dans un second projet Compose sur un
+autre port (par exemple `docker compose -p reputecast-restore-test` avec `REPUTECAST_PORT=8090`) et connectez-vous-y.
+
+## Dépannage
+
+- **`role "reputecast_segments" does not exist` pendant `pg_restore`** : le serveur est nouveau. Créez le rôle (étape 3
+  de la restauration), recréez la base de données vide et restaurez de nouveau.
+- **`reputecast doctor` signale `… sampled values don't open (…): is this the key backed up with the database?`**, ou
+  la connexion avec une application d’authentification échoue avec `secrets: cannot decrypt value` : la base de
+  données a été restaurée sans sa clé, ou avec la mauvaise. Remettez la clé d’origine. Si elle est perdue, les
+  personnes se connectent avec un code de récupération ou une clé d’accès, un admin de l’instance retire leur
+  application d’authentification avec [`reputecast user reset-2fa`](/fr/self-hosting/account-recovery/), et chaque
+  espace de travail saisit de nouveau les identifiants de ses fournisseurs.
+- **Un nouveau Propriétaire avec un mot de passe temporaire apparaît dans les journaux** : l’application a démarré
+  avant la restauration de la base de données. Arrêtez-la, recréez la base de données et restaurez de nouveau.
+- **`pg_restore: error: unsupported version` ou équivalent** : votre `pg_restore` est plus ancien que le `pg_dump` qui
+  a écrit le fichier. Lancez la restauration dans le conteneur `postgres`, ou installez un client plus récent.
+
+## Voir aussi
+
+- [Mettre à niveau ReputeCast](/fr/self-hosting/upgrades/) : faites une sauvegarde avant chaque mise à niveau.
+- [Sécurité et durcissement](/fr/self-hosting/security/) : comment la clé secrète protège les identifiants, et comment
+  la renouveler.
+- [PostgreSQL](/fr/self-hosting/postgres/) : versions, taille du pool et rôle des segments SQL.
+- [Récupérer l’accès depuis la ligne de commande](/fr/self-hosting/account-recovery/).

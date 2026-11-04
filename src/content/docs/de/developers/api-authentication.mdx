@@ -1,0 +1,144 @@
+---
+title: Authentifizierung und API-Schlüssel
+description: "Authentifizierung mit API-Schlüssel für die REST-API von ReputeCast: Präfixe, Bearer-Header, Berechtigungen, Listenbereich, Ablauf, Rotation und 401-Antworten."
+type: reference
+audience: [developer, admin]
+permissions: ['apikeys:manage']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: Authentifizierung mit API-Schlüssel
+sources:
+  - internal/api/auth.go
+  - internal/api/api.go
+  - internal/apikeys
+  - internal/authn/tokens.go
+  - internal/authz/authz.go
+  - internal/app/app.go
+  - internal/smtprelay/relay.go
+  - web/src/features/keys
+  - internal/readiness/types.go
+  - internal/campaigns/presence.go
+sidebar:
+  order: 3
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Diese Seite beschreibt die Authentifizierung mit API-Schlüssel für die REST-API von ReputeCast: welche Zugangsdaten sie
+akzeptiert, was ein Schlüssel darf und wie Schlüssel erstellt, rotiert, widerrufen und abgewiesen werden. Für einen
+ersten Aufruf folgen Sie [Ihren ersten API-Aufruf machen](/de/developers/api-quickstart/).
+
+## Schlüssel senden
+
+Senden Sie den Schlüssel bei jeder Anfrage im Header `Authorization` mit dem Schema `Bearer`:
+
+```http title="Anfrage"
+GET /api/v1/workspaces/acme-newsletter/campaigns HTTP/1.1
+Host: reputecast.example.com
+Authorization: Bearer rc_live_…
+```
+
+- Trägt eine Anfrage ein Bearer-Token, entscheidet allein der Schlüssel, wer aufruft; Sitzungscookies werden ignoriert.
+- Ein Schlüssel gehört zu einem [Arbeitsbereich](/de/reference/glossary/#workspace). Wird er im Pfad eines anderen
+  Arbeitsbereichs verwendet, lautet die Antwort `403` mit dem Detail „This key belongs to another workspace.“
+- Die einzige Operation, die keinen Arbeitsbereich im Pfad braucht, ist
+  [`GET /api/v1/integration`](/api/operations/get-integration/): Sie antwortet mit Slug, Name und Berechtigungen des
+  Arbeitsbereichs des aufrufenden Schlüssels.
+
+## Zugangsdaten
+
+Jeder geheime Schlüssel besteht aus einem Präfix und 64 hexadezimalen Zeichen. ReputeCast zeigt ihn einmal an, beim
+Erstellen oder Rotieren, und speichert nur seinen SHA-256-Hash.
+
+| Zugangsdaten                                                                  | Erstellt unter                                                                                                                                                     | Verwendet für                                                                                                                             |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [API-Schlüssel](/de/reference/glossary/#api-key) <br /> `rc_live_`            | <UiPath path="nav.settings > settings.keys > keys.createApiKey" />                                                                                                 | Die REST-API.                                                                                                                             |
+| [Integrationsschlüssel](/de/reference/glossary/#integration-key) <br /> `rc_live_` | <UiPath path="nav.settings > settings.integrations" />, wenn Sie Zapier, Make, n8n oder WordPress verbinden                                                   | Die REST-API, beschränkt auf die Auslöser und Aktionen, die für die Integration aktiviert sind.                                           |
+| [Nur-Senden-Schlüssel](/de/reference/glossary/#send-only-key) <br /> `rc_live_` | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createKey" /> oder <UiPath path="keys.presetSendOnly" /> im Dialog zum Erstellen | Die API zum Senden von Transaktions-E-Mails. Er hat `transactional:send` und sonst nichts.                                       |
+| Nur-Senden-Schlüssel im Testmodus <br /> `rc_test_`                           | Derselbe Dialog, mit <UiPath path="transactional.setup.mode" /> auf <UiPath path="transactional.setup.modeTest" />                                                 | Die API zum Senden von Transaktions-E-Mails. Er stellt nur an die Mitglieder des Arbeitsbereichs und die erlaubten Testadressen des Schlüssels zu. |
+| SMTP-Zugangsdaten <br /> `rc_smtp_`                                           | <UiPath path="nav.transactional > transactional.common.tabSetup > transactional.setup.createCredential" />                                                         | Das Passwort für das [SMTP-Relay](/de/transactional/smtp-relay/); der Benutzername ist die ID des Schlüssels.                             |
+| Token eines [MCP-Agenten](/de/reference/glossary/#mcp-agent) <br /> `rc_agent_` | <UiPath path="nav.settings > settings.keys > keys.addAgent" />                                                                                                   | Der MCP-Server unter `/mcp` (siehe [KI-Agenten mit MCP verbinden](/de/developers/mcp/)). Die REST-API akzeptiert es ebenfalls, mit den Berechtigungen des Agenten. |
+
+Die Web-App meldet Personen mit dem Cookie `rc_session` an. Skripte und Dienste verwenden Schlüssel.
+
+## Was ein Schlüssel darf
+
+- **Berechtigungen.** Sie wählen 1 bis 60 [Berechtigungsschlüssel](/de/reference/glossary/#permission), dieselben, die
+  Rollen verwenden. Sie können nur Berechtigungen vergeben, die Sie selbst haben; wer mehr anfordert, erhält `403` mit
+  dem Code `escalation_denied`. Berechtigungen, die nur Personen haben dürfen, erreichen nie einen Schlüssel (siehe die
+  Regeln für Inhaber von Berechtigungen unter [Berechtigungen und Rollen](/de/reference/permissions/)).
+- **Nie mehr als die Person, die ihn erstellt hat.** Bei jedem Aufruf werden die Berechtigungen eines Schlüssels auf das
+  beschränkt, was das Mitglied, das ihn erstellt hat, in diesem Moment hat. Verliert dieses Mitglied eine Berechtigung,
+  verliert sie auch der Schlüssel. Verlässt es den Arbeitsbereich, authentifiziert der Schlüssel weiter, aber jede
+  Operation, die eine Berechtigung braucht, antwortet mit `403`; ein Integrationsschlüssel antwortet stattdessen mit
+  `owner_deactivated`, und jemand mit `integrations:manage` kann ihn übernehmen.
+- **Listenbereich.** Ein Schlüssel kann auf Listen beschränkt werden (bis zu 100; keine heißt alle Listen). Er kann
+  keine Listen außerhalb des Bereichs der Person erreichen, die ihn erstellt hat.
+- **Integrationsschlüssel** funktionieren nur für die Operationen der Auslöser und Aktionen, die für ihre Integration
+  aktiviert sind; jeder andere Aufruf antwortet mit `403` und dem Code `integration_operation_denied`. Zwölf
+  Operationen akzeptieren nur den Schlüssel einer Integration (oder einer WordPress-Website).
+- **Nur für Personen.** Schlüssel erstellen und rotieren, Versände freigeben, Kontosicherheit und Instanzverwaltung
+  erfordern eine angemeldete Person, ebenso die Kommentare und Prüflinks des Editors, das Verwerfen einer Warnung, das
+  Fortsetzen eines Versands, den seine Canary-Phase zurückgehalten hat, die Bitte um eine E-Mail, sobald die Ergebnisse
+  eines Berichts endgültig sind, das Verschieben einer geplanten Kampagne auf eine andere Zeit, das Festlegen des
+  Marketing-Limits des Arbeitsbereichs und das Senden eines Tests einer Transaktionsvorlage. Ein Schlüssel, der sie
+  aufruft, erhält `403` mit dem Code `humans_only`. Diese Operationen stehen nicht in der [API-Referenz](/api/).
+- **Handelt als er selbst.** Ein Schlüssel oder MCP-Agent tritt nie an die Stelle der Person, die ihn erstellt hat. Das
+  [Audit-Protokoll](/de/team/audit-log/) nennt den Schlüssel oder Agenten, ebenso ein Lauf der
+  [Versandbereitschaft](/de/reference/glossary/#send-readiness), den er anfordert: `ranBy` und `startedBy` enthalten
+  seinen Namen, mit `ranByType` oder `startedByType` auf `api_key` oder `mcp_agent`. Die Liste des Editors mit den
+  Personen, die eine Kampagne geöffnet haben, zeigt nur Personen; ein Schlüssel oder Agent steht nie darin und zählt nie
+  als Anwesenheit der Person, die ihn erstellt hat.
+
+Die Berechtigung, die jede Operation braucht, steht auf ihrer Seite in der API-Referenz und in `x-permission` im
+OpenAPI-Dokument.
+
+## Lebenszyklus eines Schlüssels
+
+Schlüssel zu verwalten erfordert die Berechtigung `apikeys:manage` (MCP-Agenten: `mcp:manage`). Erstellen und Rotieren
+geschehen in der App, angemeldet.
+
+<TableScroll label="Lebenszyklus eines Schlüssels">
+
+| Aktion                                | Was passiert                                                                                                                                                                                                                                                           |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Erstellen                             | Der geheime Schlüssel wird einmal angezeigt. Das Audit-Protokoll erfasst `apikey.created` mit den Berechtigungen und dem Bereich, nie mit dem geheimen Schlüssel.                                                                                                      |
+| <UiPath path="keys.rotate" />         | Ein neuer geheimer Schlüssel mit demselben Namen, denselben Berechtigungen und demselben Bereich wird einmal angezeigt. **Der alte geheime Schlüssel funktioniert sofort nicht mehr.** Ein Schlüssel mit Ablaufdatum erhält erneut dieselbe Laufzeit, ab heute gerechnet. Das Rotieren eines abgelaufenen Schlüssels ersetzt ihn. |
+| Integrationsschlüssel rotieren        | Verwenden Sie <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: Der alte Schlüssel funktioniert noch 24 Stunden. Das Rotieren unter Schlüssel & MCP antwortet mit `409` und dem Code `managed_by_integration`.        |
+| <UiPath path="keys.revoke" />         | Der Schlüssel funktioniert sofort nicht mehr; Aufrufe erhalten `401`. Im selben Dialog können Sie einen Ersatz mit denselben Berechtigungen und demselben Bereich erstellen.                                                                                            |
+| Ablauf                                | Nach seinem Ablaufdatum antwortet der Schlüssel mit `401`. Abgelaufene Schlüssel bleiben mit der Zahl der Aufrufe gelistet, die sie noch zu verwenden versuchen, damit Sie finden, was Sie aktualisieren müssen.                                                         |
+| Löschen                               | Entfernt einen abgelaufenen oder widerrufenen Schlüssel aus der Liste. Aktive Schlüssel müssen zuerst widerrufen werden.                                                                                                                                                |
+
+</TableScroll>
+
+Die Liste der Schlüssel zeigt, wann jeder Schlüssel zuletzt verwendet wurde und von welcher IP-Adresse. Aktionen eines
+Schlüssels erscheinen im [Audit-Protokoll](/de/team/audit-log/) mit dem Schlüssel als Akteur.
+
+## Limits
+
+<LimitsTable area="api-keys" />
+
+## Abgewiesene Schlüssel
+
+Ein abgewiesener Schlüssel antwortet mit `401`, dem Code `unauthenticated` und dem Header
+`WWW-Authenticate: Bearer realm="reputecast"`. `detail` nennt den Grund:
+
+| Situation                                        | `detail`                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------ |
+| Kein Header `Authorization` und keine Sitzung    | `Sign in to continue.`                                                   |
+| Ein Token ohne Schlüsselpräfix von ReputeCast    | `Unknown API key.`                                                       |
+| Ein unbekannter oder widerrufener Schlüssel      | `This API key is revoked or unknown.`                                    |
+| Ein abgelaufener Schlüssel                       | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
+
+Integrationsschlüssel antworten stattdessen mit `401` und den Codes `key_revoked` und `key_expired`, und ihr Detail
+nennt die Integration, die neu verbunden werden muss. Kann die Datenbank nicht bestätigen, wer aufruft, lautet die
+Antwort `503` mit dem Code `unavailable`: Versuchen Sie es erneut, der Schlüssel bleibt gültig. Jeder Code steht unter
+[API-Fehler](/de/developers/api-errors/).
+
+## Verwandte Themen
+
+- [Ihren ersten API-Aufruf machen](/de/developers/api-quickstart/)
+- [Rate-Limits](/de/developers/api-rate-limits/)
+- [Rollen und Berechtigungen](/de/team/roles-and-permissions/)
+- [Sicherheit und Härtung](/de/self-hosting/security/)

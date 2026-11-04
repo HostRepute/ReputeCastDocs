@@ -1,0 +1,197 @@
+---
+title: Baja con un clic (RFC 8058)
+description: "Cómo admite ReputeCast la baja con un clic RFC 8058: las cabeceras List-Unsubscribe exactas que añade, el endpoint POST, qué cambia y una prueba con curl."
+type: explanation
+audience: [publisher, admin, developer]
+primaryKeyword: baja con un clic RFC 8058
+sources:
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/automation.go
+  - internal/providers/provider.go
+  - internal/publicurl/publicurl.go
+  - internal/publicpages/publicpages.go
+  - internal/publicpages/tokens.go
+  - internal/publicpages/notifications.go
+  - internal/audience/signup.go
+  - internal/linktoken/linktoken.go
+  - internal/app/wire_forms.go
+  - internal/transactional/send.go
+  - internal/readiness/assemble.go
+  - internal/providers/brevo/brevo.go
+  - internal/providers/azureacs/azureacs.go
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+La [baja con un clic](/es/reference/glossary/#one-click-unsubscribe) permite que un lector abandone tu boletín con el
+botón para darse de baja que su aplicación de correo muestra junto al remitente, sin abrir ninguna página web. La
+RFC 8058 define cómo funciona: dos cabeceras del mensaje y un POST por HTTPS. ReputeCast añade las cabeceras de la
+baja con un clic RFC 8058 a todos los mensajes de Envíos masivos y Automatizaciones y responde él mismo al POST, así que
+no tienes que configurar nada; esta página explica qué envía y cómo probarlo.
+
+## Las cabeceras que añade ReputeCast
+
+Todos los mensajes de Envíos masivos y Automatizaciones llevan estas cabeceras (`TOKEN` representa el token firmado de
+un destinatario):
+
+```txt title="Headers of a Broadcast message"
+List-Unsubscribe: <https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN>, <mailto:digest@news.acme.io?subject=unsubscribe%20TOKEN>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Feedback-ID: 0199ab12:acme-newsletter:broadcast:reputecast
+```
+
+- **La dirección HTTPS** es la URL pública de tu instancia seguida de `/p/<workspace>/unsubscribe/<token>`. Siempre usa
+  la URL pública de la instancia, también cuando las páginas públicas del espacio de trabajo funcionan en un
+  [dominio personalizado](/es/forms/branding-and-domain/).
+- **El token** identifica el espacio de trabajo, el mensaje y el contacto. Está firmado con un HMAC derivado de la clave
+  secreta de la instancia, no lleva datos personales en texto claro y no caduca. Después de
+  [rotar la clave secreta](/es/self-hosting/security/#rotar-la-clave), los tokens de los correos ya enviados siguen
+  funcionando mientras la clave antigua siga en `secrets.previous_keys`.
+- **La dirección `mailto:`** es la dirección Reply-To de la campaña, o la Reply-To del remitente, o si no la dirección
+  From, con el asunto `unsubscribe <token>`. Está ahí para las aplicaciones de correo que no pueden enviar el POST.
+  ReputeCast no lee el correo que se envía a ella: esas solicitudes llegan a ese buzón, y das de baja al contacto a
+  mano en [Gestionar contactos](/es/audience/contacts/).
+- **`Feedback-ID`** es para el bucle de retroalimentación de Gmail: el principio del ID de la campaña, el espacio de
+  trabajo, el flujo y `reputecast`.
+
+La RFC 8058 exige un URI HTTPS en `List-Unsubscribe`, el valor exacto `List-Unsubscribe=One-Click` en
+`List-Unsubscribe-Post` y una firma DKIM que cubra ambas cabeceras
+([RFC 8058, secciones 3.1 y 4](https://www.rfc-editor.org/rfc/rfc8058#section-3.1), comprobado en octubre de 2026). La
+firma DKIM la pone tu proveedor de envío, así que depende de que [DKIM esté configurado](/es/deliverability/spf-dkim-dmarc/).
+
+### Qué mensajes las llevan
+
+<TableScroll label="Cabeceras de baja con un clic por flujo">
+
+| Mensajes                                                       | Cabeceras                                                                                       |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Envíos masivos (campañas)                                      | `List-Unsubscribe` con la dirección HTTPS y `mailto:`, y `List-Unsubscribe-Post`                 |
+| Automatizaciones                                               | Las mismas                                                                                      |
+| Correo transaccional de una categoría Opcional                 | `List-Unsubscribe` solo con la dirección HTTPS, y `List-Unsubscribe-Post`                        |
+| Correo transaccional de una categoría Esencial                 | Ninguna. Estos correos no se pueden desactivar; su enlace de baja abre el centro de preferencias |
+| Correo de Sistema: confirmaciones, restablecimientos de contraseña, envíos de prueba | Ninguna                                                                   |
+| Copias de las pruebas de ubicación                             | Las cabeceras de Envíos masivos, pero una baja desde una copia no cambia nada                    |
+
+</TableScroll>
+
+Gmail y Yahoo solo exigen la baja con un clic para el correo de marketing; los mensajes transaccionales están exentos
+([Google, Email sender guidelines FAQ](https://support.google.com/a/answer/14229414), comprobado en octubre de 2026).
+Consulta [Correo transaccional en ReputeCast](/es/transactional/overview/) para ver las categorías.
+
+Dos proveedores de envío cambian esto:
+
+- **Brevo** quita las dos cabeceras de ReputeCast y pone las suyas, así que las bajas con un clic van a Brevo, que las
+  notifica a ReputeCast a través de su webhook de bajas. Después, ReputeCast añade la dirección a la lista de supresión.
+  Consulta [Enviar con Brevo](/es/providers/brevo/).
+- **Azure Communication Services** no cubre `List-Unsubscribe` con su firma DKIM, así que no se puede confiar en la baja
+  con un clic de Gmail y Yahoo con ese proveedor. La revisión previa avisa en su grupo Cumplimiento cuando lleva parte de
+  un envío. Consulta
+  [Enviar con Azure Communication Services](/es/providers/azure-communication-services/).
+
+## Cómo funciona una baja con un clic
+
+1. En el momento del envío, ReputeCast firma un token para cada destinatario y pone la dirección en las cabeceras y en
+   el enlace `{{ unsubscribe_url }}` del pie.
+2. La aplicación de correo muestra su botón para darse de baja. Gmail solo lo muestra en los mensajes que superan sus
+   propias comprobaciones de idoneidad, aunque las cabeceras sean correctas
+   ([FAQ](https://support.google.com/a/answer/14229414), comprobado en octubre de 2026).
+3. Cuando el lector confirma, la aplicación de correo envía un POST por HTTPS con el cuerpo
+   `List-Unsubscribe=One-Click`, sin cookies ni inicio de sesión.
+4. ReputeCast comprueba el token y da de baja al contacto en la misma solicitud, y después responde `200` con el texto
+   `Unsubscribed.` La respuesta usa el idioma de las páginas públicas: el que elige la cabecera `Accept-Language` de la
+   solicitud si las páginas lo ofrecen y, si no, el idioma predeterminado de las páginas (`Baja completada.` en
+   español).
+5. A partir de entonces, Envíos masivos y Automatizaciones omiten la dirección.
+
+```http title="The request a mail app sends"
+POST /p/acme-newsletter/unsubscribe/TOKEN HTTP/1.1
+Host: reputecast.acme.io
+Content-Type: application/x-www-form-urlencoded
+
+List-Unsubscribe=One-Click
+```
+
+| Respuesta | Cuándo                                                                                                |
+| --------- | ----------------------------------------------------------------------------------------------------- |
+| `200`     | `Unsubscribed.` El contacto se ha dado de baja, o ya lo estaba. Repetir la solicitud no cambia nada.  |
+| `400`     | No se pudo leer el cuerpo.                                                                            |
+| `404`     | El token no es válido, está dañado, está firmado con una clave que la instancia ya no tiene o pertenece a otro espacio de trabajo. |
+| `500`     | Falló la base de datos: "No se pudo completar la baja en este momento; vuelve a intentarlo en un minuto." |
+
+El endpoint solo lee el campo del cuerpo, enviado como `application/x-www-form-urlencoded` o `multipart/form-data`, y
+nunca redirige un POST de baja con un clic. Un `GET` a la misma dirección abre la página de baja (con la oferta
+opcional de "menos correos" y el motivo) y no cambia nada hasta que el lector confirma allí. Una solicitud `HEAD`, que
+es lo que envían los escáneres de enlaces, tampoco cambia nada.
+
+## Qué cambia una baja
+
+- **Listas:** el contacto sale de todas las listas del espacio de trabajo, no solo de la lista de la campaña, y su
+  estado pasa a dado de baja.
+- **Lista de supresión:** la dirección se añade con el motivo Baja y el ámbito
+  <UiPath path="audience.suppressions.marketingOnly" />: Envíos masivos y Automatizaciones se detienen, mientras que el
+  correo de Sistema (como los restablecimientos de contraseña) y el correo transaccional siguen llegando. La entrada se
+  queda en ReputeCast: la [sincronización de supresiones](/es/providers/events-and-sync/) nunca envía una baja a la
+  lista de supresión propia de un proveedor de envío, lo que detendría todos los mensajes, incluido un restablecimiento
+  de contraseña. Consulta [La lista de supresión](/es/audience/suppressions/).
+- **Historial de consentimiento:** un evento por cada lista abandonada, con el origen baja con un clic, la dirección IP
+  y el navegador o la aplicación de correo.
+- **Informes:** la baja cuenta para la campaña de la que procedía el mensaje, o para el paso de la automatización del
+  correo. Las bajas con un clic no llevan motivo.
+- **Correo transaccional:** una baja con un clic desde una categoría Opcional solo desactiva esa categoría.
+
+## Requisitos
+
+- **Una URL pública HTTPS.** Las aplicaciones de correo solo envían el POST a una dirección HTTPS. Cuando la URL pública
+  de la instancia no es `https://`, la revisión previa avisa en su grupo Cumplimiento: "La baja con un clic necesita una
+  dirección HTTPS". Define la URL pública como se describe en [Configurar ReputeCast](/es/self-hosting/configuration/).
+- **Un proxy inverso que deje pasar sin cambios las solicitudes POST** a las rutas `/p/`
+  ([Proxy inverso y TLS](/es/self-hosting/reverse-proxy/)).
+- **DKIM en el proveedor de envío**, que cubra las cabeceras, como exige la RFC 8058.
+- **Un enlace de baja visible** también en el cuerpo del correo. Las cabeceras no lo sustituyen: la revisión previa
+  bloquea una campaña cuyo cuerpo no tiene enlace de baja o dirección postal
+  ([Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)).
+
+## Probar la baja con un clic
+
+<Aside type="caution">
+Una prueba correcta da de baja al contacto de verdad. Usa un contacto con tu propia dirección en una lista de prueba.
+</Aside>
+
+<Steps>
+
+1. Envía una campaña a una lista que solo contenga tu propia dirección. Los envíos de prueba desde el editor salen como
+   correo de Sistema y no llevan la cabecera `List-Unsubscribe`.
+
+2. En tu aplicación de correo, abre el código fuente del mensaje y copia la dirección HTTPS de la cabecera
+   `List-Unsubscribe`.
+
+3. Envía la solicitud de baja con un clic:
+
+   ```sh title="Terminal"
+   curl -i -X POST 'https://reputecast.acme.io/p/acme-newsletter/unsubscribe/TOKEN' \
+     -H 'Content-Type: application/x-www-form-urlencoded' \
+     --data 'List-Unsubscribe=One-Click'
+   ```
+
+4. Comprueba la respuesta: estado `200`, `Content-Type: text/plain; charset=utf-8` y el cuerpo `Unsubscribed.` La línea
+   de estado dice `HTTP/1.1 200 OK` o `HTTP/2 200`, según tu proxy.
+
+5. Abre el contacto en <UiPath path="nav.audience" />: el perfil muestra el contacto dado de baja de todas las listas, y
+   la lista de supresión contiene la dirección con el ámbito <UiPath path="audience.suppressions.marketingOnly" />.
+   Para deshacer la prueba, abre la dirección HTTPS en un navegador y vuelve a suscribirte desde la página.
+
+</Steps>
+
+Para probar sin dar de baja a nadie, usa la dirección de una copia de una [prueba de ubicación](/es/deliverability/placement-tests/):
+el mismo POST responde `200` con "Esta es una copia de una prueba de ubicación. No se dio de baja a nadie."
+
+## Relacionado
+
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Páginas de suscripción, preferencias y baja](/es/forms/public-pages/)
+- [La lista de supresión](/es/audience/suppressions/)
+- [URL públicas y endpoints](/es/reference/public-urls/)

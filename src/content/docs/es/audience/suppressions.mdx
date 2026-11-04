@@ -1,0 +1,157 @@
+---
+title: La lista de supresión
+description: 'Cómo funciona la lista de supresión de correo de ReputeCast: una lista para todos los proveedores, qué entra, qué bloquea cada entrada y cómo se sincroniza.'
+type: explanation
+audience: [publisher, admin]
+permissions: ['subscribers:edit', 'subscribers:export']
+uiPath: 'nav.audience > audience.tabSuppressions'
+primaryKeyword: lista de supresión de correo
+sources:
+  - internal/audience/suppressions.go
+  - internal/suppressions/sync.go
+  - internal/ingest/normalize.go
+  - internal/texting/suppressions.go
+  - web/src/features/audience/SuppressionsPage.tsx
+  - web/src/features/audience/SuppressionDialogs.tsx
+  - web/src/features/audience/suppressions.messages.ts
+  - web/src/features/sms/Suppressions.tsx
+  - internal/providers/ses/ses.go
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+La [lista de supresión](/es/reference/glossary/#suppression-list) contiene todas las direcciones a las que ReputeCast no
+debe escribir. Hay una lista de supresión de correo por espacio de trabajo, compartida por todos los
+[proveedores de envío](/es/reference/glossary/#sending-provider): a una dirección que tuvo un rebote permanente a través
+de Amazon SES tampoco se le envía nunca a través de Postmark. Cada envío comprueba primero la lista, diga lo que diga el
+segmento, la lista o la ruta.
+
+<Screenshot
+  id="suppressions"
+  alt="Lista de supresión con 2162 direcciones: los recuentos de rebotes permanentes, quejas, bajas, manuales y trampas de spam y no válidas, el estado de sincronización de Amazon SES, Postmark y Postal, el selector Correo y SMS con filtros, y filas que muestran cada motivo con su código SMTP original."
+/>
+
+## Cómo llegan las direcciones a la lista
+
+1. **Eventos de los proveedores de envío.** Un rebote permanente, una queja o una baja que comunica el webhook de un
+   proveedor añade la dirección al momento, con el código original del proveedor. Un aviso leído de un buzón de rebotes
+   SMTP solo cuenta cuando trata de un mensaje que envió ReputeCast y nombra al destinatario de ese mensaje. Un rebote
+   permanente que bloquea al remitente (un bloqueo por política, por spam o por reputación, como una IP en una lista de
+   bloqueo o un fallo de DMARC) no dice nada de la dirección, así que nunca la añade: la dirección recibe el siguiente
+   envío una vez resuelto el bloqueo. Los rebotes temporales no la añaden, con una excepción: cuando un mensaje
+   transaccional tiene un rebote temporal y la dirección ha tenido 3 rebotes temporales en 7 días, se suprime para todo el
+   correo como dirección no válida.
+2. **Bajas.** El enlace de baja, la baja con un clic y la página de baja añaden una entrada solo para marketing.
+3. **Importaciones.** Los contactos que se dieron de baja, rebotaron o se quejaron en la herramienta anterior se
+   convierten en supresiones, y la importación puede traer lo que tus proveedores de envío ya bloquean. Consulta
+   [Importar contactos](/es/audience/import/).
+4. **Comprobaciones de direcciones.** Las direcciones no válidas que detecta un
+   [servicio de verificación](/es/audience/verification/) se suprimen para todo el correo.
+5. **Tu equipo.** Suprime un contacto desde su perfil o en bloque, añade direcciones a mano, sube un CSV o usa la API.
+6. **Sincronización con los proveedores.** Se reciben las supresiones de los proveedores conectados (ver más abajo).
+
+## Qué bloquea cada entrada
+
+<TableScroll label="Motivos de supresión y qué bloquean">
+
+| Motivo | Se aplica a | Bloquea |
+| --- | --- | --- |
+| Rebote permanente, queja, trampa de spam, dirección no válida, manual, entradas importadas | Todo el correo | Todos los flujos en todos los proveedores, incluido el transaccional |
+| Baja, direcciones genéricas | Solo marketing | Envíos masivos y Automatizaciones; los restablecimientos de contraseña, los recibos y el resto del correo de Sistema o transaccional siguen llegando |
+
+</TableScroll>
+
+La tabla muestra el motivo de cada entrada con el código original (por ejemplo `550 5.1.1 user unknown`), su origen (un
+proveedor, el centro de preferencias, la baja con un clic, una importación, un CSV subido, un servicio de verificación,
+un miembro del equipo o <UiPath path="audience.suppressionSource.repermission" /> para un
+[correo de reconfirmación de una importación](/es/audience/import/) que nadie respondió en 14 días), la campaña o el
+recorrido que la causó y a qué se aplica. Las direcciones aparecen parcialmente ocultas en pantalla. Las filas de una
+misma importación, y las direcciones de un mismo CSV subido con quién lo subió, se agrupan, con
+<UiPath path="audience.suppressions.viewRows" />. Con más de 10.000 coincidencias, el recuento dice “10.000+
+direcciones”.
+
+## Gestionar la lista
+
+Añadir, subir, recibir y quitar requieren `subscribers:edit` (Propietario, Administrador y Editor). Exportar requiere
+`subscribers:export` (delicado). Cada cambio queda en el registro de auditoría con tu nombre.
+
+- <UiPath path="audience.suppressions.addAddress" />: pega hasta 1000 direcciones, una por línea o separadas por comas,
+  con una nota opcional que se muestra como código original. Quedan bloqueadas para todo el correo.
+- <UiPath path="audience.suppressions.importFrom" />:
+  - **Recibir de tus proveedores de envío** copia los rebotes, las quejas y las bajas que tus proveedores conectados ya
+    bloquean. Se omiten los proveedores sin API de supresiones.
+  - **Subir un CSV** lee una columna llamada `email` o `email address` (si no, la primera columna), hasta 16 MB y
+    100.000 direcciones, por ejemplo la lista de bloqueo exportada de tu herramienta anterior. Elige el motivo para todo
+    el archivo. El archivo subido aparece como un solo grupo.
+- **Quitar** pide un motivo (al menos 3 caracteres). Lo que pasa después depende de por qué estaba ahí la dirección:
+  - Rebote permanente, queja, trampa de spam o dirección no válida: el contacto vuelve a pendiente y necesita volver a
+    darse de alta antes de recibir correo, así que a una dirección mala no se le sigue escribiendo.
+  - Baja: quítala solo cuando la persona haya pedido volver a suscribirse. Aun así tiene que volver a unirse a sus
+    listas, por ejemplo desde el centro de preferencias o un formulario de suscripción.
+  - Manual: el correo se reanuda en todos los proveedores.
+- <UiPath path="audience.suppressions.removeGroup" />, en el grupo de un CSV subido, quita todo el archivo, con un motivo
+  en <UiPath path="audience.suppressions.removeGroupReason" />. Cada dirección se trata como si la hubieras quitado por
+  separado, y el registro de auditoría guarda una sola entrada para el archivo.
+- <UiPath path="audience.suppressions.export" />: descarga toda la lista en CSV, con las direcciones completas y las
+  columnas `email`, `reason`, `scope`, `source`, `source_provider`, `original_code`, `campaign_or_flow`,
+  `suppressed_at`.
+
+No hay supresiones para un dominio entero; cada entrada es una dirección.
+
+<Aside type="caution">
+  Quita una dirección solo cuando sepas que funciona y que la persona quiere tu correo. Volver a escribir a una dirección
+  que rebotó o se quejó perjudica tu reputación ante todos los proveedores de buzón.
+</Aside>
+
+## Sincronizar con los proveedores de envío
+
+La franja bajo los recuentos muestra, para cada proveedor conectado, cuántas direcciones se recibieron de él y cuántas se
+le enviaron, y cuándo se sincronizó por última vez. La sincronización se ejecuta cada 15 minutos, y otra vez poco después
+de que un webhook comunique rebotes, quejas o bajas nuevos.
+
+<TableScroll label="Sincronización de supresiones por proveedor de envío">
+
+| Modo | Proveedores de envío | Qué ocurre |
+| --- | --- | --- |
+| Bidireccional | Amazon SES, Postmark, Mailgun, Mailjet, Resend, SendGrid, SparkPost | Se reciben sus supresiones y se les envían las de ReputeCast. |
+| Solo recibir | Brevo | Se reciben las supresiones de Brevo; Brevo no admite envíos. |
+| Solo local | SMTP, Postal, Azure Communication Services, HTTP genérico | Se añaden sus rebotes y quejas; ReputeCast comprueba la lista antes de cada envío. |
+
+</TableScroll>
+
+Un envío a un proveedor solo incluye los rebotes permanentes y las quejas que se aplican a todo el correo, primero los
+más antiguos, y una dirección que quitas de la lista también se quita de la lista del proveedor. Las bajas y las demás
+entradas solo para marketing nunca se envían, porque la lista de un proveedor detiene todos los mensajes, incluidos los
+restablecimientos de contraseña. La lista de nivel de cuenta de Amazon SES, que comparte el resto del correo de la
+cuenta, solo se lee; con un tenant de SES, ReputeCast sincroniza con la lista propia del tenant.
+
+ReputeCast deja de enviar a una supresión nueva al momento, porque cada envío comprueba la lista. Enviarla a la lista
+propia del proveedor espera a la siguiente sincronización. <UiPath path="audience.suppressions.syncSettings" /> abre
+<UiPath path="providers.events.syncTitle" /> en la página de eventos de los proveedores, con la dirección de cada
+proveedor y <UiPath path="providers.events.syncAll" /> (requiere `providers:manage`). Consulta
+[Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/).
+
+## Valores predeterminados y límites
+
+El intervalo de sincronización, las 1000 direcciones que puedes pegar a la vez y el límite de 16 MB para subir un CSV
+figuran con todos los demás valores predeterminados en
+[Límites y valores predeterminados](/es/reference/limits-and-defaults/). Ninguno se puede cambiar.
+
+## Supresiones de SMS
+
+Cuando los SMS están configurados, un selector **SMS** muestra los números de teléfono que no pueden recibir mensajes:
+dados de baja por SMS, fijos, fuera de servicio, números no válidos, filtrados por los operadores, en la lista de bajas
+del proveedor o manuales. Un STOP nunca afecta al correo. Los números que se dieron de baja por SMS no se pueden quitar;
+solo la persona puede volver, enviando START. Consulta [Enviar campañas de SMS](/es/channels/sms/).
+
+## Relacionado
+
+- [Rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/)
+- [Listas, consentimiento y doble confirmación](/es/audience/lists-and-consent/)
+- [Baja con un clic (RFC 8058)](/es/deliverability/one-click-unsubscribe/)
+- [Mantener sana tu lista](/es/audience/list-health/)

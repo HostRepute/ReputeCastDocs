@@ -1,0 +1,113 @@
+---
+title: L’e-mail transactionnel dans ReputeCast
+description: "L’e-mail transactionnel auto-hébergé de ReputeCast : son flux, sa route et son basculement, puis catégories, exclusions, états, conservation et alertes."
+type: explanation
+audience: [admin, developer]
+permissions: ['transactional:view']
+uiPath: 'nav.transactional'
+primaryKeyword: e-mail transactionnel auto-hébergé
+sources:
+  - internal/transactional
+  - internal/smtprelay
+  - web/src/features/transactional
+  - docs/spec/reputecast-design-addon-transactional.md
+  - internal/sending/engine/{transactional.go,warmup_send.go}
+sidebar:
+  order: 1
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast envoie votre e-mail transactionnel auto-hébergé (réinitialisations de mot de passe, liens de connexion,
+reçus et autres e-mails de votre produit) depuis la même instance que vos newsletters, sans partager leur réputation
+ni leur file d’attente. Votre application appelle l’API HTTP ou le SMTP relay avec un ID de modèle et des données ;
+ReputeCast effectue le rendu d’un [modèle transactionnel](/fr/reference/glossary/#transactional-template) publié,
+vérifie la liste de suppression et transmet le message aux fournisseurs d’envoi de la route Transactionnel. Tout se
+trouve sous <UiPath path="nav.transactional" />.
+
+<Screenshot
+  id="transactional"
+  alt="La vue d’ensemble Transactionnel : la route et les chiffres de livraison des 7 derniers jours, au-dessus des modèles avec leur catégorie, leur version en ligne et leurs envois des 7 derniers jours."
+/>
+
+## Comment un message transactionnel est envoyé
+
+1. **Votre application appelle ReputeCast.** Elle envoie un message, ou un lot de 100 messages au plus, avec une
+   [clé d’envoi uniquement](/fr/reference/glossary/#send-only-key) via l’API, ou se connecte au
+   [SMTP relay](/fr/transactional/smtp-relay/). L’API répond `202` avec l’ID du message. Le format de la requête,
+   l’en-tête `Idempotency-Key` et des exemples de code se trouvent dans
+   [envoyer des e-mails transactionnels avec l’API](/fr/developers/transactional-api/).
+2. **ReputeCast effectue le rendu de la version en ligne.** Seules les versions publiées partent. S’il manque des
+   variables obligatoires, l’appel échoue avec `missing_variables` et rien n’est envoyé. Les e-mails qui arrivent par
+   SMTP sont déjà rendus et figurent dans le journal comme **Brut (SMTP)**.
+3. **La liste de suppression et les catégories sont vérifiées.** L’e-mail transactionnel ne part jamais vers une
+   adresse qui a généré un rebond définitif ou une plainte, qui a touché un piège à spam, qui n’est pas valide, ou qui
+   a été ajoutée à la [liste de suppression](/fr/audience/suppressions/) manuellement ou par un import. Il ignore les
+   entrées propres au marketing : les désabonnements et les adresses génériques comme `billing@`. Un destinataire qui
+   a désactivé une catégorie facultative ne reçoit pas cette catégorie.
+4. **La route Transactionnel le délivre.** Transactionnel est le quatrième [flux](/fr/reference/glossary/#stream), à
+   côté de Diffusions, Automatisations et Système, avec sa propre [route](/fr/providers/routing/) : un fournisseur
+   d’envoi principal et un fournisseur de secours facultatif. Le basculement est automatique. Quand le même
+   fournisseur d’envoi achemine aussi une campagne, les messages transactionnels passent en premier dans la limite de
+   son débit d’envoi. Les conditions de routage sur le fournisseur de messagerie le déduisent des enregistrements MX du
+   destinataire : une adresse Google Workspace compte donc comme Gmail.
+   L’e-mail transactionnel n’attend jamais la fin d’une [chauffe](/fr/providers/warm-up/) : un fournisseur en chauffe
+   l’envoie dans la limite du plafond du jour, et il compte dans ce plafond comme les autres e-mails. Au-delà du
+   plafond, ou pendant que le plan est en pause, un message passe par un fournisseur de sa route dont la chauffe est
+   terminée et qui peut le prendre, ou à défaut par le fournisseur en chauffe malgré tout, et la page de chauffe le
+   compte comme un dépassement du plafond.
+5. **Les événements reviennent.** Les événements de livraison, de rebond, de plainte et d’engagement mettent à jour
+   l’état du message dans le [journal des messages](/fr/transactional/message-log/) et sont envoyés à vos
+   [endpoints de webhook](/fr/developers/webhooks/) sous forme d’événements `message.*`.
+
+## Catégories
+
+Chaque modèle appartient à une catégorie, et la catégorie détermine si un destinataire peut la désactiver.
+
+| Type        | Comportement                                                                                                                 |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Essentiels  | Toujours envoyés : e-mails de connexion, de mot de passe, de facturation et de compte. Le pied de page n’a pas de lien de désabonnement. |
+| Facultatifs | Les destinataires peuvent les désactiver dans le centre de préférences ou avec le lien de désabonnement du pied de page.     |
+
+Vous gérez les catégories dans les [paramètres Transactionnel](/fr/transactional/settings/).
+
+## États des messages
+
+Un message a l’un de ces états : **Programmé**, **En file d’attente**, **Envoyé**, **Délivré**, **Différé**,
+**Rebond**, **Plainte**, **Rejeté**, **Annulé**, **Échec** ou **Test**. Programmé signifie qu’il attend l’heure
+`send_at` indiquée par votre application ; d’ici là, vous pouvez
+[l’annuler ou le déplacer](/fr/transactional/message-log/#annuler-ou-déplacer-un-message-programmé), et un message
+annulé affiche Annulé. Rejeté signifie que ReputeCast l’a arrêté avant l’envoi, par exemple parce que l’adresse est
+exclue ou que le destinataire s’est désinscrit de la catégorie. Test signifie qu’une clé en mode test l’a envoyé ; les
+clés en mode test ne délivrent qu’aux membres de l’espace de travail et aux adresses de test que vous autorisez sur la
+clé.
+
+## Des alertes plutôt qu’une pause automatique
+
+Les campagnes sont [mises en pause automatiquement](/fr/campaigns/live-monitor/) quand les rebonds ou les plaintes
+augmentent. L’e-mail transactionnel n’est jamais mis en pause, car une réinitialisation de mot de passe doit continuer
+d’arriver. À la place, ReputeCast vérifie chaque minute la dernière heure écoulée et vous alerte quand le taux de
+rebond d’un modèle, le nombre de messages en échec ou le délai de livraison médian dépasse sa limite.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="transactional" />
+
+## Quand les modifier
+
+- Conservez le contenu rendu plus longtemps (jusqu’à 90 jours) quand votre support doit retrouver ce qu’un client a
+  reçu ; conservez-le moins longtemps, ou pas du tout, quand il contient des données personnelles. Modifiez ce réglage
+  dans les [paramètres Transactionnel](/fr/transactional/settings/).
+- Abaissez les limites d’alerte pour les modèles dont chaque échec compte, comme les liens de connexion.
+- Donnez à la route Transactionnel un fournisseur de secours chez un autre fournisseur d’envoi, pour qu’une panne chez
+  l’un n’arrête jamais les réinitialisations de mot de passe.
+
+## Voir aussi
+
+- [Envoyer votre premier e-mail transactionnel](/fr/transactional/first-send/)
+- [Créer et publier des modèles transactionnels](/fr/transactional/templates/)
+- [Importer des modèles transactionnels](/fr/migrate/transactional-templates/)
+- [Router les e-mails entre fournisseurs](/fr/providers/routing/)
+- [Autorisations et rôles](/fr/reference/permissions/)

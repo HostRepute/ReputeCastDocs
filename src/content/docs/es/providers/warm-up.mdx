@@ -1,0 +1,194 @@
+---
+title: Calentar un proveedor o una IP nuevos
+description: 'Sigue un calendario de calentamiento de IP en ReputeCast: límite diario estricto, primero los contactos con más interacción y freno si suben los rebotes.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabWarmup'
+primaryKeyword: calendario de calentamiento de IP
+sources:
+  - internal/warmup
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/audience.go
+  - internal/sending/engine/automation.go
+  - internal/sending/engine/transactional.go
+  - internal/automations/engine.go
+  - internal/routing/routing.go
+  - web/src/features/providers/WarmupPage.tsx
+  - web/src/features/providers/warmup-model.ts
+  - web/src/features/providers/warmup.messages.ts
+  - web/src/features/live/States.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Una [IP dedicada](/es/reference/glossary/#dedicated-ip) nueva, un proveedor de envío nuevo o tu propio servidor Postal
+no tienen historial de envío, así que los proveedores de buzón desconfían de una avalancha repentina de correo desde
+ellos. Un plan de [calentamiento](/es/reference/glossary/#warm-up) le da un calendario de calentamiento de IP: un límite
+diario que sube a lo largo de unas semanas y se aplica a medida que sale el correo, primero el correo a tus contactos con
+más interacción, y una ralentización automática cuando suben los rebotes o las quejas.
+
+## Antes de empezar
+
+- Conecta el proveedor. Lee [Conectar un proveedor de envío](/es/providers/connect/).
+- Para que su parte de los Envíos masivos suba según el calendario, ponlo en un reparto ponderado de la ruta Envíos
+  masivos junto a un proveedor que ya tenga el calentamiento completado, por ejemplo 90 % Amazon SES y 10 % Postal. Lo
+  configuras en el paso Flujos del asistente de conexión (papel Reparto ponderado) o en la página de enrutamiento. Lee
+  [Enrutar el correo entre proveedores](/es/providers/routing/).
+- Necesitas el permiso `providers:manage`. Con `providers:view` puedes seguir un plan.
+- Los grupos de interacción salen de la [salud de la lista](/es/audience/list-health/): Activo, Enfriándose, En riesgo y
+  En retirada.
+
+## Iniciar un plan
+
+<Steps>
+
+1. Abre <UiPath path="nav.providers > providers.tabWarmup" /> y elige <UiPath path="providers.warmup.newPlan" />.
+
+2. Elige el <UiPath path="providers.warmup.provider" /> y la <UiPath path="providers.warmup.length" />. Escribe su
+   <UiPath path="providers.warmup.dedicatedIp" /> si tiene una; déjalo vacío para calentar el grupo de IP compartido del
+   proveedor para tu dominio.
+
+3. Elige <UiPath path="providers.warmup.startWarmup" />. El estado del proveedor cambia a En calentamiento · día 1 de N,
+   el límite de su primer día es de 200 correos y su parte de los Envíos masivos empieza en el 10 %. Un plan nuevo envía
+   primero a los contactos con más interacción, pone un límite a cada proveedor de buzón por separado y envía lo que
+   supera el límite a través de un proveedor con el calentamiento completado. Cada proveedor puede tener un plan a la
+   vez.
+
+4. Ajusta la <UiPath path="providers.warmup.settingsTitle" /> si lo necesitas y elige
+   <UiPath path="providers.warmup.savePlan" />. El límite de hoy se queda como está; los cambios se aplican a los días
+   siguientes.
+   - <UiPath path="providers.warmup.length" />: 14 días contados (rápido), 21 (recomendado para una IP dedicada nueva)
+     o 30 (prudente). Una duración nueva rehace los días siguientes desde el límite de hoy hasta el mismo volumen final,
+     así que el límite de hoy nunca da un salto. Un plan no puede durar menos que los días que ya contó.
+   - <UiPath path="providers.warmup.ordering" />: <UiPath path="providers.warmup.orderEngaged" />, o
+     <UiPath path="providers.warmup.orderRandom" />, que envía a todos los grupos de interacción desde el primer día.
+   - <UiPath path="providers.warmup.slowIfBounces" /> una tasa de rebote,
+     <UiPath path="providers.warmup.orComplaints" /> una tasa de quejas.
+   - <UiPath path="providers.warmup.whenTrips" />: mantener el límite hasta 2 días correctos seguidos (el
+     predeterminado), <UiPath path="providers.warmup.actionStepBack" /> o <UiPath path="providers.warmup.actionPause" />.
+   - <UiPath path="providers.warmup.spread" />.
+
+</Steps>
+
+<Screenshot
+  id="providers-warmup"
+  alt="Una IP dedicada de Postal en el día 9 de 21 con 8 de 21 días contados: el recuadro que explica cómo avanza el plan, el límite de hoy de 6000 sin nada enviado en un día sin envíos masivos, así que el día 9 se repite mañana, las tasas de rebote y de quejas de 7 días por debajo de sus umbrales de protección, una ralentización, la progresión del volumen diario y los límites de hoy por proveedor de buzón."
+/>
+
+## Cómo funciona el calendario
+
+1. **La progresión.** El día 1 son 200 correos. El límite crece cada día por el mismo factor hasta que el último día
+   alcanza el objetivo: la audiencia de tu campaña más grande hasta ahora, o 48.000 si el espacio de trabajo aún no ha
+   enviado ninguna campaña. El límite de velocidad del día reparte el límite a lo largo de una hora aproximadamente y
+   nunca supera la velocidad máxima del propio proveedor.
+2. **El límite se aplica a medida que sale el correo.** Todos los flujos enviados a través del proveedor cuentan para el
+   límite del día, en la zona horaria del espacio de trabajo. Con límites por proveedor de buzón, cada uno recibe su
+   parte del límite, así que los proveedores de buzón estrictos reciben límites más bajos; Gmail incluye a los
+   destinatarios de Google Workspace y Outlook a los de Microsoft 365, identificados por los registros MX.
+3. **Quién recibe correo primero.** Con el orden de más interacción primero, el primer cuarto de los días solo envía a
+   los contactos Activo, los contactos Enfriándose se suman hasta la mitad, los contactos En riesgo se suman después, y
+   el último día envía a todos los grupos. Un destinatario de Envíos masivos fuera de los grupos del día pasa por la
+   mayor parte con el calentamiento completado de la misma ruta o, si no, por el respaldo de la ruta.
+4. **Lo que supera el límite.** Depende del flujo:
+   - **Envíos masivos** pasan por un proveedor de la ruta con el calentamiento completado cuando el plan envía allí lo
+     que supera el límite (desbordamiento). Sin desbordamiento, o sin un proveedor con el calentamiento completado, la
+     parte del envío del proveedor se retiene al llegar al límite: una [ruta retenida](/es/reference/glossary/#held-route)
+     que continúa sola con el límite del día siguiente. La página del plan y el
+     [monitor en tiempo real](/es/campaigns/live-monitor/) muestran la campaña en espera, con tres opciones:
+     <UiPath path="providers.warmup.holdWait" /> el límite siguiente, mover los destinatarios retenidos a un proveedor
+     que supere las comprobaciones de conmutación por error, o <UiPath path="providers.warmup.holdCancel" /> de esta
+     parte. Esperar y mover necesitan `campaigns:send`; cancelar necesita `campaigns:pause`.
+   - **Automatizaciones** esperan al llegar al límite y mientras el plan está en pausa, o pasan por el respaldo del
+     flujo con el calentamiento completado cuando el plan permite el desbordamiento. No se descarta nada, y una rama que
+     espera una apertura o un clic de un correo retenido solo empieza su plazo cuando el correo sale.
+   - **Transaccional** nunca espera: pasa por un proveedor de su ruta con el calentamiento completado, o se envía y se
+     cuenta por encima del límite del día. La tarjeta de límites muestra cuántos lo superaron.
+5. **La parte de Envíos masivos.** Si el proveedor está en un reparto ponderado de Envíos masivos con otro proveedor,
+   su parte sube del 10 % al 15 %, al 25 % y, finalmente, al 40 % a lo largo del plan; la parte sale del otro proveedor
+   más grande del reparto. El reparto es fijo, así que los destinatarios que ya pasaron al proveedor en calentamiento se
+   quedan allí.
+6. **Días contados.** Un plan tiene días contados, no días del calendario. ReputeCast revisa cada hora todos los planes
+   en marcha. Cuando termina un día, cuenta si salió al menos el 80 % de su límite y se respetaron los umbrales de
+   protección; si no, el mismo día se repite al día siguiente. Los umbrales de protección solo evalúan un día cuando ha
+   enviado 500 mensajes, así que una queja de cada 200 nunca retiene la progresión. La tasa de rebote es el número de
+   rebotes por mensaje enviado; la tasa de quejas solo cuenta los proveedores de buzón que informan de las quejas, porque
+   Gmail e iCloud no lo hacen.
+7. **Ralentizaciones.** Cuando la tasa de rebote o de quejas de un día evaluado supera su umbral de protección, el día no
+   cuenta y el plan hace lo que elegiste. Con mantener, el límite se mantiene hasta 2 días correctos seguidos mientras el
+   plan sigue en su día; después, la progresión se reanuda un paso por encima del límite mantenido. Con retroceder, el
+   límite retrocede primero un día, se mantiene de la misma forma y, después, la progresión se reanuda en el día que se
+   activó. Con pausar, el plan espera hasta que alguien lo reanude. Cada paso queda en
+   <UiPath path="providers.warmup.logTitle" />.
+8. **El final.** Después del último día contado, el plan termina, el estado del proveedor vuelve a Operativo y puede
+   aceptar la conmutación de Envíos masivos con la política de solo proveedores con el calentamiento completado.
+
+### Leer el plan
+
+El titular muestra el día ("día 9 de 21"), los días contados hasta ahora y cuándo termina el plan como pronto. En
+<UiPath path="providers.warmup.howTitle" />, indica qué hace que hoy cuente, por ejemplo "Hoy cuenta cuando se envíen
+4800; van 1200", o que el día se repite mañana porque salió demasiado poco. Después vienen el límite de hoy y lo enviado
+hoy, todo lo enviado durante el calentamiento, las tasas de rebote y de quejas de 7 días junto a sus umbrales de
+protección, las ralentizaciones hasta ahora y el límite de velocidad de hoy.
+
+El gráfico <UiPath path="providers.warmup.rampTitle" /> y la tabla que hay debajo muestran el límite de cada día (los
+límites mantenidos lo indican), lo enviado, sus tasas de rebote y de quejas, los grupos a los que envió y si contó:
+<UiPath path="providers.warmup.badgeCounted" />, <UiPath path="providers.warmup.badgeNotCounted" /> con el motivo,
+<UiPath path="providers.warmup.badgeHeld" /> (un día correcto durante el mantenimiento de una ralentización), Hoy,
+Previsto o En pausa. <UiPath path="providers.warmup.capsTitle" /> muestra el límite de hoy y lo enviado por proveedor de
+buzón, con el interruptor <UiPath path="providers.warmup.overflowLabelNone" /> y el correo transaccional enviado hoy por
+encima del límite.
+
+Para detener la progresión un tiempo, elige <UiPath path="providers.warmup.pause" />. Pausar congela el plan: el
+proveedor no envía nada, los Envíos masivos pasan por un proveedor de la ruta con el calentamiento completado o esperan,
+las Automatizaciones esperan, el correo Transaccional va a un proveedor con el calentamiento completado o cuenta por
+encima del límite, y los días en pausa no cuentan. <UiPath path="providers.warmup.resume" /> retoma el plan en el día en
+que se detuvo.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="warm-up" />
+
+## Comprobar que funciona
+
+- <UiPath path="nav.providers > providers.tabProviders" /> muestra el proveedor como En calentamiento · día N de M, con
+  el límite de calentamiento de hoy.
+- <UiPath path="nav.providers > providers.tabRouting" /> muestra los aumentos de proporción previstos bajo el reparto
+  ponderado, y la pestaña Campaña del probador de rutas muestra lo que el próximo envío masivo envía a través del
+  proveedor en calentamiento, lo que supera su límite y lo que queda retenido.
+- Después del primer día completo, el registro del calentamiento tiene una entrada "Día 1 contado" con lo enviado y la
+  tasa de rebote, o explica por qué se repitió el día.
+
+## Solución de problemas
+
+- **"Todos los proveedores conectados ya tienen un plan de calentamiento"**: cada proveedor tiene un plan a la vez.
+  Cambia en su lugar la configuración del plan en marcha.
+- **El plan se queda en el mismo día**: salió menos del 80 % del límite del día, por ejemplo en un día sin envíos
+  masivos. El día se repite hasta que sale suficiente correo; la tabla y el registro indican los días que no contaron.
+- **Una campaña espera en el límite de calentamiento**: ningún proveedor con el calentamiento completado comparte la
+  ruta Envíos masivos, o el desbordamiento está desactivado. Elige esperar, mover o cancelar el resto en la página del
+  plan o en el monitor en tiempo real, o activa el desbordamiento y añade al reparto un proveedor con el calentamiento
+  completado.
+- **La parte de Envíos masivos no sube**: el proveedor tiene que estar en el reparto ponderado de Envíos masivos con al
+  menos otro proveedor cuya parte pueda ceder la diferencia. Una parte que subiste a mano por encima de la prevista se
+  queda como está.
+- **Una ralentización en los primeros días**: los rebotes en una IP nueva suelen indicar direcciones antiguas o sin
+  verificar. Revisa la [salud de la lista](/es/audience/list-health/) y los códigos de rebote en el
+  [registro de eventos](/es/providers/events-and-sync/).
+- **El plan se pausó solo**: se activó el umbral de protección y el plan está configurado para pausarse hasta que lo
+  reanudes. Lee en el registro del calentamiento el día y el proveedor de buzón con más rebotes, corrige la causa y
+  elige <UiPath path="providers.warmup.resume" />.
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Enrutar el correo entre proveedores" href="/es/providers/routing/" />
+  <LinkCard title="Mantener sana tu lista" href="/es/audience/list-health/" />
+  <LinkCard title="Enviar con tu propio servidor Postal" href="/es/providers/postal/" />
+  <LinkCard title="Supervisar un envío y la pausa automática" href="/es/campaigns/live-monitor/" />
+</CardGrid>

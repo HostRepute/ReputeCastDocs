@@ -1,0 +1,399 @@
+---
+title: Supervisar un envío y la pausa automática
+description: 'Cómo protege ReputeCast un envío en curso: pausa automática por tasa de rebote y por quejas, la fase canaria, las caídas y tus opciones después de una pausa.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:pause', 'campaigns:send', 'campaigns:approve']
+uiPath: 'nav.campaigns > campaigns.liveMonitor'
+primaryKeyword: pausa automática por tasa de rebote
+sources:
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/thresholds_live.go
+  - internal/sending/engine/rearm.go
+  - internal/sending/engine/actions.go
+  - internal/sending/engine/analysis.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/routeerrors.go
+  - internal/sending/engine/doubt.go
+  - internal/sending/engine/canary.go
+  - internal/sending/engine/canary_live.go
+  - internal/sending/engine/replies.go
+  - internal/sending/engine/rates.go
+  - internal/sending/engine/estimate.go
+  - internal/sending/engine/watch.go
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/live.go
+  - internal/sending/engine/api.go
+  - internal/sending/engine/messages/en.json
+  - internal/sending/rules
+  - internal/providers/state/vet.go
+  - internal/providers/{brevo,sparkpost}/idempotency.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/live
+sidebar:
+  order: 14
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+En cuanto empieza una campaña, el <UiPath path="live.title" /> la muestra mientras ocurre, y el
+[envío protegido](/es/reference/glossary/#guarded-sending) la protege. Con la pausa automática por tasa de rebote, por
+tasa de quejas o por otro umbral, ReputeCast pausa o ralentiza solo la parte del envío que superó su límite, por ejemplo
+los destinatarios de Outlook, y el resto sigue adelante. Un envío puede empezar con un pequeño
+[envío canario](/es/reference/glossary/#canary), una caída retiene solo la parte del proveedor de envío que falla y
+ningún mensaje se envía nunca dos veces. Siempre que algo queda retenido, una persona decide qué pasa después.
+
+<Screenshot
+  id="live-monitor"
+  alt="El monitor en tiempo real mientras se envía Weekly Digest #142: la tarjeta de progreso con la parte enviada, la hora de fin de cada ruta y la línea de resumen Enviando a todos; todos los umbrales están dentro de su límite, y después los mosaicos de entregados, rebotados, quejas, aperturas y clics. Debajo, todos los umbrales de pausa automática, de los rebotes a los errores de API del proveedor de envío, están en Vigilando, dentro de su límite."
+/>
+
+## Qué muestra el monitor
+
+- **La cabecera** indica quién empezó, programó y aprobó el envío, lo recientes que son los números (“En tiempo real ·
+  actualizado hace 1 s”) y quién puede actuar sobre él. En lugar de una clave de permiso, el monitor nombra a las
+  personas que pueden reanudar o decidir.
+- **La tarjeta de progreso** muestra la parte enviada, una barra por proveedor de envío (con lo que está retenido, en
+  cola o en duda) y, a la velocidad actual, cuándo termina cada ruta. Su única línea de resumen indica lo que importa
+  ahora, como “Enviando a todos; todos los umbrales están dentro de su límite.” Los lectores de pantalla oyen esa línea
+  cuando cambia, no cada recuento.
+- **Cinco mosaicos:** entregados, rebotados (divididos en usuarios desconocidos, rebotes por bloqueo o política y
+  rebotes temporales), quejas, aperturas y clics. El mosaico de aperturas pone primero las
+  [aperturas humanas](/es/reference/glossary/#human-opens); cualquier apertura que no hizo una persona, tanto las
+  [aperturas con protección de privacidad](/es/reference/glossary/#privacy-protected-open) como las de los escáneres,
+  cuenta aquí como “automática”. El [informe de la campaña](/es/campaigns/reports/) las muestra por separado.
+- <UiPath path="live.perMailbox" />: enviados, restantes, entregados, aplazamientos de los últimos 10 minutos, tasas de
+  rebote y de quejas, la velocidad actual y cuándo termina cada [proveedor de buzón](/es/reference/glossary/#mailbox-provider).
+  Los proveedores de buzón salen de los registros MX de cada dominio, así que Gmail incluye a los destinatarios de Google
+  Workspace, y Outlook, a los de Microsoft 365.
+- <UiPath path="live.perProvider" />: la parte de cada proveedor de envío, su velocidad, su tasa de entrega, los errores
+  de API de los últimos 3 minutos y la hora de fin. Un proveedor [en calentamiento](/es/providers/warm-up/) muestra su día
+  y el límite de hoy.
+- <UiPath path="live.thresholds" />: una barra por umbral con la evidencia que la respalda, descrita más abajo.
+- <UiPath path="live.liveEvents" /> y <UiPath path="live.sendDetails" />: el remitente, la audiencia, la ruta, el costo
+  hasta ahora, quién lo programó, el envío canario y la vigilancia de quejas después del envío.
+
+Los números vienen de los webhooks de entrega de tus proveedores de envío (consulta
+[eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)) y llegan por una conexión en tiempo
+real aproximadamente una vez por segundo. Un servidor SMTP simple no informa de las entregas, así que un mensaje enviado
+a él cuenta como entregado en cuanto el servidor lo acepta, marcado como “deducido”.
+
+### Quejas solo donde se informan
+
+Gmail e iCloud nunca informan a los remitentes de las quejas individuales. Sus tasas de quejas muestran
+<UiPath path="live.model.notAvailable" /> con el motivo, y su correo entregado queda fuera de todas las tasas de quejas,
+para que no las diluya. Las tasas de quejas solo cuentan el correo entregado a proveedores de buzón que informan de las
+quejas: Outlook, Yahoo y muchos de Otros. La tasa de spam propia de Gmail llega una vez al día desde Google Postmaster
+Tools; la [vigilancia de quejas](#después-del-envío-la-vigilancia-de-quejas) puede leerla.
+
+## Cómo decide el envío protegido
+
+1. **Primero actúan las reglas de respuesta.** Las [reglas de respuesta](/es/reference/glossary/#reply-rule) cuentan las
+   respuestas SMTP de un proveedor de buzón, como el `TSS04` de Yahoo, y actúan en cuanto se alcanza su recuento, antes
+   que cualquier umbral de tasa. Cada espacio de trabajo empieza con unos valores predeterminados; consulta
+   [definir las reglas de tráfico](/es/providers/traffic-rules/).
+2. **Después, los umbrales, cada 2 segundos.** Primero, los umbrales por tipo de rebote: los rebotes por bloqueo o
+   política y los aplazamientos por proveedor de buzón y, después, los usuarios desconocidos en todo el envío. Luego, las
+   quejas y los rebotes por proveedor de buzón, los rebotes por proveedor de envío, y los rebotes y las quejas de todo el
+   envío. Actúa el primer umbral que se activa.
+3. **Cada tipo de rebote tiene su propio umbral.** Los rebotes por bloqueo o política (rechazados por reputación,
+   política o contenido) se evalúan por proveedor de buzón. Los usuarios desconocidos (direcciones que no existen) se
+   evalúan en todo el envío con dos niveles: el primero avisa y el segundo pausa el envío. Los rebotes temporales y los
+   aplazamientos se evalúan por proveedor de buzón en los últimos 10 minutos, cada mensaje una vez, con dos niveles: el
+   primero reduce ese proveedor de buzón a la mitad de velocidad y el segundo lo pausa.
+4. **Una tasa solo se activa con suficiente evidencia.** Necesita al menos 5 eventos, al menos 500 mensajes a ese
+   proveedor de buzón o proveedor de envío (1000 para todo el envío) y una confianza de alrededor del 90 % de que la tasa
+   real supera el límite, para que unas pocas quejas al principio de un envío no lo detengan. Las tasas de quejas cuentan
+   el correo entregado donde se informan las quejas; las demás tasas cuentan el correo enviado.
+5. **Algunas tasas no esperan a tanta evidencia.** Las quejas y los rebotes por bloqueo o política son el veredicto de
+   un proveedor de buzón sobre el remitente, así que también activan un envío de cualquier tamaño cuando superan
+   claramente el límite: al menos 3, con el extremo inferior del intervalo de confianza del 95 % de la tasa (Wilson) por
+   encima del límite. Los rebotes por bloqueo o política también se activan con un pico: 3 o más en Gmail, Outlook, Yahoo
+   o iCloud en 10 minutos, claramente por encima del límite respecto a lo enviado allí en ese tiempo. Así se detecta un
+   proveedor de buzón que empieza a bloquear tarde en un envío grande.
+6. **La acción decide qué pasa.** Por defecto, un umbral activado pausa solo ese proveedor de buzón (o la parte de ese
+   proveedor de envío), y todo lo demás sigue enviándose. Las reglas de tráfico pueden hacer que un umbral reduzca su
+   ámbito a la mitad de velocidad, pause todo el envío o solo avise. Con el <UiPath path="senders.providers.pauseScope" />
+   definido como toda la campaña, cada pausa lo retiene todo.
+
+Cada barra de la tarjeta de umbrales muestra uno de cuatro estados:
+
+- <UiPath path="traffic.legendCollecting" />: menos de 5 eventos o no hay suficiente correo, y no está claramente por
+  encima del límite. La barra está en gris; todavía no puede activarse.
+- <UiPath path="traffic.legendWatching" />: hay evidencia suficiente y está dentro del límite.
+- <UiPath path="traffic.legendNear" />: al 90 % del límite o más.
+- <UiPath path="traffic.legendTripped" />: hay evidencia suficiente de que la tasa supera el límite; su acción se ejecutó.
+
+La tarjeta muestra los rebotes (todo el envío), <UiPath path="live.model.thresholdBlock" /> y los aplazamientos (el
+proveedor de buzón más cercano a su límite), las quejas (todo el envío, donde se informan) y las quejas del proveedor de
+buzón con la tasa más alta, <UiPath path="live.model.thresholdReplies" /> y <UiPath path="live.model.thresholdErrors" />.
+
+Los umbrales salen de los valores predeterminados del espacio de trabajo y de las
+[reglas de tráfico](/es/reference/glossary/#traffic-rules), cambiados para esta campaña en
+<UiPath path="composer.reviewSend" /> si lo hiciste. Mientras el envío está en curso o en espera,
+<UiPath path="live.editThresholdsLive" /> abre <UiPath path="live.thresholdsEditTitle" />: los nuevos límites se aplican
+al resto de este envío en segundos, los valores predeterminados del espacio de trabajo se quedan como están y el cambio
+queda en el [registro de auditoría](/es/team/audit-log/) con tu nombre.
+
+## Qué pasa en una pausa
+
+- Los destinatarios retenidos esperan en la cola. No se descarta nada.
+- Todas las personas del espacio de trabajo que pueden enviar campañas reciben una notificación urgente en la aplicación
+  y por correo, por ejemplo “La tasa de quejas de Outlook alcanzó el 0,18 % (límite: 0,10 %). 2522 retenidos; todo lo
+  demás se sigue enviando.”
+- Se dispara el [webhook](/es/reference/webhook-events/) `campaign.paused` con `paused_by: auto_pause`, la métrica, su
+  valor y su límite, el ámbito y el número de retenidos.
+- El monitor en tiempo real abre un panel de decisión: <UiPath path="live.whatTripped" /> con la evidencia, las causas
+  probables, una recomendación y <UiPath path="live.chooseTitle" />.
+
+<Screenshot
+  id="live-monitor-paused"
+  alt="Weekly Digest #142 con solo su parte de Outlook en pausa automática: 3 quejas en 725 entregados sitúan la tasa de quejas de Outlook en el 0,41 % frente a su límite del 0,10 %, claramente por encima, mientras Gmail, Yahoo, iCloud y Otros siguen enviando. El panel muestra qué lo activó, las causas probables, la recomendación y las opciones Reanudar sin cambios, Reanudar con cambios (recomendado) y Cancelar la parte de Outlook."
+/>
+
+### Decisiones tras una pausa por umbral
+
+- <UiPath path="sending.opt.resumeAction" /> envía a todos los que siguen retenidos. Un cuadro de diálogo
+  <UiPath path="live.resumeSending" /> pregunta cómo: reanudar y volver a pausar si la tasa vuelve a superar el límite (a
+  la velocidad más baja recomendada, cuando la hay), o reanudar con el umbral subido solo para esta campaña, lo que el
+  registro de auditoría guarda con tu nombre. En ambos casos, el umbral se rearma a partir de los recuentos actuales: solo
+  cuentan los eventos nuevos, así que los que lo activaron nunca lo vuelven a pausar.
+  <UiPath path="live.keepPaused" /> lo deja retenido.
+- <UiPath path="sending.opt.changesAction" /> se ofrece cuando ReputeCast encuentra una causa. Puede dejar fuera al grupo
+  que produjo la mayoría de las quejas (importaciones que nunca interactuaron, o contactos que dejaron de interactuar),
+  enviar el resto de la parte de un proveedor de buzón o de un proveedor de envío a una velocidad más baja y, cuando hay
+  publicada una automatización de reconfirmación o de reactivación adecuada, añadirle los contactos que quedaron fuera.
+  La opción indica exactamente lo que hará antes de que la elijas.
+- **Cancelar la parte** omite a los destinatarios retenidos; el resto de la campaña termina con normalidad. Después de
+  una pausa de toda la campaña, <UiPath path="sending.opt.cancelCampaign" /> omite a todos los que quedan.
+- <UiPath path="live.cancelWhole" /> detiene todo lo que no se ha enviado.
+
+### Ralentizaciones, avisos y reglas de respuesta
+
+Un umbral definido para ralentizar o para avisar no retiene a nadie. Deja un aviso en el monitor con
+<UiPath path="live.acknowledge" />: un proveedor de buzón ralentizado mantiene la mitad de velocidad durante el resto del
+envío (cámbiala en <UiPath path="live.adjustRates" />), y un aviso también notifica a las personas que pueden enviar
+campañas.
+
+Una regla de respuesta que pausa un proveedor de buzón durante un tiempo fijo ofrece tres opciones: volver a enviarle
+ahora (la regla cuenta entonces solo las respuestas nuevas), <UiPath path="sending.opt.replyWaitAction" /> hasta que se
+acabe el tiempo de la regla (se reanuda solo) o cancelar su parte.
+
+## Caídas del proveedor de envío
+
+Quienquiera que detecte una caída, el propio envío o la comprobación de estado del proveedor, la parte sigue el mismo
+camino. La parte de un proveedor de envío se retiene cuando:
+
+- todas sus llamadas para este envío fallaron durante 3 minutos, con al menos 5 llamadas fallidas;
+- siguió limitando la velocidad de la cuenta durante 3 minutos, incluso a una velocidad más baja;
+- sus errores de API superan el límite de <UiPath path="live.model.thresholdErrors" /> en 3 minutos (el 5,0 % por
+  defecto, evaluado tras 20 llamadas y 3 fallos);
+- la comprobación de estado lo marca como caído, o rechaza las credenciales;
+- rechaza al remitente porque no está verificado allí, o indica que la cuota de la cuenta se ha agotado. No se marca
+  nada como fallido: los mensajes esperan a la ruta.
+
+Lo que pasa entonces depende de la [política de conmutación por error](/es/providers/routing/) de Envíos masivos. Con una
+política automática, ReputeCast mueve la parte a otro proveedor, pero solo a uno que supere todas las comprobaciones:
+disponible, que sus condiciones permitan el correo masivo, fuera del sandbox, con el dominio del remitente verificado
+allí, con cuota suficiente y que no esté en calentamiento. Prueba primero con el respaldo del flujo y luego con la parte
+más grande del reparto. Con “pausar y preguntar”, con credenciales rechazadas o cuando ningún proveedor cumple los
+requisitos, la parte se retiene y se pide a las personas que pueden enviar campañas que decidan.
+
+Hasta que alguien decide, la parte retenida prueba su proveedor por su cuenta: 1 mensaje de prueba cada 60 segundos, a
+un buzón de prueba cuando el espacio de trabajo tiene uno y, si no, uno de los propios mensajes de la parte. Cuando 3
+pruebas seguidas salen bien, la parte se reanuda sola.
+
+<Screenshot
+  id="live-monitor-outage"
+  alt="Postal devolvió errores de conexión durante 3 minutos, así que su parte de Weekly Digest #142 está retenida mientras Amazon SES sigue enviando, y ReputeCast prueba Postal con 1 mensaje a un buzón de prueba cada 60 segundos. El panel muestra lo que devolvió Postal, las causas probables, lo que costaría mover los destinatarios retenidos a SES (costo adicional, tiempo adicional, cuota después y riesgo para la reputación Bajo, porque SES ya completó el calentamiento) y las comprobaciones que ReputeCast hizo sobre SES, con el movimiento recomendado."
+/>
+
+### Decisiones tras una retención por caída
+
+- **Reintentar** mantiene a los destinatarios en el mismo proveedor y sigue enviando los mensajes de prueba. Si el
+  proveedor sigue fallando 15 minutos después, se te vuelve a preguntar.
+- **Mover** envía a los destinatarios retenidos al proveedor que recomienda ReputeCast. El panel muestra el costo
+  adicional, el tiempo adicional a la velocidad de ese proveedor, su cuota después del movimiento, el riesgo para la
+  reputación (“Bajo · SES ya completó el calentamiento”) y las comprobaciones que superó: el dominio del remitente
+  verificado allí, cuota libre tras el movimiento y calentamiento completado. Los destinatarios retenidos para una
+  [prueba A/B](/es/campaigns/ab-testing/) o un envío canario siguen retenidos hasta que la ganadora o el envío canario
+  decidan. Los mensajes ya enviados conservan su seguimiento.
+- **Cancelar la parte** omite a los destinatarios retenidos. Aparecen como “no enviado” en el informe y se pueden enviar
+  más tarde.
+
+Una decisión sobre una parte nunca deshace el <UiPath path="live.pause" /> de una persona: si alguien pausó todo el
+envío, sigue en pausa.
+
+## Ningún mensaje se envía dos veces
+
+Un mensaje que falla temporalmente se reintenta hasta 10 veces, a los 5, 10, 20 y 40 segundos y después cada 60
+segundos. Cada intento lleva una clave de idempotencia, y una llamada al proveedor tiene hasta 30 segundos para terminar
+incluso cuando el servidor se está deteniendo, para que su respuesta quede registrada.
+
+Cuando, aun así, una llamada termina sin una respuesta registrada (un fallo del servidor, una respuesta que llegó
+demasiado tarde), nadie sabe si el proveedor aceptó sus mensajes. Pasados 5 minutos, ReputeCast los resuelve:
+
+- un proveedor que reconoce un mensaje que ya aceptó los vuelve a recibir con la misma clave, dentro de su periodo menos
+  5 minutos. SparkPost conserva una clave durante 24 horas y Brevo, durante 30 minutos;
+- cualquier otro mensaje pasa a ser uno de los [mensajes en duda](/es/reference/glossary/#messages-in-doubt). Nunca se
+  vuelve a enviar por suposición.
+
+El monitor los muestra en su propio panel, con <UiPath path="live.model.inDoubtWho" />: cada proveedor, cuántos
+mensajes, cuándo se le entregaron y si ese proveedor reconoce un reenvío y hasta cuándo. La insignia dice
+<UiPath path="live.model.inDoubtSafeBadge" /> o <UiPath path="live.model.inDoubtTwiceBadge" />. Elige
+<UiPath path="sending.opt.resendTitle" /> o <UiPath path="sending.opt.leaveOutTitle" />; la recomendación sigue a la
+insignia. Los mensajes que quedan fuera aparecen como “no enviado, en duda” en el informe. Si el proveedor informa de un
+evento de uno de ellos (entregado, rebotado o una queja), cuenta como enviado y sale de la lista por sí solo. Mientras
+tanto, el resto del envío continúa; cuando ya no queda nada más, el envío espera esta decisión.
+
+## La fase canaria
+
+Un envío puede empezar con un envío canario: los destinatarios con más interacción, el 5 % por defecto, más los
+[buzones de prueba](/es/reference/glossary/#seed-mailbox) del espacio de trabajo, reciben el correo primero mientras el
+resto espera. Un envío canario se ejecuta solo, con una audiencia de 1000 o más, cuando:
+
+- el dominio de envío es nuevo (sus primeros 30 días), o una IP de envío dedicada nunca ha enviado para este espacio de
+  trabajo;
+- algunos destinatarios nunca han recibido correo del dominio de envío;
+- la audiencia es más del doble de lo habitual (la mediana de los últimos 8 envíos).
+
+También puedes elegir <UiPath path="review.canaryOn" /> o <UiPath path="review.canaryOff" /> en
+<UiPath path="composer.reviewSend" />. Los motivos y los tamaños se definen en las
+[reglas de tráfico](/es/providers/traffic-rules/).
+
+<Screenshot
+  id="live-monitor-canary"
+  alt="Weekly Digest #142 en su fase canaria: el 5 % de los destinatarios con más interacción y 10 buzones de prueba recibieron el correo primero y están en vigilancia mientras el resto está en cola; 2 de 5 controles salen correctos y ninguno ha fallado, mientras los rebotes, las quejas y la ubicación en los buzones de prueba siguen reuniendo evidencia. A la derecha: Continuar ya con todos, Vigilar 10 minutos más y Detener el envío."
+/>
+
+La vista del envío canario muestra <UiPath path="live.canary.why" />, el progreso con los destinatarios en cola,
+<UiPath path="live.canary.gates" /> y <UiPath path="live.canary.seedsTitle" />. Después del último mensaje del envío
+canario, se vigila durante 20 minutos por defecto. Después, cada control con evidencia suficiente debe salir correcto:
+rebotes, rebotes por bloqueo o política, aplazamientos, quejas por proveedor de buzón (cada uno necesita 500 entregados
+allí antes de poder fallar) y buzones de prueba en spam. Si salen correctos, el envío continúa solo con todos. Si falla
+un control, el envío se retiene y se pide a las personas que pueden enviar campañas que continúen o se detengan. Los
+controles que siguen reuniendo evidencia no retienen el envío; se convierten en sus umbrales.
+
+Mientras el envío canario está en curso:
+
+- <UiPath path="live.canary.continueNow" /> empieza el envío principal antes de que termine la vigilancia, y
+  <UiPath path="sending.opt.canaryContinueTitle" /> libera un envío que un control fallido retiene. Ambas requieren a
+  alguien que pueda aprobar envíos, y solo puede hacerlo una persona, nunca una clave de API ni un agente.
+- <UiPath path="live.canary.watchMore" /> retiene más tiempo a los destinatarios en cola.
+- <UiPath path="live.canary.stop" /> quita del envío a los destinatarios en cola. Los resultados del envío canario se
+  quedan en el informe.
+
+El envío canario va a tus lectores con más interacción, así que comprueba los bloqueos, los aplazamientos y la ubicación
+en la bandeja de entrada, no cómo reaccionarán las importaciones nuevas. Sus quejas se vigilan durante el envío
+principal y durante las 72 horas siguientes.
+
+## Retenciones por calentamiento
+
+Cuando un proveedor [en calentamiento](/es/providers/warm-up/) alcanza el límite de hoy, su parte espera al límite de
+mañana (<UiPath path="live.model.providerWarmupHeld" />) y el resto del envío sigue adelante. El banner ofrece
+<UiPath path="providers.warmup.holdWait" />, mover a un proveedor que ya completó el calentamiento y supera sus
+comprobaciones, o <UiPath path="providers.warmup.holdCancel" />. Esperar y mover requieren permiso para enviar campañas;
+cancelar el resto requiere permiso para pausar envíos. Una retención por calentamiento nunca se trata como una caída.
+
+## Cambiar la velocidad durante el envío
+
+<UiPath path="live.adjustRates" /> abre <UiPath path="live.ratesTitle" />. Baja una velocidad para aliviar a un
+proveedor de buzón durante el resto del envío, en todas las rutas, mientras los demás mantienen su ritmo; el panel
+muestra la nueva hora de fin antes de que lo apliques. Una velocidad empieza en la
+[limitación de velocidad](/es/reference/glossary/#throttle) del espacio de trabajo, y las limitaciones se comparten entre
+todos los envíos del espacio de trabajo que salen a la vez, así que dos campañas nunca superan juntas la velocidad de un
+proveedor de buzón. La nueva velocidad de un proveedor de buzón retenido se aplica cuando se reanuda. Durante un envío
+canario, las velocidades son las del envío principal.
+
+## Después del envío: la vigilancia de quejas
+
+Las quejas siguen llegando durante días después de la entrega, así que, cuando termina el envío, ReputeCast las vigila,
+durante 72 horas por defecto. La vista final indica para cada proveedor de buzón hasta cuándo se vigila, o “No
+informado” para Gmail e iCloud. Cuando un proveedor de buzón, o todo el envío, supera su límite de quejas con evidencia
+suficiente, las personas que pueden reanudar envíos reciben una alerta en la aplicación y por correo, y
+<UiPath path="live.acknowledge" /> la marca como leída. No se pausa nada: el envío ya terminó, y la alerta indica qué
+revisar antes del siguiente.
+
+Con los datos de Postmaster Tools de [HostRepute](/es/deliverability/hostrepute/), la vigilancia también lee la tasa de
+spam diaria de Gmail para el dominio de envío y avisa cuando supera el límite de quejas por proveedor de buzón. Gmail no
+dice quién marcó el correo como spam, así que no se suprime a nadie por ello. Las quejas tardías que se informan una a
+una añaden el contacto a la lista de supresión y cuentan en el informe de la campaña.
+
+## Pausar y reanudar a mano
+
+<TableScroll label="Acciones del monitor en tiempo real y quién puede hacerlas">
+
+| Acción                                                       | Quién puede                                    | Notas                                                                                                      |
+| ------------------------------------------------------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                                 | Las personas que pueden pausar envíos          | Todo se detiene hasta que alguien lo reanuda. Se muestra mientras la campaña se está enviando.             |
+| <UiPath path="live.resumeSending" />, decisiones sobre una retención | Las personas que pueden enviar campañas | También los movimientos, los reintentos, los mensajes en duda, las velocidades y los umbrales de este envío. |
+| <UiPath path="live.cancelSend" />                            | Las personas que pueden enviar campañas        | El cuadro de diálogo ofrece <UiPath path="live.pauseInstead" /> si puedes pausar envíos.                   |
+| Continuar antes un envío canario                             | Las personas que pueden aprobar envíos         | Solo personas, nunca una clave de API ni un agente.                                                        |
+| Ver el monitor                                               | Todas las personas que pueden ver campañas     |                                                                                                            |
+
+</TableScroll>
+
+Pausar es a propósito el permiso más fácil de conceder (`campaigns:pause`): quien detecta un problema puede detener un
+envío, y quien puede enviar (`campaigns:send`) decide cómo continúa. Cuando no puedes hacer una acción, el monitor nombra
+a las personas que pueden. Propietario, Administrador y Editor pueden pausar y enviar; Lector no puede hacer ninguna de
+las dos cosas. Consulta [roles y permisos](/es/team/roles-and-permissions/).
+
+## En el móvil
+
+<Screenshot
+  id="live-monitor-mobile"
+  alt="El monitor en tiempo real en un móvil: una cabecera corta con la actualidad de los datos, la parte enviada con la hora de fin de cada ruta, los mosaicos en dos columnas con las aperturas humanas separadas de las automáticas, los umbrales y, abajo, Pausar con un menú de más acciones."
+/>
+
+Por debajo de 768 px, la vista en tiempo real tiene su propio diseño: una cabecera corta con la actualidad de los datos,
+los mosaicos en dos columnas, filas compactas de umbrales, de proveedores de buzón y de proveedores de envío, y Pausar
+(o Reanudar) abajo, con un menú para <UiPath path="live.adjustRates" /> y <UiPath path="live.cancelSend" />. El envío
+canario y los paneles de decisión tienen sus propios diseños para móvil.
+
+### Cuando los números se quedan desactualizados
+
+El servidor da señales al menos cada 15 segundos. Si el monitor no recibe nada durante 90 segundos, puede que un proxy
+esté almacenando en búfer la conexión en tiempo real: el monitor indica “Sin actualizar desde hace 90 s” y comprueba cada
+10 segundos. Si se corta la conexión, se vuelve a conectar solo (hasta 10 intentos) y ofrece
+<UiPath path="live.reconnectNow" />. En cualquier caso, el envío continúa en el servidor. Un monitor que nunca se
+actualiza detrás de un proxy inverso suele significar que el proxy almacena en búfer el flujo; consulta
+[proxy inverso y TLS](/es/self-hosting/reverse-proxy/).
+
+## Valores predeterminados y límites
+
+<LimitsTable area="auto-pause" />
+
+### Envío canario
+
+<LimitsTable area="canary" />
+
+## Cuándo cambiarlos
+
+- Los **valores predeterminados del espacio de trabajo**, en los
+  [valores predeterminados de envío del espacio de trabajo](/es/providers/workspace-defaults/), definen los umbrales de
+  rebotes y de quejas, el límite de errores de API y el <UiPath path="senders.providers.pauseScope" />. Las
+  [reglas de tráfico](/es/providers/traffic-rules/) definen los umbrales por tipo de rebote, sus acciones, las reglas de
+  respuesta, el envío canario y la vigilancia de quejas.
+- **Una campaña** puede usar umbrales distintos o el ámbito de campaña en <UiPath path="composer.reviewSend" />, y
+  <UiPath path="live.editThresholdsLive" /> mientras se envía. Bájalos para una lista a la que hace mucho que no escribes
+  o para un proveedor nuevo; elige el ámbito de campaña cuando un envío parcial confundiría a los lectores, por ejemplo
+  con una oferta por tiempo limitado.
+- Subir un umbral por encima de lo que tolera tu proveedor de envío cambia un envío en pausa por una cuenta suspendida.
+  Compáralo con los límites del propio proveedor en
+  [rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/).
+
+## Relacionado
+
+- [Programar y enviar una campaña](/es/campaigns/schedule-and-send/) es donde se definen los umbrales de cada campaña y la
+  opción del envío canario.
+- [Definir las reglas de tráfico](/es/providers/traffic-rules/) para los umbrales por tipo de rebote, las reglas de
+  respuesta y el envío canario.
+- [Estado de los proveedores y caídas](/es/providers/health-and-outages/) explica las partes retenidas de Envíos masivos
+  desde la pantalla Proveedores de envío.
+- [Leer los informes de campaña](/es/campaigns/reports/) muestra los números finales por proveedor de buzón y de envío.
+- [Límites y valores predeterminados](/es/reference/limits-and-defaults/) enumera todos los números fijos.

@@ -1,0 +1,285 @@
+---
+title: Hacer copias de seguridad y restaurar
+description: Haz una copia de seguridad de ReputeCast con pg_dump, la clave secreta y la carpeta de archivos, y restaura las tres en el orden correcto y pruébalo.
+type: how-to
+audience: [operator]
+primaryKeyword: copia de seguridad de ReputeCast con pg_dump
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - internal/secrets/secrets.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/accounts/signin.go
+  - internal/cli/doctor.go
+  - internal/cli/migrate.go
+  - migrations/00008_segment_role.sql
+  - migrations/00151_segment_runner.sql
+  - migrations/00300_composer.sql
+  - web/src/features/admin/instance/InstancePage.tsx
+  - docs/deploy/backup-restore.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Haz la copia de seguridad de ReputeCast con pg_dump, la clave secreta y la carpeta de archivos: una restauración
+necesita las tres cosas, y la base de datos sola no basta.
+
+## Qué contiene una copia de seguridad
+
+| Parte                    | Qué guarda                                                                                                                                                                                    | Dónde está                                                                                                                                                  |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Base de datos PostgreSQL | Todo lo demás: espacios de trabajo, contactos, campañas, imágenes subidas, la cola de tareas, el [registro de auditoría](/es/reference/glossary/#audit-log) y cada credencial guardada, cifrada. | La base de datos de `database.url`.                                                                                                                       |
+| Clave secreta            | La clave AES-256-GCM que cifra en la base de datos las credenciales de los proveedores, los client secrets de OIDC, los tokens de HostRepute y las semillas de las aplicaciones de autenticación (TOTP). | `REPUTECAST_SECRETS__KEY` si la defines; si no, el archivo de clave `secrets.key_file`: `/var/lib/reputecast/secret.key` en Docker, `data/secret.key` para el binario (relativo al directorio en el que arranca ReputeCast). |
+| Carpeta de archivos      | Los archivos de los productos digitales y los regalos de suscripción, demasiado grandes para la base de datos.                                                                               | `files.dir`; por defecto, una carpeta `files` junto al archivo de clave (`/var/lib/reputecast/files` en Docker). Aparece cuando alguien sube un archivo.   |
+
+Guarda también tu configuración: el archivo `.env` o las variables de shell con las que arrancas Docker Compose, o tu
+archivo de configuración YAML y el archivo de entorno del binario. La
+[referencia de configuración](/es/reference/configuration/) recoge todas las opciones.
+
+<Aside type="caution" title="La clave no es opcional">
+  Si restauras la base de datos sin su clave secreta, ReputeCast arranca, escribe una clave nueva y registra
+  `generated a new secret key; back it up together with the database`. Todos los valores cifrados con la clave antigua
+  quedan ilegibles: el inicio de sesión con una aplicación de autenticación falla con `secrets: cannot decrypt value`,
+  y cada espacio de trabajo tiene que volver a introducir las credenciales de sus proveedores. Los enlaces de los
+  correos ya enviados (baja, centro de preferencias, seguimiento de aperturas y clics) también dejan de funcionar,
+  porque se firman con una clave derivada de la clave secreta. Los códigos de recuperación y las llaves de acceso
+  siguen funcionando, porque no se cifran con la clave.
+</Aside>
+
+<Aside type="danger" title="Guarda la clave separada de los volcados">
+  Un volcado de la base de datos junto con su clave abre todas las credenciales guardadas. Guarda la clave en otro
+  sitio que los archivos de volcado, por ejemplo en tu gestor de contraseñas, y limita quién puede leer ambos. Los
+  volcados también contienen los datos personales de tus contactos.
+</Aside>
+
+## Antes de empezar
+
+- Acceso por shell al servidor, y el directorio del proyecto de Docker Compose (el que tiene `docker-compose.yml`) o
+  el archivo de entorno del binario.
+- Para el binario: `pg_dump`, `pg_restore` y `psql` de la misma versión mayor de PostgreSQL que tu servidor, o más
+  reciente.
+- Espacio en disco suficiente fuera del volumen de datos para los volcados.
+
+## Hacer la copia de seguridad
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+El archivo Compose incluido llama al proyecto `reputecast`, así que sus volúmenes son `reputecast_pgdata` y
+`reputecast_appdata`. El volumen de la aplicación contiene el archivo de clave y la carpeta de archivos.
+
+<Steps>
+
+1. Vuelca la base de datos desde dentro del contenedor `postgres`, para que las versiones del cliente y del servidor
+   coincidan siempre. `-T` desactiva la terminal, que de otro modo corrompería el volcado binario:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-$(date +%F).dump
+   ```
+
+   `pg_dump` toma una instantánea coherente mientras ReputeCast sigue funcionando.
+
+2. Archiva el volumen de la aplicación (clave secreta y carpeta de archivos) con un contenedor de corta duración.
+   Sirve cualquier imagen con `tar`:
+
+   ```sh title="Terminal"
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar czf /backup/appdata-$(date +%F).tar.gz -C /data .
+   ```
+
+   `tar` conserva el propietario (el usuario 65532, el usuario sin privilegios de root de la imagen) y el modo `0600`
+   de `secret.key`.
+
+3. Si definiste tú `REPUTECAST_SECRETS__KEY` en lugar de usar el archivo de clave, guarda ese valor con la copia de
+   seguridad de tu configuración.
+
+4. Copia el volcado y el archivo comprimido fuera del servidor.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binario">
+
+<Steps>
+
+1. Vuelca la base de datos. Usa los datos de conexión de `REPUTECAST_DATABASE__URL`:
+
+   ```sh
+   pg_dump "postgres://reputecast:secret@localhost:5432/reputecast" -Fc -f reputecast-$(date +%F).dump
+   ```
+
+2. Copia el archivo de clave y la carpeta de archivos. Con los valores predeterminados, los dos están en la carpeta
+   `data` del directorio en el que se ejecuta ReputeCast; si definiste `secrets.key_file` o `files.dir`, copia esas
+   rutas:
+
+   ```sh
+   tar czf reputecast-data-$(date +%F).tar.gz -C /path/to/reputecast data
+   ```
+
+3. Si definiste `REPUTECAST_SECRETS__KEY` en lugar de usar un archivo de clave, haz una copia de seguridad del archivo
+   de entorno que la contiene.
+
+4. Copia el volcado y el archivo comprimido fuera del servidor.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Restaurar
+
+Restaura la base de datos antes de que arranque ReputeCast. La imagen de Docker se ejecuta con `--auto-install`: si
+arranca con una base de datos vacía, crea un primer Propietario nuevo, y eso no lo quieres encima de una restauración.
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Detén la aplicación y deja PostgreSQL en marcha. En un servidor nuevo, arranca solo PostgreSQL:
+
+   ```sh title="Terminal"
+   docker compose stop app
+   docker compose up -d --wait postgres
+   ```
+
+2. Sustituye la base de datos por una vacía:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres dropdb -U reputecast --force --if-exists reputecast
+   docker compose exec -T postgres psql -U reputecast -d postgres -c 'CREATE DATABASE reputecast'
+   ```
+
+3. En un servidor PostgreSQL nuevo, crea el rol con el que se ejecutan los
+   [segmentos SQL](/es/self-hosting/postgres/#segmentos-sql). `pg_dump` copia una base de datos, no los roles del
+   servidor, y sin este rol la restauración se detiene con `role "reputecast_segments" does not exist`:
+
+   ```sh title="Terminal"
+   docker compose exec -T postgres psql -U reputecast -d postgres \
+     -c 'CREATE ROLE reputecast_segments NOLOGIN NOINHERIT' \
+     -c 'GRANT reputecast_segments TO reputecast'
+   ```
+
+4. Restaura el volcado:
+
+   ```sh
+   docker compose exec -T postgres pg_restore -U reputecast -d reputecast --exit-on-error < reputecast-2026-10-22.dump
+   ```
+
+5. Vuelve a poner la clave secreta y los archivos en el volumen de la aplicación. `docker compose create app` crea el
+   contenedor y su volumen sin arrancarlo:
+
+   ```sh title="Terminal"
+   docker compose create app
+   docker run --rm -v reputecast_appdata:/data -v "$PWD":/backup alpine:3.22 \
+     tar xzf /backup/appdata-2026-10-22.tar.gz -C /data
+   ```
+
+6. Arranca ReputeCast:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Si la imagen es más reciente que la copia de seguridad, aplica las migraciones pendientes al arrancar.
+
+7. Comprueba la restauración (consulta [comprobar que funciona](#comprobar-que-funciona)):
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast doctor
+   ```
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binario">
+
+<Steps>
+
+1. Detén ReputeCast, por ejemplo con `sudo systemctl stop reputecast`.
+
+2. Vuelve a crear la base de datos, con un usuario que pueda crear bases de datos:
+
+   ```sh title="Terminal"
+   dropdb --force --if-exists reputecast
+   psql -d postgres -c 'CREATE DATABASE reputecast OWNER reputecast'
+   ```
+
+3. En un servidor PostgreSQL nuevo, crea primero el rol de los segmentos SQL y concédeselo al usuario de la aplicación
+   (aquí, `reputecast`):
+
+   ```sql title="segments-role.sql"
+   CREATE ROLE reputecast_segments NOLOGIN NOINHERIT;
+   GRANT reputecast_segments TO reputecast;
+   ```
+
+4. Restaura el volcado como usuario de la aplicación:
+
+   ```sh
+   pg_restore -d "postgres://reputecast:secret@localhost:5432/reputecast" --exit-on-error reputecast-2026-10-22.dump
+   ```
+
+5. Vuelve a poner el archivo de clave y la carpeta de archivos donde apuntan `secrets.key_file` y `files.dir`, de modo
+   que solo pueda leerlos el usuario con el que se ejecuta ReputeCast:
+
+   ```sh
+   tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
+   ```
+
+6. Si el binario es más reciente que la copia de seguridad, ejecuta `reputecast migrate up`. Después comprueba la
+   restauración con `reputecast doctor` (consulta [comprobar que funciona](#comprobar-que-funciona)) y vuelve a
+   arrancar ReputeCast.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Comprobar que funciona
+
+- `reputecast doctor` muestra `ok` para la base de datos, el esquema, la clave secreta, la carpeta de archivos y el rol
+  de los segmentos SQL. Abre con la clave algunos valores guardados de cada tipo, así que una clave equivocada falla
+  aquí y no en una llamada a un proveedor, y termina con `1` cuando una comprobación falla:
+  - **SQL segments role** avisa en un servidor nuevo: crea el rol (paso 3), ejecuta `reputecast migrate segments-role`
+    y reinicia ReputeCast.
+  - **Previous keys** avisa mientras haya valores guardados que todavía usan una clave de `secrets.previous_keys`
+    ([rotar la clave secreta](/es/self-hosting/security/#rotar-la-clave)).
+  - **Public URL** avisa cuando no es `https://`. Si cambió la dirección del servidor, define
+    `REPUTECAST_PUBLIC_URL`; guardarla en <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> también
+    traslada los webhooks de los proveedores.
+- `curl -s http://localhost:8080/readyz` responde `ready`. Consulta
+  [comprobaciones de estado, métricas y logs](/es/self-hosting/monitoring/).
+- Los logs de la aplicación no contienen `generated a new secret key`. Si lo contienen, ReputeCast no encontró la clave
+  restaurada: detenlo, vuelve a poner la clave y arráncalo de nuevo.
+- Inicia sesión con tu contraseña y tu aplicación de autenticación, y abre <UiPath path="nav.providers" /> en un
+  espacio de trabajo: los proveedores de envío conectados conservan su estado en lugar de pedir credenciales.
+
+Prueba una restauración antes de necesitarla: restaura la última copia de seguridad en un segundo proyecto de Compose
+en otro puerto (por ejemplo `docker compose -p reputecast-restore-test` con `REPUTECAST_PORT=8090`) e inicia sesión
+ahí.
+
+## Solución de problemas
+
+- **`role "reputecast_segments" does not exist` durante `pg_restore`**: el servidor es nuevo. Crea el rol (paso 3 de
+  la restauración), vuelve a crear la base de datos vacía y restaura otra vez.
+- **`reputecast doctor` indica `… sampled values don't open (…): is this the key backed up with the database?`**, o el
+  inicio de sesión con la aplicación de autenticación falla con `secrets: cannot decrypt value`: la base de datos se
+  restauró sin su clave, o con otra. Vuelve a poner la clave original. Si se perdió, las personas inician sesión con
+  un código de recuperación o una llave de acceso, quien administra la instancia quita su aplicación de autenticación
+  con [`reputecast user reset-2fa`](/es/self-hosting/account-recovery/), y cada espacio de trabajo vuelve a introducir
+  las credenciales de sus proveedores.
+- **En los logs aparece un Propietario nuevo con una contraseña temporal**: la aplicación arrancó antes de restaurar la
+  base de datos. Detenla, vuelve a crear la base de datos y restaura otra vez.
+- **`pg_restore: error: unsupported version` o algo parecido**: tu `pg_restore` es más antiguo que el `pg_dump` que
+  escribió el archivo. Ejecuta la restauración dentro del contenedor `postgres`, o instala un cliente más reciente.
+
+## Relacionado
+
+- [Actualizar ReputeCast](/es/self-hosting/upgrades/): haz una copia de seguridad antes de cada actualización.
+- [Seguridad y protección](/es/self-hosting/security/): cómo protege la clave secreta las credenciales, y cómo rotarla.
+- [PostgreSQL](/es/self-hosting/postgres/): versiones, tamaño del pool y el rol de los segmentos SQL.
+- [Recuperar el acceso desde la línea de comandos](/es/self-hosting/account-recovery/).

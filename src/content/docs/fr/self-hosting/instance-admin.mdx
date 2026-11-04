@@ -1,0 +1,346 @@
+---
+title: Administration de l’instance
+description: 'Administration de l’instance ReputeCast : utilisateurs, espaces de travail, connexion, URL publique, mises à jour, filtre anti-robots, tâches, journal d’audit.'
+type: how-to
+audience: [operator, admin]
+primaryKeyword: administration de l’instance
+uiPath: 'shell.userMenuInstanceAdmin'
+sources:
+  - internal/instance
+  - internal/auditlog/instance.go
+  - internal/accounts/setup.go
+  - internal/tracking/{agents,networks,classify}.go
+  - internal/useragent
+  - internal/proxycheck
+  - migrations/03201_r05_bot_clicks.sql
+  - migrations/03340_m40_tracking_user_agents.sql
+  - web/src/features/admin
+  - web/src/features/settings/messages.ts
+  - web/src/features/settings/SettingsTabs.ts
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+L’administration de l’instance regroupe tout ce qui s’applique à l’ensemble du serveur plutôt qu’à un seul espace de
+travail : qui a un compte, quels espaces de travail existent, comment les personnes se connectent, l’URL publique, les
+mises à jour, le filtre anti-robots qui exclut les ouvertures et les clics des machines des chiffres de chaque espace
+de travail, ainsi que les tâches d’arrière-plan et le stockage. Elle se trouve dans
+<UiPath path="shell.userMenuInstanceAdmin" />, que seuls les
+[admins de l’instance](/fr/reference/glossary/#instance-admin) peuvent ouvrir.
+
+## Avant de commencer
+
+- Vous devez avoir le rôle d’admin de l’instance. Le premier Propriétaire créé à l’installation l’a ; un admin de
+  l’instance peut l’attribuer à d’autres personnes (consultez [gérer les utilisateurs](#gérer-les-utilisateurs)), et
+  `reputecast user make-admin` l’attribue depuis le serveur
+  ([récupérer l’accès depuis la ligne de commande](/fr/self-hosting/account-recovery/)).
+- Ce rôle est distinct des rôles dans les espaces de travail : nommer quelqu’un admin de l’instance ne change pas ses
+  rôles dans les espaces de travail et ne l’ajoute à aucun espace de travail. Toute personne sans ce rôle qui ouvre la
+  page voit « Seuls les admins de l’instance peuvent ouvrir l’administration de l’instance ».
+- Ouvrez-la depuis le menu du compte, en haut à droite : <UiPath path="shell.userMenuInstanceAdmin" />. Elle compte
+  huit onglets : <UiPath path="admin.users" />, <UiPath path="admin.workspaces" />,
+  <UiPath path="admin.authentication" />, <UiPath path="admin.sso" />, <UiPath path="admin.instance" />,
+  <UiPath path="admin.botFilter" />, <UiPath path="admin.system" /> et <UiPath path="admin.audit" />.
+
+## Gérer les utilisateurs
+
+<Screenshot
+  id="instance-users"
+  alt="L’onglet Utilisateurs liste sept comptes avec leurs espaces de travail et leurs rôles, leurs méthodes de connexion, l’état de leur 2FA, leur dernière connexion et leur état, dont un désactivé ; l’aperçu de la politique de connexion et les événements de connexion récents se trouvent en dessous."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" /> liste tous les comptes de l’instance, avec des filtres par
+espace de travail, par état et par état de la 2FA. Sous la liste, un résumé de la politique de connexion et les
+événements de connexion les plus récents renvoient vers les autres onglets. Le menu **⋯** de chaque ligne propose ces
+actions :
+
+<TableScroll label="Actions sur les utilisateurs">
+
+| Action                                     | Effet                                                                                                                                                                                                                         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="admin.forceSignOut" />       | Met fin à toutes les sessions du compte.                                                                                                                                                                                      |
+| <UiPath path="admin.resetTwoFactor" />     | Retire son application d’authentification et ses codes de récupération ; les clés d’accès restent. Demande une raison (consignée dans le journal d’audit) et votre mot de passe, relance le délai de grâce de la politique, déconnecte la personne et la prévient. Uniquement pour les comptes qui ont une application d’authentification. |
+| <UiPath path="admin.sendPasswordReset" />  | Envoie par e-mail, sur le flux Système, un lien à usage unique valable 15 minutes. <UiPath path="admin.showCliReset" /> affiche `reputecast user reset-password --email …` pour le cas où aucun fournisseur n’assure le flux Système. |
+| <UiPath path="admin.unlockSignIn" />       | Affiché tant que le compte est bloqué après des échecs de connexion ; lève le blocage immédiatement.                                                                                                                          |
+| <UiPath path="admin.makeInstanceAdmin" />, <UiPath path="admin.removeInstanceAdmin" /> | Attribue ou retire le rôle d’admin de l’instance. Le dernier admin de l’instance ne peut pas être retiré.                                                                 |
+| <UiPath path="admin.deactivateAccount" />  | Déconnecte la personne de tous les espaces de travail et bloque la connexion. Demande une raison ; par défaut, révoque aussi les clés API et les agents qu’elle a créés. Son historique, ses campagnes et ses entrées d’audit restent. |
+| <UiPath path="admin.reactivateAccount" />  | Permet à une personne désactivée de se reconnecter et rétablit les adhésions aux espaces de travail désactivées en même temps que le compte.                                                                                  |
+
+</TableScroll>
+
+Garde-fous : vous ne pouvez pas désactiver votre propre compte, le dernier admin de l’instance, ni l’unique
+Propriétaire d’un espace de travail (transférez d’abord la propriété dans les paramètres de cet espace de travail).
+ReputeCast ne permet pas de supprimer un compte ni de changer son adresse e-mail depuis cet écran ; les personnes
+changent elles-mêmes leur adresse e-mail dans <UiPath path="shell.userMenuAccount" />.
+
+## Gérer les espaces de travail
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.workspaces" /> liste tous les espaces de travail avec leurs membres,
+leurs contacts, leurs fournisseurs d’envoi et leur date de création. La même liste figure aussi en bas de
+<UiPath path="admin.instance" />.
+
+<Steps>
+
+1. Pour en ajouter un, choisissez <UiPath path="admin.createWorkspace" />, puis saisissez un nom (80 caractères au
+   maximum), choisissez le Propriétaire (n’importe quel compte actif) et le fuseau horaire. Le Propriétaire invite
+   toutes les autres personnes.
+
+2. Pour en supprimer un, choisissez <UiPath path="admin.deleteWorkspace" /> sur sa ligne et saisissez son nom. Les
+   envois programmés s’arrêtent immédiatement, et les clés API et les agents MCP de l’espace de travail cessent de
+   fonctionner. Exportez d’abord l’espace de travail si vous avez besoin de ses données ; la boîte de dialogue renvoie
+   vers l’export pour les membres de l’espace de travail.
+
+3. Pour restaurer un espace de travail supprimé, choisissez <UiPath path="admin.restoreWorkspace" /> dans les
+   7 jours. Passé ce délai, il est supprimé définitivement. La liste de suppression partagée, le journal d’audit et
+   les comptes des membres sont conservés dans tous les cas.
+
+</Steps>
+
+Depuis cette liste, vous ne pouvez ouvrir les paramètres d’un espace de travail que si vous en êtes membre. Consultez
+[les espaces de travail](/fr/team/workspaces/) pour savoir ce que contient chacun.
+
+## Définir la politique de connexion
+
+<Screenshot
+  id="instance-auth"
+  alt="L’onglet Authentification : les méthodes de connexion autorisées (mot de passe, clés d’accès, Google, Microsoft désactivé, GitHub limité à une organisation, et l’authentification unique avec 2 fournisseurs), la politique de mot de passe, l’obligation de la 2FA et les paramètres de sessions et de blocage."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> contient la politique de tous les comptes. Rien
+ne s’applique tant que vous n’avez pas choisi <UiPath path="admin.savePolicies" />.
+
+- Dans <UiPath path="admin.signInMethods" />, activez ou désactivez <UiPath path="admin.methodPassword" />,
+  <UiPath path="admin.methodPasskeys" />, Google, Microsoft, GitHub et <UiPath path="admin.methodSso" />. ReputeCast
+  ne prend pas en charge SAML ni SCIM. Consultez
+  [connexion avec Google, Microsoft et GitHub](/fr/self-hosting/social-sign-in/) et
+  [l’authentification unique avec OIDC](/fr/self-hosting/sso/).
+- Dans <UiPath path="admin.passwordPolicy" />, définissez la longueur minimale, la réutilisation des mots de passe
+  récents et le contrôle des fuites connues.
+- Dans <UiPath path="admin.twoFactorEnforcement" />, exigez l’authentification à deux facteurs de tout le monde, des
+  membres disposant d’une [autorisation sensible](/fr/reference/glossary/#sensitive-permission), ou de personne, et
+  définissez le délai de grâce pour la configurer.
+- Dans <UiPath path="admin.sessionsLockout" />, définissez la durée de vie des sessions, le délai d’inactivité et le
+  blocage après des échecs de mot de passe.
+- Dans <UiPath path="admin.domainAllowlist" />, listez les domaines e-mail qui peuvent obtenir un compte
+  automatiquement via le SSO.
+
+ReputeCast refuse une politique qui vous bloquerait (« Vous n’auriez alors plus aucun moyen de vous connecter.
+Ajoutez une clé d’accès ou associez une connexion qui reste activée, puis enregistrez de nouveau. »), une politique où
+toutes les méthodes sont désactivées, et la désactivation de l’authentification unique tant qu’un fournisseur l’impose
+à un domaine. Une nouvelle durée de vie des sessions s’applique aux sessions ouvertes après la modification ; un délai
+d’inactivité plus court atteint les sessions existantes en 30 secondes environ.
+
+<LimitsTable area="authentication" />
+
+## Définir le nom de l’instance, l’URL publique et les valeurs par défaut
+
+<Screenshot
+  id="instance-settings"
+  alt="L’onglet Instance et mises à jour : la carte Instance avec le nom, le fuseau horaire par défaut, la langue, le format régional et l’URL publique avec ses contrôles DNS, TLS et Joignable, à côté de la carte Version et mises à jour."
+/>
+
+Dans <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, la carte <UiPath path="admin.instanceCard" />
+définit :
+
+- Le nom et le logo de l’instance, affichés sur la page de connexion et dans les e-mails à l’équipe.
+- Le fuseau horaire, la langue et le format régional par défaut, utilisés sur la page de connexion, pour les
+  invitations et pour les membres qui n’ont pas choisi les leurs ([langue et région](/fr/team/language-and-region/)).
+- L’<UiPath path="admin.publicUrl" />, utilisée pour les webhooks des fournisseurs, les URI de redirection SSO, les
+  pages publiques et les liens des e-mails. <UiPath path="admin.publicUrlCheck" /> teste trois choses : le DNS (l’hôte
+  se résout), TLS (un certificat valide, avec un avertissement à moins de 14 jours de l’expiration ou en simple
+  `http://`) et la joignabilité (`/healthz` répond depuis l’extérieur).
+
+<Aside type="caution" title="Changer l’URL publique">
+  Enregistrer une nouvelle adresse réenregistre le webhook auprès de chaque fournisseur d’envoi qui le permet et liste
+  les fournisseurs où vous devez coller vous-même la nouvelle adresse. Définissez aussi `REPUTECAST_PUBLIC_URL` sur la
+  même adresse et redémarrez : les cookies HTTPS uniquement et HSTS suivent le paramètre du serveur, et non l’adresse
+  enregistrée.
+</Aside>
+
+Les autres cartes de cet onglet :
+
+- La carte <UiPath path="admin.versionCard" /> affiche la version installée et la dernière version, la commande de
+  mise à jour et la vérification quotidienne des versions. Consultez
+  [mettre à niveau ReputeCast](/fr/self-hosting/upgrades/).
+- La carte <UiPath path="transactional.relayAdmin.title" /> active le relais pour les applications qui envoient en
+  SMTP. Consultez [envoyer par le SMTP relay](/fr/transactional/smtp-relay/).
+- La carte <UiPath path="agency.adminTitle" /> active le mode agence. Consultez
+  [gérer des espaces de travail clients en tant qu’agence](/fr/team/agencies/).
+
+<LimitsTable area="instance" />
+
+## Modifier le filtre anti-robots
+
+<Screenshot
+  id="bot-filter"
+  alt="L’onglet Filtre anti-robots de l’administration de l’instance : seules les ouvertures et les clics des personnes comptent ; Réseaux · 12 avec Ajouter un réseau, aucun réseau ajouté pour l’instant et 12 réseaux intégrés ; User agents · 28 avec Ajouter un user agent et 28 intégrés, les téléphones CUBOT listés comme ceux de personnes ; et Comment le filtre décide, pour les ouvertures, les clics, les règles et les modifications."
+/>
+
+Le [filtre anti-robots](/fr/reference/glossary/#bot-filter) détermine quelles ouvertures et quels clics proviennent de
+machines (scanners de messagerie, scripts, aperçus de liens) ou relèvent de la confidentialité protégée (un proxy de
+confidentialité comme Apple Mail Privacy Protection). Les rapports, les segments, les automatisations et les scores de
+chaque espace de travail les excluent. Les entrées intégrées sont fournies avec les versions de ReputeCast et ne
+peuvent pas être retirées ; dans <UiPath path="shell.userMenuInstanceAdmin > admin.botFilter" />, vous ajoutez celles
+par lesquelles passent les e-mails de vos destinataires, comme la passerelle de messagerie d’une entreprise ou un
+nouveau vérificateur de liens.
+
+Pour ajouter un réseau :
+
+<Steps>
+
+1. Dans <UiPath path="admin.botfilter.networksTitle" />, sélectionnez <UiPath path="admin.botfilter.addNetwork" />.
+
+2. Saisissez l’<UiPath path="admin.botfilter.cidrLabel" /> : une adresse ou un réseau comme `203.0.113.0/24` ou
+   `2001:db8::/48`.
+
+3. Indiquez <UiPath path="admin.botfilter.runByLabel" />, par exemple « Notre passerelle de messagerie ».
+
+4. Sous <UiPath path="admin.botfilter.kindLegend" />, choisissez <UiPath path="admin.botfilter.netScanner" /> (ses
+   ouvertures et ses clics à l’arrivée des e-mails sont ceux d’une machine ; les suivants peuvent venir de personnes
+   derrière la passerelle et comptent) ou <UiPath path="admin.botfilter.netPrivacy" /> (il récupère les images à
+   l’arrivée des e-mails, que quelqu’un les lise ou non, si bien que ses ouvertures relèvent de la confidentialité
+   protégée), puis sélectionnez <UiPath path="admin.botfilter.addNetwork" />.
+
+</Steps>
+
+Pour ajouter un user agent :
+
+<Steps>
+
+1. Dans <UiPath path="admin.botfilter.agentsTitle" />, sélectionnez <UiPath path="admin.botfilter.addAgent" />.
+
+2. Sous <UiPath path="admin.botfilter.itIsLegend" />, choisissez <UiPath path="admin.botfilter.aMachine" /> (un
+   scanner, un vérificateur de liens ou un script : ses ouvertures et ses clics sont exclus partout où le texte figure
+   dans le user agent) ou <UiPath path="admin.botfilter.aPerson" /> (un appareil ou une application dont le user agent
+   contient un mot que les règles attribuent à une machine, comme un mot se terminant par « bot » : ses ouvertures et
+   ses clics comptent comme ceux de personnes).
+
+3. Saisissez le <UiPath path="admin.botfilter.patternLabel" />. Il n’est pas sensible à la casse ; l’appareil d’une
+   personne est un mot composé de lettres et de chiffres. ReputeCast refuse un texte présent dans les user agents des
+   navigateurs et des clients de messagerie avec lesquels les gens lisent leurs e-mails.
+
+4. Renseignez <UiPath path="admin.botfilter.whoLabel" /> et sélectionnez <UiPath path="admin.botfilter.addAgent" />.
+
+</Steps>
+
+Pour retirer une entrée ajoutée par un admin, sélectionnez <UiPath path="admin.botfilter.remove" /> sur sa ligne et
+confirmez. Une modification s’applique aux nouvelles ouvertures et aux nouveaux clics de chaque espace de travail en
+quelques minutes ; ceux déjà comptés restent tels quels. Chaque modification figure dans le journal d’audit de
+l’instance. <UiPath path="admin.botfilter.rulesTitle" />, en bas de l’onglet, résume les règles ;
+[lire les rapports de campagne](/fr/campaigns/reports/#comment-les-clics-sont-comptés) les explique avec les chiffres
+du rapport.
+
+<LimitsTable area="tracking" />
+
+## Corriger les requêtes passant par un proxy non approuvé
+
+Derrière un reverse proxy ou un répartiteur de charge que `http.trusted_proxies` ne liste pas, chaque ouverture et
+chaque clic porte l’adresse du proxy au lieu de celle du lecteur, si bien que le filtre anti-robots ne peut pas
+distinguer un réseau de scanners ou le proxy de confidentialité d’Apple d’une personne, et que les limites de débit
+traitent tous les lecteurs comme un seul. ReputeCast repère les requêtes qui portent des en-têtes de transfert
+(`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) depuis une adresse à laquelle il ne fait pas confiance, et prévient
+chaque admin de l’instance par une notification qui renvoie vers <UiPath path="admin.instance" /> :
+
+- « Des requêtes passent par un proxy auquel ReputeCast ne fait pas confiance » nomme une adresse privée qui s’est
+  comportée comme votre proxy. Ajoutez-la à `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) et redémarrez
+  ReputeCast.
+- « La plupart des requêtes portent des en-têtes de transfert venant d’une adresse publique » nomme une adresse
+  publique. Si elle appartient à votre CDN ou à votre répartiteur de charge, ajoutez les plages d’adresses que publie
+  son fournisseur, et non l’adresse elle-même. Si vous ne la reconnaissez pas, ne changez rien : n’importe qui peut
+  envoyer ces en-têtes, et une adresse de confiance peut inventer des adresses de lecteurs.
+
+Un pic de requêtes transférées ne déclenche jamais d’avis. L’avis revient tant que le proxy continue de transférer, et
+un proxy qui devient de confiance ou qui se tait est oublié. Consultez
+[reverse proxy et TLS](/fr/self-hosting/reverse-proxy/#définir-lurl-publique-et-les-proxys-de-confiance) pour le
+paramètre ; les délais figurent dans le tableau de l’instance ci-dessus.
+
+## Vérifier les tâches, les files d’attente et le stockage
+
+<Screenshot
+  id="instance-system"
+  alt="Administration de l’instance, Système : des tuiles pour les tâches en attente, en cours et en échec sur les 7 derniers jours, la base de données et le dossier des fichiers ; Tâches en échec, vide ici ; chaque file avec ce qui s’y exécute, ses tâches en attente, programmées et en cours et la durée d’attente de sa plus ancienne tâche due ; et le haut de Plus grandes tables et de Dossier des fichiers."
+/>
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.system" /> montre l’état du travail d’arrière-plan et du stockage du
+serveur, lu dans la base de données à l’ouverture. Les tuiles du haut comptent les tâches en attente (et la durée
+d’attente de la plus ancienne tâche due), en cours et en échec sur les 7 derniers jours, et affichent la version de
+PostgreSQL avec les connexions utilisées et la taille du dossier des fichiers.
+
+- <UiPath path="admin.system.failedTitle" /> liste les tâches en échec qui attendent une nouvelle tentative, et celles
+  qui ont épuisé leurs tentatives (conservées 7 jours), avec leur espace de travail, leurs tentatives et leur dernière
+  erreur. Sur une tâche en attente de nouvelle tentative, <UiPath path="admin.system.retryNow" /> l’exécute maintenant
+  et <UiPath path="admin.system.cancel" /> l’arrête ; sur une tâche abandonnée, <UiPath path="admin.system.retry" />
+  l’exécute de nouveau et <UiPath path="admin.system.delete" /> la retire de la liste. Une nouvelle tentative conserve
+  les tentatives déjà effectuées ; après une annulation ou une suppression, ce que faisait la tâche reste inachevé.
+  Chaque action figure dans le journal d’audit de l’instance.
+- <UiPath path="admin.system.queuesTitle" /> affiche, pour chaque file, ses tâches en attente, programmées et en cours,
+  et la durée d’attente de sa plus ancienne tâche due. Créez une alerte sur ce retard avec
+  `reputecast_job_queue_lag_seconds`
+  ([vérifications de l’état, métriques et journaux](/fr/self-hosting/monitoring/#métriques)).
+- <UiPath path="admin.system.tablesTitle" /> indique la taille de la base de données, la version de son schéma et la
+  présence éventuelle de migrations en attente, ainsi que les 10 plus grandes tables avec leurs lignes, leur taille et
+  la taille de leurs index (partitions additionnées).
+- <UiPath path="admin.system.filesTitle" /> indique le chemin du dossier et le nombre de fichiers et d’octets qu’il
+  contient, recompté toutes les 5 minutes. Sauvegardez-le avec la base de données
+  ([sauvegarder et restaurer](/fr/self-hosting/backups/)).
+
+## Consulter le journal d’audit de l’instance
+
+<UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> affiche les connexions, le SSO, les modifications de
+politiques et d’utilisateurs, ainsi que les événements de chaque espace de travail. Filtrez par espace de travail, type
+d’acteur, résultat et date ; exportez avec <UiPath path="audit.exportCsv" /> ou <UiPath path="audit.exportJson" />. Les
+refus de connexion portent l’ID de référence que les personnes voient sur la page d’erreur.
+
+- <UiPath path="admin.auditRetention" /> : les entrées au niveau de l’instance sont conservées 365 jours par défaut
+  (de 90 jours à 10 ans) ; chaque espace de travail conserve ses propres entrées selon sa propre durée. Un nettoyage
+  horaire supprime les plus anciennes.
+- <UiPath path="admin.streamInstanceEvents" /> : envoie les entrées au niveau de l’instance à votre SIEM ou à votre
+  entrepôt de données par lots de 500 au maximum, signés avec HMAC-SHA256 comme les
+  [webhooks sortants](/fr/developers/webhooks/). Le secret de signature ne s’affiche qu’une fois.
+
+Consultez [le journal d’audit](/fr/team/audit-log/) pour savoir ce qu’enregistre chaque entrée.
+
+## Vérifier le résultat
+
+- Les modifications de politique affichent le message « Politiques enregistrées » et s’appliquent à la connexion
+  suivante.
+- Chaque action effectuée sur cette page apparaît dans <UiPath path="admin.audit" /> avec vous comme acteur.
+
+## Dépannage
+
+- **« Vous ne pouvez pas désactiver votre propre compte »** : demandez à un autre admin de l’instance.
+- **Le dernier admin de l’instance ne peut être ni retiré ni désactivé** : nommez d’abord quelqu’un d’autre admin de
+  l’instance.
+- **« … est l’unique Propriétaire dans… »** lors d’une désactivation : transférez d’abord la propriété de ces espaces
+  de travail.
+- **Un espace de travail supprimé n’a pas de bouton** <UiPath path="admin.restoreWorkspace" /> : le délai de 7 jours
+  est écoulé et l’espace de travail n’existe plus.
+- **La vérification de l’URL publique signale un problème à côté de Joignable** : l’adresse ne répond pas depuis
+  l’extérieur. Vérifiez le DNS, le pare-feu et votre [reverse proxy](/fr/self-hosting/reverse-proxy/).
+- **« Un réseau aussi large ferait passer des lecteurs ordinaires pour des machines. »** : ajoutez un réseau plus
+  restreint, dans la limite indiquée dans le tableau du filtre anti-robots.
+- **« … figure dans les user agents des navigateurs et des clients de messagerie avec lesquels les gens lisent leurs
+  e-mails »** : saisissez un mot que seul le user agent de la machine contient.
+- **Un réseau ou un user agent intégré n’a pas de bouton** <UiPath path="admin.botfilter.remove" /> : les entrées
+  intégrées sont fournies avec les versions de ReputeCast et restent. <UiPath path="admin.botfilter.aPerson" />
+  l’emporte sur les règles (un mot se terminant par « bot », « crawler » et autres), pas sur le user agent d’une
+  machine figurant dans la liste.
+- **Chaque ouverture et chaque clic du suivi en direct vient d’une seule adresse** : ReputeCast ne fait pas confiance à
+  votre proxy. Consultez
+  [corriger les requêtes passant par un proxy non approuvé](#corriger-les-requêtes-passant-par-un-proxy-non-approuvé).
+- **« Cette tâche n’existe plus »** ou **« … n’est plus une tâche en échec »** lors d’une action sur une tâche : elle
+  a été exécutée, ou quelqu’un d’autre l’a relancée ou supprimée, depuis le chargement de la liste. Rechargez la liste.
+
+## Voir aussi
+
+- [Récupérer l’accès depuis la ligne de commande](/fr/self-hosting/account-recovery/)
+- [Vérifications de l’état, métriques et journaux](/fr/self-hosting/monitoring/) : les mêmes files dans Prometheus.
+- [Sécurité et durcissement](/fr/self-hosting/security/)
+- [Rôles et autorisations](/fr/team/roles-and-permissions/) : ce que permettent les rôles des espaces de travail, par
+  opposition au rôle d’admin de l’instance.

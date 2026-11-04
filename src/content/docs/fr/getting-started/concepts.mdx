@@ -1,0 +1,201 @@
+---
+title: Comment fonctionne ReputeCast
+description: L’architecture d’envoi de newsletter de ReputeCast, des espaces de travail et des flux aux routes, au basculement, aux événements et à la liste de suppression.
+type: explanation
+audience: [publisher, admin, operator]
+primaryKeyword: architecture d’envoi de newsletter
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - README.md
+  - internal/providers/provider.go
+  - internal/routing/routing.go
+  - internal/ingest
+  - internal/suppressions
+  - internal/readiness
+  - internal/sending/engine
+  - internal/authz
+  - internal/mailbox
+  - internal/sending/rules
+  - internal/cadence
+  - internal/erasure
+  - internal/workspaces/retention.go
+sidebar:
+  order: 4
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Cette page explique l’architecture d’envoi de newsletter de ReputeCast : qui travaille où, quels types d’e-mails
+existent, comment chaque e-mail trouve son fournisseur d’envoi, et comment les résultats de livraison reviennent et
+protègent votre prochain envoi. Les termes employés ici reviennent dans toute l’application et dans le reste de cette
+documentation.
+
+## Instances, espaces de travail et membres
+
+- Une [instance](/fr/reference/glossary/#instance) est une installation de ReputeCast : le serveur, sa base de données
+  PostgreSQL et tous les espaces de travail qu’elle héberge. Les [admins de l’instance](/fr/reference/glossary/#instance-admin)
+  gèrent les utilisateurs, les méthodes de connexion, l’authentification unique et les mises à jour de toute l’instance,
+  et surveillent ses [tâches, files d’attente et stockage](/fr/self-hosting/instance-admin/).
+- Un [espace de travail](/fr/reference/glossary/#workspace) est un espace séparé, avec ses propres listes, campagnes,
+  automatisations, fournisseurs d’envoi et équipe. Une instance peut compter autant d’espaces de travail que nécessaire,
+  par exemple un par publication, par marque ou par client.
+- Un [membre](/fr/reference/glossary/#member) est une personne dans un espace de travail, avec exactement un
+  [rôle](/fr/reference/glossary/#role) dans cet espace. Les rôles intégrés sont Propriétaire, Admin, Éditeur et
+  Observateur ; vous pouvez ajouter des rôles personnalisés avec votre propre ensemble d’autorisations. Les clés d’API et
+  les agents d’IA reçoivent leurs autorisations de la même façon et ne peuvent jamais en détenir plus que la personne qui
+  les a créés. Lisez [Rôles et autorisations](/fr/team/roles-and-permissions/).
+
+## Fournisseurs d’envoi et fournisseurs de messagerie
+
+ReputeCast précise toujours lequel des deux il désigne :
+
+- Un [fournisseur d’envoi](/fr/reference/glossary/#sending-provider) délivre vos e-mails : Amazon SES, Postmark, Mailgun,
+  un serveur Postal, tout serveur SMTP et les autres présentés dans [Choisir un fournisseur d’envoi](/fr/providers/choose/).
+- Un [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider) est l’endroit où votre lecteur ouvre l’e-mail :
+  Gmail, Outlook, Yahoo, iCloud et d’autres.
+
+ReputeCast déduit le fournisseur de messagerie de chaque contact des enregistrements MX du domaine de l’adresse : une
+entreprise sur Google Workspace compte donc comme Gmail, et une entreprise sur Microsoft 365 comme Outlook. Le routage,
+le contrôle avant envoi, les rapports et la chauffe s’appuient tous sur cette réponse. Gmail et iCloud ne signalent
+jamais les plaintes message par message : leur taux de plainte affiche n/a et reste en dehors des totaux de taux de
+plainte.
+
+Les rapports et le suivi en direct affichent côte à côte les résultats par fournisseur de messagerie et par fournisseur
+d’envoi, car un problème peut se situer d’un côté comme de l’autre.
+
+## Quatre flux
+
+Un [flux](/fr/reference/glossary/#stream) est un type d’e-mail. Chaque flux a sa propre route et sa propre politique de
+basculement : une mauvaise campagne ne bloque donc jamais une réinitialisation de mot de passe.
+
+| Flux            | Ce qu’il transporte                                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Diffusions      | Les campagnes.                                                                                                       |
+| Automatisations | Les e-mails envoyés par les scénarios automatisés.                                                                   |
+| Système         | Les confirmations de double opt-in, les liens vers le centre de préférences, les invitations d’équipe et les réinitialisations de mot de passe. |
+| Transactionnel  | Les e-mails produit que votre propre application envoie par l’API transactionnelle ou le relais SMTP.               |
+
+Les invitations, les réinitialisations de mot de passe et les notifications par e-mail ne fonctionnent qu’une fois
+qu’un fournisseur d’envoi prend en charge le flux Système. Les e-mails transactionnels passent en premier quand ils
+partagent un fournisseur d’envoi avec les Diffusions. Lisez
+[L’e-mail transactionnel dans ReputeCast](/fr/transactional/overview/).
+
+## Routes, répartitions pondérées et basculement
+
+Une [route](/fr/reference/glossary/#route) décide quel fournisseur d’envoi délivre un e-mail. Chaque flux a une règle
+par défaut, et vous pouvez ajouter des règles pour certaines listes, certains domaines d’expéditeur ou le fournisseur
+de messagerie du destinataire. Une règle peut faire passer tous ses e-mails par un seul fournisseur ou les partager
+selon une [répartition pondérée](/fr/reference/glossary/#weighted-split), par exemple 90/10 pendant que vous passez à un
+nouveau fournisseur ou que vous chauffez une nouvelle adresse IP.
+
+Quand un fournisseur tombe en panne, la politique de [basculement](/fr/reference/glossary/#failover) du flux décide de
+la suite :
+
+- **Automatique** : les e-mails passent à un fournisseur de secours qui réussit ses contrôles, par exemple être
+  disponible, accepter ce type d’e-mail et avoir un domaine d’expéditeur vérifié. C’est le comportement par défaut pour
+  les flux Automatisations, Système et Transactionnel.
+- **Mettre en pause et demander** : les destinataires restants attendent qu’une personne décide. C’est le comportement
+  par défaut pour les Diffusions, car basculer un gros envoi vers un fournisseur froid en plein milieu peut nuire à
+  votre réputation.
+- **Automatique, chauffe terminée uniquement** : les e-mails ne passent qu’à un fournisseur de secours qui n’est pas en
+  chauffe ; sinon, ReputeCast met en pause et demande.
+
+Lisez [Router les e-mails entre fournisseurs](/fr/providers/routing/).
+
+## Un seul modèle d’événements et une seule liste de suppression
+
+Chaque fournisseur d’envoi signale les livraisons, les rebonds et les plaintes dans son propre format. ReputeCast reçoit
+ces signalements sur son URL publique (`/hooks/<adapter>/<token>`), vérifie la signature, conserve le payload brut et
+répond aussitôt ; une tâche de fond traduit ensuite chaque signalement en
+[événement normalisé](/fr/reference/glossary/#normalized-event) : délivré, différé, rebond définitif, rebond temporaire,
+plainte, rejeté, ouverture, clic ou désabonnement. Le code d’origine du fournisseur reste attaché à l’événement. Les
+serveurs SMTP n’ont pas de webhooks : ReputeCast lit donc leurs rebonds dans une boîte de réception des rebonds.
+
+Les rebonds définitifs, les plaintes et les désabonnements vont dans une seule
+[liste de suppression](/fr/reference/glossary/#suppression-list) partagée par tous les fournisseurs d’envoi : un rebond
+chez un fournisseur arrête les envois vers cette adresse partout. Chaque entrée s’applique à tous les e-mails ou aux
+seuls e-mails marketing, et seuls les rebonds définitifs et les plaintes qui s’appliquent à tous les e-mails sont
+transmis aux fournisseurs. Lisez [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/) et
+[La liste de suppression](/fr/audience/suppressions/).
+
+## Consentement
+
+ReputeCast enregistre le [consentement](/fr/reference/glossary/#consent) par liste, avec sa preuve : comment et quand le
+contact s’est abonné, et le texte exact qu’il a accepté. Les formulaires d’inscription peuvent utiliser le
+[double opt-in](/fr/reference/glossary/#double-opt-in), confirmé par un bouton sur la page qu’ouvre le lien, si bien
+qu’un scanner de liens ne peut pas confirmer à la place du lecteur. Les imports conservent le statut de consentement de
+la plateforme que vous quittez : les contacts désabonnés, en rebond ou auteurs de plaintes deviennent des exclusions et
+ne sont plus jamais réabonnés. Lisez [Listes, consentement et double opt-in](/fr/audience/lists-and-consent/).
+
+Effacer définitivement un contact supprime ses données de toutes les parties de ReputeCast qui les détiennent, et la
+[durée de conservation des données](/fr/team/workspaces/) de l’espace de travail efface les inscriptions jamais
+confirmées et vide, selon un calendrier, les adresses IP et les user agents des ouvertures et des clics, sans modifier
+aucun rapport. Lisez [Les bases du consentement et des lois anti-spam](/fr/deliverability/compliance/).
+
+## L’envoi protégé du début à la fin
+
+<SendFlowDiagram />
+
+Le contrôle avant envoi vérifie une campagne avant son démarrage, le routage confie chaque destinataire à un fournisseur
+d’envoi, les événements de livraison reviennent par les webhooks, et des seuils décident si l’envoi continue ou se met
+en pause.
+
+1. **Contrôle avant envoi.** Le [contrôle avant envoi](/fr/reference/glossary/#send-readiness) vérifie la réputation,
+   l’authentification, le contenu, les langues, l’accessibilité, le contenu conditionnel, les liens, la conformité, la
+   qualité de l’audience et le routage, puis rend un verdict : « Prête », « Prête, avec avertissements » ou « Bloquée ».
+   Il est relancé 15 minutes avant un envoi programmé et au démarrage de l’envoi. Un résultat bloquant arrête l’envoi ;
+   de nouveaux avertissements, une audience qui a changé de plus de 10 % ou des modifications faites après la
+   programmation le retiennent jusqu’à ce qu’une personne le revoie.
+2. **Routage.** L’envoi constitue sa liste de destinataires par pages, en écartant les contacts que le contrôle avant
+   envoi a exclus du décompte (comme les contacts exclus et non engagés, et ceux qui dépassent le
+   [plafond marketing](/fr/campaigns/sending-rules/) de l’espace de travail), et route chaque destinataire. Les lots
+   partent vers chaque fournisseur dans la limite de son débit et de la limitation de débit de chaque fournisseur de
+   messagerie, et les plafonds de [chauffe](/fr/providers/warm-up/) retiennent ce qu’un fournisseur récent ne peut pas
+   encore absorber. Chaque message est réservé avant de partir, si bien que rien n’est envoyé deux fois. Un envoi peut
+   commencer par une phase de [canari](/fr/reference/glossary/#canary) : les quelques pour cent de contacts les plus
+   engagés et vos boîtes témoins le reçoivent en premier.
+3. **Événements de livraison.** Les fournisseurs signalent les livraisons, les rebonds et les plaintes, et ReputeCast
+   les normalise.
+4. **Seuils.** Pendant l’envoi, ReputeCast vérifie les taux de rebond, de plainte et de report toutes les 2 secondes. Un
+   taux au-dessus de son seuil, avec suffisamment de données, [met en pause automatiquement](/fr/reference/glossary/#auto-pause)
+   le seul fournisseur de messagerie ou fournisseur d’envoi concerné, ou toute la campagne si vous avez choisi cette
+   portée. Les reports ralentissent un envoi avant de le mettre en pause, les plaintes ne comptent que là où les
+   fournisseurs de messagerie les signalent, et les règles sur les réponses des fournisseurs de messagerie peuvent
+   ralentir un fournisseur de messagerie précis. Une surveillance des plaintes suit l’envoi pendant 72 heures.
+5. **Décision.** Le suivi en direct explique ce qui a déclenché l’arrêt. Une personne autorisée reprend l’envoi, le
+   reprend avec des modifications ou l’annule.
+
+## Valeurs par défaut et limites
+
+Voici les valeurs par défaut de la pause automatique de l’[envoi protégé](/fr/reference/glossary/#guarded-sending) :
+
+<LimitsTable area="auto-pause" />
+
+Toutes les autres valeurs par défaut figurent dans [Limites et valeurs par défaut](/fr/reference/limits-and-defaults/).
+
+## Quand les modifier
+
+- **Abaissez les seuils** pour une liste à laquelle vous n’avez pas écrit depuis longtemps, ou pour un nouveau domaine
+  d’envoi, afin qu’un mauvais segment se mette en pause plus tôt.
+- **Relevez-les légèrement** uniquement quand une cause connue gonfle un taux, par exemple une liste dont vous savez
+  qu’elle contient d’anciennes adresses que vous nettoyez volontairement.
+- **Mettez en pause toute la campagne** plutôt qu’une seule route quand le moindre problème doit tout arrêter, par
+  exemple pour une annonce qui doit toucher tout le monde ou personne.
+
+Modifiez les valeurs par défaut de l’espace de travail dans <UiPath path="nav.settings > settings.providers" />, les
+seuils par type de rebond et les règles sur les réponses dans <UiPath path="nav.providers > providers.tabTraffic" />, et
+les valeurs d’une seule campagne dans <UiPath path="composer.reviewSend" /> ; lisez
+[Paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/),
+[Règles de trafic](/fr/providers/traffic-rules/) et [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/).
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Qu’est-ce que ReputeCast ?" href="/fr/getting-started/introduction/" />
+  <LinkCard title="Contrôle avant envoi : vérifier avant d’envoyer" href="/fr/campaigns/send-readiness/" />
+  <LinkCard title="Router les e-mails entre fournisseurs" href="/fr/providers/routing/" />
+  <LinkCard title="Glossaire" href="/fr/reference/glossary/" />
+</CardGrid>

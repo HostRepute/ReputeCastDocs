@@ -1,0 +1,213 @@
+---
+title: Définir les règles de trafic
+description: 'Définissez les règles de trafic e-mail que l’envoi protégé applique à chaque envoi : seuils par type de rebond, règles de réponse, envoi canari et plaintes.'
+type: how-to
+audience: [admin]
+permissions: ['providers:view', 'providers:manage']
+uiPath: 'nav.providers > providers.tabTraffic'
+primaryKeyword: règles de trafic e-mail
+sources:
+  - web/src/features/traffic
+  - internal/sending/rules
+  - internal/sending/engine/traffic_api.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/engine/canary.go
+  - internal/sending/engine/watch.go
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/messages/en.json
+  - migrations/03050_r02_guarded_sending.sql
+  - migrations/03312_m40_default_reply_rules.sql
+sidebar:
+  order: 16.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+<UiPath path="nav.providers > providers.tabTraffic" /> contient les règles de trafic e-mail que
+l’[envoi protégé](/fr/reference/glossary/#guarded-sending) applique à chaque envoi de l’espace de travail : des seuils par
+type de rebond, des règles sur ce que répondent les fournisseurs de messagerie, les cas où un envoi commence par un
+[envoi canari](/fr/reference/glossary/#canary), et la durée de surveillance des plaintes après un envoi. Chaque espace de
+travail démarre avec des valeurs par défaut opérationnelles ; ce guide montre comment les lire et les modifier.
+
+## Avant de commencer
+
+- Il vous faut `providers:view` pour voir les règles et `providers:manage` pour les modifier. Sans cette dernière
+  autorisation, la page affiche les règles en lecture seule.
+- Lisez [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/) pour savoir ce que fait une règle déclenchée
+  à un envoi en cours.
+- Facultatif : connectez des [boîtes témoins](/fr/deliverability/placement-tests/) pour que l’envoi canari puisse vérifier
+  le placement en boîte de réception, et [HostRepute](/fr/deliverability/hostrepute/) pour que la surveillance des plaintes
+  puisse lire le taux de spam de Gmail.
+
+## Modifier les règles de trafic
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers > providers.tabTraffic" />. Chaque carte affiche ses valeurs actuelles ; la ligne à
+   côté de <UiPath path="traffic.save" /> indique qui les a enregistrées en dernier, ou qu’il s’agit encore des valeurs
+   par défaut. Le panneau latéral explique comment les règles s’appliquent, ce que montre le suivi en direct, et les
+   <UiPath path="traffic.recentTitle" /> des 30 derniers jours.
+
+   <Screenshot
+     id="traffic-rules"
+     alt="Fournisseurs d’envoi, onglet Règles de trafic, enregistré il y a 2 jours par Linh Nguyen : les seuils par type de rebond, chacun avec sa limite et son action (rebonds pour blocage ou politique 0,5 %, utilisateurs inconnus 3 % et 5 %, rebonds temporaires et reports 15 % et 40 % sur 10 minutes, plaintes 0,10 %), et le panneau latéral avec le fonctionnement des règles, ce que montre le suivi en direct et les actions récentes."
+   />
+
+2. Sous <UiPath path="traffic.thresholdsTitle" />, définissez chaque limite et ce qu’elle déclenche quand elle est
+   atteinte. Ce sont les valeurs par défaut de l’espace de travail pour chaque envoi :
+   - <UiPath path="traffic.blockTitle" /> : les refus liés à la réputation, à la politique ou au contenu, comme
+     `S3150` chez Outlook ou `550 5.7.1` chez Gmail, chez un fournisseur de messagerie.
+   - <UiPath path="traffic.unknownTitle" /> : les adresses qui n’existent pas (`550 5.1.1`) sur l’ensemble de l’envoi,
+     à deux niveaux. Un grand nombre d’un coup révèle une liste ancienne ou achetée.
+   - <UiPath path="traffic.softTitle" /> : les réponses 4xx temporaires chez un fournisseur de messagerie sur une
+     période de 5, 10, 15 ou 30 minutes, à deux niveaux.
+   - <UiPath path="traffic.complaintTitle" /> : les plaintes par fournisseur de messagerie, comptées uniquement là où
+     les fournisseurs de messagerie les signalent (Outlook, Yahoo et certains dans Autre). C’est la même valeur que la
+     limite de plaintes par fournisseur de messagerie dans les
+     [paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/).
+
+   Chaque action est l’une des suivantes : mettre en pause ce fournisseur de messagerie, le ralentir à la moitié de la
+   cadence, mettre l’envoi en pause, ou avertir. Le premier niveau d’un seuil à deux niveaux doit être inférieur au
+   second.
+
+3. Sous <UiPath path="traffic.repliesTitle" />, vérifiez les règles de réponse. Chaque règle recherche un texte dans les
+   réponses SMTP d’un fournisseur de messagerie, en texte brut et sans tenir compte de la casse, sur toutes les routes,
+   et agit dès que son nombre est atteint, avant tout seuil de taux. La carte indique ce que signifie une réponse connue
+   et quand la règle a correspondu pour la dernière fois. Utilisez l’interrupteur pour désactiver une règle, ou
+   supprimez-la.
+
+   <Screenshot
+     id="traffic-rules-replies"
+     alt="La carte Réponses des fournisseurs de messagerie avec trois règles activées : les réponses de Yahoo contenant TSS04 mettent Yahoo en pause pendant 2 heures après 10 réponses en 10 minutes, les réponses d’Outlook contenant S3150 mettent Outlook en pause sur cette route et alertent dès la première réponse, et les réponses de Gmail contenant 421-4.7.28 ralentissent Gmail à 50 % pendant 30 minutes après 5 réponses, chacune avec ce que signifie la réponse et sa dernière correspondance, au-dessus du formulaire Ajouter une règle."
+   />
+
+4. Pour ajouter une règle, choisissez <UiPath path="traffic.addRule" /> et renseignez
+   <UiPath path="traffic.fieldMailbox" />, <UiPath path="traffic.fieldContains" /> (par exemple `4.7.650`),
+   <UiPath path="traffic.fieldWhen" /> (la première réponse, ou 5, 10 ou 25 réponses en 10 minutes),
+   <UiPath path="traffic.fieldAction" /> et <UiPath path="traffic.fieldDuration" /> (de 30 minutes à 6 heures, ou
+   jusqu’à une reprise manuelle). Les actions sont : ralentir ce fournisseur de messagerie à 50 %, le mettre en pause sur
+   toutes les routes, le mettre en pause sur la route qui a reçu les réponses et alerter, ou seulement alerter.
+
+5. Sous <UiPath path="traffic.canaryTitle" />, choisissez <UiPath path="traffic.runWhen" /> :
+   - <UiPath path="traffic.reasonNewDomain" /> : les 30 premiers jours du domaine, ou une IP dédiée listée dans
+     Fournisseurs d’envoi qui n’a jamais envoyé pour cet espace de travail.
+   - <UiPath path="traffic.reasonNeverMailed" /> : par exemple des contacts importés depuis le dernier envoi.
+   - <UiPath path="traffic.reasonOverUsual" /> : la taille habituelle est la médiane des 8 derniers envois.
+
+   Définissez ensuite la <UiPath path="traffic.size" /> (pourcentage des destinataires les plus engagés), si vous
+   ajoutez les boîtes témoins, la <UiPath path="traffic.watchTime" /> (10, 20, 30 ou 60 minutes) et les
+   <UiPath path="traffic.gates" /> sous lesquels l’envoi canari doit rester : rebonds, rebonds pour blocage ou politique,
+   reports, plaintes par fournisseur de messagerie et <UiPath path="traffic.gateSeeds" />. Si aucune raison n’est
+   cochée, la carte affiche Désactivé et aucun envoi canari ne se lance de lui-même ; une personne peut toujours en
+   choisir un dans Vérifier et envoyer.
+
+   <Screenshot
+     id="traffic-rules-canary"
+     alt="La carte des valeurs par défaut de l’envoi canari, activée : un envoi canari se lance quand le domaine ou l’IP d’envoi est nouveau, quand certains destinataires n’ont jamais reçu d’e-mail du domaine ou quand l’audience dépasse le double de la taille habituelle ; il part vers les 5 % les plus engagés plus les boîtes témoins, est surveillé pendant 20 minutes et doit rester sous ses seuils pour les rebonds, les rebonds pour blocage ou politique, les reports, les plaintes par fournisseur de messagerie et les boîtes témoins en spam."
+   />
+
+6. Sous <UiPath path="traffic.afterTitle" />, définissez <UiPath path="traffic.watchFor" /> (24, 48 ou 72 heures, ou
+   7 jours), <UiPath path="traffic.alertTitle" /> et <UiPath path="traffic.postmasterTitle" />.
+
+7. Choisissez <UiPath path="traffic.save" />. Les nouveaux envois utilisent les règles ; les limites propres à une
+   campagne, définies dans Vérifier et envoyer, restent prioritaires pour cette campagne. L’enregistrement est consigné
+   dans le [journal d’audit](/fr/team/audit-log/) avec ce qui a changé.
+
+</Steps>
+
+## Comment les règles s’appliquent
+
+- **Ordre.** Les règles de réponse agissent en premier, dès que leur nombre est atteint. Les seuils par type de rebond
+  viennent ensuite, puis les seuils de rebond et de plainte. Le suivi en direct les liste un par un sur sa carte des
+  seuils.
+- **Preuves.** Chaque seuil attend au moins 5 événements et 500 messages vers ce fournisseur de messagerie, puis ne se
+  déclenche que lorsque les preuves suffisent à montrer que le taux dépasse vraiment la limite. Les plaintes et les
+  rebonds pour blocage ou politique n’attendent pas aussi longtemps : dès 3, un taux nettement au-dessus de la limite
+  déclenche le seuil, quelle que soit la taille de l’envoi. Les rebonds pour blocage ou politique sont aussi jugés sur les
+  10 dernières minutes seules : un fournisseur de messagerie qui commence à bloquer tard dans un gros envoi déclenche
+  donc le seuil lui aussi.
+- **Portée.** Une action s’applique à un fournisseur de messagerie, sauf si elle mentionne « l’envoi ».
+- **Durée.** Les ralentissements prennent fin d’eux-mêmes une fois leur durée écoulée. Les pauses attendent une personne
+  autorisée à reprendre les envois, et la page indique qui. Une règle de réponse n’agit qu’une fois à la fois ; quand son
+  action prend fin, seules les nouvelles réponses comptent.
+- **Où le voir.** Chaque action apparaît dans le [suivi en direct](/fr/campaigns/live-monitor/), dans
+  <UiPath path="nav.providers > providers.tabEvents" /> et ici dans <UiPath path="traffic.recentTitle" />.
+
+### Les règles de réponse par défaut
+
+Chaque espace de travail démarre avec ces règles, et les espaces de travail créés avant elles les ont reçues aussi, sauf
+s’ils avaient déjà leurs propres règles. Modifiez-les, désactivez-les ou supprimez-les comme n’importe quelle autre
+règle.
+
+<LimitsTable area="traffic-rules" />
+
+ReputeCast interprète `TSS04` de Yahoo (et l’ancien `TS04`) comme des reports pour volume inattendu ou pour plaintes,
+`S3150` d’Outlook comme le signe que l’IP d’envoi est sur la liste de blocage de Microsoft, si bien que chaque message
+suivant rebondirait, et `421-4.7.28` de Gmail comme une limitation de débit due à un volume d’e-mails inhabituel. Une
+règle recherche du texte brut : `TS04` a donc besoin de sa propre règle, car `TSS04` ne le contient pas. Voir
+[Yahoo 421 4.7.0 TSS04](/fr/smtp-errors/yahoo-421-4-7-0-tss04/) et [Gmail 421 4.7.28](/fr/smtp-errors/gmail-421-4-7-28/).
+
+### L’envoi canari
+
+Un envoi canari ne se lance de lui-même que sur une audience de 1 000 destinataires ou plus, pour que quelques pour cent
+de cette audience puissent révéler quelque chose. L’envoi canari démarre à l’heure programmée et tous les autres
+l’attendent : un envoi avec envoi canari se termine donc environ 25 minutes plus tard avec la surveillance par défaut de
+20 minutes. Quand la surveillance prend fin et que chaque seuil disposant d’assez de preuves est respecté, l’envoi
+continue de lui-même ; si un seuil est dépassé, il reste retenu et les personnes qui peuvent envoyer des campagnes sont
+sollicitées. Les seuils qui collectent encore des preuves ne retiennent pas l’envoi ; ils deviennent ses seuils.
+
+<LimitsTable area="canary" />
+
+### La surveillance des plaintes
+
+Les plaintes continuent d’arriver pendant des jours après la livraison. Pendant la surveillance, un fournisseur de
+messagerie qui dépasse sa limite de plaintes avec assez de preuves déclenche une alerte, dans l’application et par
+e-mail, auprès des personnes qui peuvent reprendre les envois. Gmail communique un taux de spam par jour pour tout le
+domaine, pas des plaintes individuelles : avec l’option Postmaster Tools activée, la surveillance alerte quand ce taux
+dépasse la limite de plaintes par fournisseur de messagerie. Rien n’est mis en pause, car l’envoi est terminé. Les
+plaintes tardives ajoutent le contact à la liste de suppression et comptent dans le rapport de la campagne.
+
+<Aside type="note">
+Le taux Postmaster Tools vient des données que [HostRepute](/fr/deliverability/hostrepute/) synchronise pour votre domaine
+d’envoi. Sans lui, l’option n’a rien à lire.
+</Aside>
+
+## Vérifier le résultat
+
+- <UiPath path="traffic.saved" /> apparaît, et la ligne à côté de <UiPath path="traffic.save" /> vous nomme.
+- La carte des seuils du prochain envoi dans le suivi en direct affiche vos limites, et
+  <UiPath path="live.model.thresholdReplies" /> compte vos règles de réponse activées.
+- Après qu’une règle a agi, elle affiche sa dernière correspondance sur cette page et dans
+  <UiPath path="traffic.recentTitle" />.
+
+## Dépannage
+
+- **« Le premier niveau doit être inférieur au second. »** Abaissez le premier niveau du seuil des utilisateurs inconnus
+  ou des reports, ou relevez le second.
+- **« Saisissez le texte de réponse à rechercher, par exemple TSS04. »** Une règle demande au moins 2 caractères de
+  texte de réponse.
+- **Les champs sont en lecture seule.** Votre rôle peut consulter les fournisseurs d’envoi, mais pas les gérer. Demandez
+  à une personne autorisée à gérer les fournisseurs d’envoi.
+- **Une règle ne correspond jamais.** Elle recherche le texte de la réponse SMTP que signale votre fournisseur d’envoi,
+  n’importe où dans cette réponse. Vérifiez le texte exact dans <UiPath path="nav.providers > providers.tabEvents" />, et
+  cherchez une partie plus courte, comme le code seul.
+- **Aucun envoi canari n’a eu lieu.** L’audience comptait moins de 1 000 destinataires, aucune raison ne s’appliquait,
+  ou toutes les raisons sont désactivées. Choisissez <UiPath path="review.canaryOn" /> dans Vérifier et envoyer pour en
+  lancer un malgré tout.
+- **L’envoi canari n’a pas de seuil pour les boîtes témoins.** Aucune boîte témoin n’est connectée, ou l’option est
+  désactivée. Ajoutez-en dans les [tests de placement](/fr/deliverability/placement-tests/).
+- **Un envoi en cours ignore une modification.** Les envois utilisent les règles avec lesquelles ils ont démarré.
+  Modifiez les seuils d’un envoi en cours avec <UiPath path="live.editThresholdsLive" /> dans le suivi en direct.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Suivre un envoi et la pause automatique" href="/fr/campaigns/live-monitor/" />
+  <LinkCard title="Paramètres d’envoi par défaut de l’espace de travail" href="/fr/providers/workspace-defaults/" />
+  <LinkCard title="Rebonds, plaintes et limites des fournisseurs" href="/fr/deliverability/bounces-and-complaints/" />
+  <LinkCard title="Codes d’erreur SMTP" href="/fr/smtp-errors/" />
+</CardGrid>

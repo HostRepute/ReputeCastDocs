@@ -1,0 +1,212 @@
+---
+title: Bounces, Beschwerden und Anbieterlimits
+description: Was ReputeCast mit jedem Bounce und jeder Beschwerde macht, was es sofort sperrt und welche Grenzwerte für die Bounce-Rate Anbieter und ReputeCast setzen.
+type: explanation
+audience: [publisher, admin]
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Grenzwerte für die Bounce-Rate
+sources:
+  - internal/providers/provider.go
+  - internal/providers/bounce/bounce.go
+  - internal/providers/ses/sns.go
+  - internal/ingest/normalize.go
+  - internal/suppressions/sync.go
+  - internal/reports/bounces.go
+  - internal/providers/state/state.go
+  - internal/providers/manage/usage.go
+  - internal/connect/connection.go
+  - internal/deliverability/providers.go
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/watch.go
+  - internal/mailbox/mailbox.go
+  - internal/counters/counters.go
+  - web/src/features/reports/messages.ts
+  - web/src/features/traffic/traffic.messages.ts
+sidebar:
+  order: 8
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Ein [Bounce](/de/reference/glossary/#bounce) ist eine Nachricht, die der empfangende Mailserver abgelehnt hat; eine
+[Beschwerde](/de/reference/glossary/#complaint) entsteht, wenn jemand Ihre E-Mail als Spam markiert. Beide zählen gegen
+die Grenzwerte für die Bounce-Rate und die Beschwerdelimits, die Versandanbieter für Ihr Konto durchsetzen, und gegen
+die Schwellenwerte, die ReputeCast während des Versands einer Kampagne anwendet. Diese Seite erklärt, wie jede Art
+erfasst wird, welche Adressen sofort gesperrt werden und wo diese Limits liegen.
+
+## Hard Bounces, Soft Bounces und Beschwerden
+
+- Ein [Hard Bounce](/de/reference/glossary/#hard-bounce) ist ein dauerhafter Fehler: Die Adresse existiert nicht, die
+  Domain hat keinen Mailserver, oder der Empfänger hat die Nachricht endgültig abgelehnt. SMTP-Antworten dafür beginnen
+  mit 5 (zum Beispiel `550 5.1.1`).
+- Ein [Soft Bounce](/de/reference/glossary/#soft-bounce) ist ein vorübergehender Fehler, etwa ein volles Postfach oder
+  ein Empfänger, der um einen späteren Versuch bittet. Die Antworten beginnen mit 4 (zum Beispiel `452 4.2.2`). Der
+  Versandanbieter versucht es erneut; eine Nachricht, die er am Ende nicht zustellen kann, meldet er als Soft Bounce.
+- Eine [Zurückstellung](/de/reference/glossary/#deferral) ist ein einzelner verzögerter Versuch, den der
+  Versandanbieter wiederholt. Viele Zurückstellungen bei einem Postfachanbieter bedeuten meist, dass er Ihre E-Mails
+  drosselt. Eine Nachricht zählt einmal als zurückgestellt, egal wie viele Versuche zurückgestellt wurden.
+- Eine Beschwerde erreicht Sie über einen [Feedback-Loop](/de/reference/glossary/#feedback-loop): Der
+  [Postfachanbieter](/de/reference/glossary/#mailbox-provider) meldet einen Klick auf „Spam melden“ an Ihren
+  [Versandanbieter](/de/reference/glossary/#sending-provider), der ihn weitergibt.
+- Eine abgelehnte Nachricht hat der Versandanbieter schon vor dem Senden zurückgewiesen, zum Beispiel weil die Adresse
+  auf der eigenen Sperrliste des Anbieters steht oder der Inhalt beanstandet wurde.
+
+Ob ein Bounce hart oder weich ist, entscheidet der Versandanbieter. ReputeCast übernimmt diese Entscheidung zusammen mit
+dem ursprünglichen Ereignistyp und Code des Anbieters.
+
+## Wie ReputeCast jedes Ereignis behandelt
+
+1. Der Versandanbieter meldet das Ereignis an den Webhook von ReputeCast, oder ReputeCast liest es bei einem
+   SMTP-Server aus dem [Bounce-Postfach](/de/reference/glossary/#bounce-mailbox). Die Roh-Payload wird gespeichert,
+   bevor irgendetwas anderes passiert.
+2. ReputeCast ordnet das Ereignis genau einem Typ als
+   [normalisiertes Ereignis](/de/reference/glossary/#normalized-event) zu: `delivered`, `deferred`, `hard_bounce`,
+   `soft_bounce`, `complaint`, `rejected`, `open`, `click` oder `unsubscribe`. Der ursprüngliche Typ („Bounce ·
+   Permanent · General“) und der Code („550 5.1.1“) bleiben daran gespeichert.
+3. Ein Bounce erhält außerdem eine [Bounce-Klasse](/de/reference/glossary/#bounce-class), abgeleitet aus dem
+   erweiterten Statuscode und dem Diagnosetext, damit dieselbe Antwort bei jedem Versandanbieter dasselbe bedeutet.
+4. Ein Hard Bounce, eine Beschwerde und eine vom Anbieter gemeldete Abmeldung setzen die Adresse sofort auf die
+   [gemeinsame Sperrliste](/de/reference/glossary/#suppression-list), und der Status des Kontakts wechselt auf Bounce
+   bzw. Beschwerde. Die [Sperrlisten-Synchronisierung](/de/reference/glossary/#suppression-sync) überträgt die Adresse
+   dann an jeden verbundenen Versandanbieter, der Sperren annimmt, sodass ein einziger Bounce den Versand überall
+   stoppt.
+5. Eine Blockierung wegen der Reputation oder Richtlinie des Absenders (`policy_block`, `spam_block`, `reputation`)
+   sperrt die Adresse nie, auch wenn der Versandanbieter sie als dauerhaft einstuft: Die Adresse ist gültig und erhält
+   wieder E-Mails, sobald die Blockierung behoben ist.
+6. Ein Soft Bounce oder eine Zurückstellung sperrt eine Adresse nicht allein. Sie zählen in Berichten und im
+   [Live-Monitor](/de/campaigns/live-monitor/). Für Transaktions-E-Mails gilt eine zusätzliche Regel: Wenn eine
+   Nachricht im Stream Transaktional einen Soft Bounce erhält und die Adresse innerhalb von 7 Tagen 3 Soft Bounces
+   hatte, wird die Adresse gesperrt.
+7. Bounces nach Typ, Zurückstellungen und Beschwerden fließen in den
+   [abgesicherten Versand](/de/reference/glossary/#guarded-sending) ein: Wenn die Raten einer Kampagne die
+   [Schwellenwerte für Auto-Pause](#schwellenwerte-für-auto-pause) überschreiten, bremst ReputeCast den betroffenen
+   Anteil oder hält ihn zurück.
+
+Kopien, die ein [Platzierungstest](/de/deliverability/placement-tests/) an Ihre eigenen Testpostfächer sendet, sind die
+einzige Ausnahme: Ihre Bounces und Beschwerden sperren das Testpostfach nie.
+
+Jedes Rohereignis und seine normalisierte Form stehen nebeneinander unter
+<UiPath path="nav.providers > providers.tabEvents" />.
+
+<Screenshot
+  id="providers-events"
+  alt="Das Ereignisprotokoll unter Ereignisse & Sync: jedes Rohereignis eines Anbieters, etwa ein Amazon-SES-Ereignis Bounce · Permanent · General, neben seinem normalisierten Typ, dem ursprünglichen Code und der Diagnose, dem Empfänger und seiner Quelle, etwa einer Kampagne, einem Automationsschritt oder der Transaktions-API."
+/>
+
+### Bounce-Klassen
+
+Kampagnenberichte gruppieren Bounces in ihrer Bounce-Tabelle nach Klasse, mit den ursprünglichen Codes jedes
+Versandanbieters, und sagen, was mit den Adressen geschehen ist.
+
+<TableScroll label="Bounce-Klassen">
+
+| Klasse            | Was der Empfänger gemeldet hat                                    | Zeile im Bericht                       | Was passiert                                             |
+| ----------------- | ----------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| `mailbox_unknown` | Die Adresse existiert nicht (`5.1.1`, „user unknown“)             | Hard · Empfänger existiert nicht       | Automatisch gesperrt                                     |
+| `domain_invalid`  | Die Domain existiert nicht oder hat keinen Mailserver             | Hard · Domain nicht gefunden           | Automatisch gesperrt                                     |
+| `mailbox_full`    | Das Postfach hat sein Kontingent überschritten (`4.2.2`, `5.2.2`) | Soft · Postfach voll                   | Beim nächsten Versand erneut versucht                    |
+| `temporary`       | Ein vorübergehender Fehler, der sich nie aufgelöst hat            | Soft · Zurückstellung abgelaufen       | Beim nächsten Versand erneut versucht                    |
+| `policy_block`    | Wegen einer Richtlinie abgelehnt, oft Authentifizierung (`5.7.1`, `5.7.26`) | Blockiert · Richtlinie oder Reputation | Nie gesperrt; Ursache untersuchen und beheben |
+| `spam_block`      | Als Spam abgelehnt oder wegen eines Blocklisten-Eintrags          | Blockiert · Richtlinie oder Reputation | Nie gesperrt; Ursache untersuchen und beheben            |
+| `reputation`      | Wegen der Absenderreputation abgelehnt oder gedrosselt            | Blockiert · Richtlinie oder Reputation | Nie gesperrt; Ursache untersuchen und beheben            |
+| `other`           | Kein Code, den ReputeCast einordnen kann                          | Andere                                 | Sie prüfen ihn selbst                                    |
+
+</TableScroll>
+
+Blockierte Bounces weisen auf Ihr Versand-Setup hin, nicht auf die Adresse, daher sperrt ReputeCast sie nie, auch wenn
+der Versandanbieter sie als dauerhaft gemeldet hat. In der Bounce-Tabelle des Berichts bietet die Zeile „Blockiert“
+<UiPath path="reports.investigate" /> an, was zeigt, was jeder Versandanbieter gemeldet hat, und
+<UiPath path="reports.retryTitle" /> legt die Ausgabe erneut als Entwurf für die blockierten Adressen an, die noch auf
+Ihrer Liste stehen, jede einmal, damit Sie sie nach Behebung der Ursache unter Prüfen & senden versenden. Prüfen Sie
+[SPF, DKIM und DMARC](/de/deliverability/spf-dkim-dmarc/) und [Blocklisten-Einträge](/de/deliverability/blocklists/),
+und schlagen Sie den Code unter [SMTP-Fehlercodes](/de/smtp-errors/) nach.
+
+### Beschwerden: wo sie gemeldet werden
+
+Die meisten Postfachanbieter senden pro Beschwerde einen Bericht an Ihren Versandanbieter, den ReputeCast als
+`complaint`-Ereignis erhält: Outlook, Yahoo und viele der Anbieter unter Andere. Gmail und iCloud melden nie einzelne
+Beschwerden. Daher berechnet ReputeCast Beschwerderaten nur über E-Mails, die an Postfachanbieter zugestellt wurden,
+die Beschwerden melden, und zeigt die eigenen Beschwerderaten von Gmail und iCloud als „k. A.“ mit Begründung an, nie
+als 0 %. Unbekannt ist nicht null: Eine Kampagne, die nur an Gmail ging, hat keine Beschwerderate, keine perfekte.
+Welchen Postfachanbieter ein Empfänger nutzt, ergibt sich aus den MX-Einträgen der Domain, daher zählen Adressen bei
+Google Workspace als Gmail und Adressen bei Microsoft 365 als Outlook.
+
+Gmail funktioniert anders: Sein Feedback-Loop meldet in Google Postmaster Tools zusammengefasste Spamraten je
+Kennung, geschlüsselt nach einem `Feedback-ID`-Header in der Nachricht
+([Gmail-Hilfe, „Feedback Loop“](https://support.google.com/mail/answer/6254652), geprüft im Oktober 2026). ReputeCast
+fügt diesen Header E-Mails in den Streams Massenversand, Automationen und Transaktional hinzu:
+
+```text title="Feedback-ID header"
+Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
+```
+
+Die Kennungen gruppieren die Daten von Gmail je Kampagne, je Arbeitsbereich und je Stream. Mit verbundenem
+[HostRepute](/de/deliverability/hostrepute/) erscheinen die Zahlen aus Postmaster Tools, einschließlich markierter
+Kampagnen, unter Zustellbarkeit, und die Beschwerdeüberwachung nach einem Versand kann die tägliche Spamrate von Gmail
+lesen (siehe [Traffic-Regeln festlegen](/de/providers/traffic-rules/)).
+
+Beschwerden treffen noch Tage nach der Zustellung ein. Jede sperrt die Adresse trotzdem und zählt im Bericht der
+Kampagne, und 72 Stunden nach einem Versand (standardmäßig) benachrichtigt ReputeCast die Personen, die Versände
+fortsetzen dürfen, wenn ein Postfachanbieter sein Beschwerdelimit überschreitet.
+
+## Kontolimits der Versandanbieter
+
+Versandanbieter beobachten die Bounce- und Beschwerderaten Ihres Kontos und können Ihren Versand stoppen, wenn sie zu
+hoch werden. Amazon SES zum Beispiel veröffentlicht für jede Rate zwei Stufen
+([Amazon SES sending review process FAQs](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), geprüft
+im Oktober 2026):
+
+| Rate           | Konto wird geprüft | Versand kann pausiert werden |
+| -------------- | ------------------ | ---------------------------- |
+| Bounce-Rate    | 5 % oder mehr      | 10 % oder mehr               |
+| Beschwerderate | 0,1 % oder mehr    | 0,5 % oder mehr              |
+
+Amazon SES zählt nur Hard Bounces an Domains, die Sie nicht verifiziert haben, und Beschwerden nur von
+Postfachanbietern, die Feedback senden, gemessen über ein „repräsentatives Volumen“ Ihrer E-Mails statt über einen
+festen Zeitraum. AWS rät, unter 2 % Bounces und unter 0,1 % Beschwerden zu bleiben.
+
+ReputeCast speichert die beiden Stufen von Amazon SES mit jeder SES-Verbindung und zeigt die Bounce- und Beschwerderate
+jedes Versandanbieters für die letzten 7 Tage unter
+[Zustand von Domains und Anbietern überwachen](/de/deliverability/health/) an, neben dem Limit, das es für diesen
+Anbieter anwendet. Die Beschwerderate zählt nur E-Mails, die dort zugestellt wurden, wo Beschwerden gemeldet werden.
+Der Balken warnt ab der Hälfte des ersten Limits, sobald ReputeCast in den 7 Tagen 500 Nachrichten gezählt hat. Selbst
+gehostete Server wie Postal oder ein SMTP-Server haben keine Kontolimits; die dort gezeigte Linie ist die
+Schutzgrenze, die ReputeCast setzt, oder der Warm-up-Schutz, solange der Server im
+[Warm-up](/de/providers/warm-up/) ist.
+
+## Schwellenwerte für Auto-Pause
+
+Die eigenen Schwellenwerte von ReputeCast gelten während jeder Kampagne, je Postfachanbieter und Versandanbieter. Sie
+liegen auf oder unter den Stufen, bei denen ein Amazon-SES-Konto geprüft wird, sodass ein schlechter Versand stoppt,
+bevor er dem Konto schadet. Jeder Bounce-Typ hat seinen eigenen Schwellenwert: Block- und Richtlinien-Bounces je
+Postfachanbieter, unbekannte Empfänger über den ganzen Versand in zwei Stufen (warnen, dann pausieren) und Soft Bounces
+und Zurückstellungen je Postfachanbieter über 10 Minuten in zwei Stufen (verlangsamen, dann pausieren). Beschwerden
+und Block- und Richtlinien-Bounces, die deutlich über dem Limit liegen, lösen bei einem Versand jeder Größe aus. Sie
+legen sie in den [Traffic-Regeln](/de/providers/traffic-rules/) fest.
+
+<LimitsTable area="auto-pause" />
+
+## Wann Sie sie ändern sollten
+
+- Behalten Sie die Standardwerte, während Sie eine neue Domain oder IP aufwärmen oder nach einer Migration: Sie
+  erkennen eine schlechte Liste, bevor ein Versandanbieter es tut.
+- Erhöhen Sie einen Schwellenwert für eine Kampagne unter [Prüfen & senden](/de/reference/glossary/#review-and-send) nur,
+  wenn Sie wissen, warum die Rate hoch sein wird, zum Beispiel bei einer Re-Permission-Kampagne an eine alte Liste, und
+  senden Sie sie zuerst an ein kleines Segment.
+- Senken Sie den Bounce-Schwellenwert, wenn das eigene Limit eines Versandanbieters strenger ist als der Standardwert
+  von ReputeCast.
+
+Was passiert, wenn ein Schwellenwert auslöst, steht unter
+[Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/), und wo die Standardwerte des
+Arbeitsbereichs liegen, unter [Versandstandards für den Arbeitsbereich](/de/providers/workspace-defaults/).
+
+## Verwandte Themen
+
+- [Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/)
+- [Die Sperrliste](/de/audience/suppressions/)
+- [Kampagnenberichte lesen](/de/campaigns/reports/)
+- [SMTP-Fehlercodes](/de/smtp-errors/)

@@ -1,0 +1,452 @@
+---
+title: Recevoir des webhooks
+description: "Recevez les événements signés de ReputeCast sur votre endpoint : code de vérification de signature de webhook en Node.js, Python, Go et PHP, relances, rejeu."
+type: how-to
+audience: [developer]
+permissions: ['webhooks:manage']
+uiPath: 'nav.settings > settings.webhooks'
+primaryKeyword: vérification de signature de webhook
+sources:
+  - internal/webhooks/webhooks.go
+  - internal/webhooks/batch.go
+  - internal/webhooks/email.go
+  - internal/webhooks/jobs.go
+  - internal/webhooks/api.go
+  - internal/store/queries/webhooks.sql
+  - internal/netguard/netguard.go
+  - web/src/features/webhooks
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast envoie des [événements normalisés](/fr/reference/glossary/#normalized-event) (livraisons, rebonds,
+plaintes, inscriptions, envois et plus encore) aux endpoints que vous enregistrez, et signe chaque requête. Cette page
+configure un endpoint et montre la vérification de signature de webhook en Node.js, Python, Go et PHP, pour que votre
+code n’agisse que sur les requêtes qui viennent vraiment de votre instance ReputeCast.
+
+## Avant de commencer
+
+- Il vous faut `webhooks:manage` dans l’espace de travail.
+- Votre endpoint a besoin d’une URL que votre serveur ReputeCast peut joindre, comme
+  `https://api.example.com/webhooks/reputecast`. Les adresses de réseaux privés et internes (`10.0.0.0/8`,
+  `localhost`, `*.internal` et autres) sont refusées, sauf si un admin de l’instance active
+  `webhooks.allow_private_networks` ([référence de configuration](/fr/reference/configuration/)). Les identifiants dans
+  l’URL (`https://user:pass@…`) sont refusés ; le secret de signature les remplace.
+- Les webhooks appartiennent à un seul espace de travail. Ajoutez un endpoint dans chaque espace de travail dont vous
+  voulez recevoir les événements.
+
+## Ajouter un endpoint
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.webhooks" /> et sélectionnez <UiPath path="webhooks.addEndpoint" />.
+
+2. Saisissez l’URL de l’endpoint, un nom et une description facultatifs, et choisissez les événements. Cocher un
+   groupe entier abonne à son caractère générique, comme `email.*` ; les événements ajoutés plus tard à ce groupe sont
+   inclus. Dès qu’un événement `email.*` est choisi, <UiPath path="webhooks.batchLabel" /> apparaît
+   ([recevoir les événements e-mail par lots](#recevoir-les-événements-e-mail-par-lots)).
+
+3. Sélectionnez <UiPath path="webhooks.addEndpoint" />. ReputeCast affiche une fois le secret de signature,
+   `whsec_…`. Copiez-le dans la configuration de votre récepteur, par exemple sous `REPUTECAST_WEBHOOK_SECRET`.
+   ReputeCast le stocke chiffré et ne l’affiche plus jamais.
+
+4. Déployez un récepteur qui vérifie la signature ([Vérifier la signature](#vérifier-la-signature)) et répond `2xx`.
+
+5. Rouvrez l’endpoint et sélectionnez <UiPath path="webhooks.sendTestEvent" />. ReputeCast envoie immédiatement un
+   événement `webhook.test` et affiche la réponse.
+
+</Steps>
+
+<Screenshot
+  id="settings-webhooks"
+  alt="Paramètres, onglet Webhooks : quatre endpoints de webhook sortants avec leurs événements, leur taux de réussite sur 24 heures et leur état. Un endpoint d’entrepôt de données abonné à email.* est en échec avec HTTP 502, et un endpoint n8n est marqué comme géré par n8n. En dessous, la carte de vérification d’une signature."
+/>
+
+Les mêmes endpoints peuvent être gérés par l’API : `create-webhook`, `update-webhook`, `pause-webhook`,
+`test-webhook` et les autres opérations du [tag Webhooks](/api/operations/tags/webhooks/).
+
+## Événements et caractères génériques
+
+Un endpoint s’abonne à 1 à 40 entrées. Chaque entrée est un nom d’événement (`email.bounced`), un caractère générique
+de groupe (`email.*`) ou `*` pour tous les événements. Le catalogue complet, avec la signification de chaque événement
+et un exemple de son `data`, se trouve dans [Événements webhook](/fr/reference/webhook-events/). Chaque événement du
+catalogue est envoyé : les événements `email.*` concernent les e-mails de campagne et d’automatisation, et les
+messages transactionnels ont leurs propres événements `message.*`.
+
+`webhook.test` ne figure pas dans le catalogue : seuls le bouton de test et l’opération `test-webhook` l’envoient.
+
+## À quoi ressemble une livraison
+
+Chaque livraison est un `POST` HTTP avec une enveloppe JSON :
+
+```json title="Corps de la requête"
+{
+  "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44",
+  "type": "contact.subscribed",
+  "created_at": "2026-10-22T09:41:07Z",
+  "workspace": "acme-newsletter",
+  "data": { "…": "the event's own fields" }
+}
+```
+
+- `id` identifie l’événement. Il reste le même à chaque nouvelle tentative et pour chaque endpoint qui reçoit
+  l’événement : utilisez-le pour ignorer les doublons.
+- `type` est le nom de l’événement, `created_at` le moment où il s’est produit (UTC) et `workspace` le slug de
+  l’espace de travail.
+- `data` dépend de l’événement ; voir [Événements webhook](/fr/reference/webhook-events/).
+
+Ces en-têtes accompagnent chaque livraison :
+
+| En-tête                  | Valeur                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| `Content-Type`           | `application/json`                                                                          |
+| `User-Agent`             | `ReputeCast-Webhooks/<version>`                                                             |
+| `X-ReputeCast-Signature` | Le HMAC-SHA256 en hexadécimal minuscule de `<timestamp>.<raw body>`. Il n’y a pas de préfixe `sha256=` ni d’autre préfixe. Pendant les 24 heures qui suivent un [renouvellement du secret](#renouveler-le-secret-de-signature), deux signatures séparées par une virgule, celle du nouveau secret en premier. |
+| `X-ReputeCast-Timestamp` | Le moment où cette tentative a été signée, en secondes Unix.                               |
+| `X-ReputeCast-Event`     | Le nom de l’événement, le même que `type`.                                                  |
+| `X-ReputeCast-Delivery`  | L’ID de livraison : un par événement et par endpoint, le même à chaque nouvelle tentative.  |
+
+## Recevoir les événements e-mail par lots
+
+Une grosse campagne génère un événement `email.delivered` par destinataire. Avec <UiPath path="webhooks.batchLabel" />
+activé, l’endpoint reçoit plutôt ses événements `email.*` dans des livraisons de type `email.batch`, de 100 événements
+au plus chacune : un envoi à un million de destinataires génère ainsi environ dix mille requêtes. Les autres
+événements arrivent toujours un par un. L’option est désactivée par défaut et ne change rien pour les endpoints qui la
+laissent désactivée.
+
+```json title="email.batch"
+{
+  "id": "0192f1c5-0d3e-7a11-9b2c-4e6f8a0b1c2d",
+  "type": "email.batch",
+  "created_at": "2026-10-22T09:41:20Z",
+  "workspace": "acme-newsletter",
+  "data": {
+    "count": 2,
+    "events": [
+      { "id": "0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44", "type": "email.delivered", "created_at": "2026-10-22T09:41:07Z", "workspace": "acme-newsletter", "data": { "…": "…" } },
+      { "id": "0192f1c4-8c3f-7d62-8e1b-4a6f9c2b3d55", "type": "email.bounced", "created_at": "2026-10-22T09:41:09Z", "workspace": "acme-newsletter", "data": { "…": "…" } }
+    ]
+  }
+}
+```
+
+- `data.events` contient chaque événement sous la forme de l’enveloppe avec laquelle il aurait été envoyé seul, dans
+  l’ordre où ils se sont produits. Ignorez les doublons d’après chaque `id` intérieur, comme pour les événements
+  individuels.
+- Le lot est une seule livraison, avec son propre `id`, sa signature et `X-ReputeCast-Event: email.batch`, relancée et
+  rejouée en bloc.
+- Tant que l’endpoint est en pause, ses lots sont retenus comme toute autre livraison.
+
+## Vérifier la signature
+
+Pour vérifier une livraison :
+
+1. Lisez le corps brut de la requête sous forme d’octets, avant toute analyse JSON. Un JSON resérialisé ne
+   correspondra pas.
+2. Prenez l’en-tête `X-ReputeCast-Timestamp` et rejetez la requête quand il s’écarte de plus de 5 minutes de votre
+   horloge. Cela empêche de rejouer une ancienne requête interceptée. ReputeCast ne l’impose pas ; c’est votre
+   récepteur qui le fait.
+3. Calculez le HMAC-SHA256 du timestamp, d’un point et du corps brut : `<timestamp>.<raw body>`.
+4. Utilisez **la chaîne entière du secret comme clé**, préfixe `whsec_` compris, en octets UTF-8. Ne retirez pas le
+   préfixe et ne décodez pas le reste en base64.
+5. Encodez le résultat en hexadécimal minuscule et comparez-le, en temps constant, à chacune des valeurs séparées par
+   des virgules de `X-ReputeCast-Signature` : après un renouvellement, l’en-tête porte deux signatures pendant une
+   journée. Acceptez la requête quand l’une d’elles correspond ; répondez `401` quand aucune ne correspond.
+
+Chaque exemple ci-dessous est un récepteur complet sur le port 3000, à `/webhooks/reputecast`, qui lit le secret dans
+`REPUTECAST_WEBHOOK_SECRET` :
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```js title="server.mjs"
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createServer } from 'node:http'
+
+// The HMAC key is the whole secret, whsec_ prefix included.
+const secret = process.env.REPUTECAST_WEBHOOK_SECRET
+
+function verify(rawBody, timestamp, signature) {
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp))
+  if (!signature || !(age <= 300)) return false // reject timestamps more than 5 minutes off
+  const expected = Buffer.from(createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex'))
+  // For a day after a rotation the header holds two signatures, comma-separated: accept either.
+  return signature.split(',').some((s) => {
+    const b = Buffer.from(s.trim())
+    return b.length === expected.length && timingSafeEqual(expected, b)
+  })
+}
+
+createServer((req, res) => {
+  if (req.method !== 'POST' || req.url !== '/webhooks/reputecast') return res.writeHead(404).end()
+  const chunks = []
+  req.on('data', (chunk) => chunks.push(chunk))
+  req.on('end', () => {
+    const rawBody = Buffer.concat(chunks) // the exact bytes ReputeCast signed
+    if (!verify(rawBody, req.headers['x-reputecast-timestamp'], req.headers['x-reputecast-signature'])) {
+      return res.writeHead(401).end()
+    }
+    const event = JSON.parse(rawBody.toString('utf8'))
+    console.log(event.type, event.id)
+    res.writeHead(204).end()
+  })
+}).listen(3000)
+```
+
+Fonctionne sur Node.js 18 ou une version ultérieure, sans paquet : `node server.mjs`.
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="app.py"
+import hashlib
+import hmac
+import os
+import time
+
+from flask import Flask, abort, request
+
+app = Flask(__name__)
+# The HMAC key is the whole secret, whsec_ prefix included.
+SECRET = os.environ["REPUTECAST_WEBHOOK_SECRET"].encode()
+
+
+def verify(raw_body: bytes, timestamp: str | None, signature: str | None) -> bool:
+    if not timestamp or not timestamp.isdigit() or not signature:
+        return False
+    if abs(time.time() - int(timestamp)) > 300:  # reject timestamps more than 5 minutes off
+        return False
+    expected = hmac.new(SECRET, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest().encode()
+    # For a day after a rotation the header holds two signatures, comma-separated: accept either.
+    return any(hmac.compare_digest(expected, s.strip().encode()) for s in signature.split(","))
+
+
+@app.post("/webhooks/reputecast")
+def reputecast_webhook():
+    raw_body = request.get_data()  # the exact bytes ReputeCast signed
+    timestamp = request.headers.get("X-ReputeCast-Timestamp")
+    signature = request.headers.get("X-ReputeCast-Signature")
+    if not verify(raw_body, timestamp, signature):
+        abort(401)
+    event = request.get_json()
+    print(event["type"], event["id"])
+    return "", 204
+```
+
+Nécessite Python 3.10 ou une version ultérieure et Flask 3 (`pip install flask`) ; lancez-le avec
+`flask --app app run --port 3000`.
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="main.go"
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// The HMAC key is the whole secret, whsec_ prefix included.
+var secret = []byte(os.Getenv("REPUTECAST_WEBHOOK_SECRET"))
+
+func verify(body []byte, timestamp, signature string) bool {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	// Reject timestamps more than 5 minutes off.
+	if age := time.Since(time.Unix(ts, 0)); age > 5*time.Minute || age < -5*time.Minute {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := []byte(hex.EncodeToString(mac.Sum(nil)))
+	// For a day after a rotation the header holds two signatures, comma-separated: accept either.
+	for _, s := range strings.Split(signature, ",") {
+		if hmac.Equal(expected, []byte(strings.TrimSpace(s))) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	http.HandleFunc("POST /webhooks/reputecast", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20)) // the exact bytes ReputeCast signed
+		if err != nil {
+			http.Error(w, "can't read body", http.StatusBadRequest)
+			return
+		}
+		if !verify(body, r.Header.Get("X-ReputeCast-Timestamp"), r.Header.Get("X-ReputeCast-Signature")) {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+		var event struct {
+			ID   string          `json:"id"`
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &event); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		log.Println(event.Type, event.ID)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+Nécessite Go 1.22 ou une version ultérieure (motifs de méthode dans `http.HandleFunc`) : `go run .`.
+
+</TabItem>
+<TabItem label="PHP">
+
+```php title="webhook.php"
+<?php
+// The HMAC key is the whole secret, whsec_ prefix included.
+$secret = getenv('REPUTECAST_WEBHOOK_SECRET');
+$rawBody = file_get_contents('php://input'); // the exact bytes ReputeCast signed
+$timestamp = $_SERVER['HTTP_X_REPUTECAST_TIMESTAMP'] ?? '';
+$signature = $_SERVER['HTTP_X_REPUTECAST_SIGNATURE'] ?? '';
+
+$expected = hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
+// Compare in constant time. For a day after a rotation the header holds two signatures, comma-separated: accept either.
+$matches = array_filter(explode(',', $signature), fn ($s) => hash_equals($expected, trim($s)));
+// Reject timestamps more than 5 minutes off and signatures that don't match.
+if (!ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300 || !$matches) {
+    http_response_code(401);
+    exit;
+}
+
+$event = json_decode($rawBody, true, flags: JSON_THROW_ON_ERROR);
+error_log($event['type'] . ' ' . $event['id']);
+http_response_code(204);
+```
+
+Servez-le avec votre serveur web, ou essayez-le avec `php -S 127.0.0.1:3000 webhook.php`. Nécessite PHP 8.0 ou une
+version ultérieure.
+
+</TabItem>
+</Tabs>
+
+<Aside type="danger" title="Gardez le secret sur le serveur">
+Toute personne qui possède le secret peut signer des requêtes que votre récepteur accepte. Conservez-le dans le coffre
+à secrets de votre serveur, jamais dans du code de navigateur ou d’application mobile. S’il fuit, renouvelez-le
+([Renouveler le secret de signature](#renouveler-le-secret-de-signature)) et donnez immédiatement le nouveau secret à
+votre récepteur : il rejette alors les requêtes signées avec celui qui a fuité.
+</Aside>
+
+## Vérifier le résultat
+
+- Dans ReputeCast, <UiPath path="webhooks.sendTestEvent" /> indique si l’événement de test a été livré et ce qu’a
+  répondu votre récepteur. Le <UiPath path="webhooks.deliveryLog" /> de la même page liste chaque livraison avec son
+  code de réponse.
+- Pour tester votre récepteur sans ReputeCast, signez vous-même une requête avec OpenSSL. La commande calcule la même
+  signature :
+
+  ```sh title="Terminal"
+  ts=$(date +%s)
+  body='{"id":"0192f1c4-7b2e-7c51-9d0a-3f5e8b1a2c44","type":"webhook.test","created_at":"2026-10-22T09:41:07Z","workspace":"acme-newsletter","data":{}}'
+  sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$REPUTECAST_WEBHOOK_SECRET" | sed 's/^.* //')
+  curl -i -X POST http://localhost:3000/webhooks/reputecast \
+    -H 'Content-Type: application/json' \
+    -H "X-ReputeCast-Timestamp: $ts" \
+    -H "X-ReputeCast-Signature: $sig" \
+    --data "$body"
+  ```
+
+  Votre récepteur répond `204`. Changez un caractère de `body` après la signature, et il répond `401`.
+
+## Répondre vite, ReputeCast réessaie le reste
+
+- Toute réponse `2xx` compte comme livrée. Répondez en moins de 10 secondes, et faites le travail lent après avoir
+  répondu (par exemple, placez l’événement dans votre propre file d’attente). Les redirections ne sont pas suivies.
+- Toute autre réponse, un délai dépassé ou une erreur de connexion est une tentative en échec. ReputeCast essaie
+  chaque livraison jusqu’à **8 fois**, en attendant 1, 2, 4, 8, 30, 90 et 225 minutes entre les tentatives : environ
+  6 heures en tout.
+- Après le 8ᵉ échec, la livraison passe dans la file des lettres mortes (dead-letter queue) et y reste 7 jours après
+  sa dernière tentative. Pour l’envoyer de nouveau, sélectionnez <UiPath path="webhooks.replay" /> dans le
+  <UiPath path="webhooks.deliveryLog" /> : cela lance une nouvelle série de 8 tentatives.
+- Pour ne pas attendre, sélectionnez <UiPath path="webhooks.retryNow" /> sur une livraison en cours de nouvelle
+  tentative, ou <UiPath path="webhooks.retryAllFailed" /> pour remettre en file toutes les livraisons en échec
+  (`retry-failed-webhooks` dans l’API).
+- Les nouvelles tentatives et les rejeux portent le même `id` et le même `X-ReputeCast-Delivery`, avec un nouveau
+  timestamp et une nouvelle signature. Rendez votre gestionnaire idempotent : ignorez un `id` que vous avez déjà
+  traité.
+- Tant qu’un endpoint est en échec, ReputeCast n’essaie que sa plus ancienne livraison en attente, selon le calendrier
+  ci-dessus. Les autres attendent et partent dans l’ordre dès que l’endpoint répond de nouveau `2xx`. Rien d’autre dans
+  ReputeCast n’attend l’endpoint : l’envoi, les imports et les automatisations continuent.
+- Quand un endpoint est en échec depuis une heure, ou qu’une livraison passe dans la file des lettres mortes, les
+  personnes qui gèrent les webhooks reçoivent <UiPath path="notify.event.webhook_failing" />, une fois par période
+  d’échec, dans la cloche des notifications et par e-mail (voir les
+  [préférences de notification](/fr/team/notifications/)).
+
+## Mettre un endpoint en pause
+
+<UiPath path="webhooks.pauseEndpoint" /> retient les nouveaux événements de l’endpoint au lieu de les envoyer, par
+exemple pendant une maintenance. <UiPath path="webhooks.resumeEndpoint" /> livre tout ce qui a été retenu, dans
+l’ordre.
+
+## Renouveler le secret de signature
+
+<UiPath path="webhooks.rotateSecret" /> crée un nouveau secret et l’affiche une fois. Dès ce moment, chaque livraison
+est signée avec le nouveau secret et, pendant 24 heures, avec l’ancien aussi : `X-ReputeCast-Signature` contient les
+deux signatures, séparées par une virgule, la nouvelle en premier. La ligne de l’endpoint indique jusqu’à quand
+l’ancien secret signe. Un récepteur qui accepte l’une ou l’autre signature
+([Vérifier la signature](#vérifier-la-signature)) continue de fonctionner pendant que vous le passez au nouveau secret
+dans la journée. Seule une personne peut renouveler un secret ; les clés API ne le peuvent pas.
+
+## Endpoints gérés par des intégrations
+
+Zapier, Make et n8n créent leurs propres endpoints quand un workflow commence par un déclencheur ReputeCast.
+<UiPath path="nav.settings > settings.webhooks" /> les marque comme gérés par l’application et les affiche en lecture
+seule ; les clés API ne les voient pas. Quand un tel endpoint répond `410 Gone`, ReputeCast le supprime. Voir
+[Créer une intégration](/fr/developers/integration-api/).
+
+## Limites
+
+<LimitsTable area="webhooks" />
+
+## Dépannage
+
+- **Chaque livraison échoue avec un 401 de votre récepteur** : vous hachez le JSON analysé au lieu du corps brut, vous
+  utilisez le secret sans son préfixe `whsec_`, ou vous comparez avec une chaîne hexadécimale en majuscules. Testez
+  avec la commande OpenSSL ci-dessus.
+- **401 pour certaines livraisons seulement** : l’horloge de votre serveur est décalée. Synchronisez-la avec NTP ; le
+  contrôle des 5 minutes se fait par rapport à elle.
+- **401 sur chaque livraison après le renouvellement du secret** : votre récepteur compare tout l’en-tête
+  `X-ReputeCast-Signature` avec une seule signature. Découpez-le sur les virgules et acceptez une correspondance avec
+  l’une ou l’autre valeur.
+- **« … is a local hostname » ou une adresse bloquée à l’enregistrement** : l’URL pointe vers un réseau privé.
+  Utilisez une adresse publique, ou demandez à un admin de l’instance de définir `webhooks.allow_private_networks`.
+- **Les livraisons expirent** : votre gestionnaire prend plus de 10 secondes. Répondez d’abord, traitez ensuite.
+- **L’événement de test fonctionne, mais les vrais événements n’arrivent jamais** : vérifiez que l’endpoint est abonné
+  à ces événements et qu’il n’est pas en pause.
+- **Les événements arrivent deux fois** : une nouvelle tentative a suivi une réponse arrivée trop tard ou qui n’était
+  pas `2xx`. Ignorez un `id` déjà traité.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Événements webhook" href="/fr/reference/webhook-events/" description="Tous les types d’événements, groupés, avec des exemples de payload." />
+  <LinkCard title="Créer une intégration" href="/fr/developers/integration-api/" description="Des REST hooks pour les outils de workflow, avec les mêmes signatures." />
+  <LinkCard title="Envoyer des e-mails transactionnels avec l’API" href="/fr/developers/transactional-api/" description="Les événements message.* rendent compte de chaque message que vous envoyez." />
+  <LinkCard title="Événements de livraison et synchronisation des suppressions" href="/fr/providers/events-and-sync/" description="Comment les fournisseurs d’envoi rendent compte à ReputeCast." />
+</CardGrid>

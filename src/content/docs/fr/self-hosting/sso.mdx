@@ -1,0 +1,232 @@
+---
+title: Authentification unique avec OIDC
+description: 'Configurer le SSO OIDC avec Google Workspace, Microsoft Entra ID, Okta, Keycloak ou Authentik : comptes automatiques, rôles par groupe et obligation du SSO.'
+type: how-to
+audience: [operator, admin]
+primaryKeyword: configurer le SSO OIDC
+uiPath: 'shell.userMenuInstanceAdmin > admin.sso'
+sources:
+  - internal/sso
+  - internal/accounts/signin.go
+  - internal/instance/policy.go
+  - migrations/00750_instance_admin_sso.sql
+  - web/src/features/admin/sso
+  - web/src/features/admin/auth/AuthenticationPage.tsx
+  - web/src/features/auth/signin.messages.ts
+sidebar:
+  order: 14
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Configurer le SSO OIDC permet aux personnes de se connecter à ReputeCast avec le fournisseur d’identité (IdP) de votre
+organisation, de créer leur compte à la première connexion et d’obtenir leurs rôles dans les espaces de travail à
+partir de leurs groupes dans l’IdP. ReputeCast parle OpenID Connect ; il ne prend pas en charge SAML ni SCIM.
+
+## Avant de commencer
+
+- Vous êtes [admin de l’instance](/fr/reference/glossary/#instance-admin). Le SSO se configure une seule fois pour
+  toute l’instance.
+- L’URL publique est définitive et utilise `https://`
+  (<UiPath path="shell.userMenuInstanceAdmin > admin.instance > admin.publicUrl" />). L’URI de redirection que vous
+  enregistrez auprès de l’IdP en est dérivée ; si l’URL change plus tard, mettez aussi à jour l’enregistrement auprès
+  de l’IdP.
+- Vous pouvez créer une application (client) dans votre IdP, et vous savez quels domaines e-mail utilisent vos
+  équipes.
+- <UiPath path="admin.methodSso" /> est activé dans
+  <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> (c’est le cas par défaut).
+
+## Configurer un fournisseur
+
+<Screenshot
+  id="sso-setup"
+  alt="Configuration de Microsoft Entra ID : étape 1, le préréglage avec Microsoft Entra ID sélectionné ; étape 2, la connexion avec l’URI de redirection à copier, l’URL de l’émetteur dont le test de discovery a réussi, l’ID client, le secret client enregistré en écriture seule et les scopes ; l’étape 3, la correspondance des claims, commence en dessous."
+/>
+
+<Steps>
+
+1. Ouvrez <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> et choisissez
+   <UiPath path="admin.addSsoProvider" />. Dans <UiPath path="sso.cardPreset" />, choisissez votre IdP : Google
+   Workspace, Microsoft Entra ID, Okta, Keycloak, Authentik ou OIDC générique. ReputeCast enregistre aussitôt un
+   brouillon ; rien n’est actif tant que vous ne l’activez pas.
+
+2. Dans <UiPath path="sso.cardConnection" />, copiez l’<UiPath path="sso.redirectUri" />. Elle a la forme
+   `<public URL>/auth/oidc/<slug>/callback`, où le slug vient du préréglage : `google`, `entra`, `okta`, `keycloak`,
+   `authentik` ou `oidc` (un second fournisseur avec le même préréglage reçoit `-2`).
+
+3. Enregistrez ReputeCast auprès de votre IdP comme application web utilisant le flux du code d’autorisation, avec
+   l’URI de redirection de l’étape 2. Notez l’URL de l’émetteur, l’ID client et le secret client.
+
+   <Tabs syncKey="idp">
+   <TabItem label="Google Workspace">
+
+   - Créez un OAuth client ID de type **Web application** dans la console Google Cloud (APIs & Services ›
+     Credentials) et ajoutez l’URI de redirection comme URI de redirection autorisée
+     ([documentation OpenID Connect de Google](https://developers.google.com/identity/openid-connect/openid-connect),
+     vérifié en octobre 2026).
+   - URL de l’émetteur : toujours `https://accounts.google.com` (le préréglage la remplit).
+   - Groupes : Google n’envoie pas de claim de groupes via OIDC, la correspondance des groupes n’est donc pas
+     disponible. Donnez un rôle par défaut aux nouveaux comptes via les comptes automatiques (étape 7), ou attribuez
+     les rôles dans les [paramètres d’équipe](/fr/team/members/) de chaque espace de travail.
+   - Authentification à deux facteurs : ReputeCast considère la connexion Google comme une authentification à deux
+     facteurs (validation en deux étapes imposée dans Workspace).
+
+   </TabItem>
+   <TabItem label="Microsoft Entra ID">
+
+   - Créez une inscription d’application (plateforme Web) dans le centre d’administration Microsoft Entra, ajoutez
+     l’URI de redirection et créez un secret client
+     ([plateforme d’identité Microsoft et OpenID Connect](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc),
+     vérifié en octobre 2026). Les secrets client Entra expirent : saisissez la date d’expiration dans ReputeCast pour
+     qu’il indique quand remplacer le secret.
+   - URL de l’émetteur : `https://login.microsoftonline.com/<tenant-id>/v2.0`, avec l’ID de votre locataire (un GUID)
+     ou un domaine vérifié. L’ID du locataire se trouve sous Entra ID › Overview.
+   - Groupes : ouvrez la **Token configuration** de l’inscription d’application, choisissez **Add groups claim** et
+     incluez les groupes de sécurité dans le jeton d’ID. Entra envoie les **object IDs** des groupes, pas leurs noms :
+     collez l’ID dans une correspondance et donnez-lui un libellé. Une personne membre de plus de 200 groupes reçoit
+     un lien de dépassement (overage) au lieu du claim ; utilisez alors des rôles d’application.
+   - L’authentification à deux facteurs compte quand le claim `amr` du jeton d’ID indique MFA (par exemple imposée par
+     l’accès conditionnel).
+
+   </TabItem>
+   <TabItem label="Okta">
+
+   - Créez une intégration d’application web OIDC avec l’URI de redirection comme sign-in redirect URI
+     ([Okta : personnaliser les jetons avec un claim de groupes](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/),
+     vérifié en octobre 2026).
+   - URL de l’émetteur : votre domaine Okta ou un serveur d’autorisation, comme
+     `https://acme.okta.com/oauth2/default`. Elle se trouve sous Security › API › Authorization Servers.
+   - Groupes : ajoutez un claim de groupes au serveur d’autorisation (filtre : matches regex `.*`). Le préréglage Okta
+     demande déjà le scope `groups`.
+   - L’authentification à deux facteurs compte quand le claim `amr` du jeton d’ID indique MFA (imposée par une
+     politique de connexion).
+
+   </TabItem>
+   <TabItem label="Keycloak">
+
+   - Dans votre realm, créez un client OpenID Connect avec l’authentification du client activée et l’URI de
+     redirection comme valid redirect URI
+     ([guide d’administration du serveur Keycloak](https://www.keycloak.org/docs/latest/server_admin/#_oidc), vérifié
+     en octobre 2026).
+   - URL de l’émetteur : se termine par le realm, par exemple `https://sso.acme.io/realms/acme`.
+   - Groupes : dans Clients › votre client › Client scopes › le scope dédié, ajoutez un mapper **Group Membership**
+     avec le nom de claim de jeton `groups` et le chemin complet des groupes désactivé.
+   - L’authentification à deux facteurs compte quand le claim `amr` du jeton d’ID indique MFA (OTP exigé par le flux
+     navigateur du realm).
+
+   </TabItem>
+   <TabItem label="Authentik">
+
+   - Créez un fournisseur OAuth2/OpenID (client confidentiel) avec l’URI de redirection, et une application qui
+     l’utilise ([fournisseur OAuth2 d’Authentik](https://docs.goauthentik.io/docs/add-secure-apps/providers/oauth2/),
+     vérifié en octobre 2026).
+   - URL de l’émetteur : se termine par le slug de l’application et une barre oblique, par exemple
+     `https://auth.acme.io/application/o/reputecast/`.
+   - Groupes : Authentik les envoie dans le claim `groups` du scope `profile`. Conservez le mapping de profil par défaut
+     dans les scope mappings du fournisseur.
+   - L’authentification à deux facteurs compte quand le claim `amr` du jeton d’ID indique MFA (une étape MFA dans le
+     flux d’authentification).
+
+   </TabItem>
+   </Tabs>
+
+4. De retour dans <UiPath path="sso.cardConnection" />, saisissez l’<UiPath path="sso.issuerUrl" /> et choisissez
+   <UiPath path="sso.testDiscovery" />. ReputeCast récupère `<issuer>/.well-known/openid-configuration` et ses clés de
+   signature ; l’émetteur doit utiliser `https://` et correspondre exactement au document. Saisissez ensuite l’ID
+   client et le secret client. Le secret est chiffré et n’est plus jamais affiché ; vous pouvez seulement le
+   remplacer.
+
+5. Scopes : `openid`, `profile` et `email` sont toujours demandés. N’en ajoutez d’autres que si votre IdP en a besoin
+   pour les groupes.
+
+6. Dans <UiPath path="sso.cardClaims" />, vérifiez quels claims remplissent le compte : `email`, `email_verified`,
+   `name` et, quand le préréglage a des groupes, `groups`. Les valeurs par défaut conviennent à chaque préréglage ; ne
+   changez un nom que si votre IdP en utilise un autre. Une adresse e-mail que l’IdP marque comme non vérifiée est
+   rejetée. Un `email_verified` absent ne compte comme vérifié que pour les domaines autorisés de l’étape 7.
+
+7. Dans <UiPath path="sso.cardAccess" />, décidez qui peut entrer et avec quel rôle :
+
+   - Sous <UiPath path="sso.allowedDomains" /> (50 au maximum), les connexions depuis d’autres domaines sont rejetées
+     et journalisées. La page de connexion n’affiche « Continuer avec… » pour ce fournisseur qu’aux personnes dont
+     l’adresse e-mail appartient à l’un de ces domaines. Sans domaine, n’importe quel domaine peut se connecter, mais
+     le bouton n’apparaît pas sur la page de connexion.
+   - L’interrupteur <UiPath path="sso.jit" /> crée un compte à la première connexion, dans un espace de travail par
+     défaut avec un rôle par défaut (Observateur, sauf si vous en choisissez un autre ; jamais Propriétaire).
+     Désactivé, seules les personnes qui ont déjà un compte peuvent se connecter. Le paramètre
+     <UiPath path="admin.domainAllowlist" /> d’Authentification, valable pour toute l’instance, limite les domaines qui
+     peuvent obtenir des comptes automatiques.
+   - Sous <UiPath path="sso.groupMapping" />, choisissez <UiPath path="sso.addMapping" /> pour chaque groupe de l’IdP
+     (200 correspondances au maximum). Les correspondances sont réappliquées à chaque connexion et remplacent les rôles
+     définis à la main. Quand une personne quitte un groupe associé, la connexion suivante la retire de cet espace de
+     travail et révoque les clés API et les agents qu’elle y a créés ; dans l’espace de travail par défaut des comptes
+     automatiques, elle revient plutôt au rôle par défaut. Une correspondance ne fait jamais de quelqu’un un
+     Propriétaire et ne modifie jamais un Propriétaire. Vous ne pouvez associer qu’un rôle dont vous détenez vous-même
+     les autorisations dans cet espace de travail.
+   - L’interrupteur d’obligation désactive les autres méthodes de connexion pour les domaines autorisés : consultez
+     [imposer le SSO pour vos domaines](#imposer-le-sso-pour-vos-domaines).
+
+8. Dans <UiPath path="sso.cardTest" />, choisissez <UiPath path="sso.runTestSignIn" />. Une fenêtre pop-up ouvre votre
+   IdP ; après votre connexion, ReputeCast affiche les claims reçus et ce que ferait une vraie connexion (compte
+   nouveau ou existant, espaces de travail, rôles, authentification à deux facteurs). Ce test ne connecte personne et ne
+   modifie rien.
+
+9. Choisissez **Activer** (ou <UiPath path="sso.saveDraft" /> pour terminer plus tard). L’activation nécessite un test
+   de discovery réussi, l’ID client et un secret client enregistré.
+
+</Steps>
+
+## Imposer le SSO pour vos domaines
+
+L’obligation désactive la connexion par mot de passe, par clé d’accès et sociale pour chaque compte des domaines
+autorisés du fournisseur, si bien que les personnes de ces domaines ne peuvent se connecter que via l’IdP.
+Activez-la dans <UiPath path="sso.cardAccess" /> ; la boîte de dialogue indique qui se connecte comment aujourd’hui et
+après, puis confirmez avec <UiPath path="sso.turnOnEnforcement" />.
+
+- **Les Propriétaires avec compte d’urgence** conservent la connexion par mot de passe et authentification à deux
+  facteurs, pour que vous puissiez entrer quand l’IdP est en panne. Quand vous activez l’obligation, chaque
+  Propriétaire de ces domaines est marqué comme compte d’urgence ; le premier Propriétaire créé par
+  `reputecast install` l’est aussi. Leurs connexions par mot de passe sont journalisées comme connexions d’urgence.
+- Si aucun Propriétaire du domaine ne conserve de mot de passe, la boîte de dialogue vous avertit : si l’IdP tombe en
+  panne, personne de ce domaine ne pourra se connecter. Gardez un admin de l’instance dans un autre domaine, ou
+  consultez [récupérer l’accès depuis la ligne de commande](/fr/self-hosting/account-recovery/).
+- Un domaine ne peut être imposé que par un seul fournisseur activé. Désactiver le fournisseur met fin à son
+  obligation.
+
+## Vérifier le résultat
+
+- Dans une fenêtre de navigation privée, ouvrez la page de connexion et saisissez une adresse e-mail d’un domaine
+  autorisé : « Continuer avec… » vous emmène vers l’IdP et vous ramène connecté.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> affiche la personne avec sa méthode de connexion SSO, et
+  « Via l’IdP » dans la colonne 2FA quand l’IdP a garanti l’authentification à deux facteurs.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> enregistre la connexion, ainsi que tout compte ou rôle
+  qu’elle a créé.
+
+## Dépannage
+
+- **La discovery a échoué** : l’URL de l’émetteur est fausse ou injoignable depuis le serveur. Copiez-la exactement
+  comme votre IdP l’affiche, y compris la barre oblique finale pour Authentik, et utilisez l’émetteur propre au
+  locataire pour Entra ID. Un fournisseur déjà activé continue d’utiliser l’émetteur enregistré jusqu’à ce qu’un
+  nouveau test réussisse.
+- **L’IdP indique que l’URI de redirection ne correspond pas** : l’URL publique a changé, ou l’URI a été collée avec
+  une faute de frappe. Copiez de nouveau l’<UiPath path="sso.redirectUri" /> et mettez à jour l’IdP.
+- **« Aucun compte pour… »** : les comptes automatiques sont désactivés et la personne n’a pas de compte, ou son
+  domaine n’est pas autorisé ici ou dans la liste d’autorisation de l’instance. Invitez-la, ou activez
+  <UiPath path="sso.jit" />.
+- **Le test indique « Claim groups manquant »** : l’IdP n’a envoyé aucun groupe, les correspondances ne s’appliquent
+  donc pas ; les rôles existants restent et les nouveaux comptes reçoivent le rôle par défaut. Suivez l’étape des
+  groupes de votre IdP ci-dessus, puis relancez le test.
+- **« Le secret client ne peut pas être déchiffré avec la clé de ce serveur. »** : la clé secrète du serveur a changé
+  depuis l’enregistrement du secret. Remplacez le secret client. Consultez
+  [sécurité et durcissement](/fr/self-hosting/security/#la-clé-secrète).
+- **La connexion a pris trop de temps** : une connexion doit revenir de l’IdP en moins de 10 minutes. Recommencez.
+
+## Voir aussi
+
+- [Connexion avec Google, Microsoft et GitHub](/fr/self-hosting/social-sign-in/) : la connexion des personnes
+  invitées sans IdP.
+- [Administration de l’instance](/fr/self-hosting/instance-admin/) : la politique de connexion et l’obligation de
+  l’authentification à deux facteurs.
+- [Rôles et autorisations](/fr/team/roles-and-permissions/) : ce que peut faire chaque rôle attribué par une
+  correspondance.

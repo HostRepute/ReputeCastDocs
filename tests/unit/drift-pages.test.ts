@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { changedSources, hasCompleteVietnamese, sourcePrefixes } from '../../scripts/upstream/lib/pages.ts'
+import { changedSources, hasCompleteTranslation, sourcePrefixes } from '../../scripts/upstream/lib/pages.ts'
 
 describe('sourcePrefixes', () => {
   it('expands braces and drops hints after the path', () => {
@@ -27,10 +27,12 @@ describe('changedSources', () => {
   })
 })
 
-describe('hasCompleteVietnamese', () => {
+describe('hasCompleteTranslation', () => {
   it('needs a messages.vi.ts beside every messages.ts', () => {
-    expect(hasCompleteVietnamese(['messages.ts', 'messages.vi.ts', 'Page.tsx'])).toBe(true)
-    expect(hasCompleteVietnamese(['messages.ts', 'messages.vi.ts', 'sub/messages.ts'])).toBe(false)
-    expect(hasCompleteVietnamese(['Page.tsx'])).toBe(false)
+    expect(hasCompleteTranslation(['messages.ts', 'messages.vi.ts', 'Page.tsx'], 'vi')).toBe(true)
+    expect(hasCompleteTranslation(['messages.ts', 'messages.vi.ts', 'sub/messages.ts'], 'vi')).toBe(false)
+    expect(hasCompleteTranslation(['Page.tsx'], 'vi')).toBe(false)
+    expect(hasCompleteTranslation(['messages.ts', 'messages.de.ts'], 'de')).toBe(true)
+    expect(hasCompleteTranslation(['messages.ts', 'messages.vi.ts'], 'de')).toBe(false)
   })
 })

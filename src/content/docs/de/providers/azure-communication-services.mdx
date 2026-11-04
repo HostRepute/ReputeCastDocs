@@ -1,0 +1,156 @@
+---
+title: Mit Azure Communication Services senden
+description: Azure Communication Services E-Mail aus ReputeCast senden, mit Zustellberichten aus einem Event-Grid-Abonnement und Connection string oder Entra-ID-App.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: Azure Communication Services E-Mail
+sources:
+  - internal/providers/azureacs
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/ingest/handler.go
+  - web/src/features/connect
+sidebar:
+  order: 11
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast sendet Azure Communication Services E-Mail über Ihre Email-Communication-Ressource und liest Zustellberichte
+aus einem Abonnement von Azure Event Grid. ReputeCast kann in Azure nichts für Sie anlegen: Sie richten die E-Mail-Domain
+und das Event-Grid-Abonnement im Azure-Portal ein, und ReputeCast gibt Ihnen die Webhook-URL und prüft, dass jede
+Zustellung echt ist.
+
+<ProviderMatrix family="email" id="azureacs" />
+
+<Aside type="caution" title="Azure Communication Services Email wird eingestellt">
+  Microsoft stellt Azure Communication Services als eigenständiges Angebot am 30. September 2028 ein, und ACS Email
+  steht auf der Liste der eingestellten Dienste. Ab dem 23. Oktober 2026 schränkt Microsoft das Onboarding für Kunden
+  ein, die noch keine Communication-Services-Ressource haben
+  ([Microsoft Learn: Retirement and breaking changes guide](https://learn.microsoft.com/en-us/azure/communication-services/acs-retirement-and-breaking-changes-guide),
+  geprüft im Oktober 2026). Planen Sie einen zweiten Versandanbieter ein, bevor Sie sich auf Azure verlassen.
+</Aside>
+
+## Bevor Sie beginnen
+
+- **Eine Communication-Services-Ressource mit einer verifizierten eigenen E-Mail-Domain**, die mit ihr verbunden ist,
+  und die Absender-Benutzernamen, von denen Sie senden
+  ([Microsoft Learn: Add custom verified email domains](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/add-custom-verified-domains),
+  geprüft im Oktober 2026). Der Anzeigename im Absender stammt vom Absender-Benutzernamen in Azure, nicht von
+  ReputeCast.
+- **Zugangsdaten.** Entweder der Connection string der Ressource (Azure-Portal › Ihre
+  Communication-Services-Ressource › Keys) oder eine App-Registrierung in Microsoft Entra ID mit einem Client Secret und
+  der Rolle Communication and Email Service Owner für die Ressource.
+- **Berechtigungen.** Zum Verbinden brauchen Sie `providers:manage`; um eine neue Versand-Domain hinzuzufügen,
+  `domains:manage`.
+- **Eine öffentliche HTTPS-Adresse.** Event Grid liefert an `<public URL>/hooks/azureacs/<token>`. Azure lässt sich
+  nicht nach früheren Ereignissen abfragen, daher muss die Adresse aus dem Internet erreichbar sein.
+
+## Azure Communication Services verbinden
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.providers" />, wählen Sie <UiPath path="providers.overview.addProvider" /> und im
+   Katalog Azure Communication Services. [Versandanbieter verbinden](/de/providers/connect/) erklärt die Schritte, die
+   alle Anbieter gemeinsam haben.
+
+2. Geben Sie einen Satz Zugangsdaten ein:
+   - den <UiPath path="providers.fields.azureacs.connectionString" /> (`endpoint=https://…/;accesskey=…`) oder
+   - unter den zusätzlichen Azure-Einstellungen den <UiPath path="providers.fields.azureacs.endpoint" />
+     (`https://<resource>.communication.azure.com`), die <UiPath path="providers.fields.azureacs.tenantId" />, die
+     <UiPath path="providers.fields.azureacs.clientId" /> und das <UiPath path="providers.fields.azureacs.clientSecret" />.
+     Sind beide ausgefüllt, wird Entra ID verwendet.
+
+   Geben Sie außerdem die Limits ein, die Azure Ihrer Domain gewährt: <UiPath path="providers.fields.azureacs.perMinute" />
+   wird zur Senderate von ReputeCast für Azure (das Formular schlägt für eine neue eigene Domain 30 vor, bis Azure den
+   Wert anhebt), und <UiPath path="providers.fields.azureacs.perHour" /> wird auf der Karte angezeigt.
+
+3. Wählen Sie <UiPath path="connect.connection.connect" />. ReputeCast macht einen reinen Leseaufruf an Ihre Ressource
+   und speichert die Zugangsdaten verschlüsselt. Die Karte zeigt „Communication Services · erreichbar“ und Ihre Limits.
+
+4. Unter <UiPath path="connect.connection.webhooksTitle" /> prüft ReputeCast, ob seine Webhook-Adresse aus dem Internet erreichbar ist, und zeigt dann die
+   Webhook-URL an, die Sie in Azure hinzufügen. Wählen Sie <UiPath path="connect.connection.copyUrl" />.
+
+5. Legen Sie fest, wie Event Grid nachweist, dass jede Zustellung von Ihrem Abonnement stammt:
+   - **Ein gemeinsamer Signaturschlüssel.** Wählen Sie <UiPath path="connect.connection.createSecret" /> und kopieren
+     Sie den Schlüssel; er wird nur einmal angezeigt, und ein neuer ersetzt den alten. Event Grid sendet ihn als
+     benutzerdefinierten Zustellungs-Header `X-ReputeCast-Secret` (oder als `Authorization: Bearer <secret>`).
+   - **Microsoft Entra ID.** Geben Sie die <UiPath path="providers.fields.azureacs.eventGridAudience" /> (die
+     Anwendungs-ID oder ihren `api://`-URI) ein und, wenn diese App in einem anderen Tenant liegt, die
+     <UiPath path="providers.fields.azureacs.eventGridTenant" />. ReputeCast akzeptiert dann nur Entra-Token, die für
+     diese Anwendung mit der Rolle `AzureEventGridSecureWebhookSubscriber` ausgestellt wurden.
+
+6. Öffnen Sie im Azure-Portal Ihre Communication-Services-Ressource › Events › Add Event Subscription und legen Sie ein
+   Abonnement an mit:
+   - Ereignistyp **Email Delivery Report Received** (`Microsoft.Communication.EmailDeliveryReportReceived`);
+   - Ereignisschema **Event Grid Schema**;
+   - Endpunkttyp **Web Hook** mit der kopierten URL;
+   - bei einem gemeinsamen Signaturschlüssel eine Zustellungseigenschaft (benutzerdefinierter Header)
+     `X-ReputeCast-Secret` mit dem Schlüssel als Wert und angehaktem „Is secret?“; bei Entra ID die Authentifizierung
+     über Microsoft Entra mit der Anwendung aus Schritt 5.
+
+   ReputeCast beantwortet den Validierungs-Handshake von Event Grid selbst, daher wird das Abonnement sofort angelegt.
+   Siehe [Microsoft Learn: Handle email events](https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/email/handle-email-events),
+   [Set custom headers on delivered events](https://learn.microsoft.com/en-us/azure/event-grid/delivery-properties)
+   und [Deliver events to Microsoft Entra protected endpoints](https://learn.microsoft.com/en-us/azure/event-grid/secure-webhook-delivery)
+   (geprüft im Oktober 2026).
+
+7. Wählen Sie <UiPath path="connect.connection.continueDomain" />. Die DKIM- und Verifizierungseinträge von Azure
+   stammen aus dem Azure-Portal, daher prüft der Domain-Schritt nur, was ReputeCast prüfen kann (DMARC wird
+   vorgeschlagen, wenn die Domain keinen Eintrag hat).
+
+8. Senden Sie unter <UiPath path="connect.stepTest" /> einen Test. Der Assistent lässt Sie weitermachen, bevor Event
+   Grid eingerichtet ist, daher ist dieser Schritt der Nachweis: Die Zeitleiste wartet auf den ersten Zustellbericht von
+   Azure.
+
+9. Schließen Sie <UiPath path="connect.stepStreams" /> und <UiPath path="connect.stepContacts" /> ab. Es gibt nichts
+   abzurufen: ReputeCast liest und schreibt die Sperrliste von Azure nicht.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Die Zeitleiste des Testversands zeigt den Zustellbericht von Azure.
+- Die Azure-Karte unter <UiPath path="nav.providers > providers.tabProviders" /> zeigt
+  <UiPath path="providers.statusHealthy" />.
+- Im Azure-Portal zeigen die Metriken des Ereignisabonnements zugestellte Ereignisse und keine Zustellfehler.
+
+ReputeCast sendet einen API-Aufruf pro Nachricht, bei ausgeschaltetem Engagement-Tracking von Azure; Öffnungen und
+Klicks erfasst es selbst. Zustellberichte werden ReputeCast-Ereignissen zugeordnet: Delivered einer Zustellung, Bounced
+einem Hard Bounce (einem Soft Bounce, wenn der Empfänger den Absender blockiert hat), Suppressed einer Ablehnung,
+FilteredSpam, Quarantined und Failed Soft Bounces. Azure meldet keine Beschwerden oder Abmeldungen, daher kommen diese nur
+über die eigenen Abmeldelinks von ReputeCast. Die gemeinsame [Sperrliste](/de/reference/glossary/#suppression-list) wird
+vor jedem Versand durchgesetzt. Die DKIM-Signatur von Azure deckt die `List-Unsubscribe`-Header nicht ab, die ReputeCast
+hinzufügt, daher bieten Gmail und Yahoo bei E-Mails über Azure möglicherweise keine Abmeldung mit einem Klick an; die
+[Versandbereitschaft](/de/campaigns/send-readiness/) warnt, wenn ein Versand einen Anteil über Azure leitet.
+
+## Fehlerbehebung
+
+- **„Diese Einstellungen können nicht verwendet werden: … the connection string needs endpoint= and accesskey=“.**
+  Kopieren Sie den vollständigen Connection string von der Seite Keys der Ressource.
+- **„Azure Communication Services hat diesen Schlüssel abgelehnt“.** Der Zugriffsschlüssel wurde neu erzeugt, oder das
+  Client Secret oder die IDs der Entra-App sind falsch. Prüfen Sie bei Entra ID auch, ob die App die Rolle
+  Communication and Email Service Owner hat.
+- **Der Test wartet endlos auf das erste Ereignis.** Prüfen Sie das Abonnement in Azure: Ereignistyp, Event Grid
+  Schema, die genaue Webhook-URL und den Header `X-ReputeCast-Secret` (oder die Entra-Authentifizierung). Zustellungen
+  ohne gültige Authentifizierung erhalten von ReputeCast `401`.
+- **Zustellungen schlagen fehl, seit Sie einen neuen Signaturschlüssel erstellt haben.** Jeder neue Schlüssel ersetzt
+  den alten sofort. Fügen Sie den neuen Schlüssel in den Zustellungs-Header des Abonnements ein.
+- **E-Mails kommen mit dem falschen Absendernamen an.** Azure verwendet den Anzeigenamen des in Azure konfigurierten
+  Absender-Benutzernamens. Ändern Sie ihn dort.
+- **Transaktions-E-Mails mit Cc, Bcc oder Anhängen schlagen fehl.** Der Azure-Adapter kann keine Kopien oder Anhänge
+  senden; leiten Sie diese Vorlagen über einen anderen Anbieter.
+- **Sie haben die öffentliche URL geändert oder Azure getrennt.** ReputeCast ändert in Azure nichts. Aktualisieren oder
+  löschen Sie das Ereignisabonnement selbst.
+
+## Verwandte Themen
+
+- [Versandanbieter verbinden](/de/providers/connect/)
+- [E-Mails über mehrere Anbieter routen](/de/providers/routing/)
+- [Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/)
+- [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/)
+- [Versandanbieter auswählen](/de/providers/choose/)

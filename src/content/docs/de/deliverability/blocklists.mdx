@@ -1,0 +1,225 @@
+---
+title: Blocklisten-Einträge prüfen und beheben
+description: Blocklisten-Prüfung für Ihre Versand-Domains und dedizierten IPs ausführen, die Ergebnisse der acht integrierten Listen lesen und Einträge entfernen lassen.
+type: how-to
+audience: [publisher, admin]
+permissions: ['deliverability:view']
+uiPath: 'nav.deliverability > placement.health'
+primaryKeyword: Blocklisten-Prüfung
+sources:
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/deliverability/checks.go
+  - internal/deliverability/blocklists.go
+  - internal/readiness/assemble.go
+  - internal/readiness/gather.go
+  - internal/contentcheck/contentcheck.go
+  - internal/contentcheck/blocklist.go
+  - internal/app/wire_approvals.go
+  - internal/config/config.go
+  - web/src/features/deliverability
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast führt einmal täglich eine Blocklisten-Prüfung für Ihre [Versand-Domains](/de/reference/glossary/#sending-domain)
+und [dedizierten IPs](/de/reference/glossary/#dedicated-ip) durch, zeigt die Ergebnisse unter
+<UiPath path="nav.deliverability > placement.health" /> und macht aus einem Eintrag ein Ergebnis der
+[Versandbereitschaft](/de/reference/glossary/#send-readiness), bevor Ihre nächste Kampagne rausgeht. Diese Anleitung
+zeigt, wie Sie die Prüfung bei Bedarf starten, ihre Ergebnisse lesen und einen Eintrag entfernen lassen.
+
+## Die Listen, die ReputeCast prüft
+
+Ohne [HostRepute](/de/reference/glossary/#hostrepute) fragt ReputeCast selbst acht öffentliche
+[Blocklisten](/de/reference/glossary/#blocklist) (DNSBLs) ab. IP-Listen werden für Ihre dedizierten IPs abgefragt,
+Domainlisten für Ihre Versand-Domains. E-Mails, die über den gemeinsamen IP-Pool eines Versandanbieters gehen, etwa bei
+Amazon SES ohne dedizierte IPs, werden nur auf Domainebene geprüft, weil der Versandanbieter diese IPs verwaltet.
+
+<TableScroll label="Integrierte Blocklisten">
+
+| Liste          | Prüft   | Auswirkung | Delisting-Seite                                                                  |
+| -------------- | ------- | ---------- | -------------------------------------------------------------------------------- |
+| Spamhaus ZEN   | IPs     | Hoch       | [check.spamhaus.org](https://check.spamhaus.org/)                                |
+| Spamhaus DBL   | Domains | Hoch       | [check.spamhaus.org](https://check.spamhaus.org/)                                |
+| SURBL          | Domains | Hoch       | [surbl.org](https://surbl.org/surbl-analysis)                                    |
+| URIBL          | Domains | Hoch       | [admin.uribl.com](https://admin.uribl.com/)                                      |
+| Barracuda BRBL | IPs     | Hoch       | [barracudacentral.org](https://www.barracudacentral.org/rbl/removal-request)     |
+| SpamCop        | IPs     | Mittel     | [spamcop.net](https://www.spamcop.net/bl.shtml)                                  |
+| Mailspike      | IPs     | Mittel     | [mailspike.org](https://mailspike.org/anubis/lookup.html)                        |
+| PSBL           | IPs     | Niedrig    | [psbl.org](https://psbl.org/)                                                    |
+
+</TableScroll>
+
+Die Auswirkung entscheidet, was die Gruppe <UiPath path="review.groupReputation" /> der Versandbereitschaft mit einem
+Eintrag der Domain oder der IPs macht, von denen eine Kampagne sendet: Ein Eintrag auf einer Liste mit hoher Auswirkung
+ergibt <UiPath path="review.statusBlock" />, ein Eintrag auf einer Liste mit mittlerer oder niedriger Auswirkung
+<UiPath path="review.statusWarn" />. Eine dedizierte IP, die diese Prüfungen noch nicht erfasst haben, etwa eine seit
+dem letzten täglichen Lauf hinzugefügte, steht dort auf <UiPath path="review.statusUnknown" />, bis sie geprüft ist:
+Nicht geprüft zählt nie als nicht gelistet.
+
+### Domains, die live abgefragt werden
+
+Manche Domains werden über denselben DNS-Resolver live bei Spamhaus DBL und SURBL abgefragt, statt auf die tägliche
+Prüfung zu warten:
+
+- **Link-Domains.** Der Editor fragt die Domains, auf die Ihre E-Mail verlinkt, schon beim Schreiben ab, und die
+  Versandbereitschaft fragt sie bei jedem Lauf erneut ab. Eine Kampagne, die auf eine gelistete Domain verlinkt, wird
+  blockiert (siehe [Inhaltswarnungen vor dem Versand beheben](/de/campaigns/content-checks/)).
+- **Die Domains, über die ein Versand läuft und die diese Seite nicht prüft:** die übergeordnete Domain der
+  Versand-Domain (`acme.io` für `news.acme.io`), die Return-Path-Domains (MAIL FROM) der Versandanbieter, die den
+  Versand übernehmen, und die Tracking-Domain der öffentlichen URL der Instanz. Die Versandbereitschaft fragt sie bei
+  jedem Lauf ab; Postfachanbieter bewerten eine Subdomain auch nach ihrer übergeordneten Domain, daher blockiert eine
+  gelistete übergeordnete Domain den Versand.
+
+Die Antworten werden gespeichert und von allen Arbeitsbereichen der Instanz geteilt, sodass eine Domain erst wieder
+abgefragt wird, wenn ihre Antwort veraltet ist. Eine fehlgeschlagene Abfrage, weil DNS nicht rechtzeitig geantwortet
+hat oder die Listen den Resolver abgelehnt haben, ist unbekannt, nie nicht gelistet: Die Versandbereitschaft zeigt sie
+als <UiPath path="review.statusUnknown" /> und fragt sie bei der erneuten Prüfung zum Versandzeitpunkt noch einmal ab.
+
+Ist HostRepute verbunden, prüft es stattdessen stündlich 84 Quellen, und die integrierte Prüfung entfällt, solange
+diese Verbindung fehlerfrei ist. Ist HostRepute nicht erreichbar, läuft die integrierte Prüfung als Ersatz. Siehe
+[HostRepute verbinden](/de/deliverability/hostrepute/).
+
+### Wann Prüfungen laufen
+
+<LimitsTable area="deliverability" />
+
+## Bevor Sie beginnen
+
+- Sie brauchen `deliverability:view`, um die Seite zu öffnen und Prüfungen zu starten. Inhaber, Admins, Bearbeiter und
+  Betrachter haben diese Berechtigung.
+- Verbinden Sie zuerst einen [Versandanbieter](/de/providers/connect/) und
+  [fügen Sie eine Versand-Domain hinzu](/de/providers/senders-and-domains/). Bis dahin gibt es nichts zu prüfen.
+- Wenn Sie den Server betreiben: Die Instanz braucht einen DNS-Resolver, dem Blocklisten antworten. Richten Sie ihn
+  ein, bevor Sie sich auf die Ergebnisse verlassen.
+
+<Aside type="caution" title="Öffentliche DNS-Resolver werden abgelehnt">
+Spamhaus lehnt DNSBL-Abfragen ab, die über einen öffentlichen oder offenen Resolver wie 1.1.1.1 oder 8.8.8.8 kommen,
+und antwortet statt mit einem Eintrag mit dem Fehlercode `127.255.255.254`
+([Spamhaus, „Using our public mirrors? Check your return codes now“](https://www.spamhaus.org/resource-hub/dnsbl/using-our-public-mirrors-check-your-return-codes-now/),
+geprüft im Oktober 2026). SURBL und URIBL lehnen auf dieselbe Weise mit `127.0.0.1` ab. ReputeCast wertet diese
+Antworten nie als gelistet oder nicht gelistet: Die Abfrage erscheint als unbekannt. Richten Sie
+[`dns.servers`](/de/reference/configuration/#dns) auf einen rekursiven Resolver, den Sie selbst betreiben.
+</Aside>
+
+```yaml title="config.yaml"
+dns:
+  servers:
+    - 10.0.0.53
+    - 10.0.0.54:53
+```
+
+Als Umgebungsvariable trennen Sie die Server mit Kommas:
+
+```sh title="Environment"
+REPUTECAST_DNS__SERVERS=10.0.0.53,10.0.0.54:53
+```
+
+Ein leeres `dns.servers` nutzt die Resolver des Systems aus `/etc/resolv.conf`. Leitet Ihr Host oder Container DNS an
+einen öffentlichen Resolver weiter, schlagen Abfragen bei Spamhaus und URIBL fehl, obwohl die
+Authentifizierungsprüfungen (SPF, DKIM, DMARC) weiter funktionieren.
+
+## Blocklisten-Prüfung ausführen
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.deliverability > placement.health" />.
+
+2. Wählen Sie <UiPath path="deliverability.runChecks" />. Ist HostRepute verbunden, heißt der Button
+   <UiPath path="deliverability.runAll" /> und bittet HostRepute ebenfalls um eine neue Prüfung.
+
+   Eine Fortschrittszeile zeigt, wie viele Quellen geantwortet haben. Ein Lauf, der weniger als eine Minute nach dem
+   vorherigen gestartet wird, liefert diesen vorherigen Lauf, statt einen neuen zu starten.
+
+3. Wenn der Lauf fertig ist, lesen Sie die Blocklisten-Tabelle. Jede Liste zeigt, was sie geprüft hat, ihren Status
+   (<UiPath path="deliverability.listed" /> oder <UiPath path="deliverability.clean" />), seit wann ein Asset gelistet
+   ist und bei einem Eintrag die <UiPath path="deliverability.delistingPage" /> der Liste.
+
+4. Um eine Kopie für ein Ticket oder eine Tabelle aufzubewahren, wählen Sie
+   <UiPath path="deliverability.exportReport" />: eine CSV-Zeile pro Prüfung.
+
+</Steps>
+
+<Screenshot
+  id="deliverability"
+  alt="Zustellbarkeit › Zustand mit verbundenem HostRepute: oben Karten für Domains und IPs, in der Mitte der Kontozustand der Anbieter und unten eine Blocklisten-Tabelle, in der 203.0.113.25 auf UCEPROTECT Level 3 gelistet ist."
+>
+  1. Zustand je Versand-Domain und dedizierter IP, mit der Zahl der Listen, die sie jeweils führen.
+  2. Kontozustand je Versandanbieter, gemessen an den eigenen Limits des Anbieters.
+  3. Die Blocklisten-Tabelle: zuerst die Quellen mit Eintrag, dann die ohne, mit Delisting-Links.
+</Screenshot>
+
+Ein neuer Eintrag, den die integrierte Prüfung findet, erscheint außerdem in der Störungszeitleiste auf derselben Seite
+und in den Benachrichtigungen aller Mitglieder, die die Zustellbarkeit sehen können, mit der Delisting-Seite der Liste.
+Ein Eintrag auf einer Liste mit hoher Auswirkung ist als schwerwiegend markiert.
+
+## Eintrag entfernen lassen
+
+<Steps>
+
+1. Finden Sie heraus, warum das Asset gelistet wurde. Öffnen Sie die <UiPath path="deliverability.delistingPage" />
+   der Liste und suchen Sie das Asset dort. Häufige Ursachen sind E-Mails an alte oder gekaufte Adressen, die zu
+   [Spamfallen](/de/reference/glossary/#spam-trap) geworden sind, und ein plötzlicher Volumensprung von einer neuen IP.
+
+2. Beheben Sie die Ursache, bevor Sie die Entfernung beantragen. Entfernen Sie die Adressen, die den Eintrag ausgelöst
+   haben (siehe [Die Liste gesund halten](/de/audience/list-health/) und [Die Sperrliste](/de/audience/suppressions/)),
+   bremsen Sie eine neue IP mit einem [Warm-up-Plan](/de/providers/warm-up/) und prüfen Sie die
+   [SPF-, DKIM- und DMARC-Einträge](/de/deliverability/spf-dkim-dmarc/) der Versand-Domain.
+
+3. Beantragen Sie die Entfernung auf der Seite der Liste; jede Liste beschreibt dort ihr eigenes Verfahren. Mit
+   verbundenem HostRepute stellt <UiPath path="deliverability.requestDelisting" /> den Antrag aus ReputeCast heraus,
+   und HostRepute kümmert sich um den weiteren Verlauf.
+
+4. Gehört die gelistete IP Ihrem Versandanbieter und nicht Ihnen, wenden Sie sich an den Versandanbieter, der diese IP
+   und ihren Versand kontrolliert. Leiten Sie den betroffenen Stream in der Zwischenzeit über einen anderen Anbieter
+   ([E-Mails über mehrere Anbieter routen](/de/providers/routing/)).
+
+5. Führen Sie die Prüfung erneut aus, sobald die Liste meldet, dass der Eintrag entfernt ist.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Die Liste zeigt nach dem nächsten Lauf <UiPath path="deliverability.clean" /> für das Asset.
+- Die Reputationsgruppe der Versandbereitschaft besteht für die Versand-Domain der Kampagne, ihre übergeordnete Domain,
+  die Return-Path- und Tracking-Domains und ihre dedizierten IPs
+  ([Versandbereitschaft: vor dem Senden prüfen](/de/campaigns/send-readiness/)).
+
+## Fehlerbehebung
+
+- **Der Lauf meldet, dass einige Abfragen unbeantwortet blieben.** Diese Abfragen erscheinen als unbekannt, nicht als
+  nicht gelistet. Die übliche Ursache ist ein öffentlicher DNS-Resolver: Setzen Sie `dns.servers` wie unter
+  [Bevor Sie beginnen](#bevor-sie-beginnen) gezeigt. Langsame Resolver können auch in eine Zeitüberschreitung laufen;
+  das Zeitlimit pro Abfrage ist `dns.timeout` (Standard 4 s).
+- **Die Versandbereitschaft meldet, dass eine Domain nicht auf Spamhaus DBL und SURBL geprüft werden konnte.** Die
+  Live-Abfrage wurde nicht beantwortet oder abgelehnt. Dieselbe Lösung: Ihr eigener Resolver. Wählen Sie danach unter
+  Prüfen & senden <UiPath path="review.rerun" />.
+- **Die Versandbereitschaft meldet, dass eine dedizierte IP noch nicht auf IP-Blocklisten geprüft wird.** Die IP ist
+  neu für diese Prüfungen. Wählen Sie hier <UiPath path="deliverability.runChecks" /> und führen Sie die
+  Versandbereitschaft danach erneut aus.
+- **Spamhaus ZEN oder DBL erscheint nie in der Tabelle.** Spamhaus hat jede Abfrage abgelehnt, daher wurde kein
+  Ergebnis gespeichert. Dieselbe Lösung: Ihr eigener Resolver.
+- **Der Button bewirkt nichts Neues.** Ein laufender oder vor weniger als einer Minute gestarteter Lauf wird statt
+  eines neuen angezeigt. Warten Sie, bis er fertig ist.
+- **„Verbinden Sie zuerst einen Versandanbieter“ erscheint.** Es gibt noch keine Versand-Domain und keine dedizierte
+  IP. Schließen Sie das [Verbinden eines Versandanbieters](/de/providers/connect/) ab.
+- **Eine IP aus einem gemeinsamen Pool ist anderswo gelistet.** ReputeCast prüft keine gemeinsam genutzten IPs; Ihr
+  Versandanbieter überwacht sie. Fragen Sie den Versandanbieter oder verlegen Sie den Stream zu einem Anbieter mit
+  sauberem Pool.
+- **Der Eintrag kommt nach der Entfernung zurück.** Die Ursache besteht noch. Sehen Sie sich in Ihren
+  [Kampagnenberichten](/de/campaigns/reports/) Bounces und Beschwerden je Postfachanbieter an und senden Sie nicht
+  mehr an Kontakte, die nie interagieren.
+
+## Verwandte Themen
+
+- [HostRepute verbinden](/de/deliverability/hostrepute/) für stündliche Prüfungen von 84 Quellen und Delisting-Anträge
+  aus ReputeCast
+- [Zustand von Domains und Anbietern überwachen](/de/deliverability/health/)
+- [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/)
+- [Konfigurationsreferenz](/de/reference/configuration/#dns)
