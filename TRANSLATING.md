@@ -8,6 +8,8 @@ the app itself speaks. `pnpm check` runs with `--strict-i18n` and fails when a p
 
 - A full translation written for readers of that language, not a word-for-word copy. Same structure, same headings
   order, same components, same screenshot ids, same legend items.
+- A table your translation makes too wide for a 320 px phone gets `<TableScroll label="…" wrap>`, on the English page
+  and every translation too, so the pages keep the same components. Translate the `label`.
 - Same frontmatter values for `type`, `audience`, `permissions`, `uiPath`, `sources` and `sidebar.order`.
 - Translated `title` (≤ 60 characters) and `description` (90–160 characters), both unique in the locale.
 - Its own `primaryKeyword`: what readers of that language actually search, e.g. "SPF DKIM DMARC einrichten",
