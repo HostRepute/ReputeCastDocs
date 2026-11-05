@@ -1,6 +1,6 @@
 ---
 title: Requisitos del sistema
-description: 'Requisitos del sistema de ReputeCast para el autoalojamiento: sistemas operativos, imagen de Docker, PostgreSQL 16 a 18, red, puertos y almacenamiento.'
+description: 'Requisitos del sistema de ReputeCast para el autoalojamiento: CPU, memoria y disco según la audiencia, imagen de Docker, PostgreSQL 16 a 18 y red.'
 type: reference
 audience: [operator]
 primaryKeyword: requisitos del sistema de ReputeCast
@@ -9,6 +9,8 @@ sources:
   - Dockerfile
   - deploy/Dockerfile.release
   - deploy/docker-compose.yml
+  - docs/deploy/performance.md
+  - loadtest/k6
   - .github/workflows/ci.yml
   - internal/config/config.go
   - internal/app/app.go
@@ -24,6 +26,51 @@ import UiPath from '~/components/UiPath.astro'
 
 Estos son los requisitos del sistema de ReputeCast: lo que necesita un servidor para ejecutar una
 [instancia](/es/reference/glossary/#instance) con el binario o con la imagen de Docker.
+
+## Hardware
+
+Un servidor que ejecuta ReputeCast y PostgreSQL juntos, con un SSD:
+
+| Audiencia                        | vCPU | Memoria | Disco |
+| -------------------------------- | ---- | ------- | ----- |
+| Hasta 250.000 contactos (mínimo) | 2    | 2 GB    | 20 GB |
+| Hasta 1.000.000 de contactos     | 4    | 4 GB    | 40 GB |
+
+- **Memoria.** En su momento de más carga, ReputeCast usó entre 300 y 380 MB y PostgreSQL unos 500 MB (la configuración
+  predeterminada del archivo de Compose), sin importar el tamaño de la audiencia; el resto de la memoria sirve de caché
+  para la base de datos. 1 GB es poco: ReputeCast, PostgreSQL y Docker llegaron juntos a 0,86 GB, lo que no deja nada
+  para el sistema operativo. Un millón de contactos con 2 GB en un disco en la nube no pasó la prueba: las búsquedas y
+  la API de envío se volvieron lentas (el 95 % de los envíos en 3,9 s en lugar de 300 ms) y `/readyz` agotó su tiempo de
+  espera, así que una comprobación de estado podría haber reiniciado la aplicación.
+- **CPU.** Una vCPU atendió la lista de contactos y los recuentos de segmentos, pero una ráfaga de correo transaccional
+  (subiendo hasta 200 por segundo) respondió más lento que el objetivo de 300 ms.
+- **Disco.** La base de datos de prueba ocupó 0,7 GB con 100.000 contactos, 1,4 GB con 300.000 y 3,8 GB con 1.050.000,
+  con unos dos mensajes y tres eventos de entrega por contacto. El registro de escritura anticipada (WAL) de PostgreSQL
+  añade hasta 1 GB, y las dos imágenes 0,5 GB. Los tamaños de arriba dejan sitio para una
+  [copia de seguridad](/es/self-hosting/backups/) y para crecer. La base de datos crece con cada mensaje que envías,
+  mientras [se conserven los datos](/es/reference/limits-and-defaults/).
+- **Después de una importación grande.** Las tareas en segundo plano del primer arranque (niveles de interacción,
+  atribución del crecimiento, proveedores de buzón) tardaron unos 7 minutos para un millón de contactos con 4 vCPU y 4
+  GB en un disco en la nube.
+- **Más de un millón de contactos** no se ha medido. [Reparte los roles](/es/self-hosting/scaling/), [ajusta la memoria
+  de PostgreSQL](/es/self-hosting/postgres/#ajustar-la-memoria-para-audiencias-grandes) y mide tu propia carga.
+
+### Cómo se midieron estas cifras
+
+Medido en noviembre de 2026 con ReputeCast 1.4.0, el archivo de Compose incluido y PostgreSQL 18. Cada servidor era un
+contenedor con límite de CPU y de memoria, sin swap y con un disco limitado a 3.000 IOPS y 125 MB/s, como un volumen
+estándar en la nube. Tenía los datos de la prueba de carga: el espacio de trabajo de demostración más 50.000, 250.000 o
+1.000.000 de contactos con sus mensajes y eventos. Las pruebas de carga de upstream se ejecutaron desde fuera: diez
+personas paginando y buscando contactos sin pausa, cuatro personas contando segmentos y la API de envío subiendo hasta
+200 mensajes por segundo.
+
+Un tamaño pasaba cuando se cumplían todos los objetivos, sin reinicios ni cierres por falta de memoria: páginas de
+contactos por debajo de 200 ms, búsqueda por debajo de 150 ms, recuentos de segmentos por debajo de 2 s y envíos por
+debajo de 300 ms en el percentil 95, con menos del 1 % de errores. Los núcleos de la máquina de prueba son unas 1,5
+veces más rápidos que una vCPU en la nube (la primera ejecución de niveles de interacción de un millón de contactos
+tardó 200 s en cuatro de ellos y 317 s en el runner de GitHub de 4 vCPU de upstream), así que cada tamaño se comprobó
+con su tiempo de CPU recortado en esa proporción. Los resultados en un runner de 4 vCPU están en
+[escalar con los roles web, ingest y worker](/es/self-hosting/scaling/#rendimiento-medido).
 
 ## Software
 

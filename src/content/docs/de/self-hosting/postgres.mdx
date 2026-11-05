@@ -17,6 +17,8 @@ sources:
   - internal/config/config.go
   - .github/workflows/ci.yml
   - docs/deploy/partitioning.md
+  - docs/deploy/postgres-tuning.md
+  - internal/segments/segments.go
 sidebar:
   order: 7
 ---
@@ -93,6 +95,38 @@ Senken Sie `database.max_conns` je Prozess oder erhöhen Sie `max_connections`, 
 Jede Verbindung führt nach dem Verbindungsaufbau einmal `SET jit = off` aus: Die Abfragen von ReputeCast sind kurz, und
 sie mit JIT zu kompilieren dauerte länger, als sie auszuführen. Der Wert wird nach dem Verbinden gesetzt, nicht im
 Startpaket, damit Pooler wie PgBouncer die Verbindung annehmen.
+
+## Arbeitsspeicher für große Zielgruppen einstellen
+
+Die Standardeinstellungen von PostgreSQL für den Arbeitsspeicher sind klein (`shared_buffers` ist 128 MB), und die
+Compose-Datei behält sie bei. In den [Hardwaretests](/de/self-hosting/requirements/#hardware) reichten sie für eine
+Million Kontakte auf einem Server mit 4 GB: PostgreSQL belegte etwa 500 MB, und der übrige freie Speicher diente als
+Cache für die Datenbankdateien. Bei einigen zehntausend Kontakten können Segmentzählungen mit Ereignisbedingungen
+(geöffnet, geklickt) trotzdem langsam werden; eine Live-Zählung, die länger als 10 Sekunden dauert, zeigt stattdessen
+die letzte bekannte Zahl. Beim Versand funktioniert das Segment weiterhin.
+
+Ausgangswerte für einen Server, auf dem nur PostgreSQL läuft. Auf einem Server, auf dem auch ReputeCast läuft, rechnen
+Sie die Prozente von dem, was nach den 300–400 MB von ReputeCast übrig bleibt:
+
+| Einstellung            | Ausgangswert    | Warum                                                                                                              |
+| ---------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `shared_buffers`       | 25 % des RAM    | Hält Kontakte und aktuelle Ereignisse im Speicher.                                                                 |
+| `effective_cache_size` | 50–75 % des RAM | Sagt dem Planer, wie viel das Betriebssystem zwischenspeichert.                                                    |
+| `work_mem`             | `32MB`          | Sortieren und Hashen für Segmentzählungen und Berichte. Gilt pro Operation, achten Sie also auf `max_connections`. |
+| `maintenance_work_mem` | `512MB`         | Schnelleres Vacuum und schnellerer Indexaufbau nach großen Importen.                                               |
+| `random_page_cost`     | `1.1`           | Index-Scans sind auf SSDs günstig.                                                                                 |
+
+Beim Docker-Compose-Stack übergeben Sie sie dem Dienst `postgres` in `docker-compose.override.yml` (für einen Server mit
+4 GB für PostgreSQL) und führen dann `docker compose up -d` aus:
+
+```yaml title="docker-compose.override.yml"
+services:
+  postgres:
+    command: ['postgres', '-c', 'shared_buffers=1GB', '-c', 'effective_cache_size=3GB', '-c', 'work_mem=32MB']
+```
+
+Führen Sie nach einem großen Import `ANALYZE;` aus, damit der Planer die neuen Daten sofort sieht, statt auf Autovacuum
+zu warten.
 
 ## SQL-Segmente
 
