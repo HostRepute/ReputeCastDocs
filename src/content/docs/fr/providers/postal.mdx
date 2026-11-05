@@ -1,0 +1,147 @@
+---
+title: Envoyer avec votre propre serveur Postal
+description: 'Envoyez une newsletter avec un serveur Postal via ReputeCast : connectez l’API du serveur, ajoutez son webhook signé dans Postal et chauffez la nouvelle IP.'
+type: how-to
+audience: [admin, operator]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter avec un serveur Postal
+sources:
+  - internal/providers/postal
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/netguard/netguard.go
+  - internal/config/config.go
+  - web/src/features/connect
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Si vous exploitez votre propre serveur de messagerie Postal, ReputeCast peut envoyer votre newsletter par son API HTTP et
+lire ses webhooks signés : une newsletter avec un serveur Postal bénéficie ainsi de la même gestion des rebonds, de la
+même pause automatique et des mêmes rapports que n’importe quel autre fournisseur d’envoi. Vous ajoutez vous-même le
+webhook dans Postal, publiez les enregistrements DNS de Postal et chauffez l’IP du serveur avant qu’elle transporte des
+Diffusions.
+
+<ProviderMatrix family="email" id="postal" />
+
+## Avant de commencer
+
+- **Un serveur de messagerie Postal** et un identifiant d’API pour celui-ci (Postal › votre serveur de messagerie ›
+  Credentials, de type API ; un identifiant SMTP ne fonctionne pas)
+  ([Postal : Using the API](https://docs.postalserver.io/developer/api/), vérifié en octobre 2026).
+- **Un accès réseau dans les deux sens.** ReputeCast appelle l’API de Postal et lit sa clé publique de signature sur
+  `<Server URL>/.well-known/jwks.json` ; Postal envoie les webhooks à `<public URL>/hooks/postal/<token>`.
+- **Pour un serveur Postal sur votre propre réseau**, un admin de l’instance active `providers.allow_private_networks`
+  (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`) et redémarre ReputeCast. Sans cela, ReputeCast refuse les
+  adresses de bouclage et privées. Les adresses de métadonnées cloud et link-local sont toujours refusées. Voir la
+  [référence de configuration](/fr/reference/configuration/).
+- **Autorisations.** La connexion demande `providers:manage` ; ajouter un nouveau domaine d’envoi demande
+  `domains:manage`.
+
+## Connecter Postal
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers" />, choisissez <UiPath path="providers.overview.addProvider" /> et sélectionnez
+   Postal dans le catalogue. [Connecter un fournisseur d’envoi](/fr/providers/connect/) explique les étapes que partagent
+   tous les fournisseurs.
+
+2. Saisissez l’<UiPath path="providers.fields.postal.serverUrl" /> (l’adresse de votre interface web Postal, par
+   exemple `https://mta.acme.io`) et la <UiPath path="providers.fields.apiKey" />. Choisissez
+   <UiPath path="connect.connection.connect" />. ReputeCast vérifie la clé par un appel d’API sans effet et la stocke
+   chiffrée ; la carte affiche ensuite « Postal · joignable ».
+
+3. Dans <UiPath path="connect.connection.webhooksTitle" />, ReputeCast vérifie que son adresse de webhook est joignable
+   depuis Internet, puis affiche l’URL du webhook. Choisissez <UiPath path="connect.connection.copyUrl" />. L’assistant
+   propose aussi <UiPath path="connect.connection.createSecret" /> : ignorez cette option. Postal signe ses webhooks avec
+   sa propre clé RSA, et ReputeCast vérifie cette signature à la place.
+
+4. Dans Postal, ouvrez le serveur de messagerie › Webhooks et ajoutez un webhook avec cette URL pour tous les
+   événements. ReputeCast utilise `MessageSent`, `MessageDelayed`, `MessageDeliveryFailed`, `MessageHeld` et
+   `MessageBounced`, plus `MessageLinkClicked` et `MessageLoaded` si Postal les envoie
+   ([Postal : Webhooks](https://docs.postalserver.io/developer/webhooks/), vérifié en octobre 2026).
+
+5. Choisissez <UiPath path="connect.connection.continueDomain" /> et saisissez votre domaine d’envoi. ReputeCast ne
+   peut pas l’ajouter dans Postal : ajoutez le domaine dans Postal et publiez les enregistrements DKIM et return-path
+   qu’affiche Postal. ReputeCast suggère un enregistrement SPF avec `a:<your Postal host>`, fusionné avec votre
+   enregistrement SPF existant, et DMARC si le domaine n’en a pas.
+
+6. Dans <UiPath path="connect.stepTest" />, envoyez un test. La chronologie attend le webhook `MessageSent` de Postal.
+
+7. Dans <UiPath path="connect.stepStreams" />, choisissez les flux. Une nouvelle IP n’a pas encore de réputation :
+   commencez par les e-mails Système ou Automatisations, ou par une petite part pondérée des Diffusions.
+
+8. Ouvrez <UiPath path="nav.providers > providers.tabWarmup" />, choisissez <UiPath path="providers.warmup.newPlan" />
+   pour le serveur Postal et lancez-le. Le plan augmente progressivement le volume quotidien, envoie d’abord à vos
+   contacts les plus engagés et ralentit quand les rebonds ou les plaintes augmentent.
+
+   <Screenshot
+     id="providers-warmup"
+     alt="L’IP dédiée d’un serveur Postal au jour 9 d’une chauffe de 21 jours, avec 8 jours comptés : le plafond du jour de 6 000, des taux de rebond et de plainte sous leurs seuils de protection, la montée en charge du volume quotidien et les plafonds du jour par fournisseur de messagerie."
+   />
+
+</Steps>
+
+## Vérifier le résultat
+
+- La carte Postal dans <UiPath path="nav.providers > providers.tabProviders" /> affiche
+  <UiPath path="providers.statusWarmingUp" /> tant que le plan est en cours. Ses IP d’envoi affichent « Dédiées · pas
+  encore définies » jusqu’à ce que vous listiez les IP publiques du serveur avec
+  <UiPath path="providers.overview.editIps" />, pour que le contrôle avant envoi les vérifie sur les listes de blocage
+  et qu’une nouvelle IP démarre un canari ; lisez
+  [Vérifier les IP d’envoi](/fr/providers/senders-and-domains/#vérifier-les-ip-denvoi).
+- Les événements de Postal apparaissent dans <UiPath path="nav.providers > providers.tabEvents" /> à côté de
+  l’événement ReputeCast normalisé et de la réponse SMTP d’origine.
+
+  <Screenshot
+    id="providers-events"
+    alt="Le journal des événements : le MessageDeliveryFailed de Postal avec HardFail normalisé en rebond définitif, et SoftFail en rebond temporaire, avec les codes SMTP d’origine."
+  />
+
+ReputeCast envoie un message brut par appel d’API et l’étiquette pour que les webhooks de Postal retrouvent leur
+chemin. Les copies et les pièces jointes fonctionnent. Postal n’indique ni quota ni cadence : ReputeCast lui envoie donc
+au maximum 20 messages par seconde, et moins quand le plafond quotidien et la cadence du plan de chauffe s’appliquent. Un
+`MessageDeliveryFailed` avec un échec permanent est un rebond définitif et exclut l’adresse ; `MessageBounced` (un
+rebond reçu plus tard par Postal) compte comme un rebond temporaire. Postal n’a pas d’événements de plainte ni de
+désabonnement : ReputeCast ne reçoit donc aucune plainte par Postal, et les désabonnements viennent uniquement des liens
+de ReputeCast.
+
+## Dépannage
+
+- **« ReputeCast ne se connectera pas à cette adresse ».** L’URL du serveur se résout en adresse privée ou de
+  bouclage. Activez `providers.allow_private_networks`, ou utilisez l’adresse publique de Postal.
+- **« Postal (auto-hébergé) a refusé cette clé »** avec `InvalidServerAPIKey`. Utilisez un identifiant d’API du même
+  serveur de messagerie, pas un identifiant SMTP.
+- **« Postal (auto-hébergé) n’a pas répondu à la vérification ».** ReputeCast n’a pas pu joindre l’URL du serveur, elle
+  a redirigé (les redirections ne sont pas suivies), ou le serveur est suspendu. Utilisez l’adresse HTTPS exacte de
+  l’interface web.
+- **Les webhooks reçoivent `401`.** ReputeCast n’a pas pu vérifier la signature de Postal : il ne peut pas lire
+  `<Server URL>/.well-known/jwks.json`, ou le webhook vient d’un autre serveur Postal. Vérifiez que l’URL JWKS se charge
+  depuis l’hôte de ReputeCast.
+- **Le test de l’endpoint échoue parce que ReputeCast n’a lui-même qu’une adresse privée.** Postal ne peut pas y envoyer.
+  Donnez à ReputeCast une URL publique joignable, ou choisissez <UiPath path="connect.connection.usePolling" /> après la
+  connexion : l’interrogation périodique ne lit que le dernier état de livraison de chaque message, sans rebonds,
+  ouvertures ni clics.
+- **Les ouvertures ou les clics semblent doublés.** Le suivi des clics et des ouvertures de Postal est activé pour votre
+  serveur. Désactivez-le dans Postal ; ReputeCast ne peut pas lire ce réglage.
+- **Vous avez changé l’URL publique ou déconnecté Postal.** ReputeCast ne modifie rien dans Postal. Mettez à jour ou
+  supprimez le webhook là-bas.
+
+<Aside type="tip">
+  Postal a aussi un endpoint SMTP. Connecter Postal comme [n’importe quel serveur SMTP](/fr/providers/smtp/) fonctionne
+  également, mais les rebonds viennent alors d’une boîte de réception des rebonds au lieu des webhooks.
+</Aside>
+
+## Voir aussi
+
+- [Chauffer un nouveau fournisseur ou une nouvelle IP](/fr/providers/warm-up/)
+- [Router les e-mails entre fournisseurs](/fr/providers/routing/)
+- [Connecter un fournisseur d’envoi](/fr/providers/connect/)
+- [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)
+- [Vérifier et corriger les inscriptions sur les listes de blocage](/fr/deliverability/blocklists/)

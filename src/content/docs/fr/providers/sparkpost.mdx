@@ -1,0 +1,129 @@
+---
+title: Envoyer avec SparkPost
+description: Envoyez une newsletter avec SparkPost via ReputeCast et une clé API de votre compte US ou UE ; webhooks, DKIM et synchronisation des suppressions configurés.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter avec SparkPost
+sources:
+  - internal/providers/sparkpost
+  - internal/connect
+  - internal/domains/attach.go
+  - web/src/features/connect
+sidebar:
+  order: 8
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Pour envoyer une newsletter avec SparkPost depuis ReputeCast, vous connectez une clé API et la région de votre compte
+SparkPost (US ou UE). ReputeCast enregistre un webhook protégé par basic auth, configure DKIM pour votre domaine
+d’envoi, désactive le suivi de SparkPost sur chaque message et synchronise les deux listes de suppression.
+
+<ProviderMatrix family="email" id="sparkpost" />
+
+## Avant de commencer
+
+- **Un compte SparkPost** sur `app.sparkpost.com` (US) ou `app.eu.sparkpost.com` (UE). L’adaptateur parle l’API de
+  SparkPost ; les comptes Bird Email utilisent une autre API et ne peuvent pas être connectés avec lui.
+- **Une clé API** avec les autorisations Transmissions, Webhooks, Sending Domains, Suppression Lists, Account, Metrics
+  et Message Events, créée sous Configuration › API Keys dans SparkPost
+  ([SparkPost : Create API keys](https://support.sparkpost.com/docs/getting-started/create-api-keys), vérifié en
+  octobre 2026). Les comptes UE créent leurs clés dans l’application UE.
+- **Autorisations.** La connexion demande `providers:manage` ; ajouter un nouveau domaine d’envoi demande
+  `domains:manage`.
+- **Une adresse HTTPS publique** pour le webhook : `<public URL>/hooks/sparkpost/<token>`. SparkPost envoie un lot de
+  test à l’adresse avant d’enregistrer un webhook : l’adresse doit donc être joignable. En attendant, ReputeCast peut
+  interroger l’API d’événements de SparkPost toutes les minutes.
+
+## Connecter SparkPost
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers" />, choisissez <UiPath path="providers.overview.addProvider" /> et sélectionnez
+   SparkPost dans le catalogue. [Connecter un fournisseur d’envoi](/fr/providers/connect/) explique les étapes que
+   partagent tous les fournisseurs.
+
+2. Collez la <UiPath path="providers.fields.apiKey" /> et choisissez la <UiPath path="providers.fields.region" /> :
+   `us` pour `api.sparkpost.com`, `eu` pour `api.eu.sparkpost.com`. Dans les paramètres SparkPost supplémentaires, vous
+   pouvez indiquer un <UiPath path="providers.fields.ipPool" /> d’IP dédiées par lequel envoyer.
+
+3. Choisissez <UiPath path="connect.connection.connect" />. ReputeCast lit votre compte et son utilisation avec la clé,
+   puis la stocke chiffrée. La carte affiche l’ID du compte, son état et votre forfait.
+
+4. Dans <UiPath path="connect.connection.webhooksTitle" />, ReputeCast vérifie que son adresse de webhook est joignable
+   depuis Internet, puis crée (ou met à jour) un webhook nommé « ReputeCast » avec basic auth (utilisateur
+   `reputecast`, un secret généré par ReputeCast) pour les livraisons, les rebonds, les rebonds hors bande, les retards,
+   les plaintes pour spam, les rejets pour raison de politique, les échecs de génération et les désabonnements. Les
+   événements d’ouverture et de clic ne sont pas souscrits. Si l’endpoint n’est pas encore joignable, choisissez
+   <UiPath path="connect.connection.usePolling" />.
+
+5. Choisissez <UiPath path="connect.connection.continueDomain" /> et saisissez votre domaine d’envoi. ReputeCast
+   l’ajoute comme domaine d’envoi SparkPost avec une clé DKIM de 2048 bits et liste l’enregistrement TXT DKIM. Pour un
+   sous-domaine comme `news.acme.io`, il liste aussi le CNAME de rebond (vers `sparkpostmail.com`, ou
+   `eu.sparkpostmail.com` dans l’UE) ; un domaine racine comme `acme.io` ne peut pas porter de CNAME, il n’a donc que
+   DKIM. ReputeCast suggère DMARC si le domaine n’en a pas.
+
+6. Dans <UiPath path="connect.stepTest" />, envoyez un test et regardez arriver l’événement de livraison.
+
+7. Dans <UiPath path="connect.stepStreams" /> et <UiPath path="connect.stepContacts" />, choisissez les flux et laissez
+   cochée l’option qui importe les suppressions déjà présentes chez SparkPost.
+
+</Steps>
+
+## Vérifier le résultat
+
+- La carte SparkPost dans <UiPath path="nav.providers > providers.tabProviders" /> affiche
+  <UiPath path="providers.statusHealthy" /> et votre limite d’envoi mensuelle ou quotidienne avec son utilisation.
+- Dans SparkPost, la liste des webhooks contient un webhook « ReputeCast » qui pointe vers `/hooks/sparkpost/…` avec
+  basic auth.
+- Les livraisons et les rebonds apparaissent dans <UiPath path="nav.providers > providers.tabEvents" />.
+
+SparkPost ne signe pas les webhooks : ReputeCast s’appuie donc sur les identifiants basic auth et sur une URL impossible
+à deviner. ReputeCast envoie une transmission par message, avec le suivi des ouvertures et des clics désactivé et une
+clé d’idempotence construite à partir de l’ID ReputeCast du message. SparkPost conserve la clé 24 heures : un message
+renvoyé dans ce délai, après un dépassement de délai ou une réponse perdue, est reconnu et n’est jamais délivré deux
+fois ; le [suivi en direct](/fr/campaigns/live-monitor/) indique quel fournisseur reconnaît un renvoi et jusqu’à quand.
+Chaque message part comme transactionnel au sens de SparkPost, car SparkPost ajoute son propre en-tête
+`List-Unsubscribe` aux autres e-mails et ReputeCast en ajoute déjà un avec le désabonnement en un clic. Pour la même
+raison, ReputeCast pousse les rebonds définitifs et les plaintes qui s’appliquent à tous les e-mails vers les deux
+listes de suppression de SparkPost, les retire des deux quand ils quittent la liste partagée, et importe en retour les
+entrées de rebond, de plainte pour spam et de désabonnement de SparkPost.
+
+À la connexion, ReputeCast demande à SparkPost de valider le webhook avec un lot de test et continue dès qu’il arrive. Il
+lit aussi, à la connexion puis chaque jour, les IP d’envoi dédiées du compte dans le pool d’IP de la connexion (ou le
+pool par défaut), et les affiche comme [IP d’envoi](/fr/providers/senders-and-domains/#vérifier-les-ip-denvoi) de la
+carte ; un compte sans IP dédiées envoie depuis les IP partagées de SparkPost.
+
+## Dépannage
+
+- **« SparkPost a refusé cette clé »** avec `401 Unauthorized`. La clé est erronée, n’a pas les autorisations
+  nécessaires ou appartient à l’autre région. Vérifiez les autorisations de la clé et que la région correspond à
+  l’application dans laquelle vous l’avez créée.
+- **L’enregistrement du webhook échoue.** SparkPost teste l’URL avant d’enregistrer un webhook : l’enregistrement échoue
+  donc tant que SparkPost ne peut pas joindre ReputeCast. Corrigez l’URL publique (voir
+  [Reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)), puis choisissez
+  <UiPath path="connect.connection.registerAgain" />.
+- **L’étape du domaine ne liste qu’un enregistrement DKIM.** Vous avez saisi un domaine racine. Envoyez depuis un
+  sous-domaine si vous voulez que le domaine de rebond de SparkPost soit aligné sur le vôtre.
+- **L’envoi ralentit avec des erreurs HTTP 420.** SparkPost répond 420 quand votre limite d’envoi quotidienne ou
+  mensuelle est épuisée. ReputeCast le traite comme une limitation de débit et réessaie plus tard ; augmentez la limite
+  dans SparkPost ou faites passer une partie du trafic par un autre fournisseur.
+- **Le catalogue affiche un badge « Domaine sandbox ».** ReputeCast n’a pas de mode sandbox SparkPost : connectez un
+  vrai domaine d’envoi.
+- **Le suivi au niveau du compte est activé.** Le contrôle du suivi de l’onglet Événements et synchronisation le
+  signale, même si ReputeCast désactive le suivi sur chaque message qu’il envoie. Pour modifier les valeurs par défaut
+  du compte par l’API, la clé doit avoir un accès en écriture à Account.
+- **Vous avez déconnecté SparkPost.** ReputeCast supprime les webhooks qui pointent vers son URL. Le domaine d’envoi et
+  les suppressions poussées restent dans SparkPost.
+
+## Voir aussi
+
+- [Connecter un fournisseur d’envoi](/fr/providers/connect/)
+- [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/)
+- [Désabonnement en un clic (RFC 8058)](/fr/deliverability/one-click-unsubscribe/)
+- [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)
+- [Choisir un fournisseur d’envoi](/fr/providers/choose/)

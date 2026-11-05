@@ -1,0 +1,408 @@
+---
+title: Versand überwachen und automatisch pausieren
+description: 'Wie ReputeCast einen laufenden Versand absichert: Auto-Pause bei Bounce-Rate und Beschwerden einer E-Mail-Kampagne, Canary-Phase, Ausfälle und Ihre Optionen.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:pause', 'campaigns:send', 'campaigns:approve']
+uiPath: 'nav.campaigns > campaigns.liveMonitor'
+primaryKeyword: Auto-Pause bei Bounce-Rate
+sources:
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/thresholds_live.go
+  - internal/sending/engine/rearm.go
+  - internal/sending/engine/actions.go
+  - internal/sending/engine/analysis.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/routeerrors.go
+  - internal/sending/engine/doubt.go
+  - internal/sending/engine/canary.go
+  - internal/sending/engine/canary_live.go
+  - internal/sending/engine/replies.go
+  - internal/sending/engine/rates.go
+  - internal/sending/engine/estimate.go
+  - internal/sending/engine/watch.go
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/live.go
+  - internal/sending/engine/api.go
+  - internal/sending/engine/messages/en.json
+  - internal/sending/rules
+  - internal/providers/state/vet.go
+  - internal/providers/{brevo,sparkpost}/idempotency.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/live
+sidebar:
+  order: 14
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Sobald eine Kampagne startet, zeigt der <UiPath path="live.title" /> sie in Echtzeit, und der
+[abgesicherte Versand](/de/reference/glossary/#guarded-sending) schützt sie. Die Auto-Pause bei Bounce-Rate,
+Beschwerderate oder einem anderen Schwellenwert einer E-Mail-Kampagne greift, sobald dieser sein Limit überschreitet:
+ReputeCast pausiert oder verlangsamt dann nur den Teil des Versands, der es verursacht hat, zum Beispiel die
+Outlook-Empfänger, und der Rest läuft weiter. Ein Versand kann mit einem kleinen [Canary](/de/reference/glossary/#canary)
+beginnen, ein Ausfall hält nur den Anteil des ausgefallenen Versandanbieters zurück, und keine Nachricht wird je doppelt
+gesendet. Wann immer etwas zurückgehalten wird, entscheidet ein Mensch, wie es weitergeht.
+
+<Screenshot
+  id="live-monitor"
+  alt="Der Live-Monitor während des Versands von Weekly Digest #142: die Fortschrittskarte mit dem gesendeten Anteil, der Endzeit jeder Route und der Zusammenfassung Versand an alle; jeder Schwellenwert liegt innerhalb seines Limits, dann die Kacheln für zugestellt, Bounces, Beschwerden, geöffnet und geklickt. Darunter steht jeder Schwellenwert für Auto-Pause, von Bounces bis zu API-Fehlern des Versandanbieters, auf Beobachtung innerhalb seines Limits."
+/>
+
+## Was der Monitor zeigt
+
+- **Die Kopfzeile** nennt, wer den Versand gestartet, geplant und freigegeben hat, wie aktuell die Zahlen sind („Live ·
+  aktualisiert vor 1 s“) und wer eingreifen kann. Statt eines Berechtigungsschlüssels nennt der Monitor die Personen, die
+  fortsetzen oder entscheiden können.
+- **Die Fortschrittskarte** zeigt den gesendeten Anteil, einen Balken je Versandanbieter (mit dem, was zurückgehalten,
+  eingereiht oder ungewiss ist) und, bei den aktuellen Raten, wann jede Route fertig ist. Ihre eine Zusammenfassungszeile
+  sagt, was gerade zählt, etwa „Versand an alle; jeder Schwellenwert liegt innerhalb seines Limits.“ Screenreader lesen
+  diese Zeile vor, wenn sie sich ändert, nicht jede Zahl.
+- **Fünf Kacheln:** zugestellt, Bounces (aufgeteilt in unbekannte Empfänger, Block-/Richtlinien-Bounces und Soft
+  Bounces), Beschwerden, geöffnet und geklickt. Die Kachel geöffnet stellt die
+  [menschlichen Öffnungen](/de/reference/glossary/#human-opens) an den Anfang; jede Öffnung, die keine Person ausgelöst
+  hat, [datenschutzgeschützte Öffnungen](/de/reference/glossary/#privacy-protected-open) ebenso wie die von Scannern,
+  zählt hier als „maschinell“. Der [Kampagnenbericht](/de/campaigns/reports/) zeigt beide getrennt.
+- <UiPath path="live.perMailbox" />: gesendet, verbleibend, zugestellt, Zurückstellungen der letzten 10 Minuten,
+  Bounce- und Beschwerderate, die aktuelle Rate und wann jeder
+  [Postfachanbieter](/de/reference/glossary/#mailbox-provider) fertig ist. Postfachanbieter werden aus den MX-Einträgen
+  jeder Domain ermittelt, daher umfasst Gmail auch Empfänger bei Google Workspace und Outlook auch bei Microsoft 365.
+- <UiPath path="live.perProvider" />: Anteil, Rate, Zustellrate, API-Fehler über 3 Minuten und Endzeit jedes
+  Versandanbieters. Ein Anbieter [im Warm-up](/de/providers/warm-up/) zeigt seinen Tag und das heutige Limit.
+- <UiPath path="live.thresholds" />: ein Balken je Schwellenwert mit den zugrunde liegenden Daten, unten beschrieben.
+- <UiPath path="live.liveEvents" /> und <UiPath path="live.sendDetails" />: Absender, Zielgruppe, Route, bisherige
+  Kosten, wer geplant hat, der Canary und die Beschwerdeüberwachung nach dem Versand.
+
+Die Zahlen stammen aus den Zustell-Webhooks Ihrer Versandanbieter (siehe
+[Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/)) und kommen über eine
+Live-Verbindung etwa einmal pro Sekunde an. Ein einfacher SMTP-Server meldet keine Zustellungen, daher zählt eine
+Nachricht an ihn als zugestellt, sobald der Server sie annimmt, markiert als „abgeleitet“.
+
+### Beschwerden nur, wo sie gemeldet werden
+
+Gmail und iCloud melden Absendern einzelne Beschwerden nie. Ihre Beschwerderaten zeigen
+<UiPath path="live.model.notAvailable" /> mit dem Grund, und ihre zugestellten E-Mails werden aus jeder Beschwerderate
+herausgerechnet, damit sie diese nicht verwässern. Beschwerderaten zählen nur E-Mails, die an Postfachanbieter
+zugestellt wurden, die Beschwerden melden: Outlook, Yahoo und viele unter Andere. Die eigene Spamrate von Gmail kommt
+einmal täglich aus den Google Postmaster Tools; die
+[Beschwerdeüberwachung](#nach-dem-versand-die-beschwerdeüberwachung) kann sie lesen.
+
+## Wie der abgesicherte Versand entscheidet
+
+1. **Antwortregeln greifen zuerst.** [Antwortregeln](/de/reference/glossary/#reply-rule) zählen die SMTP-Antworten
+   eines Postfachanbieters, etwa `TSS04` von Yahoo, und greifen, sobald ihre Anzahl erreicht ist, noch vor jedem
+   Ratenschwellenwert. Jeder Arbeitsbereich beginnt mit Standardwerten; siehe
+   [Traffic-Regeln festlegen](/de/providers/traffic-rules/).
+2. **Dann die Schwellenwerte, alle 2 Sekunden.** Zuerst die Schwellenwerte nach Bounce-Typ: Block-/Richtlinien-Bounces
+   und Zurückstellungen je Postfachanbieter, dann unbekannte Empfänger über den gesamten Versand. Danach Beschwerden und
+   Bounces je Postfachanbieter, Bounces je Versandanbieter und Bounces und Beschwerden des gesamten Versands. Der erste
+   Schwellenwert, der auslöst, greift.
+3. **Jeder Bounce-Typ hat seinen eigenen Schwellenwert.** Block-/Richtlinien-Bounces (wegen Reputation, Richtlinie oder
+   Inhalt abgelehnt) werden je Postfachanbieter bewertet. Unbekannte Empfänger (Adressen, die es nicht gibt) werden über
+   den gesamten Versand auf zwei Stufen bewertet: Die erste warnt, die zweite pausiert den Versand. Soft Bounces und
+   Zurückstellungen werden je Postfachanbieter über die letzten 10 Minuten bewertet, jede Nachricht einmal, auf zwei
+   Stufen: Die erste verlangsamt diesen Postfachanbieter auf die halbe Rate, die zweite pausiert ihn.
+4. **Eine Rate löst nur bei ausreichender Datenlage aus.** Sie braucht mindestens 5 Ereignisse, mindestens
+   500 Nachrichten an diesen Postfach- oder Versandanbieter (1.000 für den gesamten Versand) und etwa 90 % Konfidenz,
+   dass die tatsächliche Rate über dem Limit liegt, damit ein paar Beschwerden früh im Versand ihn nicht stoppen.
+   Beschwerderaten zählen E-Mails, die dort zugestellt wurden, wo Beschwerden gemeldet werden; die anderen Raten zählen
+   gesendete E-Mails.
+5. **Manche Raten warten nicht auf so viele Daten.** Beschwerden und Block-/Richtlinien-Bounces sind das Urteil eines
+   Postfachanbieters über den Absender, daher lösen sie bei einem Versand jeder Größe auch dann aus, wenn sie klar über
+   dem Limit liegen: mindestens 3, wobei die Untergrenze des 95-%-Konfidenzintervalls der Rate (Wilson) über dem Limit
+   liegt. Block-/Richtlinien-Bounces lösen außerdem bei einer Häufung aus: 3 oder mehr bei Gmail, Outlook, Yahoo oder
+   iCloud innerhalb von 10 Minuten, klar über dem Limit gemessen an dem, was in dieser Zeit dorthin gesendet wurde. So
+   wird ein Postfachanbieter erkannt, der spät in einem großen Versand zu blockieren beginnt.
+6. **Die Aktion bestimmt, was geschieht.** Standardmäßig pausiert ein ausgelöster Schwellenwert nur diesen
+   Postfachanbieter (oder den Anteil dieses Versandanbieters), und alles andere wird weiter gesendet. Traffic-Regeln
+   können einen Schwellenwert den Bereich auf die halbe Rate verlangsamen, den ganzen Versand pausieren oder nur warnen
+   lassen. Ist <UiPath path="senders.providers.pauseScope" /> auf die ganze Kampagne gesetzt, hält jede Pause alles an.
+
+Jeder Balken auf der Karte der Schwellenwerte zeigt einen von vier Zuständen:
+
+- <UiPath path="traffic.legendCollecting" />: weniger als 5 Ereignisse oder nicht genug E-Mails und nicht klar über dem
+  Limit. Der Balken ist grau; er kann noch nicht auslösen.
+- <UiPath path="traffic.legendWatching" />: genug Daten, innerhalb des Limits.
+- <UiPath path="traffic.legendNear" />: bei 90 % des Limits oder mehr.
+- <UiPath path="traffic.legendTripped" />: genug Daten, dass die Rate über dem Limit liegt; seine Aktion wurde
+  ausgeführt.
+
+Die Karte listet Bounces (gesamter Versand), <UiPath path="live.model.thresholdBlock" /> und Zurückstellungen (der
+Postfachanbieter, der seinem Limit am nächsten ist), Beschwerden (gesamter Versand, wo gemeldet) und die Beschwerden des
+Postfachanbieters mit dem höchsten Wert, <UiPath path="live.model.thresholdReplies" /> und
+<UiPath path="live.model.thresholdErrors" />.
+
+Die Schwellenwerte stammen aus den Standardwerten des Arbeitsbereichs und den
+[Traffic-Regeln](/de/reference/glossary/#traffic-rules), für diese Kampagne unter
+<UiPath path="composer.reviewSend" /> geändert, falls Sie das getan haben. Während der Versand läuft oder wartet, öffnet
+<UiPath path="live.editThresholdsLive" /> <UiPath path="live.thresholdsEditTitle" />: Neue Limits gelten innerhalb von
+Sekunden für den Rest dieses Versands, die Standardwerte des Arbeitsbereichs bleiben unverändert, und die Änderung wird
+mit Ihrem Namen im [Audit-Protokoll](/de/team/audit-log/) festgehalten.
+
+## Was bei einer Pause geschieht
+
+- Die zurückgehaltenen Empfänger warten in der Warteschlange. Nichts geht verloren.
+- Alle im Arbeitsbereich, die Kampagnen senden dürfen, erhalten eine dringende Benachrichtigung in der App und per
+  E-Mail, zum Beispiel „Beschwerderate bei Outlook erreicht 0,18 % (Limit 0,10 %). 2.522 zurückgehalten, alles andere
+  wird weiter gesendet.“
+- Der [Webhook](/de/reference/webhook-events/) `campaign.paused` wird mit `paused_by: auto_pause`, der Kennzahl, ihrem
+  Wert und Limit, dem Bereich und der Zahl der Zurückgehaltenen ausgelöst.
+- Der Live-Monitor öffnet ein Entscheidungsfeld: <UiPath path="live.whatTripped" /> mit den Daten, den wahrscheinlichen
+  Ursachen, einer Empfehlung und <UiPath path="live.chooseTitle" />.
+
+<Screenshot
+  id="live-monitor-paused"
+  alt="Weekly Digest #142, bei dem nur der Outlook-Anteil automatisch pausiert ist: 3 Beschwerden bei 725 Zustellungen bringen die Beschwerderate von Outlook auf 0,41 % gegenüber dem Limit von 0,10 %, klar darüber, während Gmail, Yahoo, iCloud und Andere weiter gesendet werden. Das Feld zeigt, was ausgelöst hat, die wahrscheinlichen Ursachen, die Empfehlung und die Optionen Unverändert fortsetzen, Mit Änderungen fortsetzen (empfohlen) und Outlook-Anteil abbrechen."
+/>
+
+### Entscheidungen nach einer Pause durch einen Schwellenwert
+
+- <UiPath path="sending.opt.resumeAction" /> sendet an alle, die noch zurückgehalten werden. Ein Dialog
+  <UiPath path="live.resumeSending" /> fragt nach dem Wie: fortsetzen und erneut pausieren, wenn die Rate das Limit
+  wieder überschreitet (mit der empfohlenen niedrigeren Rate, falls es eine gibt), oder fortsetzen mit einem nur für
+  diese Kampagne angehobenen Schwellenwert, was das Audit-Protokoll mit Ihrem Namen festhält. So oder so wird der
+  Schwellenwert ab den aktuellen Zahlen neu scharf geschaltet: Nur neue Ereignisse zählen, daher pausieren die, die ihn
+  ausgelöst haben, ihn nie erneut. <UiPath path="live.keepPaused" /> lässt den Anteil zurückgehalten.
+- <UiPath path="sending.opt.changesAction" /> wird angeboten, wenn ReputeCast eine Ursache findet. Es kann die Gruppe
+  auslassen, die die meisten Beschwerden verursacht hat (importierte Kontakte ohne Interaktion oder nicht mehr aktive
+  Kontakte), den Rest des Anteils eines Postfach- oder Versandanbieters mit niedrigerer Rate senden und, wenn eine
+  passende Re-Permission- oder Reaktivierungs-Automation live ist, die ausgelassenen Kontakte hinzufügen. Die Option
+  nennt genau, was sie tun wird, bevor Sie sie wählen.
+- **Anteil abbrechen** überspringt die zurückgehaltenen Empfänger; der Rest der Kampagne wird normal abgeschlossen. Nach
+  einer Pause der ganzen Kampagne überspringt <UiPath path="sending.opt.cancelCampaign" /> alle verbleibenden.
+- <UiPath path="live.cancelWhole" /> stoppt alles, was noch nicht gesendet wurde.
+
+### Verlangsamungen, Warnungen und Antwortregeln
+
+Ein Schwellenwert, der verlangsamen oder warnen soll, hält niemanden zurück. Er hinterlässt im Monitor einen Hinweis mit
+<UiPath path="live.acknowledge" />: Ein verlangsamter Postfachanbieter behält seine halbe Rate für den Rest des Versands
+(ändern Sie sie unter <UiPath path="live.adjustRates" />), und eine Warnung benachrichtigt außerdem die Personen, die
+Kampagnen senden dürfen.
+
+Eine Antwortregel, die einen Postfachanbieter für eine festgelegte Zeit pausiert, bietet drei Optionen: jetzt wieder an
+ihn senden (die Regel zählt dann nur neue Antworten), <UiPath path="sending.opt.replyWaitAction" />, bis die Zeit der
+Regel abgelaufen ist (er läuft dann von selbst weiter), oder seinen Anteil abbrechen.
+
+## Ausfälle von Versandanbietern
+
+Ganz gleich, wer einen Ausfall feststellt, der Versand selbst oder die Zustandsprüfung des Anbieters, der Anteil
+durchläuft denselben Weg. Der Anteil eines Versandanbieters wird zurückgehalten, wenn:
+
+- seine Aufrufe für diesen Versand 3 Minuten lang alle fehlgeschlagen sind, mit mindestens 5 fehlgeschlagenen Aufrufen;
+- er das Konto 3 Minuten lang immer wieder gedrosselt hat, auch bei niedrigerer Rate;
+- seine API-Fehler das Limit <UiPath path="live.model.thresholdErrors" /> über 3 Minuten überschreiten (standardmäßig
+  5,0 %, bewertet nach 20 Aufrufen und 3 Fehlschlägen);
+- die Zustandsprüfung ihn als ausgefallen markiert oder er die Zugangsdaten ablehnt;
+- er den Absender ablehnt, weil der Absender dort nicht verifiziert ist, oder meldet, dass das Kontingent des Kontos
+  aufgebraucht ist. Nichts wird als fehlgeschlagen markiert: Die Nachrichten warten auf die Route.
+
+Was dann geschieht, hängt von der [Failover-Richtlinie](/de/providers/routing/) für Massenversand ab. Bei einer
+automatischen Richtlinie verschiebt ReputeCast den Anteil zu einem anderen Anbieter, aber nur zu einem, der jede Prüfung
+besteht: verfügbar, seine Bedingungen erlauben Massen-E-Mails, nicht in der Sandbox, die Domain des Absenders dort
+verifiziert, genug Kontingent übrig und nicht im Warm-up. Zuerst wird der Ersatzanbieter des Streams versucht, dann der
+größte Anteil der Aufteilung. Bei „pausieren und nachfragen“, bei abgelehnten Zugangsdaten oder wenn kein Anbieter
+infrage kommt, wird der Anteil zurückgehalten, und die Personen, die Kampagnen senden dürfen, werden um eine Entscheidung
+gebeten.
+
+Bis jemand entscheidet, testet der zurückgehaltene Anteil seinen Anbieter selbst: 1 Testnachricht alle 60 Sekunden, an
+ein Testpostfach, wenn der Arbeitsbereich eines hat, sonst eine der eigenen Nachrichten des Anteils. Nachdem 3 Tests in
+Folge durchgegangen sind, läuft der Anteil von selbst weiter.
+
+<Screenshot
+  id="live-monitor-outage"
+  alt="Postal hat 3 Minuten lang Verbindungsfehler gemeldet, daher ist sein Anteil von Weekly Digest #142 zurückgehalten, während Amazon SES weiter sendet, und ReputeCast testet Postal alle 60 Sekunden mit 1 Nachricht an ein Testpostfach. Das Feld zeigt, was Postal gemeldet hat, die wahrscheinlichen Ursachen, was eine Verschiebung der zurückgehaltenen Empfänger zu SES kosten würde (Mehrkosten, zusätzliche Zeit, Kontingent danach, Reputationsrisiko Niedrig, weil SES aufgewärmt ist) und die Prüfungen, die ReputeCast bei SES durchgeführt hat, mit der Verschiebung als Empfehlung."
+/>
+
+### Entscheidungen nach einer Zurückhaltung wegen Ausfalls
+
+- **Erneut versuchen** belässt die Empfänger beim selben Anbieter, und die Testnachrichten laufen weiter. Schlägt der
+  Anbieter nach weiteren 15 Minuten immer noch fehl, werden Sie erneut gefragt.
+- **Verschieben** sendet die zurückgehaltenen Empfänger an den Anbieter, den ReputeCast empfiehlt. Das Feld zeigt die
+  Mehrkosten, die zusätzliche Zeit bei der Rate dieses Anbieters, sein Kontingent nach der Verschiebung, das
+  Reputationsrisiko („Niedrig · SES ist aufgewärmt“) und die bestandenen Prüfungen: die Domain des Absenders dort
+  verifiziert, Kontingent nach der Verschiebung frei, aufgewärmt. Empfänger, die für einen
+  [A/B-Test](/de/campaigns/ab-testing/) oder einen Canary zurückgehalten werden, bleiben zurückgehalten, bis der Gewinner
+  oder der Canary entschieden ist. Bereits gesendete Nachrichten behalten ihr Tracking.
+- **Anteil abbrechen** überspringt die zurückgehaltenen Empfänger. Sie werden im Bericht als „nicht gesendet“ markiert
+  und können später gesendet werden.
+
+Eine Entscheidung zu einem Anteil macht nie das <UiPath path="live.pause" /> einer Person rückgängig: Hat jemand den
+ganzen Versand pausiert, bleibt er pausiert.
+
+## Keine Nachricht wird doppelt gesendet
+
+Eine Nachricht, die vorübergehend fehlschlägt, wird bis zu 10-mal erneut versucht, nach 5, 10, 20 und 40 Sekunden und
+danach alle 60 Sekunden. Jeder Versuch trägt einen Idempotenzschlüssel, und ein Aufruf beim Anbieter hat bis zu
+30 Sekunden Zeit, auch wenn der Server gerade beendet wird, damit seine Antwort festgehalten wird.
+
+Endet ein Aufruf trotzdem ohne festgehaltene Antwort (ein Absturz, eine zu spät gekommene Antwort), weiß niemand, ob der
+Anbieter seine Nachrichten übernommen hat. Nach 5 Minuten klärt ReputeCast sie:
+
+- Ein Anbieter, der eine bereits übernommene Nachricht wiedererkennt, erhält sie erneut mit demselben Schlüssel,
+  innerhalb seines Zeitfensters abzüglich 5 Minuten. SparkPost bewahrt einen Schlüssel 24 Stunden auf, Brevo
+  30 Minuten;
+- jede andere Nachricht wird zu einer der
+  [Nachrichten mit unklarem Status](/de/reference/glossary/#messages-in-doubt). Sie wird nie auf Verdacht erneut gesendet.
+
+Der Monitor zeigt sie in einem eigenen Feld mit <UiPath path="live.model.inDoubtWho" />: jeder Anbieter, wie viele
+Nachrichten, wann sie übergeben wurden und ob dieser Anbieter ein erneutes Senden erkennt und bis wann. Das Badge zeigt
+<UiPath path="live.model.inDoubtSafeBadge" /> oder <UiPath path="live.model.inDoubtTwiceBadge" />. Wählen Sie
+<UiPath path="sending.opt.resendTitle" /> oder <UiPath path="sending.opt.leaveOutTitle" />; die Empfehlung folgt dem
+Badge. Ausgelassene Nachrichten erscheinen im Bericht als „nicht gesendet, Status unklar“. Meldet der Anbieter ein
+Ereignis zu einer davon (zugestellt, Bounce oder Beschwerde), zählt sie als gesendet und verschwindet von selbst aus der
+Liste. Der Rest des Versands läuft währenddessen weiter; sobald nichts anderes mehr übrig ist, wartet der Versand auf
+diese Entscheidung.
+
+## Die Canary-Phase
+
+Ein Versand kann mit einem Canary beginnen: Die aktivsten Empfänger, standardmäßig 5 %, sowie die
+[Testpostfächer](/de/reference/glossary/#seed-mailbox) des Arbeitsbereichs erhalten die E-Mail zuerst, während alle
+anderen warten. Ein Canary läuft bei einer Zielgruppe ab 1.000 von selbst, wenn:
+
+- die Absenderdomain neu ist (ihre ersten 30 Tage) oder eine dedizierte Versand-IP noch nie für diesen Arbeitsbereich
+  gesendet hat;
+- einige Empfänger noch nie E-Mails von der Absenderdomain erhalten haben;
+- die Zielgruppe mehr als doppelt so groß ist wie üblich (der Median der letzten 8 Versände).
+
+Sie können auch unter <UiPath path="composer.reviewSend" /> <UiPath path="review.canaryOn" /> oder
+<UiPath path="review.canaryOff" /> wählen. Die Gründe und die Größen werden in den
+[Traffic-Regeln](/de/providers/traffic-rules/) festgelegt.
+
+<Screenshot
+  id="live-monitor-canary"
+  alt="Weekly Digest #142 in seiner Canary-Phase: die aktivsten 5 % der Empfänger sowie 10 Testpostfächer haben die E-Mail zuerst erhalten und werden beobachtet, während alle anderen warten; 2 von 5 Kriterien sind bestanden und keines ist durchgefallen, während Bounces, Beschwerden und die Platzierung in Testpostfächern noch Daten sammeln. Rechts: Jetzt an alle senden, 10 Minuten länger beobachten und Versand stoppen."
+/>
+
+Die Canary-Ansicht zeigt <UiPath path="live.canary.why" />, den Fortschritt mit den wartenden Empfängern,
+<UiPath path="live.canary.gates" /> und <UiPath path="live.canary.seedsTitle" />. Nach der letzten Canary-Nachricht wird
+der Canary standardmäßig 20 Minuten lang beobachtet. Dann muss jedes Kriterium mit genug Daten bestanden sein: Bounces,
+Block-/Richtlinien-Bounces, Zurückstellungen, Beschwerden je Postfachanbieter (jedes braucht dort 500 Zustellungen,
+bevor es durchfallen kann) und Testpostfächer im Spam. Sind sie bestanden, geht der Versand von selbst an alle weiter.
+Fällt ein Kriterium durch, wird der Versand zurückgehalten, und die Personen, die Kampagnen senden dürfen, werden
+gefragt, ob es weitergehen oder stoppen soll. Kriterien, die noch Daten sammeln, halten den Versand nicht zurück; sie
+werden zu seinen Schwellenwerten.
+
+Während der Canary läuft:
+
+- <UiPath path="live.canary.continueNow" /> startet den Hauptversand vor dem Ende der Beobachtung, und
+  <UiPath path="sending.opt.canaryContinueTitle" /> gibt einen Versand frei, den ein durchgefallenes Kriterium
+  zurückhält. Beides erfordert jemanden, der Versände freigeben darf, und nur ein Mensch kann es tun, nie ein
+  API-Schlüssel oder Agent.
+- <UiPath path="live.canary.watchMore" /> hält die wartenden Empfänger länger zurück.
+- <UiPath path="live.canary.stop" /> entfernt die wartenden Empfänger aus dem Versand. Die Ergebnisse des Canary bleiben
+  im Bericht.
+
+Der Canary geht an Ihre aktivsten Leser, prüft also Blockierungen, Zurückstellungen und die Platzierung im Posteingang,
+nicht, wie neue Importe reagieren werden. Deren Beschwerden werden während des Hauptversands und 72 Stunden danach
+beobachtet.
+
+## Zurückhaltung durch Warm-up
+
+Erreicht ein Anbieter [im Warm-up](/de/providers/warm-up/) das heutige Limit, wartet sein Anteil auf das Limit von
+morgen (<UiPath path="live.model.providerWarmupHeld" />), und der Rest des Versands läuft weiter. Das Banner bietet
+<UiPath path="providers.warmup.holdWait" />, eine Verschiebung zu einem aufgewärmten Anbieter, der seine Prüfungen
+besteht, oder <UiPath path="providers.warmup.holdCancel" /> an. Warten und Verschieben erfordern die Berechtigung,
+Kampagnen zu senden; das Abbrechen des Rests erfordert die Berechtigung, Versände zu pausieren. Eine Zurückhaltung durch
+Warm-up wird nie als Ausfall behandelt.
+
+## Raten während des Versands ändern
+
+<UiPath path="live.adjustRates" /> öffnet <UiPath path="live.ratesTitle" />. Senken Sie eine Rate, um einen
+Postfachanbieter für den Rest des Versands auf allen Routen zu entlasten, während die anderen ihr Tempo behalten; das
+Feld zeigt die neue Endzeit, bevor Sie die Änderung anwenden. Eine Rate beginnt bei der
+[Drosselung](/de/reference/glossary/#throttle) des Arbeitsbereichs, und die Drosselungen gelten gemeinsam für alle
+gleichzeitig laufenden Versände des Arbeitsbereichs, sodass zwei Kampagnen zusammen nie die Rate eines
+Postfachanbieters überschreiten. Die neue Rate eines zurückgehaltenen Postfachanbieters gilt, wenn er fortgesetzt wird.
+Während eines Canary sind die Raten die des Hauptversands.
+
+## Nach dem Versand: die Beschwerdeüberwachung
+
+Beschwerden treffen noch Tage nach der Zustellung ein, daher beobachtet ReputeCast sie nach dem Ende des Versands,
+standardmäßig 72 Stunden lang. Die abgeschlossene Ansicht listet für jeden Postfachanbieter, bis wann er beobachtet wird,
+oder „Nicht gemeldet“ für Gmail und iCloud. Überschreitet ein Postfachanbieter oder der gesamte Versand sein
+Beschwerdelimit bei ausreichender Datenlage, erhalten die Personen, die Versände fortsetzen dürfen, einen Alarm in der
+App und per E-Mail, und <UiPath path="live.acknowledge" /> markiert ihn als gelesen. Nichts wird pausiert: Der Versand
+ist vorbei, und der Alarm sagt, was vor dem nächsten zu prüfen ist.
+
+Mit Daten aus den Postmaster Tools über [HostRepute](/de/deliverability/hostrepute/) liest die Überwachung außerdem die
+tägliche Spamrate von Gmail für die Absenderdomain und schlägt Alarm, wenn sie das Beschwerdelimit je Postfachanbieter
+überschreitet. Gmail sagt nicht, wer die E-Mail als Spam markiert hat, daher wird dafür niemand gesperrt. Späte
+Beschwerden, die einzeln gemeldet werden, fügen den Kontakt der Sperrliste hinzu und zählen im Bericht der Kampagne.
+
+## Von Hand pausieren und fortsetzen
+
+<TableScroll label="Aktionen im Live-Monitor und wer sie ausführen darf">
+
+| Aktion                                                         | Wer darf                                  | Hinweise                                                                                                  |
+| -------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                                   | Wer Versände pausieren darf               | Alles stoppt, bis jemand fortsetzt. Wird angezeigt, während die Kampagne gesendet wird.                    |
+| <UiPath path="live.resumeSending" />, Entscheidungen zu Zurückhaltungen | Wer Kampagnen senden darf        | Auch Verschiebungen, Wiederholungen, Nachrichten mit unklarem Status, Raten und Schwellenwerte für diesen Versand. |
+| <UiPath path="live.cancelSend" />                              | Wer Kampagnen senden darf                 | Der Dialog bietet <UiPath path="live.pauseInstead" /> an, wenn Sie Versände pausieren dürfen.               |
+| Canary vorzeitig fortsetzen                                    | Wer Versände freigeben darf               | Nur Menschen, nie ein API-Schlüssel oder Agent.                                                           |
+| Den Monitor ansehen                                            | Alle, die Kampagnen sehen dürfen          |                                                                                                           |
+
+</TableScroll>
+
+Pausieren ist bewusst die geringere Berechtigung (`campaigns:pause`): Wer ein Problem bemerkt, kann einen Versand
+stoppen, und wer senden darf (`campaigns:send`), entscheidet, wie es weitergeht. Wenn Sie eine Aktion nicht ausführen
+dürfen, nennt der Monitor die Personen, die es dürfen. Inhaber, Admin und Bearbeiter dürfen pausieren und senden;
+Betrachter darf beides nicht. Siehe [Rollen und Berechtigungen](/de/team/roles-and-permissions/).
+
+## Auf dem Smartphone
+
+<Screenshot
+  id="live-monitor-mobile"
+  alt="Der Live-Monitor auf einem Smartphone: eine kurze Kopfzeile mit der Aktualität der Daten, der gesendete Anteil mit der Endzeit jeder Route, die Kacheln in zwei Spalten mit menschlichen Öffnungen getrennt von maschinellen, die Schwellenwerte und unten Pausieren mit einem Menü weiterer Aktionen."
+/>
+
+Unter 768 px erhält die Live-Ansicht ein eigenes Layout: eine kurze Kopfzeile mit der Aktualität, die Kacheln in zwei
+Spalten, kompakte Zeilen für Schwellenwerte, Postfachanbieter und Versandanbieter sowie unten Pausieren (oder
+Fortsetzen) mit einem Menü für <UiPath path="live.adjustRates" /> und <UiPath path="live.cancelSend" />. Der Canary und
+die Entscheidungsfelder haben eigene Layouts für Smartphones.
+
+### Wenn die Zahlen veralten
+
+Der Server meldet sich mindestens alle 15 Sekunden. Hört der Monitor 90 Sekunden lang nichts, puffert möglicherweise
+ein Proxy die Live-Verbindung: Der Monitor zeigt „Seit 90 s keine Aktualisierung“ und fragt stattdessen alle
+10 Sekunden ab. Bricht die Verbindung ab, verbindet er sich von selbst neu (bis zu 10 Versuche) und bietet
+<UiPath path="live.reconnectNow" /> an. Der Versand läuft auf dem Server in jedem Fall weiter. Ein Monitor, der hinter
+einem Reverse Proxy nie aktualisiert, bedeutet meist, dass der Proxy den Stream puffert; siehe
+[Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/).
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="auto-pause" />
+
+### Canary
+
+<LimitsTable area="canary" />
+
+## Wann Sie sie ändern sollten
+
+- **Standardwerte des Arbeitsbereichs** in den [Versandstandards des Arbeitsbereichs](/de/providers/workspace-defaults/)
+  legen die Schwellenwerte für Bounces und Beschwerden, das Limit für API-Fehler und
+  <UiPath path="senders.providers.pauseScope" /> fest. Die [Traffic-Regeln](/de/providers/traffic-rules/) legen die
+  Schwellenwerte nach Bounce-Typ, ihre Aktionen, die Antwortregeln, den Canary und die Beschwerdeüberwachung fest.
+- **Eine einzelne Kampagne** kann unter <UiPath path="composer.reviewSend" /> andere Schwellenwerte oder den
+  Kampagnenbereich nutzen und während des Versands <UiPath path="live.editThresholdsLive" />. Senken Sie sie für eine
+  Liste, die Sie lange nicht angeschrieben haben, oder einen neuen Anbieter; wählen Sie den Kampagnenbereich, wenn ein
+  Teilversand Leser verwirren würde, etwa bei einem zeitlich begrenzten Angebot.
+- Wer einen Schwellenwert über das hinaus anhebt, was Ihr Versandanbieter toleriert, tauscht einen pausierten Versand
+  gegen ein gesperrtes Konto. Vergleichen Sie mit den eigenen Limits des Anbieters unter
+  [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/).
+
+## Verwandte Themen
+
+- [Kampagne planen und senden](/de/campaigns/schedule-and-send/): Dort werden die Schwellenwerte je Kampagne und die
+  Canary-Auswahl festgelegt.
+- [Traffic-Regeln festlegen](/de/providers/traffic-rules/) für Schwellenwerte nach Bounce-Typ, Antwortregeln und den
+  Canary.
+- [Anbieterzustand und Ausfälle](/de/providers/health-and-outages/) behandelt zurückgehaltene Anteile im Massenversand
+  auf dem Bildschirm Versandanbieter.
+- [Kampagnenberichte lesen](/de/campaigns/reports/) zeigt die endgültigen Zahlen je Postfach- und Versandanbieter.
+- [Limits und Standardwerte](/de/reference/limits-and-defaults/) listet jeden festen Wert auf.

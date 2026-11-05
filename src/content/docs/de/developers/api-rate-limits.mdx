@@ -1,0 +1,121 @@
+---
+title: Rate-Limits
+description: "API-Rate-Limits in ReputeCast: Anfragen pro Minute je Schlüssel und Browsersitzung, Limits für Anmeldung und MCP, Senderaten, X-RateLimit-Header und 429."
+type: reference
+audience: [developer, operator]
+primaryKeyword: API-Rate-Limits
+sources:
+  - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/api/auth.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/send.go
+  - internal/revenue/conversions.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 6
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Dies sind die API-Rate-Limits einer ReputeCast-Instanz: wie viele Anfragen jeder Aufrufer stellen darf, wie der Server
+sie zählt und was er antwortet, wenn ein Aufrufer darüber liegt.
+
+## Limits
+
+<LimitsTable area="rate-limits" />
+
+- Aufrufe mit einem API-Schlüssel oder Agenten-Token werden je Schlüssel gezählt, egal von welcher Adresse sie kommen.
+  Ein angemeldeter Browser wird je Sitzung gezählt, sobald seine Anmeldung geprüft ist, und alle angemeldeten Browser
+  von einer IP-Adresse teilen sich ein höheres Limit, damit ein Team hinter einem Büronetz nicht ein einziges Budget
+  teilt. Aufrufe ohne beides werden je Client-IP-Adresse gezählt.
+- Sende- und Batch-Aufrufe für Transaktions-E-Mails zählen nicht gegen das Anfragelimit je Schlüssel; stattdessen hat
+  jeder Schlüssel seine eigene Nachrichtenrate (siehe
+  [Transaktions-E-Mails mit der API senden](/de/developers/transactional-api/)).
+- Öffentliche Seiten, Tracking-Links und Webhooks der Anbieter (`/p/`, `/t/`, `/hooks/`) liegen außerhalb dieser
+  Limits. Anmeldeformulare haben eigene Limits (siehe [Anmeldeformulare](/de/forms/signup-forms/)).
+- Jeder Serverprozess zählt für sich, außer bei den Senderaten für Transaktions-E-Mails, die alle Web-Knoten aus
+  demselben Budget nehmen. Mit mehreren Web-Knoten hinter einem Load Balancer kann ein Aufrufer die anderen Limits auf
+  jedem Knoten erreichen.
+
+## Header
+
+<TableScroll label="Header für Rate-Limits">
+
+| Header                  | Gesendet bei                                                             | Wert                                                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-RateLimit-Limit`     | Jeder Antwort unter `/api/` außer Senden und Batch für Transaktions-E-Mails | Erlaubte Anfragen pro Minute für diesen Aufrufer (bei einem angemeldeten Browser das gemeinsame Limit seiner Adresse).                          |
+| `X-RateLimit-Remaining` | Ebenso                                                                   | Verbleibende Anfragen im aktuellen Zeitfenster.                                                                                                      |
+| `X-RateLimit-Reset`     | Ebenso                                                                   | Wann das aktuelle Zeitfenster endet, in Unix-Sekunden.                                                                                               |
+| `Retry-After`           | Antworten mit `429`                                                      | Sekunden, die zu warten sind. `60` bei den Limits je Schlüssel, je Adresse, für die Anmeldung und für MCP; bei einer Browsersitzung, Transaktions-E-Mails und Conversions die Zeit, bis wieder Platz ist (mindestens 1). |
+
+</TableScroll>
+
+```http title="Antwort-Header"
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Ratelimit-Limit: 600
+X-Ratelimit-Remaining: 590
+X-Ratelimit-Reset: 1792671646
+```
+
+Bei HTTP-Headernamen spielt die Groß- und Kleinschreibung keine Rolle; lesen Sie sie, ohne davon abzuhängen.
+
+## Antworten, wenn ein Limit erreicht ist
+
+Oberhalb des Anfragelimits je Schlüssel:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Die „1,000 items“ in dieser Meldung gelten für das Hinzufügen von Sperrlisteneinträgen; die Batch-Operation für
+Transaktions-E-Mails nimmt bis zu 100 Nachrichten.
+
+Oberhalb der Nachrichtenrate eines Nur-Senden-Schlüssels (hier 50 pro Sekunde), mit `Retry-After: 1`:
+
+```json title="429 Too Many Requests"
+{
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This key sends at most 50 messages per second. Wait 1 second (Retry-After) and send again with the same idempotency key.",
+  "code": "rate_limited"
+}
+```
+
+Oberhalb des Anmeldelimits lautet das Detail „Too many sign-in attempts from your network. Wait a minute and try
+again.“ Oberhalb des Limits einer Browsersitzung lautet es „Too many requests from this session: at most 600 a minute.
+Requests resume in 12 s.“, mit denselben Sekunden in `Retry-After`; das Limit je Adresse antwortet wie das Limit je
+Schlüssel. Der MCP-Server beantwortet sein Limit mit reinem Text und `Retry-After: 60`: „Rate limit reached: 120 calls
+per minute per agent. Calls resume within a minute.“ (mit dem eigenen Limit des Agenten statt 120). Das Format der
+Problem-Dokumente finden Sie unter [API-Fehler](/de/developers/api-errors/).
+
+## Unter den Limits bleiben
+
+- Lesen Sie `X-RateLimit-Remaining` und werden Sie langsamer, bevor der Wert 0 erreicht.
+- Warten Sie bei `429` die Sekunden in `Retry-After` ab und versuchen Sie es dann erneut. Ein früherer Versuch bringt
+  nur ein weiteres `429`.
+- Verwenden Sie Batch-Operationen und die größte Seitengröße, die Sie brauchen (siehe
+  [Paginierung](/de/developers/api-pagination/)).
+- [Empfangen Sie Webhooks](/de/developers/webhooks/), statt nach Änderungen abzufragen.
+- Wiederholen Sie Sendeaufrufe für Transaktions-E-Mails mit demselben `Idempotency-Key`, damit eine Nachricht nur
+  einmal gesendet wird.
+- Geben Sie jedem Job einen eigenen Schlüssel, damit ein ausgelasteter Job nicht das Limit eines anderen aufbraucht.
+
+## Limits ändern
+
+Serverbetreiber legen die Anfragelimits in der Konfiguration fest: `http.rate_limit_api` für jeden API-Schlüssel und
+jede Browsersitzung, `http.rate_limit_ip` für alle angemeldeten Browser von einer Adresse zusammen und
+`http.rate_limit_auth` für die Anmeldung (siehe die [Konfigurationsreferenz](/de/reference/configuration/)). Wird
+`http.rate_limit_api` auf 0 gesetzt, sind alle drei aus. Läuft ReputeCast hinter einem Reverse Proxy, setzen Sie
+`http.trusted_proxies`, damit Aufrufer nach ihrer eigenen Adresse gezählt werden, nicht nach der des Proxys (siehe
+[Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)). Die Nachrichtenrate eines Nur-Senden-Schlüssels wird beim
+Erstellen des Schlüssels festgelegt, das Aufruflimit eines MCP-Agenten in den MCP-Einstellungen des Arbeitsbereichs.

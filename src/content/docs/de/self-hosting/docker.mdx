@@ -1,0 +1,318 @@
+---
+title: Mit Docker Compose installieren
+description: 'ReputeCast Docker Compose in Produktion: PostgreSQL, eine .env für Ihre öffentliche URL, das Passwort des ersten Inhabers und vertrauenswürdige Proxys.'
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast Docker Compose
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - Dockerfile
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/cli/healthcheck.go
+  - internal/config/config.go
+  - internal/server/middleware.go
+  - README.md
+  - internal/proxycheck/proxycheck.go
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Diese Anleitung installiert den Stack von ReputeCast Docker Compose, also PostgreSQL und die App, auf einem Server und
+bereitet ihn für einen Reverse Proxy vor. Für einen zehnminütigen Test auf Ihrem eigenen Rechner folgen Sie
+stattdessen dem [Schnellstart](/de/getting-started/quickstart/).
+
+## Bevor Sie beginnen
+
+- Ein Server, der die [Systemanforderungen](/de/self-hosting/requirements/) erfüllt, mit Docker Engine und dem Plugin
+  Docker Compose (`docker compose`).
+- Ein DNS-Name für ReputeCast, etwa `news.example.com`, der auf den Server zeigt.
+- Ein Reverse Proxy, der TLS beendet, oder ein Plan dafür: [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)
+  enthält Konfigurationen für Caddy, nginx und Traefik.
+
+## ReputeCast installieren
+
+<Steps>
+
+1. Legen Sie einen Ordner für ReputeCast an und laden Sie die Compose-Datei hinein:
+
+   ```sh
+   mkdir -p /opt/reputecast && cd /opt/reputecast
+   curl -fsSL https://raw.githubusercontent.com/hostrepute/reputecast/main/deploy/docker-compose.yml -o docker-compose.yml
+   ```
+
+2. Legen Sie daneben eine Datei `.env` an, mit mindestens Ihrer öffentlichen URL, der E-Mail-Adresse des ersten
+   Inhabers und einem Datenbankpasswort (siehe
+   [Produktionseinstellungen in .env](#produktionseinstellungen-in-env)).
+
+3. Starten Sie den Stack:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Compose startet PostgreSQL, wartet, bis es fehlerfrei läuft, und startet dann die App. Beim ersten Start legt die
+   App ihren geheimen Schlüssel an, wendet die Datenbankmigrationen an und legt den ersten Inhaber an.
+
+4. Lesen Sie das temporäre Passwort des ersten Inhabers aus den Protokollen:
+
+   ```sh
+   docker compose logs app | grep -A4 "ReputeCast is installed"
+   ```
+
+   ```txt title="Ausgabe"
+   app-1  |   ReputeCast is installed.
+   app-1  |
+   app-1  |   Sign in at  https://news.example.com
+   app-1  |   Email       you@company.com
+   app-1  |   Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Das Banner wird einmal ausgegeben, wenn der erste Inhaber angelegt wird.
+
+5. Stellen Sie Ihren [Reverse Proxy](/de/self-hosting/reverse-proxy/) vor Port 8080, öffnen Sie die öffentliche URL und
+   melden Sie sich an. Bei der [ersten Anmeldung](/de/self-hosting/first-run/) ersetzen Sie das temporäre Passwort,
+   fügen einen Passkey oder eine Authenticator-App hinzu, speichern Wiederherstellungscodes, bestätigen die
+   Grunddaten der Instanz und legen den ersten Arbeitsbereich an.
+
+</Steps>
+
+## Die Compose-Datei Zeile für Zeile
+
+So sieht `deploy/docker-compose.yml` in der veröffentlichten Fassung aus:
+
+```yaml title="docker-compose.yml"
+# Production-style stack: `docker compose -f deploy/docker-compose.yml up -d`
+# Set REPUTECAST_PUBLIC_URL and REPUTECAST_ADMIN_EMAIL (in .env next to this
+# file or your shell) before the first start; the first Owner's temporary
+# password is printed in the logs: docker compose logs app | grep Password
+name: reputecast
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reputecast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reputecast}
+      POSTGRES_DB: reputecast
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reputecast -d reputecast"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    # REPUTECAST_IMAGE=reputecast with REPUTECAST_VERSION=local runs an image
+    # built from a checkout (make docker VERSION=local).
+    image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${REPUTECAST_PORT:-8080}:8080"
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+      REPUTECAST_ADMIN_EMAIL: ${REPUTECAST_ADMIN_EMAIL:-admin@example.com}
+      REPUTECAST_AUTO_MIGRATE: "true"
+      REPUTECAST_AUTO_INSTALL: "true"
+      # Set when ReputeCast runs behind a reverse proxy (CIDRs or IPs):
+      # REPUTECAST_HTTP__TRUSTED_PROXIES: 172.16.0.0/12
+      # Prometheus metrics listen on port 9464 inside the container (not
+      # published). To scrape the main port instead, set a bearer token:
+      # REPUTECAST_METRICS__TOKEN: change-me-at-least-16-chars
+    volumes:
+      - appdata:/var/lib/reputecast
+    # Ready once the database answers and its schema has every migration
+    # this release needs (/readyz); a worker-only container answers on the
+    # metrics port, which `reputecast healthcheck` tries next.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 2m
+
+  # To run background workers in their own container, add --role=web,ingest
+  # to the app (command: ["serve", "--role=web,ingest"]) and uncomment:
+  # worker:
+  #   image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+  #   restart: unless-stopped
+  #   command: ["worker"]
+  #   depends_on:
+  #     app:
+  #       condition: service_healthy
+  #   environment:
+  #     REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+  #     REPUTECAST_PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+  #   volumes:
+  #     - appdata:/var/lib/reputecast
+  #   healthcheck:
+  #     test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 4
+
+volumes:
+  pgdata:
+  appdata:
+```
+
+- **Kopfkommentar.** `grep Password` gibt nur die Zeile mit dem Passwort aus; `grep -A4 "ReputeCast is installed"`
+  zeigt das ganze Banner mit der Anmeldeadresse und der E-Mail-Adresse.
+- **`name: reputecast`** legt den Projektnamen fest, egal wie der Ordner heißt. Docker nennt die Volumes
+  `reputecast_pgdata` und `reputecast_appdata` und das Netzwerk `reputecast_default`.
+- **`postgres`** betreibt PostgreSQL 18 mit einer Datenbank und einem Benutzer, die beide `reputecast` heißen.
+  `restart: unless-stopped` startet den Dienst nach einem Neustart des Servers wieder. Das Passwort stammt aus
+  `POSTGRES_PASSWORD` (Standard `reputecast`: Ändern Sie es).
+- **`pgdata:/var/lib/postgresql`** ist der Ort, an dem Images von PostgreSQL 18 ihre Daten ablegen (ältere Images
+  verwendeten `/var/lib/postgresql/data`).
+- **`healthcheck`** führt alle 5 Sekunden `pg_isready` aus, bis zu 20-mal. Mit `depends_on … condition: service_healthy`
+  wartet die App darauf.
+- **`image`** ist `ghcr.io/hostrepute/reputecast:latest`, sofern Sie nicht `REPUTECAST_IMAGE` oder
+  `REPUTECAST_VERSION` setzen. Die Image-Tags sind die Release-Tags (mit ihrem führenden `v`) und `latest`.
+- **`ports`** veröffentlicht den Port 8080 der App auf dem Host-Port aus `REPUTECAST_PORT` (Standard `8080`).
+- **`REPUTECAST_DATABASE__URL`** verweist die App mit demselben Passwort auf den Dienst `postgres`.
+- **`REPUTECAST_PUBLIC_URL`** kommt unverändert aus `.env` und setzt `http.public_url`. ReputeCast verwendet sie für die
+  Webhooks der Versandanbieter, SSO-Weiterleitungen, Passkeys, öffentliche Seiten und jeden Link in E-Mails. Mit dem
+  Standard `http://localhost:8080` funktioniert davon außerhalb des Servers nichts. Compose-Dateien von vor 1.2.0
+  übergeben sie als `REPUTECAST_HTTP__PUBLIC_URL`, ihrem früheren Namen, der weiterhin funktioniert, wenn
+  `REPUTECAST_PUBLIC_URL` nicht gesetzt ist.
+- **`REPUTECAST_ADMIN_EMAIL`** ist die E-Mail-Adresse des ersten Inhabers und wird nur verwendet, solange die Datenbank
+  keine Benutzer hat.
+- **`REPUTECAST_AUTO_MIGRATE`** und **`REPUTECAST_AUTO_INSTALL`** schalten die Migrationen beim Start und das Anlegen
+  des ersten Inhabers ein. Der Befehl des Images, `serve --auto-migrate --auto-install`, übergibt beide Flags bereits.
+- **`REPUTECAST_HTTP__TRUSTED_PROXIES`** ist auskommentiert; siehe
+  [Vertrauenswürdige Proxys](#vertrauenswürdige-proxys).
+- **`REPUTECAST_METRICS__TOKEN`** ist auskommentiert. Die Prometheus-Metriken lauschen im Container auf Port 9464, den
+  die Datei nicht veröffentlicht; siehe [Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/).
+- **`appdata:/var/lib/reputecast`** enthält den geheimen Schlüssel (`secret.key`) und hochgeladene Dateien (`files/`).
+  Das Image verweist `REPUTECAST_SECRETS__KEY_FILE` dorthin, protokolliert als JSON (`REPUTECAST_LOG__FORMAT=json`) und
+  läuft als Benutzer `nonroot` (UID 65532).
+- **Der `healthcheck` der App** führt alle 15 Sekunden `reputecast healthcheck` aus, dieselbe Prüfung, die das Image
+  deklariert. Der Container wird `healthy`, sobald `/readyz` antwortet: PostgreSQL ist erreichbar und jede Migration
+  ist angewendet. In den ersten 2 Minuten zählt er keine Fehlschläge, damit die Migrationen beim Start Zeit haben;
+  danach markieren ihn 4 Fehlschläge in Folge als `unhealthy`.
+- **`worker`** ist auskommentiert. Entfernen Sie die Kommentarzeichen, zusammen mit
+  `command: ["serve", "--role=web,ingest"]` bei `app`, um die Hintergrundjobs in einem eigenen Container auszuführen
+  ([Mit den Rollen web, ingest und worker skalieren](/de/self-hosting/scaling/)).
+
+## Produktionseinstellungen in .env
+
+Compose liest `.env` aus dem Projektordner, um die Platzhalter `${…}` in der Datei zu füllen:
+
+```sh title=".env"
+# The address people and sending providers use, without a trailing slash.
+REPUTECAST_PUBLIC_URL=https://news.example.com
+# The first Owner (used only on the first start).
+REPUTECAST_ADMIN_EMAIL=you@company.com
+# Database password: letters and digits only, because it is part of a URL.
+POSTGRES_PASSWORD=replace-with-the-output-of-openssl-rand-hex-24
+# Listen on the loopback interface only, for a reverse proxy on this server.
+REPUTECAST_PORT=127.0.0.1:8080
+# Pin the release you run instead of latest.
+REPUTECAST_VERSION=v1.4.2
+```
+
+- Erzeugen Sie das Datenbankpasswort mit `openssl rand -hex 24`. Setzen Sie es vor dem ersten Start: Das
+  PostgreSQL-Image übernimmt `POSTGRES_PASSWORD` nur, wenn es ein leeres Daten-Volume anlegt
+  ([Dokumentation des postgres-Images](https://hub.docker.com/_/postgres), geprüft im Oktober 2026).
+- `REPUTECAST_PORT=127.0.0.1:8080` veröffentlicht `127.0.0.1:8080:8080`, sodass nur ein Proxy auf demselben Server die
+  App erreicht. Lassen Sie den Wert weg, wenn der Proxy als weiterer Dienst in diesem Compose-Projekt läuft.
+- `.env` füllt nur die Platzhalter. Eine Variable, die die Compose-Datei nicht erwähnt, etwa `REPUTECAST_LOG__LEVEL`,
+  erreicht den Container aus `.env` nie. Tragen Sie solche Variablen stattdessen in `docker-compose.override.yml` ein.
+
+### Weitere Einstellungen in docker-compose.override.yml
+
+Compose führt eine `docker-compose.override.yml` im selben Ordner automatisch mit `docker-compose.yml` zusammen
+([Regeln für das Zusammenführen](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/), geprüft im
+Oktober 2026). Wenn Sie Ihre Änderungen dort ablegen, können Sie `docker-compose.yml` durch eine neuere Fassung
+ersetzen, ohne sie erneut zu bearbeiten:
+
+```yaml title="docker-compose.override.yml"
+services:
+  app:
+    environment:
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+      REPUTECAST_DNS__SERVERS: 10.0.0.53:53
+```
+
+Jede Einstellung hat eine Umgebungsvariable: siehe die [Konfigurationsreferenz](/de/reference/configuration/) und
+[ReputeCast konfigurieren](/de/self-hosting/configuration/).
+
+## Vertrauenswürdige Proxys
+
+ReputeCast verwendet die IP-Adresse des Clients für die Ratenlimits bei der Anmeldung, Anmeldesperren, Sitzungen und
+das Audit-Protokoll. Hinter einem Proxy kommt jede Anfrage vom Proxy, daher liest ReputeCast `X-Forwarded-For` (oder
+`X-Real-IP`), aber nur von Adressen in `http.trusted_proxies`. Von allen anderen wird der Header ignoriert, sodass er
+sich nicht fälschen lässt. Solange der Proxy nicht eingetragen ist, scheinen auch Öffnungen und Klicks von einer
+einzigen Adresse zu kommen, und der Bot-Filter kann die Empfänger nicht auseinanderhalten; ReputeCast bemerkt eine private
+Adresse, die immer wieder Anfragen weiterleitet, und sendet den Instanz-Admins eine Benachrichtigung, die sie nennt.
+
+<Steps>
+
+1. Ermitteln Sie das Subnetz des Projektnetzwerks:
+
+   ```sh
+   docker network inspect reputecast_default --format '{{(index .IPAM.Config 0).Subnet}}'
+   ```
+
+   Ein Proxy, der als Container in diesem Netzwerk läuft, verbindet sich von einer Adresse darin. Ein Proxy auf dem
+   Server selbst erreicht den veröffentlichten Port über das Gateway von Docker, das im selben Subnetz liegt.
+
+2. Setzen Sie es in `docker-compose.override.yml` als `REPUTECAST_HTTP__TRUSTED_PROXIES` (mehrere Werte trennen Sie
+   durch Kommas, etwa `172.18.0.0/16,10.0.0.5`).
+
+3. Übernehmen Sie die Änderung mit `docker compose up -d`.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- `docker compose ps` zeigt `postgres` und `app` als `healthy`.
+- `curl http://127.0.0.1:8080/readyz` antwortet `ready` (sonst 503 mit dem Grund, etwa `database unavailable`).
+- `docker compose exec app /usr/local/bin/reputecast migrate status` listet keine Migration als `pending`.
+- Die öffentliche URL öffnet über Ihren Proxy die Anmeldeseite von ReputeCast.
+
+## Fehlerbehebung
+
+- **Das Banner zeigt `Sign in at http://localhost:8080`**: `REPUTECAST_PUBLIC_URL` wurde nicht gesetzt. Tragen Sie die
+  Variable in `.env` ein und führen Sie `docker compose up -d` aus; Sie können die öffentliche URL auch bei der ersten
+  Anmeldung im Schritt <UiPath path="setup.instanceBasics" /> korrigieren.
+- **`grep` findet kein Banner**: Die Datenbank hatte bereits Benutzer, zum Beispiel weil das Volume
+  `reputecast_pgdata` von einer früheren Installation stammt. Setzen Sie das Passwort des Inhabers stattdessen auf dem
+  Server zurück:
+  `docker compose exec app /usr/local/bin/reputecast user reset-password --email you@company.com`
+  ([Zugriff wiederherstellen](/de/self-hosting/account-recovery/)).
+- **Der App-Container stoppt mit `Error: owner email: missing (pass --email or set REPUTECAST_ADMIN_EMAIL)`**: Die
+  Datenbank ist leer, und keine E-Mail-Adresse für den Inhaber hat den Container erreicht. Setzen Sie
+  `REPUTECAST_ADMIN_EMAIL` und starten Sie ihn erneut.
+- **Die App kann sich nicht mit PostgreSQL verbinden, nachdem Sie `POSTGRES_PASSWORD` geändert haben**: Das Volume hat
+  noch das alte Passwort. Setzen Sie den alten Wert zurück oder ändern Sie das Passwort des Benutzers in PostgreSQL
+  passend dazu (`docker compose exec postgres psql -U reputecast -c "ALTER USER reputecast PASSWORD '…'"`).
+- **`Bind for 0.0.0.0:8080 failed: port is already allocated`**: Ein anderer Dienst belegt Port 8080. Setzen Sie
+  `REPUTECAST_PORT` auf einen freien Port und richten Sie den Proxy darauf aus.
+- **Jede Person erscheint in Sitzungen und im Audit-Protokoll mit der Adresse des Proxys**: Legen Sie
+  [vertrauenswürdige Proxys](#vertrauenswürdige-proxys) fest.
+
+<Aside type="caution">
+  `docker compose down -v` löscht die Volumes `reputecast_pgdata` und `reputecast_appdata`: die Datenbank und den
+  geheimen Schlüssel. [Sichern Sie sie](/de/self-hosting/backups/) vorher.
+</Aside>
+
+## Verwandte Themen
+
+- [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)
+- [Erste Anmeldung und Einrichtung der Instanz](/de/self-hosting/first-run/)
+- [Sichern und wiederherstellen](/de/self-hosting/backups/) und [ReputeCast aktualisieren](/de/self-hosting/upgrades/)
+- [Binärdatei installieren](/de/self-hosting/binary/), um ReputeCast ohne Docker zu betreiben
+- [Auf einer Hosting-Plattform bereitstellen](/de/deploy/overview/): Coolify, Dokploy, Easypanel, CapRover, Railway
+  oder Render

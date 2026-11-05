@@ -1,0 +1,227 @@
+---
+title: Fehlerbehebung
+description: 'ReputeCast Fehlerbehebung für Serverbetreiber: jedes Symptom mit Ursache und Lösung, vom fehlenden ersten Passwort bis zu stummen Webhooks und Live-Monitoren.'
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast Fehlerbehebung
+sources:
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/app/app.go
+  - internal/app/schema.go
+  - internal/app/metrics.go
+  - internal/cli/doctor.go
+  - internal/accounts/service.go
+  - internal/accounts/reset.go
+  - internal/config/config.go
+  - internal/segments/sqlmode.go
+  - internal/dnscheck/dnsbl.go
+  - internal/dnscheck/resolver.go
+  - internal/netguard/netguard.go
+  - internal/connect/connection.go
+  - internal/sending/engine/api.go
+  - internal/linktoken/linktoken.go
+  - deploy/docker-compose.yml
+  - internal/providers/manage/health.go
+  - web/src/features/live/useLiveSend.ts
+sidebar:
+  order: 17
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Diese Seite zur ReputeCast Fehlerbehebung listet auf, was auf einer selbst gehosteten Instanz am häufigsten schiefgeht,
+warum, und wie Sie es beheben. Jeder Eintrag beginnt mit dem, was Sie sehen.
+
+## Bevor Sie beginnen
+
+<Steps>
+
+1. Lesen Sie die Protokolle der App. Mit Docker Compose: `docker compose logs app --since 1h`. Mit der Binärdatei unter
+   systemd: `journalctl -u reputecast --since "1 hour ago"`.
+
+2. Prüfen Sie den Prozess: `curl -s http://localhost:8080/readyz` antwortet `ready`, wenn ReputeCast PostgreSQL
+   erreicht, sein Schema aktuell ist und seine Worker laufen, und sonst `503` mit dem Grund
+   ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)).
+
+3. Prüfen Sie die Datenbank, das Schema, den geheimen Schlüssel, den Dateiordner und die Rolle für SQL-Segmente:
+   `docker compose exec app /usr/local/bin/reputecast doctor` (oder `reputecast doctor`) gibt eine Zeile pro Prüfung
+   aus.
+
+4. Für mehr Details starten Sie mit `REPUTECAST_LOG__LEVEL=debug` neu und setzen den Wert danach zurück.
+
+</Steps>
+
+## Installation und Start
+
+### Das temporäre Passwort steht nicht in den Protokollen
+
+Der erste Inhaber und sein temporäres Passwort werden nur beim ersten Start gegen eine leere Datenbank angelegt.
+Führen Sie aus:
+
+```sh
+docker compose logs app | grep -A4 "ReputeCast is installed"
+```
+
+- **Nichts gefunden, und das Datenbank-Volume existierte schon vorher:** Es gibt bereits Benutzer, daher wurde nichts
+  angelegt. Verwenden Sie das Konto, das Sie damals angelegt haben, oder setzen Sie vom Server aus ein neues Passwort
+  dafür (siehe unten).
+- **Nichts gefunden, und der Container wurde neu erstellt:** `docker compose logs` zeigt nur die Protokolle des
+  aktuellen Containers. Setzen Sie vom Server aus ein neues Passwort.
+- **Sie kennen die E-Mail-Adresse des Inhabers nicht:** Ohne `REPUTECAST_ADMIN_EMAIL` verwendet die mitgelieferte
+  Compose-Datei `admin@example.com`.
+
+So setzen Sie ein Passwort vom Server aus:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email admin@example.com --password 'a long passphrase here'
+```
+
+Siehe [Zugriff über die Kommandozeile wiederherstellen](/de/self-hosting/account-recovery/).
+
+### Der App-Container startet immer wieder neu
+
+Lesen Sie die letzten Zeilen von `docker compose logs app`. Der Start bricht mit `Error: …` ab:
+
+- `Error: previous secret key: key must be 32 bytes, got 0`: `REPUTECAST_SECRETS__PREVIOUS_KEYS` ist gesetzt, aber
+  leer. Entfernen Sie die Variable.
+- `Error: secret key: key must be 32 bytes, got …` oder `key must be base64-encoded`: Der Schlüssel in
+  `REPUTECAST_SECRETS__KEY` oder in der Schlüsseldatei ist kein Base64-kodierter 32-Byte-Schlüssel. Verwenden Sie den
+  Wert, den `reputecast secrets generate-key` ausgegeben hat, unverändert.
+- `Error: owner email: … (pass --email or set REPUTECAST_ADMIN_EMAIL)`: Die Datenbank ist leer, und die E-Mail-Adresse
+  des ersten Inhabers fehlt oder ist keine gültige Adresse.
+- `Error: migrate: …`: Eine Migration ist fehlgeschlagen. Stellen Sie die vor dem Upgrade erstellte Sicherung wieder
+  her und melden Sie den Fehler mit der Version ([ReputeCast aktualisieren](/de/self-hosting/upgrades/)).
+
+### Die App ist während eines Upgrades schreibgeschützt
+
+Die App zeigt das Banner <UiPath path="shell.bannerMaintenance" />, Bearbeitungen und Versände antworten mit `503` und
+dem Code `maintenance`, und `/readyz` antwortet
+``database schema behind this release: run `reputecast migrate up` ``. Die Binärdatei ist neuer als das
+Datenbankschema, und kein Prozess hat die Migrationen angewendet. Führen Sie `reputecast migrate up` einmal mit der
+Umgebung des Servers aus oder starten Sie einen Prozess mit `--auto-migrate`: Jeder Prozess macht innerhalb von
+Sekunden weiter, ohne Neustart
+([solange Migrationen ausstehen](/de/self-hosting/upgrades/#solange-migrationen-ausstehen)).
+
+### Prometheus erhält `404` von `/metrics`
+
+Seit 1.3.0 hat `/metrics` einen eigenen Listener auf Port 9464, und der Hauptport antwortet mit `404`, sofern
+`metrics.token` nicht gesetzt ist. Richten Sie Prometheus auf Port 9464 aus (die Compose-Datei veröffentlicht ihn
+nicht: Betreiben Sie Prometheus im selben Docker-Netzwerk), oder setzen Sie `metrics.token` und senden Sie es als
+Bearer-Token ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)).
+
+### `/readyz` antwortet `503 database unavailable`
+
+ReputeCast erreicht PostgreSQL nicht innerhalb von 2 Sekunden. Prüfen Sie, ob die Datenbank läuft, ob
+`REPUTECAST_DATABASE__URL` auf sie zeigt und ob `database.max_conns` je Prozess mal der Anzahl der Prozesse unter
+`max_connections` von PostgreSQL bleibt ([PostgreSQL](/de/self-hosting/postgres/)).
+
+## Anmeldung
+
+### Die Anmeldung über `http://` führt zurück zur Anmeldeseite
+
+Außerhalb der Entwicklung ist das Sitzungscookie als `Secure` markiert, und Browser behalten `Secure`-Cookies nicht,
+die eine reine `http://`-Website setzt, außer auf `localhost`
+([MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie), geprüft im
+Oktober 2026). Stellen Sie ReputeCast hinter TLS und setzen Sie `http.public_url` auf die `https://`-Adresse
+([Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)). Nur für einen kurzen Test in einem privaten Netzwerk können
+Sie `REPUTECAST_AUTH__COOKIE_SECURE=false` setzen.
+
+### „Die Anmeldung ist nach zu vielen Versuchen gesperrt“
+
+Zu viele falsche Passwörter für diese E-Mail-Adresse. Heben Sie die Sperre unter
+<UiPath path="shell.userMenuInstanceAdmin > admin.users" /> auf, setzen Sie über einen Link zum Zurücksetzen ein neues
+Passwort oder warten Sie, bis die Sperre endet (standardmäßig 15 Minuten). `reputecast user unlock` hebt diese Sperre
+in der aktuellen Version nicht auf. Siehe
+[Anmeldesperre aufheben](/de/self-hosting/account-recovery/#anmeldesperre-aufheben).
+
+### Codes der Authenticator-App schlagen mit `secrets: cannot decrypt value` fehl
+
+Der geheime Schlüssel passt nicht zur Datenbank, meist nach einer Wiederherstellung ohne den Schlüssel oder nachdem
+die Schlüsseldatei verloren ging. Legen Sie den ursprünglichen Schlüssel zurück. Ist er weg, siehe
+[Sichern und wiederherstellen](/de/self-hosting/backups/): Personen melden sich mit einem Wiederherstellungscode oder
+Passkey an, und ein Admin setzt ihre Authenticator-App zurück.
+
+### E-Mails zum Zurücksetzen des Passworts kommen nie an
+
+E-Mails zum Zurücksetzen gehen über den Stream System hinaus. Solange kein Versandanbieter ihn bedient, zeigt die App
+stattdessen den auszuführenden Befehl: `reputecast user reset-password --email <address>` gibt den Link auf dem Server
+aus.
+
+## Versandanbieter und Webhooks
+
+### Webhooks der Anbieter kommen nie an
+
+Zustellereignisse bleiben leer, und ein Versandanbieter zeigt unter <UiPath path="nav.providers" /> „Beeinträchtigt ·
+Webhooks stumm“. Das geschieht nach 6 Stunden ohne Ereignis, während mindestens 10 Nachrichten, die vor mehr als
+30 Minuten gesendet wurden, keines haben, oder, bei einem Anbieter, der noch nie ein Ereignis gemeldet hat, sobald eine
+Nachricht 30 Minuten überfällig ist. Anbieter senden Ereignisse an `<public URL>/hooks/…`, daher gilt:
+
+- Die öffentliche URL muss aus dem Internet erreichbar sein. Führen Sie <UiPath path="admin.publicUrlCheck" /> unter
+  <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> aus: Die Zeile zur Erreichbarkeit muss bestehen. Eine
+  URL wie `http://localhost:8080` kann keine Webhooks empfangen.
+- Ihr Reverse Proxy muss Pfade unter `/hooks/` unverändert an ReputeCast weiterleiten.
+- Wenn Sie Rollen aufteilen, muss hinter dieser Adresse mindestens ein Prozess die Rolle `ingest` ausführen
+  ([Mit den Rollen web, ingest und worker skalieren](/de/self-hosting/scaling/)).
+- Bei Amazon SES können Sie Ereignisse stattdessen an eine SQS-Queue liefern lassen, die ReputeCast abfragt; das braucht
+  keine öffentliche URL und funktioniert hinter NAT ([Amazon SES verbinden](/de/providers/amazon-ses/)).
+
+Nach einer Änderung der öffentlichen URL erhalten die Anbieter, die das unterstützen, die neue Webhook-Adresse
+automatisch; die Seite listet die übrigen auf, bei denen Sie sie selbst eintragen. Siehe
+[Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/).
+
+### Anfragen an private Adressen werden abgelehnt
+
+ReputeCast lehnt ausgehende Anfragen an private und Loopback-Adressen ab, zum Beispiel
+`address not allowed: 10.0.0.5 is a private or loopback address`. Für einen Postal-Server, einen SMTP-Server oder einen
+anderen Dienst in Ihrem eigenen Netzwerk setzen Sie `providers.allow_private_networks: true`; für Webhook-Endpunkte,
+n8n und den Audit-Stream setzen Sie `webhooks.allow_private_networks: true`. Link-Local- und Cloud-Metadatenadressen
+bleiben gesperrt. Siehe [Sicherheit und Härtung](/de/self-hosting/security/#private-netzwerke).
+
+## Der Live-Monitor aktualisiert sich nie
+
+Der Live-Monitor eines laufenden Versands meldet, dass er seit einer Weile keine Aktualisierung erhalten hat und nur
+noch alle 10 Sekunden prüft. Er liest einen Server-Sent-Event-Stream unter
+`/api/v1/workspaces/<workspace>/campaigns/<campaign>/live/stream`, der alle 15 Sekunden einen Heartbeat sendet; nach
+90 Sekunden ohne Heartbeat fragt der Monitor die Zahlen stattdessen alle 10 Sekunden ab. Der Versand läuft in jedem
+Fall weiter. Ein Proxy, der Antworten puffert, hält die Ereignisse zurück. Schalten Sie das Puffern für diesen Pfad
+ab, wie unter [Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/) gezeigt.
+
+## SQL-Segmente sind deaktiviert
+
+Beim Erstellen eines SQL-Segments erscheint „SQL-Segmente sind in dieser Datenbank deaktiviert.“ Die PostgreSQL-Rolle
+`reputecast_segments` fehlt, oder der Datenbankbenutzer der App ist nicht Mitglied darin, typischerweise bei
+verwaltetem PostgreSQL, wo der Benutzer keine Rollen anlegen kann. Folgen Sie
+[den Schritten für SQL-Segmente](/de/self-hosting/postgres/#sql-segmente): Bei einer Datenbank, die migriert wurde,
+bevor die Rolle existierte, führen Sie nach dem Anlegen `reputecast migrate segments-role` aus.
+
+## Blocklisten-Prüfungen schlagen fehl
+
+Blocklisten-Ergebnisse für Spamhaus oder URIBL melden einen Fehler wie `Spamhaus answered 127.255.255.254 (use your own
+resolver, not a public one)` oder `the list refused queries from this resolver`. Diese Listen lehnen Abfragen ab, die
+über öffentliche Resolver kommen (1.1.1.1, 8.8.8.8). Richten Sie `dns.servers` auf Ihren eigenen rekursiven Resolver
+aus, zum Beispiel `REPUTECAST_DNS__SERVERS=10.0.0.53`. Siehe
+[Blocklisten-Einträge prüfen und beheben](/de/deliverability/blocklists/).
+
+## Links in gesendeten E-Mails funktionieren nicht mehr
+
+Abmelde-, Einstellungs- und Tracking-Links in früher gesendeten E-Mails führen zu einem Fehler. Die Links sind mit
+einem aus dem geheimen Schlüssel abgeleiteten Schlüssel signiert, und Links, die mit einem Schlüssel aus
+`secrets.previous_keys` signiert sind, funktionieren weiter. Sie gehen kaputt, wenn der Schlüssel, mit dem sie signiert
+wurden, weg ist: eine Wiederherstellung ohne den ursprünglichen Schlüssel oder ein nach einer Rotation entfernter
+vorheriger Schlüssel. Neue E-Mails funktionieren. Legen Sie den alten Schlüssel wieder in `secrets.previous_keys`, wenn
+Sie ihn noch haben ([Schlüssel rotieren](/de/self-hosting/security/#schlüssel-rotieren)).
+
+<Aside type="tip">
+  Kommen Sie nicht weiter? Suchen oder eröffnen Sie ein Issue unter
+  [github.com/hostrepute/reputecast](https://github.com/hostrepute/reputecast/issues), mit der Version
+  (`reputecast version`) und den Protokollzeilen rund um das Problem. Sicherheitsprobleme melden Sie stattdessen an
+  security@hostrepute.com.
+</Aside>
+
+## Verwandte Themen
+
+- [Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)
+- [Zugriff über die Kommandozeile wiederherstellen](/de/self-hosting/account-recovery/)
+- [Konfigurationsreferenz](/de/reference/configuration/)

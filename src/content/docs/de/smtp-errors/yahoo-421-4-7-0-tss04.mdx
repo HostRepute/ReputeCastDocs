@@ -1,0 +1,145 @@
+---
+title: 'Yahoo 421 4.7.0 [TSS04]: vorübergehend zurückgestellt'
+description: Yahoo TSS04 (421 4.7.0) bedeutet, dass Yahoo Ihre Nachrichten wegen Beschwerden, Inhalt, IP-Reputation oder Traffic zurückstellt. So senden Sie wieder normal.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Yahoo TSS04
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
+  - internal/sending/engine/analysis.go
+  - internal/ingest/normalize.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+sidebar:
+  label: Yahoo 421 4.7.0 TSS04
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Yahoo TSS04 ist eine vorübergehende Zurückstellung: Die Server von Yahoo antworten mit `421 4.7.0` und dem Tag
+`[TSS04]`, wenn sie vorerst weniger E-Mails von Ihnen wollen, meist wegen Beschwerden von Yahoo-Nutzern oder eines
+plötzlichen Volumenanstiegs. Ihr Versandanbieter versucht es später erneut. Diese Seite erklärt, worauf Yahoo achtet und
+wie Sie die Zurückstellungen senken.
+
+## Was Yahoo damit meint
+
+Die Server von Yahoo antworten mit einer Zeile wie dieser:
+
+```text title="SMTP reply"
+421 4.7.0 [TSS04] Messages from 203.0.113.25 temporarily deferred due to unexpected volume or user complaints - 4.16.55.1; see https://postmaster.yahooinc.com/error-codes
+```
+
+Der Sender Hub von Yahoo beschreibt diese „TS“-Fehler als vorübergehend zurückgestellte Nachrichten:
+
+> This is a temporary error and your mail server may automatically re-try sending the email at a later time. Your message
+> may have been deferred due to one or more of the following:
+>
+> - Emails from your mail server are generating substantial complaints from Yahoo users.
+> - The message contained objectionable content or exhibited characteristics indicative of spam.
+> - The IP (`x.x.x.x` or its subnet, i.e., .255 ) has a poor reputation.
+> - We are seeing unusual traffic patterns from your mail servers.
+
+Das heißt: Der Fehler ist vorübergehend, und Ihr Mailserver kann den Versand später automatisch erneut versuchen. Die
+Nachricht wurde aus einem oder mehreren dieser Gründe zurückgestellt: E-Mails Ihres Mailservers lösen viele Beschwerden
+von Yahoo-Nutzern aus, die Nachricht enthielt anstößige Inhalte oder typische Spam-Merkmale, die IP (oder ihr Subnetz)
+hat eine schlechte Reputation, oder Yahoo sieht ungewöhnliche Traffic-Muster von Ihren Mailservern.
+
+Quelle: [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yahoo Sender Hub. Geprüft im Oktober 2026.
+
+## Warum es passiert
+
+- Yahoo-Nutzer markieren Ihre E-Mails als Spam. Yahoo bittet jeden Absender, die Spamrate unter 0,3 % zu halten
+  ([Sender Requirements & Recommendations](https://senders.yahooinc.com/best-practices/), geprüft im Oktober 2026).
+- Das Volumen springt, zum Beispiel bei der ersten großen Kampagne von einer neuen IP-Adresse oder einem neuen
+  Versandanbieter.
+- Die sendende IP-Adresse oder ihr Bereich hat eine schlechte Reputation.
+- Der Inhalt sieht nach Spam aus.
+
+## Wie ReputeCast den Code einordnet
+
+- Solange der Versandanbieter es erneut versucht, ist jeder abgelehnte Versuch eine
+  [Zurückstellung](/de/reference/glossary/#deferral): ein Ereignis <UiPath path="providers.events.optionDeferred" /> im
+  Ereignisprotokoll. Zurückstellungen erscheinen nicht in der Bounce-Tabelle des Kampagnenberichts.
+- Jeder Arbeitsbereich startet mit einer [Antwortregel](/de/reference/glossary/#reply-rule) für diesen Code: Wenn
+  innerhalb von 10 Minuten 10 Antworten von Yahoo `TSS04` enthalten, pausiert ReputeCast Yahoo auf jeder Route für
+  2 Stunden, noch vor jedem Ratenschwellenwert. Eine zweite Standardregel tut dasselbe für das ältere `TS04`. Der Rest
+  des Versands läuft weiter, und Yahoo wird nach den 2 Stunden von selbst fortgesetzt. Sie ändern oder deaktivieren die
+  Regeln in den [Traffic-Regeln](/de/providers/traffic-rules/).
+- Zurückstellungen und Soft Bounces zählen außerdem zu den Zurückstellungs-Schwellenwerten von Yahoo, jede Nachricht
+  einmal, über die letzten 10 Minuten. Bei 15 % der an Yahoo gesendeten E-Mails drosselt ReputeCast Yahoo auf die halbe
+  Rate; bei 40 % [pausiert](/de/reference/glossary/#auto-pause) es den Yahoo-Anteil der Kampagne automatisch, oder die
+  ganze Kampagne, wenn der Pausierungsbereich auf die Kampagne gesetzt ist. Jede Stufe wartet auf 500 Nachrichten an
+  Yahoo in diesem Zeitraum und mindestens 5 Zurückstellungen.
+- Gibt der Versandanbieter die Versuche auf, ist die [Bounce-Klasse](/de/reference/glossary/#bounce-class)
+  wegen des Tags `TSS04` `reputation`, und die Zeile im Bericht ist <UiPath path="reports.bounceType.blocked" />. Eine
+  Blockierung wegen der Reputation des Absenders sperrt die Adresse nie, auch wenn der Versandanbieter sie als dauerhaft
+  einstuft (siehe [Wann ReputeCast eine Adresse sperrt](/de/smtp-errors/#wann-reputecast-eine-adresse-sperrt)).
+- Gibt ein Versandanbieter nur `421 4.7.0` ohne das Tag weiter, ist die Klasse `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+## Bevor Sie beginnen
+
+- `providers:view`, um das Ereignisprotokoll zu lesen.
+- `providers:manage`, um die Drosselung unter <UiPath path="nav.settings > settings.providers" /> und die
+  Antwortregeln unter <UiPath path="nav.providers > providers.tabTraffic" /> zu ändern.
+- `campaigns:send`, um einen automatisch pausierten Versand fortzusetzen oder seine Raten zu ändern.
+
+## Zurückstellungen senken
+
+<Steps>
+
+1. Bestätigen Sie den Code. Öffnen Sie <UiPath path="nav.providers > providers.tabEvents" />, setzen Sie
+   <UiPath path="providers.events.typeFilter" /> auf <UiPath path="providers.events.optionDeferred" /> und suchen Sie
+   nach einem Yahoo-Empfänger. <UiPath path="providers.events.colCode" /> zeigt das Tag `[TSS04]` und die IP-Adresse,
+   die Yahoo zurückgestellt hat.
+2. Senden Sie langsamer an Yahoo. Standardmäßig drosselt ReputeCast Yahoo auf jeder Route auf 4 Nachrichten pro
+   Sekunde; senken Sie den Wert unter
+   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />. Senken Sie während eines
+   Versands die Rate für Yahoo mit <UiPath path="live.adjustRates" /> im [Live-Monitor](/de/campaigns/live-monitor/).
+   Nach einer Auto-Pause empfiehlt der Live-Monitor eine niedrigere Rate für den Yahoo-Anteil; setzen Sie mit dieser
+   Änderung fort.
+3. Senken Sie die Beschwerden. Senden Sie nur an Kontakte, die Ihre E-Mails angefordert haben, schließen Sie die aus,
+   die nicht mehr öffnen ([Die Liste gesund halten](/de/audience/list-health/)), und halten Sie die
+   [Abmeldung mit einem Klick](/de/deliverability/one-click-unsubscribe/) funktionsfähig, damit Leser sich abmelden,
+   statt Spam zu melden.
+4. Ist die IP-Adresse oder der Versandanbieter neu, folgen Sie einem [Warm-up-Plan](/de/providers/warm-up/).
+5. Halten die Zurückstellungen lange an, empfiehlt der Sender Hub von Yahoo einen
+   [Sender Support Request](https://senders.yahooinc.com/contact/#sender-support-request) mit den Fehler- und
+   Diagnosecodes aus Ihren Protokollen. Der CSV-Export des Ereignisprotokolls enthält sie.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Die Zurückstellungsrate für Yahoo im Live-Monitor bleibt beim nächsten Versand niedrig, und seine Zeile
+  <UiPath path="live.model.thresholdReplies" /> zeigt die Regel `TSS04` deutlich unter ihrer Anzahl.
+- Das Ereignisprotokoll zeigt für Yahoo-Empfänger Zustellereignisse statt neuer Zurückstellungen mit `[TSS04]`.
+
+## Fehlerbehebung
+
+- **Der Versand pausiert immer wieder bei Yahoo.** Wenn die Regel `TSS04` ihn pausiert hat, lassen Sie Yahoo nach
+  2 Stunden von selbst fortsetzen, oder setzen Sie mit niedrigerer Rate über <UiPath path="live.adjustRates" /> fort.
+  Senken Sie die Drosselung für Yahoo bei künftigen Versänden.
+- **Die Beschwerden bei Yahoo sind hoch.** Lesen Sie
+  [Bounces, Beschwerden und Anbieterlimits](/de/deliverability/bounces-and-complaints/); standardmäßig pausiert ein
+  laufender Versand Yahoo automatisch, wenn dessen Beschwerderate 0,10 % überschreitet.
+- **Sie senden von einer gemeinsam genutzten IP-Adresse.** Der Sender Hub von Yahoo weist darauf hin, dass bei einer
+  gemeinsam genutzten IP-Adresse E-Mails anderer Domains Ihrer IP-Reputation schaden können, und empfiehlt, Ihren
+  Anbieter nach dedizierten IP-Adressen zu fragen. Eine neue dedizierte IP-Adresse braucht einen Warm-up-Plan.
+
+## Verwandte Themen
+
+- [SMTP-Fehlercodes](/de/smtp-errors/)
+- [Gmail 421 4.7.28](/de/smtp-errors/gmail-421-4-7-28/), die vorübergehende Ratenbegrenzung von Gmail
+- [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)
+- [Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/)

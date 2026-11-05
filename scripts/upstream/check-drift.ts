@@ -9,11 +9,12 @@ import { join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 import { diffIds } from './lib/diff.ts'
-import { changedSources, hasCompleteVietnamese } from './lib/pages.ts'
+import { changedSources, hasCompleteTranslation } from './lib/pages.ts'
 import type { Catalog } from './lib/types.ts'
-import { checkUiLabelsAt } from './lib/ui-labels.ts'
+import { LANGUAGE_IN_ENGLISH, checkUiLabelsAt } from './lib/ui-labels.ts'
 import { parseFrontmatter } from '../content/lib.ts'
 import { shots } from '../screenshots/manifest.ts'
+import { PREFIXED_LOCALES, localeOf } from '../../src/lib/locales.ts'
 
 const repo = resolve(import.meta.dirname, '../..')
 const upstream = resolve(process.env.REPUTECAST_SRC ?? join(repo, '../ReputeCast'))
@@ -71,7 +72,8 @@ const labels = checkUiLabelsAt(upstream, readYaml('src/data/ui-labels.yaml'))
 console.log(`\nUI labels`)
 if (labels.problems.length === 0) console.log(`  ✓ ui-labels: all literals found upstream`)
 for (const p of labels.problems) fail(`ui-labels: ${p}`)
-for (const id of labels.viAvailable) warn(`ui-labels: Vietnamese now exists upstream for ${id}`)
+for (const { id, lang } of labels.available)
+  warn(`ui-labels: ${LANGUAGE_IN_ENGLISH[lang]} now exists upstream for ${id}`)
 
 // 3. OpenAPI spec unchanged since the last sync.
 console.log(`\nOpenAPI`)
@@ -97,7 +99,7 @@ const walk = (dir: string): string[] =>
 let reviews = 0
 for (const page of walk(docsDir)) {
   const rel = relative(docsDir, page)
-  if (rel.startsWith('vi/')) continue // same sources as the English page
+  if (localeOf(rel) !== 'en') continue // same sources as the English page
   const { data } = parseFrontmatter(readFileSync(page, 'utf8'))
   const hits = changedSources(Array.isArray(data.sources) ? (data.sources as string[]) : [], changed)
   if (hits.length === 0) continue
@@ -110,7 +112,7 @@ console.log(
   `  ${changed.length} upstream files changed since ${state.commit.slice(0, 8)}; ${reviews} page(s) to review`,
 )
 
-// 5. English-only screenshots whose screens now have Vietnamese UI upstream.
+// 5. English-only screenshots whose screens now have another locale's UI upstream.
 console.log(`\nScreenshots`)
 const featuresDir = join(upstream, 'web/src/features')
 const filesUnder = (dir: string, base = dir): string[] =>
@@ -119,14 +121,17 @@ const filesUnder = (dir: string, base = dir): string[] =>
   )
 let recaptures = 0
 for (const shot of shots) {
-  if (!shot.locales || shot.locales.includes('vi')) continue
+  if (!shot.locales) continue
   const dir = join(featuresDir, shot.feature)
-  if (existsSync(dir) && hasCompleteVietnamese(filesUnder(dir))) {
+  if (!existsSync(dir)) continue
+  const files = filesUnder(dir)
+  for (const lang of PREFIXED_LOCALES) {
+    if (shot.locales.includes(lang) || !hasCompleteTranslation(files, lang)) continue
     recaptures++
-    warn(`Vietnamese UI available: recapture ${shot.id} (and allow locale vi in the manifest)`)
+    warn(`${LANGUAGE_IN_ENGLISH[lang]} UI available: recapture ${shot.id} (and allow locale ${lang} in the manifest)`)
   }
 }
-console.log(`  ${recaptures} English-only screenshot(s) can now be captured in Vietnamese`)
+console.log(`  ${recaptures} English-only screenshot(s) can now be captured in another language`)
 
 console.log(`\n${failures} failure(s), ${warnings} warning(s).`)
 if (failures > 0) process.exit(1)

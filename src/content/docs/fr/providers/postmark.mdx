@@ -1,0 +1,155 @@
+---
+title: Envoyer avec Postmark
+description: 'Configurez un flux Broadcast Postmark pour newsletters avec ReputeCast : un jeton de serveur suffit ; webhooks, DNS et synchronisation des suppressions suivent.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: flux Broadcast Postmark pour newsletters
+sources:
+  - internal/providers/postmark
+  - internal/connect
+  - internal/providers/manage/actions.go
+  - internal/domains/attach.go
+  - web/src/features/connect
+  - web/src/features/providers/bulk.messages.ts
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Postmark n’autorise les envois en masse que sur un flux de messages Broadcast : un
+flux Broadcast Postmark pour newsletters est donc au cœur de cette configuration. Vous connectez Postmark avec un jeton de serveur, et ReputeCast crée
+le flux Broadcast, enregistre des webhooks sur chaque flux, récupère les enregistrements DNS de votre domaine et
+synchronise les suppressions.
+
+<ProviderMatrix family="email" id="postmark" />
+
+## Avant de commencer
+
+- **Un serveur Postmark et son Server API token** (Postmark › Servers › votre serveur › API Tokens). Tant que votre
+  compte Postmark est en attente d’approbation, chaque destinataire doit avoir le même domaine que l’adresse From
+  ([Postmark API overview, error 412](https://postmarkapp.com/developer/api/overview), vérifié en octobre 2026) :
+  envoyez donc vos tests à une adresse de votre propre domaine jusqu’à ce que Postmark approuve le compte.
+- **Facultatif : un Account API token.** Avec lui, ReputeCast ajoute votre domaine d’envoi dans Postmark et affiche ses
+  enregistrements DKIM et Return-Path. Sans lui, vous ajoutez vous-même le domaine dans Postmark.
+- **Autorisations.** La connexion demande `providers:manage` ; ajouter un nouveau domaine d’envoi demande
+  `domains:manage`.
+- **Une adresse HTTPS publique.** Postmark envoie les événements à `<public URL>/hooks/postmark/<token>`. Postmark n’a
+  pas d’API d’événements que ReputeCast pourrait interroger à la place : l’adresse doit donc être joignable depuis
+  Internet.
+
+Postmark sépare les flux de messages Transactional (e-mails individuels déclenchés par une action de l’utilisateur) des
+flux Broadcast (newsletters et annonces)
+([Postmark : How to create and send through Message Streams](https://postmarkapp.com/support/article/how-to-create-and-send-through-message-streams),
+vérifié en octobre 2026). ReputeCast envoie les e-mails Système, Automatisations et Transactionnel sur le flux
+transactionnel de votre serveur, `outbound`, et les Diffusions uniquement sur un flux Broadcast.
+
+## Connecter Postmark
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers" />, choisissez <UiPath path="providers.overview.addProvider" /> et sélectionnez
+   Postmark dans le catalogue. [Connecter un fournisseur d’envoi](/fr/providers/connect/) détaille les étapes que partagent
+   tous les fournisseurs.
+
+   <Screenshot
+     id="providers-catalog"
+     alt="Le catalogue des fournisseurs : la carte de Postmark indique que le marketing de masse est autorisé sur les flux Broadcast uniquement, qu’il coûte 55,00 $US par mois pour 50 000 e-mails avec un forfait jusqu’à 50 000, et que sa configuration prend 10 à 15 minutes avec un jeton de serveur et des enregistrements DNS."
+   />
+
+2. Collez le <UiPath path="providers.fields.postmark.serverToken" /> et laissez
+   <UiPath path="providers.fields.postmark.messageStream" /> sur `outbound`. Dans les paramètres Postmark
+   supplémentaires, vous pouvez ajouter l’<UiPath path="providers.fields.postmark.accountToken" /> et votre
+   <UiPath path="providers.fields.monthlyLimit" /> (utilisé pour la barre de quota). Laissez
+   <UiPath path="providers.fields.postmark.broadcastStream" /> vide : ReputeCast crée le flux à l’étape 8.
+
+3. Choisissez <UiPath path="connect.connection.connect" />. ReputeCast vérifie le jeton par des appels en lecture seule
+   (`GET /server` et les statistiques d’envoi du mois) et le stocke chiffré.
+
+4. Dans <UiPath path="connect.connection.webhooksTitle" />, ReputeCast vérifie d’abord que son adresse de webhook est
+   joignable depuis Internet, puis enregistre un webhook sur le flux de messages avec une authentification HTTP basic
+   (utilisateur `reputecast`, un secret généré par ReputeCast). Le webhook signale Delivery, Bounce, SpamComplaint et
+   SubscriptionChange ; Open et Click restent désactivés, car ReputeCast suit lui-même les ouvertures et les clics.
+
+5. Choisissez <UiPath path="connect.connection.continueDomain" /> et saisissez votre domaine d’envoi. Avec un Account
+   API token, ReputeCast ajoute le domaine dans Postmark avec le Return-Path `pm-bounces.<your domain>` et liste
+   l’enregistrement TXT DKIM et le CNAME Return-Path (vers `pm.mtasv.net`), plus un enregistrement DMARC si le domaine
+   n’en a pas.
+
+6. Dans <UiPath path="connect.stepTest" />, envoyez un test. Il passe par le flux `outbound` ; la chronologie attend le
+   webhook Delivery de Postmark.
+
+7. Dans <UiPath path="connect.stepStreams" /> et <UiPath path="connect.stepContacts" />, choisissez les flux que
+   transporte Postmark et indiquez s’il faut importer les suppressions existantes depuis Postmark. Les Diffusions ne
+   sont pas encore proposées : les conditions de Postmark n’autorisent les envois en masse que sur un flux Broadcast.
+
+8. Pour envoyer des newsletters par Postmark, ouvrez <UiPath path="nav.providers > providers.tabRouting" /> et faites de
+   Postmark la route (ou le secours) de <UiPath path="providers.streamBroadcast" />. À l’enregistrement, ReputeCast
+   propose de créer le flux : choisissez <UiPath path="providers.bulk.actionCreate" />. Il crée dans votre serveur
+   Postmark un flux Broadcast appelé « ReputeCast Broadcasts » (ID de flux `broadcast`, ou `reputecast-broadcasts` si
+   cet ID est déjà pris), y enregistre aussi le webhook et l’utilise pour la route.
+
+</Steps>
+
+<Aside type="caution">
+  Saisir l’ID d’un flux existant dans le champ du flux Broadcast ne débloque pas les Diffusions ; ReputeCast l’utilise
+  pour envoyer, mais continue de traiter Postmark comme réservé au transactionnel. Créez le flux depuis le routage comme
+  à l’étape 8.
+</Aside>
+
+## Vérifier le résultat
+
+- La carte Postmark dans <UiPath path="nav.providers > providers.tabProviders" /> affiche
+  <UiPath path="providers.statusHealthy" /> et le volume du mois.
+- Dans Postmark, chaque flux qu’utilise ReputeCast a un webhook qui pointe vers `/hooks/postmark/…` avec une
+  authentification basic, et votre serveur liste le flux « ReputeCast Broadcasts » une fois que vous l’avez créé.
+- Les événements de livraison des deux flux apparaissent dans <UiPath path="nav.providers > providers.tabEvents" />.
+
+ReputeCast envoie jusqu’à 500 messages par appel au point de terminaison batch de Postmark, avec `TrackOpens`
+désactivé et `TrackLinks` défini sur `None` pour chaque message. Si les réglages de suivi de votre serveur sont activés,
+le <UiPath path="providers.events.trackingTitle" /> de l’onglet Événements et synchronisation l’indique et peut les
+désactiver par l’API ; d’ici là, le [contrôle avant envoi](/fr/reference/glossary/#send-readiness) vous avertit du double
+suivi. Les suppressions se synchronisent par flux toutes les 15 minutes : ReputeCast pousse vers les deux flux les
+rebonds définitifs et les plaintes qui s’appliquent à tous les e-mails, y réactive les adresses quand elles quittent la
+liste partagée (Postmark conserve les plaintes pour spam, qui ne peuvent pas être retirées) et, si vous avez coché
+l’option d’import, importe les rebonds, plaintes pour spam et désabonnements de Postmark. Postmark n’indique pas les IP
+depuis lesquelles il envoie ; si vous avez des IP dédiées, listez-les dans les
+[IP d’envoi](/fr/providers/senders-and-domains/#vérifier-les-ip-denvoi) de la carte.
+
+## Dépannage
+
+- **« Postmark a refusé cette clé »** avec `ErrorCode 10`. Le jeton n’est pas un Server API token, ou il appartient à
+  un autre serveur. Copiez le jeton du serveur avec lequel vous envoyez, pas l’Account token.
+- **La carte du webhook indique que l’adresse n’est pas joignable depuis Internet.** Postmark ne peut pas être
+  interrogé : corrigez donc l’URL publique (ou utilisez un tunnel pendant vos tests), puis choisissez
+  <UiPath path="connect.connection.recheck" />. Postmark ne sait pas envoyer de webhook de test à la demande : c’est
+  l’événement de livraison de l’envoi de test qui confirme que ses événements arrivent. Voir
+  [Reverse proxy et TLS](/fr/self-hosting/reverse-proxy/).
+- **Les messages de test restent en file et sont réessayés** tant que votre compte Postmark est en attente
+  d’approbation. Postmark refuse les destinataires hors du domaine From (erreur 412) et ReputeCast réessaie comme pour
+  une erreur temporaire. Envoyez le test à une adresse de votre propre domaine, ou attendez l’approbation de Postmark.
+- **Les Diffusions ne peuvent pas utiliser Postmark** à l’étape des flux ou dans le routage. Créez le flux Broadcast
+  comme à l’étape 8.
+- **L’étape du domaine n’affiche aucun enregistrement DKIM ni Return-Path.** Vous vous êtes connecté sans Account API
+  token. Ajoutez le domaine dans Postmark et publiez l’enregistrement DKIM qu’il affiche, ou ajoutez le jeton dans
+  <UiPath path="providers.overview.settings > providers.overview.credentials" /> sur la carte du fournisseur.
+- **« Postmark n’a pas créé le flux »** parce que les deux ID de flux sont pris. Créez un flux Broadcast dans Postmark,
+  puis saisissez son ID.
+- **Le catalogue affiche un badge « Jeton sandbox ».** ReputeCast n’a pas de mode test pour Postmark : l’envoi de test
+  de la configuration délivre un vrai message.
+- **Vous avez changé l’URL publique ou déconnecté Postmark.** Une nouvelle URL publique ajoute un webhook pour la
+  nouvelle adresse ; supprimez l’ancien dans Postmark. La déconnexion retire les webhooks de ReputeCast, mais le flux
+  Broadcast, le domaine et les suppressions poussées restent dans Postmark.
+
+## Voir aussi
+
+- [Connecter un fournisseur d’envoi](/fr/providers/connect/)
+- [Router les e-mails entre fournisseurs](/fr/providers/routing/)
+- [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/)
+- [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)
+- [Choisir un fournisseur d’envoi](/fr/providers/choose/)

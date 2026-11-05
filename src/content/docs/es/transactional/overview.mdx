@@ -1,0 +1,112 @@
+---
+title: Correo transaccional en ReputeCast
+description: "Cómo funciona el correo transaccional autoalojado en ReputeCast: flujo, ruta y conmutación por error propios, categorías, supresiones, estados y alertas."
+type: explanation
+audience: [admin, developer]
+permissions: ['transactional:view']
+uiPath: 'nav.transactional'
+primaryKeyword: correo transaccional autoalojado
+sources:
+  - internal/transactional
+  - internal/smtprelay
+  - web/src/features/transactional
+  - docs/spec/reputecast-design-addon-transactional.md
+  - internal/sending/engine/{transactional.go,warmup_send.go}
+sidebar:
+  order: 1
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast envía correo transaccional autoalojado (restablecimientos de contraseña, enlaces de acceso, recibos y el
+resto del correo de tu producto) desde la misma instancia que tus boletines, sin compartir con ellos ni la reputación
+ni la cola. Tu aplicación llama a la API HTTP o al SMTP relay con el ID de una plantilla y unos datos; ReputeCast
+renderiza una [plantilla transaccional](/es/reference/glossary/#transactional-template) publicada, comprueba las
+supresiones y entrega el mensaje a los proveedores de envío de la ruta Transaccional. Todo está en
+<UiPath path="nav.transactional" />.
+
+<Screenshot
+  id="transactional"
+  alt="El resumen de Transaccional: la ruta y las cifras de entrega de los últimos 7 días, encima de las plantillas con su categoría, su versión publicada y los envíos de los últimos 7 días."
+/>
+
+## Cómo se envía un mensaje transaccional
+
+1. **Tu aplicación llama a ReputeCast.** Envía un mensaje, o un lote de hasta 100, con una
+   [clave solo de envío](/es/reference/glossary/#send-only-key) a través de la API, o se conecta al
+   [SMTP relay](/es/transactional/smtp-relay/). La API responde `202` con el ID del mensaje. El formato de la
+   solicitud, la cabecera `Idempotency-Key` y los ejemplos de código están en
+   [enviar correo transaccional con la API](/es/developers/transactional-api/).
+2. **ReputeCast renderiza la versión publicada.** Solo se envían las versiones publicadas. Si faltan variables
+   obligatorias, la llamada falla con `missing_variables` y no se envía nada. El correo que llega por SMTP ya viene
+   renderizado y se registra como **Sin procesar (SMTP)**.
+3. **Se comprueban las supresiones y las categorías.** El correo transaccional nunca va a una dirección que tuvo un
+   rebote permanente, generó una queja, cayó en una trampa de spam, no es válida o se añadió a la
+   [lista de supresión](/es/audience/suppressions/) a mano o por importación. Ignora las entradas que solo afectan al
+   marketing: las bajas y las direcciones genéricas como `billing@`. Quien desactivó una categoría opcional no recibe
+   esa categoría.
+4. **La ruta Transaccional lo entrega.** Transaccional es el cuarto [flujo](/es/reference/glossary/#stream), junto a
+   Envíos masivos, Automatizaciones y Sistema, con su propia [ruta](/es/providers/routing/): un proveedor de envío
+   principal y un respaldo opcional. La conmutación por error es automática. Cuando el mismo proveedor de envío lleva
+   también una campaña, los mensajes transaccionales van primero dentro de su velocidad de envío. Las condiciones de
+   enrutamiento sobre el proveedor de buzón lo leen de los registros MX del destinatario, así que una dirección de
+   Google Workspace cuenta como Gmail. El correo transaccional nunca espera a un
+   [calentamiento](/es/providers/warm-up/): un proveedor en calentamiento lo envía dentro del límite de hoy, y cuenta
+   para ese límite como el resto del correo. Por encima del límite, o mientras el plan está en pausa, el mensaje sale
+   por un proveedor ya calentado de su ruta que pueda aceptarlo o, si no lo hay, por el proveedor en calentamiento de
+   todas formas, y la página de calentamiento lo cuenta como por encima del límite.
+5. **Vuelven los eventos.** Los eventos de entrega, rebote, queja e interacción actualizan el estado del mensaje en
+   el [registro de mensajes](/es/transactional/message-log/) y se envían a tus
+   [endpoints de webhook](/es/developers/webhooks/) como eventos `message.*`.
+
+## Categorías
+
+Cada plantilla pertenece a una categoría, y la categoría decide si el destinatario puede desactivarla.
+
+| Tipo     | Comportamiento                                                                                                         |
+| -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Esencial | Se envía siempre: correos de inicio de sesión, contraseña, facturación y cuenta. El pie no lleva enlace de baja.      |
+| Opcional | Los destinatarios pueden desactivarla en el centro de preferencias o con el enlace de baja del pie.                    |
+
+Las categorías se gestionan en la [configuración de Transaccional](/es/transactional/settings/).
+
+## Estados de los mensajes
+
+Un mensaje está **Programado**, **En cola**, **Enviado**, **Entregado**, **Aplazado**, **Rebotado**, **Con queja**,
+**Rechazado**, **Cancelado**, **Fallido** o en **Prueba**. Programado significa que espera la hora `send_at` que
+indicó tu aplicación; hasta entonces puedes
+[cancelarlo o moverlo](/es/transactional/message-log/#cancelar-o-mover-un-mensaje-programado), y uno cancelado
+muestra Cancelado. Rechazado significa que ReputeCast lo detuvo antes de enviarlo, por ejemplo porque la dirección
+está suprimida o el destinatario se dio de baja de la categoría. Prueba significa que lo envió una clave en modo de
+prueba; las claves en modo de prueba solo entregan a los miembros del espacio de trabajo y a las direcciones de prueba
+que permitas en la clave.
+
+## Alertas en lugar de pausa automática
+
+Las campañas se [pausan automáticamente](/es/campaigns/live-monitor/) cuando suben los rebotes o las quejas. El
+correo transaccional nunca se pausa, porque un restablecimiento de contraseña tiene que seguir llegando. En su lugar,
+ReputeCast comprueba cada minuto la última hora y te avisa cuando la tasa de rebote de una plantilla, el número de
+mensajes fallidos o el tiempo mediano de entrega supera su límite.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="transactional" />
+
+## Cuándo cambiarlos
+
+- Conserva el contenido renderizado más tiempo (hasta 90 días) cuando el equipo de soporte consulta lo que recibió un
+  cliente; consérvalo menos tiempo, o nada, cuando el contenido incluye datos personales. Cámbialo en la
+  [configuración de Transaccional](/es/transactional/settings/).
+- Baja los límites de alerta en las plantillas en las que cada fallo importa, como los enlaces de acceso.
+- Da a la ruta Transaccional un respaldo en otro proveedor de envío, para que una caída en uno nunca detenga los
+  restablecimientos de contraseña.
+
+## Relacionado
+
+- [Enviar tu primer correo transaccional](/es/transactional/first-send/)
+- [Crear y publicar plantillas transaccionales](/es/transactional/templates/)
+- [Importar plantillas transaccionales](/es/migrate/transactional-templates/)
+- [Enrutar el correo entre proveedores](/es/providers/routing/)
+- [Permisos y roles](/es/reference/permissions/)

@@ -1,0 +1,144 @@
+---
+title: Envoyer avec Mailgun
+description: Envoyez une newsletter avec Mailgun via ReputeCast, par Private API key et région. Webhooks, DNS et synchronisation bidirectionnelle sont configurés.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter avec Mailgun
+sources:
+  - internal/providers/mailgun
+  - internal/providers/webhookauth
+  - internal/connect
+  - internal/domains/attach.go
+  - web/src/features/connect
+sidebar:
+  order: 5
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Pour envoyer une newsletter avec Mailgun depuis ReputeCast, vous connectez une Private API key, la région de votre
+compte Mailgun et le domaine Mailgun depuis lequel vous envoyez. ReputeCast enregistre les webhooks sur ce domaine,
+ajoute et vérifie les domaines d’envoi, détecte les domaines sandbox et synchronise les suppressions dans les deux sens.
+
+<ProviderMatrix family="email" id="mailgun" />
+
+## Avant de commencer
+
+- **Un domaine Mailgun** (par exemple `mg.acme.io`) qui existe déjà dans votre compte Mailgun, dans la région que vous
+  connectez. La connexion est vérifiée sur ce domaine : créez-le d’abord dans Mailgun, ou connectez le domaine sandbox
+  pour faire des essais.
+- **Une Private API key**, depuis Mailgun › API Security. Une Domain Sending key ou la HTTP webhook signing key ne
+  fonctionnent pas.
+- **Autorisations.** La connexion demande `providers:manage` ; ajouter un nouveau domaine d’envoi demande
+  `domains:manage`.
+- **Une adresse HTTPS publique** pour les webhooks : `<public URL>/hooks/mailgun/<token>`. Si ReputeCast n’est pas
+  encore joignable depuis Internet, il peut interroger à la place l’API d’événements de Mailgun toutes les minutes.
+
+Mailgun signe chaque webhook avec la HTTP webhook signing key de votre compte, qui n’est pas votre clé API
+([Mailgun : Securing webhooks](https://documentation.mailgun.com/docs/mailgun/user-manual/webhooks/securing-webhooks),
+vérifié en octobre 2026). ReputeCast lit cette clé par l’API : vous n’avez pas à la coller, sauf si votre clé API ne peut
+pas la lire.
+
+## Connecter Mailgun
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers" />, choisissez <UiPath path="providers.overview.addProvider" /> et sélectionnez
+   Mailgun dans le catalogue. [Connecter un fournisseur d’envoi](/fr/providers/connect/) explique les étapes que partagent
+   tous les fournisseurs.
+
+2. Collez la <UiPath path="providers.fields.mailgun.apiKey" />, choisissez la <UiPath path="providers.fields.region" />
+   (`US · api.mailgun.net` ou `EU · api.eu.mailgun.net`, selon l’endroit où le domaine a été créé) et saisissez le
+   <UiPath path="providers.fields.mailgun.domain" />. Les paramètres Mailgun supplémentaires contiennent votre
+   <UiPath path="providers.fields.monthlyLimit" /> (utilisé pour la barre de quota quand le compte n’a pas de limite
+   d’envoi personnalisée) et la <UiPath path="providers.fields.mailgun.webhookSigningKey" />.
+
+3. Choisissez <UiPath path="connect.connection.connect" />. ReputeCast lit le domaine avec votre clé, puis la limite
+   d’envoi mensuelle du compte, et stocke la clé chiffrée. Rien n’est enregistré si la vérification échoue.
+
+4. Dans <UiPath path="connect.connection.webhooksTitle" />, ReputeCast enregistre l’URL de son webhook sur le domaine
+   pour `delivered`, `permanent_fail`, `temporary_fail`, `complained` et `unsubscribed`. Les ouvertures et les clics ne
+   sont pas enregistrés : ReputeCast les suit lui-même. Il vérifie d’abord que l’adresse est joignable depuis Internet ;
+   Mailgun ne sait pas envoyer de webhook de test à la demande, c’est donc l’événement de livraison de l’envoi de test
+   qui confirme que ses événements arrivent. Si l’adresse est injoignable, choisissez
+   <UiPath path="connect.connection.usePolling" /> et corrigez l’URL publique plus tard.
+
+   <Screenshot
+     id="connect-mailgun-error"
+     alt="Une connexion Mailgun en échec : la Private API key a été refusée avec 401 Unauthorized, et l’adresse du webhook sur localhost n’est pas joignable depuis Internet, donc l’enregistrement est ignoré, avec trois façons d’y remédier : une URL publique, un tunnel ou l’interrogation périodique."
+   />
+
+5. Choisissez <UiPath path="connect.connection.continueDomain" /> et saisissez votre domaine d’envoi. S’il n’est pas
+   encore dans Mailgun, ReputeCast l’ajoute (sécurité automatique de l’expéditeur, DKIM 2048 bits) et liste les
+   enregistrements SPF, DKIM et MX à publier. Le CNAME de suivi de Mailgun est laissé de côté, car ReputeCast suit
+   lui-même les ouvertures et les clics.
+
+6. Dans <UiPath path="connect.stepTest" />, envoyez un test et regardez arriver le webhook `delivered`.
+
+7. Dans <UiPath path="connect.stepStreams" /> et <UiPath path="connect.stepContacts" />, choisissez les flux et laissez
+   cochée l’option qui importe les rebonds, plaintes et désabonnements déjà présents chez Mailgun.
+
+</Steps>
+
+## Vérifier le résultat
+
+- La carte Mailgun dans <UiPath path="nav.providers > providers.tabProviders" /> affiche
+  <UiPath path="providers.statusHealthy" /> avec votre domaine et son état (par exemple « Domaine mg.acme.io · active »).
+  Un domaine sandbox affiche plutôt <UiPath path="providers.statusSandbox" />.
+- Dans Mailgun, les webhooks du domaine listent votre URL ReputeCast pour les cinq événements.
+- Les livraisons et les rebonds apparaissent dans <UiPath path="nav.providers > providers.tabEvents" />.
+
+ReputeCast envoie un appel d’API par message, avec le suivi des ouvertures, des clics et des désabonnements de Mailgun
+désactivé sur chaque message. Si le suivi des désabonnements est activé pour le domaine, Mailgun ajoute son propre lien
+de désabonnement et son pied de page à côté de ceux de ReputeCast ; le
+[contrôle avant envoi](/fr/reference/glossary/#send-readiness) vous en avertit, et le
+<UiPath path="providers.events.trackingTitle" /> de l’onglet Événements et synchronisation peut le désactiver. Depuis la
+[liste de suppression](/fr/reference/glossary/#suppression-list) partagée, ReputeCast pousse les rebonds définitifs et les
+plaintes qui s’appliquent à tous les e-mails vers la table des désabonnements du domaine d’envoi (pour tous les tags),
+et les y retire quand ils quittent la liste partagée ; les désabonnements et les autres entrées propres au marketing
+restent dans ReputeCast. ReputeCast lit aussi, à la connexion puis chaque jour, les IP dédiées du compte attribuées au
+domaine de la connexion, et les affiche comme [IP d’envoi](/fr/providers/senders-and-domains/#vérifier-les-ip-denvoi) de la
+carte ; s’il n’y en a aucune, le domaine envoie depuis le pool d’IP partagé de Mailgun.
+
+Le domaine sandbox de Mailgun ne délivre qu’à des destinataires autorisés, 5 au maximum
+([Mailgun : Sandbox domain](https://documentation.mailgun.com/docs/mailgun/user-manual/domains/domains-sandbox),
+vérifié en octobre 2026). Tant que Mailgun est connecté avec un domaine sandbox, le contrôle avant envoi bloque les
+Diffusions qui passent par lui.
+
+## Dépannage
+
+- **« Mailgun a refusé cette clé »** avec `401 Unauthorized`. Utilisez une Private API key du même compte, pas une
+  Sending key ni la webhook signing key.
+- **« Mailgun a refusé cette clé »** avec `404 Not Found · domain_not_found`. La clé est bonne, mais Mailgun ne connaît
+  pas le domaine d’envoi dans la région choisie. Vérifiez l’orthographe du domaine et la région, ou créez d’abord le
+  domaine dans Mailgun.
+- **« Mailgun autorise trois URL par événement »** lors de l’enregistrement des webhooks. L’un des événements envoie
+  déjà vers trois adresses. Retirez une ancienne URL dans Mailgun, puis choisissez
+  <UiPath path="connect.connection.registerAgain" />.
+- **L’adresse du webhook n’est pas joignable depuis Internet** (par exemple « localhost ne fonctionne que sur cette
+  machine »). Définissez `REPUTECAST_PUBLIC_URL` sur l’adresse HTTPS qu’expose votre reverse proxy, utilisez un tunnel
+  pendant vos tests, ou passez à l’interrogation périodique pour l’instant. Voir
+  [Reverse proxy et TLS](/fr/self-hosting/reverse-proxy/).
+- **Les webhooks arrivent mais échouent à la vérification, et le fournisseur passe à « Webhooks silencieux ».** Votre clé
+  API ne peut pas lire la webhook signing key du compte. Copiez-la depuis Settings › API Security › HTTP webhook signing
+  key dans Mailgun vers <UiPath path="providers.overview.settings > providers.overview.credentials" /> sur la carte du
+  fournisseur.
+- **Les destinataires de test sont refusés avec `unauthorized_recipient`.** Le domaine est le sandbox de Mailgun :
+  ajoutez l’adresse comme destinataire autorisé dans Mailgun, ou connectez un domaine vérifié.
+- **Les messages transactionnels avec Cc, Cci ou pièces jointes échouent.** L’adaptateur Mailgun ne sait pas envoyer de
+  copies ni de pièces jointes ; faites passer ces modèles par un autre fournisseur.
+- **Vous avez déconnecté Mailgun.** ReputeCast retire son URL de chaque événement webhook. Le domaine et les
+  désabonnements poussés restent dans Mailgun.
+
+## Voir aussi
+
+- [Connecter un fournisseur d’envoi](/fr/providers/connect/)
+- [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/)
+- [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)
+- [État et pannes des fournisseurs](/fr/providers/health-and-outages/)
+- [Choisir un fournisseur d’envoi](/fr/providers/choose/)

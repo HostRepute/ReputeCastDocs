@@ -1,0 +1,366 @@
+---
+title: Reverse Proxy und TLS
+description: 'Getestete Konfigurationen für den ReputeCast Reverse Proxy mit Caddy, nginx und Traefik: TLS, Host-Header, vertrauenswürdige Proxys, SSE, MCP, eigene Domains.'
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast Reverse Proxy
+sources:
+  - internal/app/app.go
+  - internal/server/middleware.go
+  - internal/proxycheck
+  - internal/app/wire_proxycheck.go
+  - internal/sending/engine/api.go
+  - internal/mcpserver/server.go
+  - internal/publicpages/publicpages.go
+  - internal/forms/domain.go
+  - internal/accounts/setup.go
+  - internal/smtprelay
+  - internal/app/wire_smtprelay.go
+  - internal/config/config.go
+  - internal/app/metrics.go
+  - docs/deploy/reverse-proxy.md
+  - README.md
+sidebar:
+  order: 6
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Ein ReputeCast Reverse Proxy beendet TLS für Ihre öffentliche URL und leitet jede Anfrage mit dem ursprünglichen
+`Host`-Header an Port 8080 von ReputeCast weiter, wobei gestreamte Antworten ungepuffert durchgereicht werden. Die
+Konfigurationen unten wurden im Oktober 2026 mit `caddy:2` (2.11), `nginx:stable-alpine` (1.30) und `traefik:v3` (3.7)
+vor ReputeCast getestet.
+
+## Was der Proxy leisten muss
+
+- **TLS beenden** für den Host der öffentlichen URL und für [eigene Domains](#eigene-domains), falls Arbeitsbereiche
+  welche nutzen.
+- **Jeden Pfad weiterleiten** an ReputeCast: die App und die API, `/hooks/…` (die Webhooks der Versandanbieter), `/p/…`
+  (öffentliche Seiten), `/t/…` (Öffnungs- und Klick-Tracking), `/mcp` und `/healthz`, das die Prüfung der öffentlichen
+  URL abruft.
+- **Den `Host`-Header beibehalten.** ReputeCast erkennt eigene Domains daran.
+- **`X-Forwarded-For` senden.** ReputeCast liest den Header nur von
+  [vertrauenswürdigen Proxys](#öffentliche-url-und-vertrauenswürdige-proxys-festlegen), egal ob der Proxy die Zeile des
+  Clients erweitert oder eine eigene Header-Zeile hinzufügt. `X-Forwarded-Proto` braucht es nicht: Dass es über HTTPS
+  läuft, weiß es aus `http.public_url`.
+- **Zwei Arten von Antworten ungepuffert streamen**:
+  - den Live-Monitor, Server-Sent Events unter
+    `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (ein Heartbeat alle 15 Sekunden,
+    `retry: 3000`);
+  - den [MCP-Endpunkt](/de/developers/mcp/) `/mcp` (Streamable HTTP), dessen Antworten `text/event-stream` sind.
+- **Große Anfragekörper annehmen.** ReputeCast setzt ein Limit pro Vorgang; das größte beträgt 105 MiB (Import von
+  Transaktionsvorlagen), und Kontaktimporte nehmen 100 MiB an.
+- **Mit Browsern HTTP/2 sprechen.** Die Web-App lädt den Code eines Bildschirms in vielen kleinen Dateien: Über HTTP/2
+  fragt ein Browser alle auf einmal an, über HTTP/1.1 sechs gleichzeitig. In einem langsamen Mobilfunknetz erschien die
+  Seite Kontakte nach etwa 6 statt nach 12 Sekunden. Caddy schaltet HTTP/2 von selbst ein; nginx braucht `http2 on`.
+- **`/metrics` in Ruhe lassen.** Prometheus-Metriken haben einen eigenen Port, 9464: Leiten Sie ihn nie über den Proxy
+  und veröffentlichen Sie ihn nie. Der Hauptport beantwortet `/metrics` mit `404`, sofern kein
+  [Metrik-Token](/de/self-hosting/monitoring/) gesetzt ist.
+
+## Bevor Sie beginnen
+
+- ReputeCast läuft mit [Docker Compose](/de/self-hosting/docker/) oder [als Binärdatei](/de/self-hosting/binary/).
+- Der öffentliche Hostname (hier `news.example.com`) zeigt auf den Server, und die Ports 80 und 443 sind für die
+  Zertifizierungsstelle und Ihre Besucher offen.
+
+## Proxy konfigurieren
+
+Die Beispiele für Caddy und Traefik fügen den Proxy in `docker-compose.override.yml` zum Compose-Projekt hinzu, sodass
+er ReputeCast als `app:8080` erreicht. Läuft der Proxy auf dem Server selbst (eine Installation als Binärdatei oder
+Compose mit `REPUTECAST_PORT=127.0.0.1:8080`), verwenden Sie stattdessen `127.0.0.1:8080`.
+
+<Tabs syncKey="proxy">
+<TabItem label="Caddy">
+
+Caddy holt und erneuert das Zertifikat selbst, behält den `Host`-Header bei, setzt `X-Forwarded-For` und gibt
+Antworten vom Typ `text/event-stream` sofort weiter, sodass der Live-Monitor und MCP keine zusätzlichen Zeilen brauchen
+([Dokumentation zu reverse_proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy), geprüft im
+Oktober 2026).
+
+```txt title="Caddyfile"
+{
+	email you@company.com
+	on_demand_tls {
+		ask http://app:8080/p/_/tls-check
+	}
+}
+
+news.example.com {
+	reverse_proxy app:8080
+}
+
+# Workspaces' custom domains for public pages: a certificate only for verified domains.
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy app:8080
+}
+```
+
+```yaml title="docker-compose.override.yml"
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+  app:
+    environment:
+      # The subnet of the reputecast_default network (see below).
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
+Lassen Sie den Block `https://` weg, wenn kein Arbeitsbereich eine eigene Domain nutzt.
+
+</TabItem>
+<TabItem label="nginx">
+
+Diese Konfiguration ist für nginx 1.25.1 oder neuer (die Direktive `http2`; vor 1.25.1 schreiben Sie
+`listen 443 ssl http2;`) auf dem Server selbst, mit einem Let's-Encrypt-Zertifikat am Standardort von Certbot. nginx
+puffert weitergeleitete Antworten standardmäßig, daher schalten die beiden Streaming-Pfade das Puffern ab.
+
+```nginx title="/etc/nginx/conf.d/reputecast.conf"
+upstream reputecast {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    server_name news.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name news.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/news.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/news.example.com/privkey.pem;
+
+    # ReputeCast enforces its own size limit per operation (largest: 105 MiB).
+    client_max_body_size 110m;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection "";
+
+    location / {
+        proxy_pass http://reputecast;
+    }
+
+    # Live monitor (Server-Sent Events) and the MCP endpoint: no buffering.
+    location ~ ^/api/v1/workspaces/[^/]+/campaigns/[^/]+/live/stream$ {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+}
+```
+
+- Mit eingeschaltetem Puffern erreichten die Ereignisse des Live-Monitors den Browser beim Testen verspätet und
+  stückweise; mit der Konfiguration oben kommen sie jede Sekunde an.
+- Der Standardwert von `client_max_body_size` in nginx ist 1 MiB, zu klein für Kontaktimporte und Anhänge.
+- Läuft nginx als Compose-Dienst, verwenden Sie `server app:8080;` und starten Sie nginx nach der App
+  (`depends_on: [app]`): nginx löst den Namen des Upstreams beim Start auf.
+
+</TabItem>
+<TabItem label="Traefik">
+
+Traefik liest seine Routen aus den Labels des App-Containers, holt das Zertifikat von Let's Encrypt, behält den
+`Host`-Header bei, setzt `X-Forwarded-For` und streamt Server-Sent Events ohne zusätzliche Einstellungen
+([Dokumentation von Traefik](https://doc.traefik.io/traefik/), geprüft im Oktober 2026).
+
+```yaml title="docker-compose.override.yml"
+services:
+  traefik:
+    image: traefik:v3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.email=you@company.com
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+  app:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.reputecast.rule=Host(`news.example.com`)
+      - traefik.http.routers.reputecast.entrypoints=websecure
+      - traefik.http.routers.reputecast.tls.certresolver=le
+      - traefik.http.services.reputecast.loadbalancer.server.port=8080
+    environment:
+      # The subnet of the reputecast_default network (see below).
+      REPUTECAST_HTTP__TRUSTED_PROXIES: 172.18.0.0/16
+
+volumes:
+  letsencrypt:
+```
+
+</TabItem>
+</Tabs>
+
+## Öffentliche URL und vertrauenswürdige Proxys festlegen
+
+<Steps>
+
+1. Setzen Sie `http.public_url` auf die HTTPS-Adresse, ohne Schrägstrich am Ende:
+   `REPUTECAST_PUBLIC_URL=https://news.example.com`, in der `.env` von Compose oder in der Umgebung der Binärdatei. Der
+   frühere Name `REPUTECAST_HTTP__PUBLIC_URL` funktioniert weiterhin, wenn `REPUTECAST_PUBLIC_URL` nicht gesetzt ist.
+   Mit einer öffentlichen URL mit `https://` sendet ReputeCast HSTS und markiert sein Sitzungscookie als Secure.
+
+2. Setzen Sie `http.trusted_proxies` auf die Adressen, von denen sich der Proxy verbindet: `127.0.0.1` für einen Proxy
+   auf demselben Server wie die Binärdatei oder das Subnetz des Compose-Netzwerks:
+
+   ```sh
+   docker network inspect reputecast_default --format '{{(index .IPAM.Config 0).Subnet}}'
+   ```
+
+3. Starten Sie ReputeCast neu (`docker compose up -d` oder Neustart des Dienstes).
+
+</Steps>
+
+ReputeCast fügt alle Header-Zeilen `X-Forwarded-For` der Reihe nach zusammen, liest die Adressen von rechts nach links
+und nimmt die erste, die kein vertrauenswürdiger Proxy ist; danach greift es auf `X-Real-IP` zurück. Ein Proxy, der
+seinen Hop als eigene Header-Zeile hinzufügt (`option forwardfor` von HAProxy), funktioniert genauso wie einer, der die
+Zeile des Clients erweitert, und die Zeilen, die ein Client gesendet hat, setzen sich nie gegen die Hops Ihrer Proxys
+durch. Hinter einer Kette von Proxys (ein CDN, dann nginx) vertrauen Sie jedem Hop.
+
+Ohne diese Einstellung zeigen Sitzungen, Ratenlimits und das Audit-Protokoll für alle die Adresse des Proxys: Beim
+Testen zeigte eine über nginx geöffnete Sitzung die Adresse `172.19.0.6` des Proxy-Containers, bis das Subnetz als
+vertrauenswürdig eingetragen war. Auch jede Öffnung und jeder Klick trägt diese Adresse, sodass der
+[Bot-Filter](/de/reference/glossary/#bot-filter) Scanner-Netzwerke oder den Datenschutz-Proxy von Apple nicht von
+Empfängern unterscheiden kann.
+
+### Der Hinweis auf nicht vertrauenswürdige Proxys
+
+ReputeCast achtet auf Anfragen, die `X-Forwarded-For`, `X-Real-IP` oder `Forwarded` von einer Adresse tragen, die
+`http.trusted_proxies` nicht aufführt. Verhält sich eine private Adresse Minute für Minute weiter wie ein Proxy,
+erhält jeder Instanz-Admin die Benachrichtigung „Anfragen kommen über einen Proxy, dem ReputeCast nicht vertraut“, mit
+der Adresse, dem Header und der Einstellung, die zu ändern ist. Tragen Sie diese Adresse in `http.trusted_proxies` ein
+und starten Sie neu.
+
+Eine öffentliche Adresse, die lange Zeit den größten Teil des Datenverkehrs weiterleitet, bekommt einen anderen
+Hinweis: Ist es Ihr CDN oder Load Balancer, vertrauen Sie den Adressbereichen, die dessen Anbieter veröffentlicht;
+erkennen Sie die Adresse nicht, lassen Sie sie weg, denn jeder kann Weiterleitungs-Header senden. Eine kurze Häufung
+nennt niemanden. Beide Hinweise und wann sie erscheinen, beschreibt
+[Anfragen über einen nicht vertrauenswürdigen Proxy beheben](/de/self-hosting/instance-admin/#anfragen-über-einen-nicht-vertrauenswürdigen-proxy-beheben).
+
+## Eigene Domains
+
+Ein Arbeitsbereich kann seine Anmeldeseite, sein Präferenzcenter, sein Archiv und andere öffentliche Seiten im
+Stammverzeichnis seiner eigenen Domain ausliefern, eingerichtet unter
+<UiPath path="nav.forms > forms.tabs.branding" />
+([Branding der Seiten festlegen und eigene Domain nutzen](/de/forms/branding-and-domain/)). Die Domain zeigt mit einem
+`CNAME` auf den Host der öffentlichen URL auf Ihren Server. Für den Proxy bedeutet das:
+
+- **Die Domain mit ihrem `Host`-Header an ReputeCast weiterleiten.** ReputeCast sucht den Host unter den verifizierten
+  Domains und liefert die Seiten dieses Arbeitsbereichs aus; ein unbekannter Host bekommt die App.
+- **Ein Zertifikat dafür bereitstellen.** Mit Caddy stellt der Block `https://` Zertifikate bei Bedarf aus. Vor jedem
+  ruft Caddy `http://app:8080/p/_/tls-check?domain=<name>` auf, das für eine verifizierte eigene Domain mit `200` und
+  für alles andere mit `404` antwortet, sodass Zertifikate nur für verifizierte Domains ausgestellt werden. Prüfen Sie
+  eine Domain selbst mit `curl -i "http://127.0.0.1:8080/p/_/tls-check?domain=news.acme.io"`.
+- **nginx und Traefik** haben keine solche Prüfung: Tragen Sie jede verifizierte Domain in `server_name` ein und
+  hinterlegen Sie ihr Zertifikat (nginx), oder ergänzen Sie sie in der Router-Regel, etwa
+  ``Host(`news.example.com`) || Host(`news.acme.io`)`` (Traefik).
+
+E-Mails verlinken weiterhin auf die öffentliche URL; die eigene Domain ist für die öffentlichen Seiten da.
+
+## Ports des SMTP-Relays
+
+Das [SMTP-Relay](/de/transactional/smtp-relay/) spricht selbst SMTP auf 587 (STARTTLS) und 465 (TLS), mit einem eigenen
+Zertifikat, daher transportieren HTTP-Proxys es nicht:
+
+- Veröffentlichen Sie die Ports direkt aus dem App-Container, zum Beispiel in `docker-compose.override.yml`:
+
+  ```yaml title="docker-compose.override.yml"
+  services:
+    app:
+      ports:
+        - "587:587"
+        - "465:465"
+  ```
+
+  Oder leiten Sie sie auf Schicht 4 (TCP) weiter, ohne TLS zu beenden. Das Relay nimmt die Adresse des Clients aus der
+  TCP-Verbindung und liest das PROXY-Protokoll nicht; hinter einer TCP-Weiterleitung ist die zuletzt verwendete Adresse
+  des Schlüssels daher die der Weiterleitung.
+- Für ein Zertifikat von Let's Encrypt beantwortet ReputeCast die HTTP-01-Challenge für den Hostnamen des Relays unter
+  `/.well-known/acme-challenge/…` auf seinem Web-Port. Let's Encrypt ruft sie über Port 80 ab und folgt Weiterleitungen
+  zu HTTPS ([Challenge-Typen](https://letsencrypt.org/docs/challenge-types/), geprüft im Oktober 2026), daher muss der
+  Proxy diesen Pfad für den Hostnamen des Relays weiterleiten. Beantwortet Ihr Proxy diesen Pfad selbst, geben Sie dem
+  Relay stattdessen Zertifikatsdateien.
+
+## Prüfen, ob es funktioniert hat
+
+- `curl -sI https://news.example.com/healthz` antwortet `HTTP/2 200` mit einem Header `Strict-Transport-Security`, und
+  `https://news.example.com/metrics` antwortet `404`.
+- Die Prüfung der öffentlichen URL unter <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> zeigt DNS, TLS
+  und Erreichbar als bestanden ([erste Anmeldung](/de/self-hosting/first-run/#die-prüfung-der-öffentlichen-url)).
+- Der Live-Stream sendet sofort Daten. Mit einem API-Schlüssel, der `campaigns:view` hat:
+
+  ```sh
+  curl -N -H "Authorization: Bearer rc_live_…" \
+    https://news.example.com/api/v1/workspaces/acme-newsletter/campaigns/<campaign id>/live/stream
+  ```
+
+  Sie sehen sofort `retry: 3000` und `: connected`, danach alle 15 Sekunden `: heartbeat …`.
+- Die aktiven Sitzungen Ihres Kontos zeigen Ihre eigene IP-Adresse, nicht die des Proxys.
+- Instanz-Admins erhalten keine Benachrichtigung „Anfragen kommen über einen Proxy, dem ReputeCast nicht vertraut“.
+
+## Fehlerbehebung
+
+- **Der Live-Monitor bewegt sich nicht oder springt alle paar Sekunden**: Der Proxy puffert den Stream. Ergänzen Sie in
+  nginx die `location` für den Live-Stream mit `proxy_buffering off`.
+- **`413 Request Entity Too Large` bei Importen oder Uploads**: Erhöhen Sie `client_max_body_size` in nginx.
+- **Bildschirme brauchen auf Smartphones viele Sekunden**: Der Proxy spricht mit Browsern HTTP/1.1. Ergänzen Sie in
+  nginx `http2 on;` im Block `server`.
+- **Alle erscheinen mit der Adresse des Proxys**: `http.trusted_proxies` enthält die Adresse nicht, von der sich der
+  Proxy verbindet.
+- **Instanz-Admins erhalten „Anfragen kommen über einen Proxy, dem ReputeCast nicht vertraut“**: Tragen Sie die
+  genannte Adresse in `http.trusted_proxies` (`REPUTECAST_HTTP__TRUSTED_PROXIES`) ein und starten Sie neu. Der Hinweis
+  endet, sobald die Adresse vertrauenswürdig ist.
+- **Eine eigene Domain öffnet die ReputeCast-App statt der öffentlichen Seiten**: Der Proxy ersetzt den `Host`-Header,
+  oder die Domain ist noch nicht verifiziert.
+- **Caddy verweigert TLS für eine eigene Domain** (`tlsv1 alert internal error`): `/p/_/tls-check` hat mit `404`
+  geantwortet, weil die Domain in ReputeCast noch nicht verifiziert ist.
+- **`502 Bad Gateway` von nginx in Docker, nachdem die App neu erstellt wurde**: nginx hat die alte Adresse des
+  Containers behalten. Starten Sie nginx neu (`docker compose restart nginx`).
+- **Die Prüfung der öffentlichen URL warnt mit `Antwort mit HTTP …`**: Der Proxy antwortet, leitet `/healthz` aber nicht
+  an ReputeCast weiter.
+
+## Verwandte Themen
+
+- [Mit Docker Compose installieren](/de/self-hosting/docker/)
+- [Mit den Rollen web, ingest und worker skalieren](/de/self-hosting/scaling/): `/hooks/` an Ingest-Prozesse leiten.
+- [Konfigurationsreferenz](/de/reference/configuration/#http): jeder Schlüssel `http.*`.

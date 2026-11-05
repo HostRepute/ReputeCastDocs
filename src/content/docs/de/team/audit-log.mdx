@@ -1,0 +1,156 @@
+---
+title: Audit-Protokoll
+description: Was das Audit-Protokoll von ReputeCast zu jeder Aktion erfasst, wer es sieht, Filter, Export als CSV und JSON, der signierte Audit-Stream und die Aufbewahrung.
+type: reference
+audience: [admin, operator]
+permissions: ['audit:view']
+uiPath: 'nav.settings > settings.audit'
+primaryKeyword: Audit-Protokoll
+sources:
+  - internal/audit/audit.go
+  - internal/auditlog
+  - internal/maintenance/maintenance.go
+  - migrations/00002_workspaces.sql
+  - web/src/features/audit
+  - web/src/features/admin/audit
+  - internal/readiness/{service.go,undo.go,rules.go}
+  - internal/sending/engine/{canary.go,traffic_api.go}
+  - internal/brandkit
+  - internal/renders/renders.go
+  - internal/tracking/{networks.go,agents.go}
+  - internal/campaigns/manage.go
+  - internal/instance/system.go
+  - internal/cli/secrets.go
+sidebar:
+  order: 7
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Das [Audit-Protokoll](/de/reference/glossary/#audit-log) hält fest, wer was woran von wo aus getan hat und ob es
+erlaubt war: für jeden Arbeitsbereich unter <UiPath path="nav.settings > settings.audit" /> und für die Instanz unter
+<UiPath path="shell.userMenuInstanceAdmin > admin.audit" />.
+
+<Screenshot
+  id="settings-audit"
+  alt="Das Audit-Protokoll eines Arbeitsbereichs: Stream-Status, CSV exportieren, JSON exportieren und Webhook-Stream über der Suche und den Filtern für Akteurtyp, Aktion, Ergebnis und Zeitraum, eine Liste von Einträgen mit Zeit, Akteur, Ereignis, Ziel, Quelle und Ergebnis sowie ein ausgewählter Eintrag post.published mit seinem Vorher-nachher-Vergleich."
+/>
+
+## Zugriff
+
+| Protokoll     | Wer es lesen kann                                                                                    | Wer Aufbewahrungsdauer und Streaming ändern kann |
+| ------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| Arbeitsbereich | Mitglieder, API-Schlüssel und MCP-Agenten mit `audit:view` (Inhaber, Admin, Bearbeiter, Betrachter; nicht die Kundenrollen) | Angemeldete Mitglieder mit `workspace:manage`    |
+| Instanz       | Instanz-Admins, angemeldet                                                                           | Instanz-Admins                                   |
+
+Das Protokoll der Instanz zeigt die Einträge aller Arbeitsbereiche und zusätzlich die Einträge auf Instanzebene:
+Anmeldungen, Single Sign-on, Richtlinien, Konten und den Agenturmodus. Instanz-Admins wechseln zwischen beiden mit
+<UiPath path="audit.instanceView" />.
+
+## Was ein Eintrag erfasst
+
+<TableScroll label="Felder eines Audit-Eintrags">
+
+| Feld               | Inhalt                                                                                                          |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Zeit               | Wann es geschah (in Exporten in UTC).                                                                           |
+| Akteur             | Typ (Mitglied, API-Schlüssel, MCP-Agent oder automatisch für das System), ID und Name.                          |
+| Aktion             | Ein Name mit Punkten wie `role.updated`, `member.removed` oder `audit.exported`.                                |
+| Ziel               | Typ, ID und Name dessen, was geändert wurde.                                                                    |
+| Ergebnis           | `allowed`, `denied` oder `error`, mit dem Grund (zum Beispiel der fehlenden Berechtigung).                      |
+| Vorher und nachher | Die geänderten Werte; der Detailbereich zeigt sie als Vergleich.                                                |
+| Quelle             | Client-IP-Adresse (wie über Ihre vertrauenswürdigen Proxys aufgelöst), User-Agent und Anfrage-ID.               |
+| Metadaten          | Zusätzlicher Kontext, etwa die Zahl der Einträge eines Exports.                                                 |
+
+</TableScroll>
+
+## Hinweise zur Erfassung
+
+- Eine Aktion und ihr Eintrag werden in derselben Datenbanktransaktion gespeichert.
+- Einträge sind unveränderlich: Ein Datenbank-Trigger lehnt Änderungen und Löschungen ab, außer bei der Bereinigung
+  nach Aufbewahrungsdauer. Die App bietet keine Möglichkeit, sie zu bearbeiten oder zu löschen.
+- Einträge bestehen über den Arbeitsbereich, das Konto oder den Schlüssel hinaus, die sie nennen.
+- Verweigerte Änderungen werden immer erfasst. Verweigerte Lesezugriffe werden nur erfasst, wenn sie eine sensible
+  Berechtigung erfordern, etwa ein Export. Die meisten einfachen Lesezugriffe werden nicht erfasst.
+- Vertrauliche Zugangsdaten (API-Schlüssel, Signaturschlüssel von Webhooks und Geheimnisse von Anbietern) erscheinen nie
+  in Einträgen.
+- Exporte werden selbst als `audit.exported` erfasst.
+- Eine angeforderte Prüfung der [Versandbereitschaft](/de/reference/glossary/#send-readiness) (`readiness.run` oder
+  `readiness.send_time_check`, wenn ein geplanter Versand erneut geprüft wird) nennt, wer sie angefordert hat: das
+  Mitglied oder den API-Schlüssel oder MCP-Agenten selbst. Korrekturen mit einem Klick werden als die Änderungen
+  erfasst, die sie vornehmen, und ihr Rückgängigmachen als `readiness.fixes_undone`.
+- Eine Canary-Phase erfasst, wie sie endete: `campaign.canary_passed`, `campaign.canary_continued`,
+  `campaign.canary_held` oder `campaign.canary_extended`.
+- [Versandregeln](/de/campaigns/sending-rules/) des Arbeitsbereichs (`sending_rule.created`, `.updated`, `.deleted`),
+  [Traffic-Regeln](/de/providers/traffic-rules/) (`traffic_rules.updated`), das [Brand-Kit](/de/campaigns/brand-kit/)
+  und seine synchronisierten Blöcke (`brand_kit.save`, `synced_block.*`) sowie Rendering-Dienste
+  (`rendering.connect`, `.test`, `.disconnect`) werden im Protokoll des Arbeitsbereichs erfasst. Änderungen an den
+  Netzwerken und User-Agents des Bot-Filters (`tracking_network.*`, `tracking_user_agent.*`) sind Einträge der Instanz.
+- Die Verwaltung von Kampagnen wird als `campaign.delete`, `.restore`, `.archive`, `.unarchive`,
+  `campaign.rescheduled`, `campaign.tags` und `campaign.follow_up` erfasst. Die Arbeit mit Kontakten ergänzt
+  `contact.remove_from_list`, die Massenaktionen `contacts.remove_from_list` und `contacts.remove_tag`,
+  `contacts.export_downloaded`, `contact_view.update`, `field.restore`, `field.values_removed` und
+  `suppression.upload_remove`. Automationen ergänzen `automation.contact_remove` (mit dem Grund) und
+  `automation.test_send`, und `automation.resume` hält die Entscheidung für überfällige Kontakte fest.
+- Weitere Einträge des Arbeitsbereichs: `marketing_cap.updated`, `transactional.message_cancelled` und
+  `.message_rescheduled`, `payments.webhook_events_added` sowie die Exporte `gift.exported`, `conversion.exported`,
+  `payment_events.exported`, `sponsor.bookings_exported` und `sponsor.report_exported`. Eine Änderung unter
+  <UiPath path="nav.settings > settings.general > workspace.retentionTitle" /> wird als `workspace.updated` erfasst.
+- Einen fehlgeschlagenen Job unter <UiPath path="shell.userMenuInstanceAdmin > admin.system" /> erneut versuchen,
+  abbrechen oder löschen (`instance.job_retried`, `.job_cancelled`, `.job_deleted`) sowie `reputecast secrets reseal`
+  (`instance.secrets_resealed`) sind Einträge der Instanz.
+
+## Filter
+
+| Filter         | Werte                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------- |
+| Suche          | Name von Ziel oder Akteur (enthält), Ziel-ID oder Anfrage-ID (genau). Das Protokoll der Instanz findet auch die Referenz-ID einer Anmeldung, die auf Fehlerseiten steht. |
+| Akteurtyp      | Mitglieder, API-Schlüssel, MCP-Agenten, System                                                                |
+| Aktion         | 22 Kategorien, von Versand und Team & Zugriff bis Agentur                                                     |
+| Ergebnis       | Erlaubt, Verweigert, Fehler (Protokoll der Instanz: Erlaubt, Verweigert)                                      |
+| Zeitraum       | Letzte 24 Stunden, 7 Tage (Standard), 30 Tage, 90 Tage, gesamte Aufbewahrungsdauer oder eigene Daten in der Zeitzone des Arbeitsbereichs |
+| Arbeitsbereich | Nur im Protokoll der Instanz: alle Arbeitsbereiche, ein Arbeitsbereich oder nur Einträge der Instanz          |
+
+## Export
+
+<UiPath path="audit.exportCsv" /> und <UiPath path="audit.exportJson" /> laden die Einträge herunter, die den aktuellen
+Filtern entsprechen, ohne Zeilenlimit, als `audit-<workspace>-<date>.csv` oder `.json` (Instanz:
+`audit-instance-<date>`). Die CSV-Spalten sind `occurred_at, actor_type, actor_name, actor_id, action, target_type,
+target_id, target_name, result, reason, summary, ip, user_agent, request_id, before, after`; der Export der Instanz
+ergänzt `workspace`. Das Gegenstück in der API ist
+`GET /api/v1/workspaces/<workspace>/audit/export?format=csv|json` mit denselben Filtern (siehe die
+[API-Referenz](/api/)).
+
+## Audit-Stream
+
+Der Dialog <UiPath path="audit.streamDialog" /> des Arbeitsbereichs sendet mit <UiPath path="audit.streamToggle" />
+neue Einträge an einen HTTPS-Endpunkt, etwa ein SIEM oder Data Warehouse. Instanz-Admins richten mit
+<UiPath path="audit.streamInstance" /> einen eigenen Stream für Einträge auf Instanzebene ein.
+
+- Alle 30 Sekunden sendet ReputeCast bis zu 500 neue Einträge je Arbeitsbereich, die ältesten zuerst, als
+  `{"workspace": "<id>", "sent_at": "…", "events": [ … ]}`.
+- Jede Anfrage ist signiert wie [Webhooks des Arbeitsbereichs](/de/developers/webhooks/): Header
+  `X-ReputeCast-Timestamp`, `X-ReputeCast-Event: audit.batch` und `X-ReputeCast-Signature`, der HMAC-SHA256 von
+  `<timestamp>.<raw body>` mit dem Signaturschlüssel `whsec_…`, der nach dem Speichern einmal angezeigt wird.
+- Ein Batch gilt bei jeder 2xx-Antwort als zugestellt. Bis dahin wird derselbe Batch alle 30 Sekunden erneut gesendet,
+  in Reihenfolge, und nichts geht verloren.
+- Wird der Stream aktiviert oder seine URL geändert, beginnt er ab diesem Moment; ältere Einträge werden nicht gesendet.
+- Private Adressen und Loopback-Adressen werden abgelehnt, sofern der Betreiber nicht
+  `webhooks.allow_private_networks` setzt.
+
+## Aufbewahrung
+
+Legen Sie <UiPath path="audit.keepEntriesFor" /> im Dialog des Arbeitsbereichs fest, oder
+<UiPath path="audit.changeRetention" /> für das Protokoll der Instanz. Die Bereinigung läuft stündlich.
+
+<LimitsTable area="audit-log" />
+
+## Verwandte Themen
+
+- [Rollen und Berechtigungen](/de/team/roles-and-permissions/)
+- [Sicherheit und Härtung](/de/self-hosting/security/)
+- [Webhooks empfangen](/de/developers/webhooks/)
+- [Instanzverwaltung](/de/self-hosting/instance-admin/)

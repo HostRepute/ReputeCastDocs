@@ -1,0 +1,262 @@
+---
+title: 'Schnellstart: ReputeCast mit Docker betreiben'
+description: 'Schnellstart: Newsletter mit Docker selbst hosten. ReputeCast in Containern starten, die Einrichtung abschließen und in etwa 15 Minuten eine Test-E-Mail senden.'
+type: tutorial
+audience: [operator, admin]
+primaryKeyword: Newsletter mit Docker selbst hosten
+sources:
+  - deploy/docker-compose.yml
+  - Dockerfile
+  - Makefile
+  - README.md
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/accounts/setup_state.go
+  - web/src/features/auth/SetupPage.tsx
+  - web/src/features/connect
+  - internal/connect
+  - internal/providers/smtp
+  - internal/config/config.go
+  - web/src/features/overview/FirstRun.tsx
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Wer einen Newsletter mit Docker selbst hosten möchte, beginnt hier: In diesem Tutorial starten Sie die
+Newsletter-Plattform ReputeCast auf Ihrem eigenen Computer, schließen die erste Einrichtung ab und senden eine
+Test-E-Mail an einen lokalen Test-Mailserver. Das dauert etwa 15 Minuten. Alles läuft in Containern, und am Ende
+können Sie alles mit einem einzigen Befehl wieder entfernen.
+
+## Bevor Sie beginnen
+
+- Docker mit Compose v2 (Docker Desktop oder Docker Engine mit dem Compose-Plugin). Prüfen Sie das mit
+  `docker compose version`.
+- Port 8080 (ReputeCast) und Port 8025 (der Posteingang des Test-Mailservers) frei auf Ihrem Computer.
+- Ein Passkey (Touch ID, Face ID, Windows Hello oder ein Sicherheitsschlüssel) oder eine Authenticator-App wie
+  1Password, Google Authenticator oder Authy. Für den ersten Inhaber ist die Anmeldung mit
+  Zwei-Faktor-Authentifizierung erforderlich.
+
+ReputeCast braucht neben der App nur PostgreSQL; die Compose-Datei startet beides.
+
+## ReputeCast starten
+
+<Steps>
+
+1. **Die Compose-Datei herunterladen**, in einen leeren Ordner:
+
+   ```sh
+   mkdir reputecast && cd reputecast
+   curl -fsSL https://raw.githubusercontent.com/hostrepute/reputecast/main/deploy/docker-compose.yml -o docker-compose.yml
+   ```
+
+   Sie definiert zwei Dienste: `postgres` (PostgreSQL 18) und `app` (ReputeCast). Die App führt beim Start ihre
+   Datenbankmigrationen aus und legt den ersten Inhaber an, und ihre Zustandsprüfung meldet sie als fehlerfrei, sobald
+   die Datenbank antwortet und das Schema aktuell ist.
+
+2. **Einen Test-Mailserver für diesen Versuch hinzufügen.** Eine echte Installation sendet über Ihren
+   [Versandanbieter](/de/reference/glossary/#sending-provider). Für diesen lokalen Versuch fügen Sie
+   [Mailpit](https://mailpit.axllent.org) hinzu, einen Test-Mailserver, der jede Nachricht in einem Web-Posteingang
+   aufbewahrt. ReputeCast liest Bounces über TLS aus einem Postfach; erstellen Sie deshalb zuerst ein Zertifikat für
+   Mailpit:
+
+   ```sh
+   docker run --rm -v "$PWD/mailpit-tls:/tls" alpine:3.22 sh -c 'apk add --no-cache openssl >/dev/null && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=mailpit" -addext "subjectAltName=DNS:mailpit" -keyout /tls/mailpit.key -out /tls/mailpit.crt'
+   ```
+
+   Speichern Sie dann diese Datei neben `docker-compose.yml`. Compose liest sie automatisch:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     mailpit:
+       image: axllent/mailpit:v1.31.5
+       restart: unless-stopped
+       ports:
+         - "8025:8025" # Mailpit's inbox: http://localhost:8025
+       environment:
+         MP_SMTP_AUTH_ACCEPT_ANY: "1"
+         MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+         MP_SMTP_BIND_ADDR: 0.0.0.0:2525
+         MP_POP3_BIND_ADDR: 0.0.0.0:995
+         MP_POP3_AUTH: "bounces:bounces-password"
+         MP_POP3_TLS_CERT: /tls/mailpit.crt
+         MP_POP3_TLS_KEY: /tls/mailpit.key
+       volumes:
+         - ./mailpit-tls:/tls:ro
+
+     app:
+       environment:
+         # Mailpit runs on the private Docker network.
+         REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS: "true"
+         # Trust Mailpit's certificate next to the system certificates.
+         SSL_CERT_DIR: /etc/ssl/certs:/trust
+       volumes:
+         - ./mailpit-tls/mailpit.crt:/trust/mailpit.crt:ro
+   ```
+
+   <Aside type="caution">
+     Diese Override-Datei ist nur für einen Versuch auf Ihrem eigenen Computer gedacht. Entfernen Sie sie, bevor Sie
+     echte E-Mails senden: `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS` erlaubt ReputeCast, sich mit Adressen in
+     privaten Netzwerken zu verbinden.
+   </Aside>
+
+3. **Den Stack starten**, mit Ihrer E-Mail-Adresse als erstem Inhaber:
+
+   ```sh
+   REPUTECAST_ADMIN_EMAIL=you@company.com docker compose up -d
+   ```
+
+4. **Das temporäre Passwort lesen.** Der erste Start dauert etwa 20 Sekunden, während die Migrationen laufen. Dann:
+
+   ```sh
+   docker compose logs app | grep -A4 "ReputeCast is installed"
+   ```
+
+   ```text title="Output"
+   app-1  |   ReputeCast is installed.
+   app-1  |
+   app-1  |   Sign in at  http://localhost:8080
+   app-1  |   Email       you@company.com
+   app-1  |   Password    aEkq-cFUR-E5js-vfyU   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Gibt der Befehl nichts aus, warten Sie einige Sekunden und führen Sie ihn erneut aus. `docker compose ps` zeigt die
+   App als `healthy`, sobald sie bereit ist.
+
+</Steps>
+
+<Aside type="note" title="Das Image selbst bauen">
+  Um eigene Änderungen oder eine unveröffentlichte Version zu betreiben, bauen Sie das Image aus einem Checkout des
+  ReputeCast-Repositorys und lassen die Compose-Datei darauf zeigen:
+
+```sh
+make docker VERSION=local
+REPUTECAST_IMAGE=reputecast REPUTECAST_VERSION=local REPUTECAST_ADMIN_EMAIL=you@company.com \
+  docker compose -f deploy/docker-compose.yml up -d
+```
+
+`REPUTECAST_IMAGE` und `REPUTECAST_VERSION` funktionieren auch mit der heruntergeladenen Compose-Datei.
+`REPUTECAST_PORT` ändert den Port auf Ihrem Computer und `REPUTECAST_PUBLIC_URL` die Adresse, die ReputeCast in Links
+einsetzt (der eine Name der öffentlichen URL, auch für die Binärdatei).
+
+
+</Aside>
+
+## Die erste Einrichtung abschließen
+
+<Steps>
+
+1. **Anmelden.** Öffnen Sie http://localhost:8080, geben Sie Ihre E-Mail-Adresse ein, wählen Sie **Weiter** und geben
+   Sie dann das temporäre Passwort ein.
+
+   <Screenshot
+     id="sign-in"
+     alt="Die Anmeldeseite von ReputeCast fragt zuerst nach einer geschäftlichen E-Mail-Adresse, darunter die Anmeldung mit Passkey und, wo ein Admin sie aktiviert hat, Google und GitHub."
+   />
+
+2. **Die sechs Einrichtungsschritte durcharbeiten.** ReputeCast speichert jeden Schritt, sodass Sie unterbrechen und
+   später weitermachen können.
+
+   <Screenshot
+     id="setup-password"
+     alt="Schritt 1 von 6 der Einrichtung: das temporäre Passwort ersetzen, links die übrigen Schritte."
+   />
+
+   - Geben Sie unter <UiPath path="setup.stepPassword" /> das temporäre Passwort und ein neues mit mindestens 12
+     Zeichen ein.
+   - <UiPath path="setup.stepSecondFactor" />: Fügen Sie einen Passkey hinzu, oder scannen Sie den QR-Code mit Ihrer
+     Authenticator-App und geben Sie den angezeigten Code ein.
+   - <UiPath path="setup.stepRecoveryCodes" />: Laden Sie die 10 Codes herunter, drucken oder kopieren Sie sie. Jeder
+     meldet Sie einmal an, falls Sie Ihren Passkey oder Ihre Authenticator-App verlieren; Sie sehen sie nur jetzt.
+   - <UiPath path="setup.instanceBasics" />: Benennen Sie die Instanz, wählen Sie Standardzeitzone und -sprache und
+     prüfen Sie die öffentliche URL. Auf Ihrem eigenen Computer warnt die TLS-Zeile vor einfachem `http`, und die
+     Erreichbarkeitsprüfung kann fehlschlagen; Sie können trotzdem speichern. Lassen Sie
+     <UiPath path="setup.updateCheck" /> an oder aus; die Prüfung ruft nur die neueste Versionsnummer ab.
+   - <UiPath path="setup.stepWorkspace" />: Benennen Sie Ihren ersten
+     [Arbeitsbereich](/de/reference/glossary/#workspace), zum Beispiel nach Ihrem Newsletter.
+   - <UiPath path="setup.stepProvider" />: Wählen Sie diesen Schritt, um den Assistenten für Anbieter zu öffnen.
+
+</Steps>
+
+<Aside type="tip">
+  Um sich umzusehen, bevor Sie etwas verbinden, öffnen Sie die Übersicht und wählen Sie
+  <UiPath path="overview.exploreDemo" />. Damit werden die Beispieldaten von Acme in einen eigenen Demo-Arbeitsbereich
+  geladen, dessen Inhaber Sie sind; seine Anbieter sind Demo-Verbindungen, es wird also nichts gesendet. Sie können
+  auch in Ihrem eigenen Arbeitsbereich Kampagnen schreiben, bevor ein Anbieter verbunden ist.
+</Aside>
+
+## Den Test-Mailserver verbinden und einen Test senden
+
+<Steps>
+
+1. **Den Anbieter wählen.** Der Assistent listet jeden integrierten Versandanbieter mit seinen Bedingungen für
+   Massenmarketing, Preis und Einrichtungszeit auf; <UiPath path="connect.catalog.chooseTitle" /> oben empfiehlt einen
+   für Ihr Volumen. Scrollen Sie für diesen Test daran vorbei und wählen Sie **Beliebiger SMTP-Server**.
+
+   <Screenshot
+     id="providers-catalog"
+     alt="Der Anbieterkatalog, Schritt 1 der sechs links aufgeführten Schritte des Assistenten: Hilfe bei der Auswahl empfiehlt Amazon SES für 50.000 E-Mails im Monat, und Karten für Amazon SES, Postmark und Mailgun zeigen ihre Bedingungen für Massenmarketing, Preis und Einrichtungszeit."
+   />
+
+2. **Den Postausgangsserver verbinden.** Geben Sie den Host `mailpit`, den Port `2525` und die Verschlüsselung
+   **kein TLS** ein; lassen Sie Benutzername und Passwort leer. Wählen Sie
+   <UiPath path="connect.connection.smtp.testConnection" />: Das Ergebnis lautet „Verbunden … Kein TLS · keine
+   Authentifizierung“.
+
+3. **Das Bounce-Postfach verbinden.** SMTP hat keine Webhooks, deshalb liest ReputeCast Bounces aus einem Postfach.
+   Geben Sie die Return-Path-Adresse `bounces@example.com`, das Protokoll **POP3**, den E-Mail-Server `mailpit`, den
+   Port **995 · TLS**, den Benutzernamen `bounces` und das Passwort `bounces-password` ein. Wählen Sie
+   <UiPath path="connect.connection.smtp.testMailbox" /> und fahren Sie dann mit der Domainverifizierung fort.
+
+4. **Eine Versand-Domain eingeben.** Geben Sie `example.com` ein, wählen Sie **DNS-Einträge anzeigen** und fahren Sie
+   dann mit dem Testversand fort. Bei einer echten Domain legen Sie diese Einträge bei Ihrem DNS-Hoster an; lesen Sie
+   [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/).
+
+5. **Einen Absender hinzufügen.** Der Test braucht eine From-Adresse. Öffnen Sie in einem neuen Browser-Tab
+   <UiPath path="nav.settings > settings.senders" />, wählen Sie <UiPath path="senders.addSender" />, geben Sie einen
+   Namen und `news@example.com` ein, aktivieren Sie Massenversand, Automationen und System und fügen Sie den Absender
+   hinzu. Laden Sie im Assistenten die Seite neu.
+
+6. **Den Test senden.** Wählen Sie <UiPath path="connect.steps.sendTest" />. Die Zustell-Zeitleiste füllt sich, sobald
+   Mailpit die Nachricht annimmt. Öffnen Sie http://localhost:8025, um sie im Posteingang von Mailpit zu lesen.
+
+7. **Den Assistenten abschließen.** Lassen Sie alle vier Streams auf dem SMTP-Server und wählen Sie dann **Leer
+   beginnen und abschließen** (oder importieren Sie Kontakte). Die Zusammenfassung listet auf, was eingerichtet wurde.
+
+</Steps>
+
+## Was Sie erstellt haben
+
+ReputeCast und PostgreSQL laufen auf Ihrem Computer, Ihr Inhaberkonto ist mit Zwei-Faktor-Authentifizierung geschützt,
+die Instanz und Ihr erster Arbeitsbereich sind eingerichtet, und eine Test-E-Mail ging von ReputeCast über einen
+SMTP-Server in einen Posteingang.
+
+Um alles zu entfernen, einschließlich der Datenbank, führen Sie im Ordner `docker compose down -v` aus.
+
+Für echten Versand betreiben Sie ReputeCast auf einem Server mit öffentlicher HTTPS-Adresse, damit Versandanbieter
+Zustellungen, Bounces und Beschwerden an ihn zurückmelden können, und verbinden Ihren eigenen Anbieter. Lesen Sie
+[Mit Docker Compose installieren](/de/self-hosting/docker/) und
+[Einen Versandanbieter verbinden](/de/providers/connect/).
+
+## Nächste Schritte
+
+<CardGrid>
+  <LinkCard
+    title="Den ersten Newsletter senden"
+    description="Kontakte importieren, eine Kampagne schreiben und die Versandbereitschaft bestehen."
+    href="/de/getting-started/first-campaign/"
+  />
+  <LinkCard
+    title="Mit Amazon SES senden"
+    description="SES mit einem CloudFormation-Stack oder IAM-Schlüsseln verbinden."
+    href="/de/providers/amazon-ses/"
+  />
+  <LinkCard
+    title="Reverse Proxy und TLS"
+    description="ReputeCast mit HTTPS hinter Caddy, nginx oder Traefik betreiben."
+    href="/de/self-hosting/reverse-proxy/"
+  />
+</CardGrid>

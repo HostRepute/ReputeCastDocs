@@ -1,0 +1,225 @@
+---
+title: Estado de los proveedores y caídas
+description: 'Qué hace ReputeCast ante una caída del proveedor de correo: comprobaciones, estados Caído o Degradado, conmutación comprobada, retención y vuelta al principal.'
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: caída del proveedor de correo
+sources:
+  - internal/providers/manage/health.go
+  - internal/providers/manage/record.go
+  - internal/opsmetrics/opsmetrics.go
+  - internal/providers/manage/review_health.go
+  - internal/providers/manage/actions.go
+  - internal/providers/manage/usage.go
+  - internal/providers/state/state.go
+  - internal/providers/state/vet.go
+  - internal/providers/state/messages/en.json
+  - internal/routing/routing.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/routeerrors.go
+  - web/src/features/providers/messages.ts
+  - web/src/features/providers/overview.messages.ts
+  - web/src/features/providers/incidents.messages.ts
+sidebar:
+  order: 18
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast comprueba en segundo plano cada proveedor de envío conectado y le asigna un estado. Cuando empieza una caída
+del proveedor de correo, el correo que tiene que seguir saliendo pasa a un respaldo que supera sus comprobaciones, la
+parte de una campaña en el proveedor que falla espera tu decisión, y el tráfico vuelve en cuanto el proveedor lleva 10
+minutos operativo.
+
+## Qué significan los estados
+
+<UiPath path="nav.providers > providers.tabProviders" /> muestra una tarjeta por proveedor con su estado, los flujos que
+lleva, sus IP de envío, la actividad reciente de sus webhooks, su tasa de errores de la API, su cuota y su velocidad de
+envío, su costo de este mes y sus funciones.
+
+<Screenshot
+  id="providers-list"
+  alt="La página de proveedores: 3 proveedores conectados, 2 Operativo y 1 En calentamiento. Las tarjetas de Amazon SES y Postmark están en Operativo, cada una con los flujos que lleva, sus IP de envío, los webhooks, la tasa de errores de la API en 7 días, las tasas de rebote y de quejas frente a sus límites, la cuota, la velocidad de envío, el costo y las etiquetas de funciones."
+/>
+
+<TableScroll label="Estados de los proveedores">
+
+| Estado                                                                                       | Significado                                                                                                                                                                                         | Acepta correo nuevo                                                  |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| <UiPath path="providers.statusHealthy" />                                                    | Las últimas comprobaciones fueron correctas.                                                                                                                                                        | Sí                                                                   |
+| <UiPath path="providers.statusWarmingUp" /> · día N de M                                     | Hay un [plan de calentamiento](/es/providers/warm-up/) en marcha; su límite diario se aplica a los Envíos masivos.                                                                                   | Sí, hasta el límite de hoy                                           |
+| <UiPath path="providers.statusSandbox" />                                                    | La cuenta solo puede enviar a direcciones verificadas, como en el sandbox de Amazon SES.                                                                                                             | Solo a esas direcciones                                              |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.webhooksSilent" /> | El proveedor acepta correo, pero no informa de eventos de entrega, rebote ni queja. Consulta [webhooks sin eventos](#webhooks-sin-eventos).                                                        | No: los Envíos masivos esperan y los demás flujos usan su respaldo    |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.rejecting" />    | El proveedor rechaza una proporción inusual de los mensajes que se le entregan, por ejemplo por un remitente sin verificar o una cuenta suspendida. Consulta [rechazo de mensajes](#rechazo-de-mensajes). | Sí; los mensajes rechazados no se enviaron                         |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.mailboxFailing" /> | No se puede leer el [buzón de rebotes](/es/reference/glossary/#bounce-mailbox) de un servidor SMTP, así que sus rebotes no llegan a la lista de supresión.                                       | Sí                                                                   |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.queueFailing" /> | No se puede leer la cola de eventos de Amazon SES; sus eventos esperan allí.                                                                                                                         | Sí                                                                   |
+| <UiPath path="providers.statusDown" />                                                       | Las llamadas fallan, o el proveedor rechazó las credenciales (<UiPath path="providers.health.downAuth" />).                                                                                          | No                                                                   |
+| <UiPath path="providers.statusPaused" />                                                     | El proveedor está en pausa.                                                                                                                                                                          | No                                                                   |
+
+</TableScroll>
+
+Las tasas de rebote y de quejas de una tarjeta cubren los últimos 7 días (o son las cifras del propio proveedor, cuando
+las facilita). Se muestran frente a los límites de la cuenta del proveedor, como los niveles de revisión y de pausa de
+Amazon SES, para que veas lo cerca que está tu cuenta de ellos. Puedes cambiar los límites que se muestran en
+<UiPath path="providers.overview.settings" /> del proveedor. Son solo una referencia: los umbrales que pausan un envío
+son los [valores de envío predeterminados del espacio de trabajo](/es/providers/workspace-defaults/) y las
+[reglas de tráfico](/es/providers/traffic-rules/).
+
+Una tasa sin datos nunca se muestra como 0 %:
+
+- La tasa de quejas solo cuenta el correo entregado a [proveedores de buzón](/es/reference/glossary/#mailbox-provider)
+  que informan de las quejas. Gmail e iCloud nunca lo hacen, así que un proveedor cuyo correo solo fue allí muestra
+  "n/d" con el motivo: "Gmail e iCloud no informan de las quejas".
+- Si no se entregó nada en los últimos 7 días, las tasas también muestran "n/d".
+- La tasa de errores de la API de un proveedor que no tuvo llamadas muestra
+  <UiPath path="providers.overview.errorRateNoCalls" />.
+
+## Cómo se comprueba el estado
+
+1. Cada 5 minutos, ReputeCast hace una llamada de solo lectura a cada proveedor (por ejemplo, `GetAccount` en Amazon SES
+   o `GET /server` en Postmark) y registra el resultado, la cuota y la velocidad de envío que indica. Mientras un
+   proveedor está Caído o Degradado, lo comprueba cada minuto.
+2. Los envíos reales también cuentan: se registra cada llamada a la API durante un envío.
+3. Un proveedor se marca como **Caído** tras 2 comprobaciones fallidas seguidas, o cuando falló al menos la mitad de al
+   menos 5 llamadas en los últimos 3 minutos. Un `401` o una respuesta similar de "credenciales rechazadas" lo marca
+   como Caído de inmediato.
+4. Un proveedor se marca como **Degradado** cuando sus webhooks se quedan sin eventos, cuando empieza a rechazar
+   mensajes o cuando ReputeCast no puede leer su buzón de rebotes o su cola de eventos. Cada uno de estos casos abre un
+   incidente y avisa a quienes gestionan los proveedores de envío.
+5. Un proveedor Caído se considera recuperado cuando las llamadas vuelven a funcionar (falla menos de 1 de cada 10)
+   durante 10 minutos. Después de reemplazar unas credenciales rechazadas, se recupera en la siguiente comprobación
+   correcta.
+
+El aviso de caída tiene un botón para volver a comprobar el proveedor ahora en lugar de esperar a la siguiente
+comprobación.
+
+## Qué pasa durante una caída
+
+Cuando un proveedor se cae, ReputeCast gestiona cada flujo que enruta correo a través de él según la
+[política de conmutación por error](/es/providers/routing/) del flujo. El correo solo pasa a un respaldo que antes supera
+todas las comprobaciones: disponible, con condiciones que permiten el correo masivo (para Envíos masivos), fuera del
+sandbox, con el dominio del remitente verificado allí, con cuota suficiente para el correo que se movería y con el
+calentamiento completado. Un proveedor en calentamiento solo acepta correo de conmutación con la política automática y
+dentro del límite de hoy.
+
+- **Automatizaciones, Sistema y Transaccional** conmutan automáticamente al respaldo del flujo cuando supera sus
+  comprobaciones. El aviso indica cuántos correos se reenrutaron. Cuando el respaldo no supera una comprobación,
+  ReputeCast sigue reintentando con el proveedor en lugar de conmutar, y el correo nuevo del flujo espera hasta que el
+  proveedor se recupere.
+- **Envíos masivos** sigue la política de Envíos masivos. Con la predeterminada, pausar y preguntar, cada campaña que
+  envía a través del proveedor tiene retenida la parte de ese proveedor mientras las demás partes siguen enviando, y se
+  pide a quienes pueden enviar campañas que decidan. Con la conmutación automática, o la que es solo a proveedores con el
+  calentamiento completado, la parte pasa al respaldo cuando la política lo permite y el respaldo supera sus
+  comprobaciones.
+
+Una parte retenida pasa por la única vía de caídas del motor de envío, tanto si la caída la detectó la comprobación de
+estado como si la detectó antes el envío: sus llamadas fallaron durante 3 minutos, siguió limitando la velocidad de la
+cuenta, sus errores de API superaron el límite del envío, o rechazó al remitente o se quedó sin cuota. Hasta que alguien
+decide, la parte prueba el proveedor con un mensaje por minuto y se reanuda sola cuando pasan 3 seguidos. El
+[monitor en tiempo real](/es/campaigns/live-monitor/) muestra la misma retención con el análisis del motor y sus
+opciones.
+
+Para una parte retenida de Envíos masivos, el aviso de caída de la página de proveedores ofrece tres opciones. Encima de
+ellas aparece <UiPath path="providers.incidents.checksFirst" />, y cada destino muestra las comprobaciones que superó.
+
+- **Esperar** al proveedor: la parte se reanuda sola cuando el proveedor lleva 10 minutos operativo. Es la opción
+  recomendada cuando ningún destino superó todas las comprobaciones.
+- **Mover** los destinatarios retenidos a otro proveedor. No se puede elegir un destino que no superó una comprobación.
+  Si aún está en calentamiento y el movimiento superaría el límite de hoy, el botón indica que no se recomienda.
+- <UiPath path="providers.incidents.cancelSend" />: los destinatarios retenidos no reciben la campaña, el resto del envío
+  se detiene y lo que ya se envió sigue enviado. No se puede deshacer.
+
+Esperar y mover reanudan el envío y necesitan `campaigns:send`; cancelar necesita `campaigns:pause`.
+
+Los miembros con `providers:manage` reciben un aviso cuando un proveedor se cae. Cada paso (caída, conmutación, espera,
+vuelta, recuperación) se escribe en <UiPath path="providers.incidents.timelineTitle" />, y la caída queda en el
+[registro de auditoría](/es/team/audit-log/). Los [endpoints de webhook](/es/developers/webhooks/) del espacio de
+trabajo reciben `provider.down` cuando el proveedor se cae (con el motivo, el error y qué flujos conmutaron y cuáles
+esperan) y `provider.recovered` cuando vuelve (con cuántos minutos estuvo caído).
+
+Los operadores del servidor pueden seguir las mismas llamadas en las [métricas de Prometheus](/es/self-hosting/monitoring/):
+`reputecast_provider_calls_total` cuenta las llamadas de envío por adaptador (ok o error), y
+`reputecast_provider_messages_total`, los mensajes entregados al proveedor (aceptados, rechazados, aplazados o
+fallidos).
+
+### Volver al proveedor principal
+
+Tras 10 minutos operativo, los flujos que conmutaron vuelven a su proveedor principal, y las partes de Envíos masivos que
+estaban en espera se reanudan donde se detuvieron.
+
+### Webhooks sin eventos
+
+Los webhooks de un proveedor se quedan sin eventos cuando sigue aceptando correo, pero no vuelve ningún evento de
+entrega, rebote ni queja: los mensajes que aceptó llevan retraso más allá de un periodo de gracia, como establece la fila
+"Webhooks sin eventos" de [valores predeterminados y límites](#valores-predeterminados-y-límites). Un proveedor que nunca
+ha informado de un evento se señala en cuanto el correo que se le envió lleva retraso, para que un webhook que nunca
+funcionó no muestre "aún no hay eventos" para siempre. Los servidores SMTP quedan exentos porque sus rebotes llegan de un
+buzón.
+
+Mientras los webhooks no tienen eventos, el envío funciona, pero el estado de los mensajes nuevos se desconoce, así que
+la protección contra rebotes de esa ruta está a ciegas. El proveedor se marca como Degradado. ReputeCast no conmuta solo
+por el silencio: los Envíos masivos del proveedor esperan hasta que lleguen eventos o decidas, y los demás flujos usan
+su respaldo cuando lo tienen. El aviso muestra lo que comprobó ReputeCast (la API, si el webhook sigue registrado en el
+proveedor, si su dirección de webhook es pública y cuándo llegó a ella el proveedor por última vez), las causas probables
+y el impacto: los mensajes con retraso y los que siguen dentro de los 30 minutos de gracia, las campañas afectadas y los
+rebotes que aún no se han suprimido. Desde ahí puedes elegir <UiPath path="providers.incidents.sendTestEvent" /> (el
+proveedor envía uno al webhook, y su llegada demuestra que la dirección funciona),
+<UiPath path="providers.incidents.reregister" /> o, cuando la API del proveedor guarda los mensajes pasados,
+<UiPath path="providers.incidents.checkNow" /> para leer el estado de los mensajes con retraso. El aviso desaparece en
+cuanto llegan eventos. Cómo llegan los eventos a ReputeCast se explica en
+[eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/).
+
+### Rechazo de mensajes
+
+Un proveedor que rechaza los mensajes que se le entregaron, por ejemplo porque el remitente no está verificado allí o la
+cuenta está suspendida, se marca como <UiPath path="providers.health.rejecting" /> cuando los rechazos superan la fila
+"Rechaza mensajes" de [valores predeterminados y límites](#valores-predeterminados-y-límites). Los mensajes rechazados no
+se enviaron. El incidente muestra cuántos rechazó y su última respuesta; revisa el dominio del remitente y la cuenta en
+el proveedor. El estado desaparece cuando vuelve a aceptar mensajes. Durante una campaña, un proveedor que rechaza al
+remitente retiene su parte en lugar de hacer fallar todos los mensajes: no se marca nada como fallido, y los mensajes
+esperan a que corrijas el remitente, los muevas o los canceles.
+
+### Credenciales rechazadas
+
+Cuando un proveedor responde que las credenciales ya no son válidas, por ejemplo porque alguien rotó la clave de API en
+el proveedor, se marca como Caído de inmediato y sus flujos conmutan como se explica arriba. Reemplaza las credenciales
+en <UiPath path="providers.overview.settings" /> del proveedor: ReputeCast comprueba las nuevas con el proveedor antes de
+guardarlas.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="providers" />
+
+## Cuándo cambiarlos
+
+- **Da a cada flujo un respaldo que pueda llevar su correo.** Un segundo proveedor con el dominio del remitente
+  verificado y cuota suficiente convierte una caída en una breve conmutación para el correo de Automatizaciones, Sistema
+  y Transaccional. Lee [Enrutar el correo entre proveedores](/es/providers/routing/).
+- **Elige con cuidado la política de Envíos masivos.** Pausar y preguntar es la opción segura predeterminada. Conmuta
+  automáticamente, solo a un proveedor con el calentamiento completado, si prefieres que las campañas sigan avanzando y
+  tu respaldo tiene historial de envío.
+- **Asegúrate de que los webhooks puedan llegar a ti.** Los webhooks sin eventos suelen deberse a un problema del proxy
+  inverso, de un cortafuegos o de la URL pública. Lee [Proxy inverso y TLS](/es/self-hosting/reverse-proxy/) y
+  [Solución de problemas](/es/self-hosting/troubleshooting/).
+
+<Aside type="tip">
+El estado de la cuenta del proveedor más allá de las comprobaciones propias de ReputeCast, como las listas de bloqueo y
+la reputación ante los proveedores de buzón, está en las páginas de Entregabilidad. Lee
+[Supervisar el estado de los dominios y proveedores](/es/deliverability/health/).
+</Aside>
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Enrutar el correo entre proveedores" href="/es/providers/routing/" />
+  <LinkCard title="Supervisar un envío y la pausa automática" href="/es/campaigns/live-monitor/" />
+  <LinkCard title="Eventos de entrega y sincronización de supresiones" href="/es/providers/events-and-sync/" />
+  <LinkCard title="Notificaciones" href="/es/team/notifications/" />
+</CardGrid>

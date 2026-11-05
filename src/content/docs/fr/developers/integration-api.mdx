@@ -1,0 +1,250 @@
+---
+title: Créer une intégration
+description: "Créez une intégration e-mail marketing sur l’API ReputeCast comme les applications Zapier, Make, n8n et WordPress : clés, déclencheurs, actions, consentement."
+type: how-to
+audience: [developer]
+permissions: ['webhooks:manage', 'subscribers:create', 'subscribers:edit']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: intégration e-mail marketing
+sources:
+  - docs/integrations/hub.md
+  - internal/integrations/api.go
+  - internal/integrations/actions.go
+  - internal/integrations/catalog.go
+  - internal/integrations/hub.go
+  - internal/api/integrations.go
+  - internal/api/api.go
+  - internal/webhooks/webhooks.go
+  - src/data/api-samples/upsert-contact.yaml
+  - src/data/api-samples/add-contact-to-list.yaml
+sidebar:
+  order: 10
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Les applications Zapier, Make et n8n et le plugin WordPress que publie ReputeCast n’utilisent que l’API REST publique.
+Cette page montre comment créer une intégration e-mail marketing de la même façon : vous authentifier, trouver l’espace
+de travail, vous abonner à des événements et appeler les cinq actions que proposent les applications officielles, sans
+jamais revenir sur le consentement d’un contact.
+
+## Avant de commencer
+
+- Une instance ReputeCast joignable en HTTPS depuis l’endroit où tourne votre intégration, et son URL publique
+  (l’« URL de l’instance »). Tous les chemins ci-dessous commencent par `/api/v1`.
+- Une clé API. Pour votre propre application ou service, créez-en une dans
+  <UiPath path="nav.settings > settings.keys" /> avec <UiPath path="keys.createApiKey" /> et donnez-lui seulement ce
+  dont l’intégration a besoin : `webhooks:manage` pour les déclencheurs, `subscribers:create` et `subscribers:edit`
+  pour les actions sur les contacts, `transactional:send` pour envoyer des e-mails transactionnels. Voir
+  [Authentification et clés API](/fr/developers/api-authentication/).
+- Les applications officielles reçoivent un autre type de clé, une
+  [clé d’intégration](/fr/reference/glossary/#integration-key), depuis
+  <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.connect" />. ReputeCast ne crée
+  de clés d’intégration que pour Zapier, Make, n8n et WordPress
+  ([Connecter d’autres outils](/fr/integrations/overview/)).
+
+## Se connecter et tester
+
+<Steps>
+
+1. Demandez à l’utilisateur l’URL de l’instance et la clé. Stockez la clé chiffrée ; envoyez-la sous la forme
+   `Authorization: Bearer rc_live_…` à chaque appel.
+
+2. Appelez `GET /api/v1/integration`. Toute clé API peut l’appeler, sans autorisation, et il indique à quel espace de
+   travail appartient la clé :
+
+   ```sh title="Terminal"
+   curl https://reputecast.example.com/api/v1/integration \
+     --header "Authorization: Bearer $REPUTECAST_API_KEY"
+   ```
+
+   ```json title="200 OK"
+   {
+     "workspace": "acme-newsletter",
+     "workspaceName": "Acme Newsletter",
+     "integration": "",
+     "key": "CRM sync",
+     "triggers": [],
+     "actions": [],
+     "permissions": ["subscribers:create", "subscribers:edit", "webhooks:manage"]
+   }
+   ```
+
+3. Utilisez `workspace` dans tous les autres chemins (`/api/v1/workspaces/acme-newsletter/…`) et vérifiez
+   `permissions` avant de proposer une fonctionnalité. `integration`, `triggers` et `actions` ne sont remplis que pour
+   les clés d’intégration.
+
+</Steps>
+
+## Déclencheurs : s’abonner à des événements
+
+Votre intégration apprend les changements par les [webhooks sortants](/fr/developers/webhooks/). Quand un utilisateur
+active un déclencheur, créez un endpoint pour celui-ci ; quand il le désactive, supprimez-le.
+
+```sh title="Terminal"
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/acme-newsletter/webhooks \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{ "name": "CRM sync · unsubscribes", "url": "https://crm.example.com/hooks/reputecast", "events": ["contact.unsubscribed"] }'
+```
+
+La réponse `201` porte l’endpoint dans `webhook` et son secret de signature dans `secret`, affiché uniquement dans
+cette réponse. Stockez le secret avec l’abonnement et vérifiez chaque livraison avec lui
+([vérifier la signature](/fr/developers/webhooks/#vérifier-la-signature)). `DELETE …/webhooks/<webhookId>` annule
+l’abonnement. Les événements que la plupart des intégrations proposent comme déclencheurs :
+
+| Déclencheur                         | Événement              | La clé nécessite     |
+| ----------------------------------- | ---------------------- | -------------------- |
+| Contact inscrit                     | `contact.subscribed`   | `subscribers:view`   |
+| Contact désabonné                   | `contact.unsubscribed` | `subscribers:view`   |
+| Contact mis à jour                  | `contact.updated`      | `subscribers:view`   |
+| Formulaire soumis                   | `form.submitted`       | `subscribers:view`   |
+| Campagne envoyée                    | `campaign.completed`   | `campaigns:view`     |
+| Rebond d’un message transactionnel  | `message.bounced`      | `transactional:view` |
+
+Tous les autres événements de [Événements webhook](/fr/reference/webhook-events/) fonctionnent de la même façon.
+`form.submitted` se déclenche quand une inscription est confirmée (immédiatement en opt-in simple) et porte l’ID du
+formulaire, pour que votre application puisse filtrer par formulaire.
+
+Les applications officielles utilisent plutôt des REST hooks : `POST …/integration/hooks` avec `{ "event", "url" }`
+crée un endpoint géré, et un endpoint qui répond `410 Gone` est supprimé. Ces opérations, ainsi que les recherches
+d’exemples, de listes, de champs et de modèles sous `…/integration/`, n’acceptent que les clés d’intégration
+([référence de l’API d’intégration](/api/operations/tags/integration-api/)).
+
+## Actions
+
+<TableScroll label="Actions d’intégration">
+
+| Action                              | Appel                                                     | La clé nécessite                                               |
+| ----------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| Créer ou mettre à jour un contact   | `POST …/contacts/upsert`                                  | `subscribers:create` ; `subscribers:edit` pour mettre à jour un contact |
+| Ajouter un contact à une liste      | `POST …/lists/<listId>/contacts`                          | `subscribers:edit`                                             |
+| Ajouter des tags à un contact       | `POST …/contacts/tags`                                    | `subscribers:edit`                                             |
+| Enregistrer un événement            | `POST …/automations/events`                               | `subscribers:edit`                                             |
+| Envoyer un e-mail transactionnel    | `POST …/transactional/messages`                           | `transactional:send` ([sensible](/fr/reference/glossary/#sensitive-permission)) |
+
+</TableScroll>
+
+**Créer ou mettre à jour un contact** fait la correspondance par adresse e-mail : le répéter met donc à jour le même
+contact au lieu d’en créer un deuxième :
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:create (and subscribers:edit to update contacts).
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# List IDs come from GET /api/v1/workspaces/your-workspace/lists.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/contacts/upsert \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "email": "sam.rivera@outlook.com",
+    "firstName": "Sam",
+    "lastName": "Rivera",
+    "language": "en-US",
+    "tags": ["trial"],
+    "lists": ["0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f"],
+    "consent": "double"
+  }'
+```
+
+- `consent: "single"` ajoute immédiatement le contact aux listes ; `"double"` envoie d’abord l’e-mail de
+  confirmation, et la liste affiche `pending` jusqu’au clic. Sans `consent`, le réglage propre à chaque liste
+  s’applique.
+- `language` prend un code BCP 47. Des valeurs comme `Spanish` ou `es_MX` sont normalisées (`es`, `es-MX`) ; une
+  valeur inconnue répond `422`, en nommant la correspondance la plus proche quand il y en a une.
+- Les listes acceptent jusqu’à 20 ID par appel, et les tags jusqu’à 50. Obtenez les ID de liste avec `GET …/lists` et
+  les clés des champs personnalisés pour `fields` avec `GET …/fields` (les deux nécessitent `subscribers:view`).
+- La réponse indique si le contact a été créé (`created`), quelles listes il a rejointes avec quel état, et si un
+  e-mail de confirmation est parti (`confirmationSent`).
+
+**Ajouter un contact à une liste** nécessite un contact existant ; une nouvelle adresse répond `404` : appelez donc
+d’abord l’upsert. **Enregistrer un événement** est décrit dans
+[Enregistrer des événements et des conversions](/fr/developers/events-and-conversions/), et
+**Envoyer un e-mail transactionnel** dans
+[Envoyer des e-mails transactionnels avec l’API](/fr/developers/transactional-api/).
+
+## Le consentement est respecté
+
+Une action ne réinscrit jamais quelqu’un à une liste qu’il a quittée et n’ajoute jamais une adresse exclue. Elle
+répond plutôt `409` :
+
+```json title="409 Conflict"
+{
+  "status": 409,
+  "title": "Conflict",
+  "code": "unsubscribed",
+  "detail": "rob@example.net left Beta Program on 2 Oct. ReputeCast doesn't add people back to a list they left.",
+  "meta": { "list": "Beta Program", "listId": "0192…", "leftAt": "2026-10-02T13:41:00Z" }
+}
+```
+
+`409 suppressed` porte `meta.reason` et `meta.since`. Traitez les deux comme « ignoré » pour cet enregistrement, et
+non comme un workflow en échec : signalez-le à l’utilisateur et continuez avec le reste.
+
+## Nouvelles tentatives et idempotence
+
+- L’envoi transactionnel et l’API des conversions acceptent un en-tête `Idempotency-Key` : une nouvelle tentative avec
+  la même clé reçoit la première réponse et n’envoie ni n’enregistre rien deux fois. Mettez dans la clé l’ID
+  d’exécution ou d’enregistrement de votre plateforme, comme le font les applications officielles
+  (`make-<scenario ID>-<value>`, `n8n-<workflow ID>-<value>`).
+- Les autres actions ne prennent pas de clé. Ne les relancez qu’après une erreur réseau ou une réponse `429`/`5xx`,
+  et jamais après une réponse `2xx`.
+- Répondez à `429` en attendant `Retry-After`. La limite générale est de 600 requêtes par minute et par clé
+  ([limites de débit](/fr/developers/api-rate-limits/)).
+
+## Clés d’intégration et noms de workflows
+
+Si vous maintenez l’une des applications officielles, sa clé provient de
+<UiPath path="nav.settings > settings.integrations" /> et suit des règles supplémentaires :
+
+- Elle ne fonctionne que pour les opérations des déclencheurs et des actions que l’utilisateur a activés, même là où
+  ses autorisations en permettraient davantage. Tout le reste répond `403 integration_operation_denied`.
+- <UiPath path="integrations.rotateKey" /> laisse l’ancienne clé fonctionner pendant 24 heures, pour que l’application
+  puisse être mise à jour sans exécutions en échec ; <UiPath path="integrations.stopOldKey" /> met fin à ce
+  chevauchement.
+- Quand le propriétaire de la clé est désactivé ou retiré, les appels répondent `403 owner_deactivated` jusqu’à ce
+  qu’un membre disposant de `integrations:manage` sélectionne <UiPath path="integrations.takeOver" />. Une clé
+  révoquée ou expirée répond `401 key_revoked` ou `401 key_expired`.
+- Chaque appel est conservé 7 jours dans le journal des appels de l’intégration. Envoyez le nom et l’ID du workflow
+  avec chaque appel pour que le journal puisse les afficher :
+
+  ```http title="En-tête de requête"
+  X-ReputeCast-Workflow: Beta application (Typeform) → ReputeCast contact; id=284113907
+  ```
+
+  Encodez en pourcentage (UTF-8) les caractères hors de l’ASCII imprimable ainsi que `%`, `;`, `=` et `"` ;
+  ReputeCast les décode. Les formes `name="…"` et RFC 8187 `name*=UTF-8''…` sont acceptées aussi.
+
+<LimitsTable area="integrations" />
+
+## Vérifier le résultat
+
+- `GET /api/v1/integration` répond `200` avec l’espace de travail et les autorisations attendus.
+- Après la création d’un endpoint, <UiPath path="nav.settings > settings.webhooks" /> le liste, et son
+  <UiPath path="webhooks.sendTestEvent" /> atteint votre récepteur.
+- Après un upsert, le contact apparaît dans <UiPath path="nav.audience" /> avec les listes, les tags et le
+  consentement que vous avez envoyés.
+
+## Dépannage
+
+- **`403 permission_denied`** : la clé n’a pas l’autorisation nommée dans `permission` ; le champ `helpers` nomme des
+  membres qui peuvent l’accorder.
+- **`422 private_address` à la création d’un endpoint** : l’URL pointe vers un réseau privé. Utilisez une adresse
+  publique, ou demandez à un admin de l’instance de définir `webhooks.allow_private_networks`.
+- **`404` à l’ajout à une liste** : le contact n’existe pas encore ; faites d’abord un upsert.
+- **`409 unsubscribed` ou `409 suppressed`** : comportement attendu ; ignorez l’enregistrement.
+- **`403 integration_operation_denied`** : la clé d’intégration n’a pas le droit de faire cet appel. Modifiez ce que
+  l’intégration peut faire dans <UiPath path="nav.settings > settings.integrations" />.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Recevoir des webhooks" href="/fr/developers/webhooks/" description="Enveloppe, en-têtes, signatures et nouvelles tentatives." />
+  <LinkCard title="Connecter d’autres outils" href="/fr/integrations/overview/" description="Le catalogue des intégrations dans l’application." />
+  <LinkCard title="Erreurs de l’API" href="/fr/developers/api-errors/" description="Documents de problème et tous les codes d’erreur." />
+  <LinkCard title="Référence de l’API" href="/api/" description="Toutes les opérations qu’une clé API peut appeler." />
+</CardGrid>

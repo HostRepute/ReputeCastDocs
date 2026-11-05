@@ -1,0 +1,115 @@
+---
+title: Migrar a ReputeCast sin perder el consentimiento
+description: 'Cómo migrar de plataforma de newsletter a ReputeCast: contactos, consentimiento, supresiones, suscriptores de pago y plantillas, y qué se queda atrás.'
+type: explanation
+audience: [publisher, admin]
+permissions: ['subscribers:import']
+uiPath: 'nav.audience > audience.tabContacts > audience.contacts.import'
+primaryKeyword: migrar de plataforma de newsletter
+sources:
+  - internal/imports
+  - web/src/features/imports
+  - internal/store/queries/imports.sql
+  - internal/earn/imports.go
+  - internal/transactional/importer
+  - internal/audience/profile.go
+  - internal/audience/retention.go
+sidebar:
+  order: 1
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Cuando decides migrar de plataforma de newsletter a ReputeCast, tres importadores hacen el trabajo: uno para los contactos y su [consentimiento](/es/reference/glossary/#consent), otro para los suscriptores de pago y otro para las plantillas transaccionales. Los tres solo leen de la plataforma anterior. No se escribe nada en ella, y una importación nunca puede convertir una baja, un rebote o una queja de nuevo en una suscripción.
+
+## Lo que puedes traer
+
+<TableScroll label="Lo que trae cada importador">
+
+| Qué se traslada                                                                          | Desde                                                                                    | Guía                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Contactos, listas, campos personalizados, etiquetas y el estado de cada contacto en cada lista | Brevo, Mailchimp, MailerLite, listmonk, Keila y Notifuse (API), o un archivo CSV o XLSX | [Mailchimp](/es/migrate/mailchimp/), [Brevo](/es/migrate/brevo/), [MailerLite](/es/migrate/mailerlite/), [listmonk](/es/migrate/listmonk/), [Keila](/es/migrate/keila/), [Notifuse](/es/migrate/notifuse/), [archivo CSV o XLSX](/es/audience/import/) |
+| Suscriptores de pago, vinculados con sus suscripciones en tu cuenta de Stripe             | Exportaciones de Substack, Ghost, beehiiv y Kit, o cualquier CSV                         | [Importar suscriptores de pago](/es/migrate/paid-members/)                                                                                                                                                                                                 |
+| Plantillas transaccionales, convertidas a Liquid de ReputeCast                            | Postmark, SendGrid, Mailgun, Notifuse, o archivos MJML y HTML                            | [Importar plantillas transaccionales](/es/migrate/transactional-templates/)                                                                                                                                                                                |
+
+</TableScroll>
+
+Abre el importador de contactos desde <UiPath path="shell.importContacts" />, al final de la barra lateral, o desde <UiPath path="nav.audience > audience.tabContacts > audience.contacts.import" />. El último paso del asistente de conexión también lo ofrece cuando [conectas un proveedor de envío](/es/providers/connect/). Para ejecutarlo necesitas el permiso `subscribers:import`, que tienen los roles Propietario, Administrador y Editor.
+
+<Screenshot
+  id="import-source"
+  alt="Paso 1 del asistente Importar contactos: siete orígenes, Mailchimp conectado con una audience de 12.480 contactos suscritos, 1033 dados de baja y 212 cleaned que van a la lista Product Updates."
+/>
+
+## Cómo conserva el consentimiento una importación de contactos
+
+El asistente tiene cinco pasos: <UiPath path="imports.stepSource" />, <UiPath path="imports.stepFields" />, <UiPath path="imports.stepConsent" />, <UiPath path="imports.stepPreview" /> e <UiPath path="imports.stepImport" />. Se guarda un borrador a medida que avanzas, así que puedes salir y volver. Por el camino ocurre lo siguiente:
+
+1. **Conectar el origen.** Pegas una clave de API (y, para listmonk, Keila y Notifuse, la dirección del servidor). ReputeCast la comprueba, la guarda cifrada y no vuelve a mostrarla. Las direcciones de servidor de una red privada o interna se rechazan, salvo que la instancia defina `providers.allow_private_networks`.
+2. **Elegir qué importar.** Cada lista del origen va a una [lista](/es/reference/glossary/#list) de ReputeCast existente o a una nueva. Opciones: importar las etiquetas, importar lo que el origen sabe sobre la interacción y traer primero las supresiones existentes de tus proveedores de envío conectados. Las tres están activadas por defecto.
+3. **ReputeCast lee todas las filas** de las listas elegidas en segundo plano y luego propone un campo de ReputeCast para cada campo del origen. Los campos sin asignar se omiten; se quedan en el origen.
+4. **Asignar el consentimiento.** Cada estado del origen se convierte en un estado de ReputeCast, como en la tabla de abajo. Los contactos dados de baja, rebotados o con queja quedan fijados en la [lista de supresión](/es/reference/glossary/#suppression-list): ninguna opción del asistente puede importarlos como suscritos. Con <UiPath path="imports.importTag" />, cada contacto que la importación añade o actualiza recibe además una etiqueta, como `mailchimp-2026-09`, para encontrarlo o segmentarlo más tarde.
+5. **Vista previa.** Una simulación compara cada fila con tus contactos y con la lista de supresión, y separa los duplicados, las direcciones no válidas y los grupos de riesgo (direcciones genéricas, desechables, posibles erratas, posibles trampas). Todavía no se escribe nada.
+6. **Importar.** Las filas entran por lotes, con un registro en tiempo real. Cuando las filas ya están dentro, ReputeCast envía cada supresión que creó la importación, bajas incluidas, a cada proveedor de envío conectado cuya lista de supresión acepte entradas nuevas (el registro los nombra), y envía los correos de reconfirmación si los elegiste. A partir de entonces, la [sincronización de supresiones](/es/providers/events-and-sync/) habitual solo envía los rebotes permanentes y las quejas que se aplican a todo el correo. Una importación se inicia una sola vez: volver a iniciarla, desde otra pestaña o por otra persona del equipo, se rechaza con "Esta importación ya ha comenzado."
+7. **Informe.** El resumen cuenta qué pasó con cada fila y ofrece el informe completo y las filas omitidas como archivos CSV. Contienen todas las direcciones que leyó la importación, así que solo se conservan durante un tiempo (consulta los [valores predeterminados y límites](#valores-predeterminados-y-límites)): el resumen indica hasta cuándo, y después se borran y ya no se pueden descargar (la API responde `410`). [Borrar definitivamente un contacto](/es/audience/contacts/#borrar-contactos-definitivamente) también quita sus filas de estos archivos; una importación que todavía conserva un archivo subido que menciona al contacto pierde ese archivo, y su registro te pide que lo vuelvas a subir.
+
+| Estado en el origen                                   | Se convierte en ReputeCast en                                                                       | Efecto                                                           |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Suscrito                                              | Suscrito · confirmado (predeterminado), Suscrito · pendiente con un correo de reconfirmación, u Omitir | Los contactos confirmados reciben Envíos masivos y Automatizaciones de inmediato |
+| Pendiente (nunca completó la doble confirmación)      | Suscrito · pendiente (predeterminado) u Omitir                                                      | Sin correo de marketing hasta que confirme                       |
+| Solo transaccional (Mailchimp)                        | Omitir (predeterminado) o Suscrito · pendiente                                                      | No se importa por defecto                                        |
+| Dado de baja                                          | Suprimido · dado de baja (bloqueado)                                                                | Envíos masivos y Automatizaciones bloqueados; correo de Sistema permitido |
+| Rebote permanente (cleaned, bounced, unreachable)     | Suprimido · rebote permanente (bloqueado)                                                           | Todos los flujos bloqueados                                      |
+| Queja (denuncia de spam)                              | Suprimido · queja (bloqueado)                                                                       | Todos los flujos bloqueados                                      |
+
+Una supresión pertenece a la dirección, no a una lista: un contacto que se dio de baja de una lista del origen no recibe Envíos masivos ni Automatizaciones en ninguna lista de ReputeCast. Cada guía de origen enumera los estados exactos del origen que hay detrás de estas filas.
+
+### Evidencia de consentimiento y reconfirmación
+
+Por defecto, la suscripción registrada en el origen se conserva como evidencia de consentimiento: la fecha y la dirección IP de la suscripción cuando el origen las tiene (`OPTIN_TIME` y `OPTIN_IP` de Mailchimp, la fecha y la IP de suscripción de MailerLite, la fecha de suscripción de Notifuse). Con <UiPath path="imports.repermission" />, todos los contactos suscritos se importan en su lugar como pendientes y reciben un correo de confirmación por el [flujo](/es/reference/glossary/#stream) Sistema cuando termina la importación. Sin un proveedor en el flujo Sistema no sale ningún correo y los contactos siguen pendientes, así que conecta uno antes de importar.
+
+Los contactos pendientes no reciben correo de marketing hasta que confirman. Quienes siguen sin confirmar 14 días después de su último correo de confirmación quedan suprimidos para Envíos masivos y Automatizaciones, con el origen <UiPath path="audience.suppressionSource.repermission" /> en la [lista de supresión](/es/audience/suppressions/); si confirman más tarde, la supresión se levanta. Un reenvío por parte de tu equipo vuelve a iniciar los 14 días. Para hacer un seguimiento antes, usa una [automatización](/es/automations/overview/).
+
+Cada contacto importado recibe también una entrada en su historial de consentimiento, como "Importado de Mailchimp por Linh Nguyen, 12 oct 2026, estado subscribed, evidencia OPTIN_TIME 2025-03-02".
+
+## Lo que nunca se traslada
+
+- **Una dirección suprimida sigue suprimida.** Si una dirección ya está en la lista de supresión de ReputeCast, la fila se omite con el motivo <UiPath path="imports.reasonAlready" />, diga lo que diga el origen.
+- **El historial de envíos.** Las campañas anteriores, sus informes y las aperturas, clics y rebotes de cada mensaje se quedan en la plataforma anterior. Expórtalos allí si necesitas conservarlos.
+- **Automatizaciones, segmentos, formularios y diseños de campaña.** Vuelve a crearlos con [automatizaciones](/es/automations/overview/), [segmentos](/es/audience/segments/), [formularios de suscripción](/es/forms/signup-forms/) y el [editor](/es/campaigns/composer/). Notifuse es el único origen cuyas plantillas de correo llegan junto con sus contactos.
+- **La configuración de envío.** Los dominios, los remitentes y las conexiones con proveedores se configuran en el propio ReputeCast.
+- **Los datos de las tarjetas.** Los suscriptores de pago siguen pagando a través de Stripe; ReputeCast no guarda datos de tarjetas ni cambia nada en Stripe.
+
+## Lista de comprobación para la migración
+
+1. [Añade tus dominios de envío y remitentes](/es/providers/senders-and-domains/) y después [configura SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/) para ellos.
+2. [Conecta un proveedor de envío](/es/providers/connect/). Si la plataforma anterior también es tu proveedor de envío (Brevo, Mailgun, SendGrid y otros), puedes mantenerla conectada mientras te cambias.
+3. Importa los contactos trayendo primero las supresiones de tus proveedores, para que las direcciones que un proveedor ya bloquea sigan suprimidas en ReputeCast.
+4. [Calienta](/es/providers/warm-up/) cualquier proveedor nuevo o dirección IP dedicada.
+5. Traslada el tráfico poco a poco con un [reparto ponderado](/es/providers/routing/), por ejemplo un 90 % en el proveedor que conoces y un 10 % en el nuevo.
+6. Envía la primera campaña al [grupo de interacción](/es/audience/list-health/) Activo y vigila la [revisión previa](/es/campaigns/send-readiness/) y el [monitor en tiempo real](/es/campaigns/live-monitor/).
+7. Haz que la plataforma anterior deje de enviar (y, en el caso de los suscriptores de pago, de cobrar) cuando todo funcione en ReputeCast.
+
+## Valores predeterminados y límites
+
+<LimitsTable area="imports" />
+
+El importador de suscriptores de pago y el de plantillas tienen sus propios límites de archivo, que aparecen en [importar suscriptores de pago](/es/migrate/paid-members/) e [importar plantillas transaccionales](/es/migrate/transactional-templates/). Todos los valores están también en [límites y valores predeterminados](/es/reference/limits-and-defaults/).
+
+## Cuándo cambiarlos
+
+- **Pide la reconfirmación en lugar de fiarte del origen** cuando la lista es antigua, usó la suscripción simple o no sabes cómo se unió la gente.
+- **Baja a 3 solicitudes por segundo** cuando el origen sigue respondiendo 429 Too Many Requests: la importación en pausa ofrece <UiPath path="imports.slowDown" />.
+- **Sobrescribe en lugar de completar** cuando el origen está más actualizado que ReputeCast para los contactos que ya tienes. La opción predeterminada de la vista previa, <UiPath path="imports.conflictFill" />, nunca reemplaza un valor que ya tienes.
+- **Permite las redes privadas** (`providers.allow_private_networks`, consulta la [referencia de configuración](/es/reference/configuration/)) cuando listmonk, Keila o Notifuse se ejecutan en tu propia red.
+
+## Relacionado
+
+- [Importar contactos desde CSV o XLSX](/es/audience/import/)
+- [Listas, consentimiento y doble confirmación](/es/audience/lists-and-consent/)
+- [La lista de supresión](/es/audience/suppressions/)
+- [Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)
+- [Las importaciones en la referencia de la API](/api/operations/tags/imports/)

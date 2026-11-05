@@ -1,0 +1,199 @@
+---
+title: Comprobaciones de estado, métricas y logs
+description: 'Referencia para la supervisión de ReputeCast con Prometheus: las sondas /healthz y /readyz, el comando healthcheck, las series de /metrics y los logs JSON.'
+type: reference
+audience: [operator]
+primaryKeyword: supervisión de ReputeCast con Prometheus
+sources:
+  - internal/app/app.go
+  - internal/app/metrics.go
+  - internal/app/schema.go
+  - internal/opsmetrics/opsmetrics.go
+  - internal/server/metrics.go
+  - internal/server/middleware.go
+  - internal/logging/logging.go
+  - internal/logging/context.go
+  - internal/config/config.go
+  - internal/cli/serve.go
+  - internal/cli/healthcheck.go
+  - internal/db/db.go
+  - deploy/Dockerfile.release
+  - deploy/docker-compose.yml
+sidebar:
+  order: 11
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Lo que ofrece ReputeCast para la supervisión de ReputeCast con Prometheus, las comprobaciones de estado de los
+balanceadores de carga y los contenedores, y el envío de logs.
+
+## Endpoints
+
+<TableScroll label="Endpoints de estado y métricas">
+
+| Endpoint       | Respuesta                                                                                                      | Para qué sirve                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `GET /healthz` | `200` con el cuerpo `ok` (`text/plain`). Nunca consulta la base de datos.                                     | Liveness: el proceso está en marcha y sirve HTTP.                            |
+| `GET /readyz`  | `200` con `ready` cuando la base de datos responde en menos de 2 s, su esquema tiene todas las migraciones que necesita esta versión y, en un proceso con el rol `worker`, los workers están en marcha. Si no, `503` con el motivo: `database unavailable`, ``database schema behind this release: run `reputecast migrate up` `` o `workers not started`. | Readiness: un balanceador de carga o un orquestador mantiene el tráfico lejos del proceso, y en la versión anterior mientras haya migraciones pendientes ([actualizar ReputeCast](/es/self-hosting/upgrades/#mientras-hay-migraciones-pendientes)). |
+| `GET /metrics` | Formato de texto de Prometheus.                                                                                | Scraping. Se sirve en el listener de métricas (`metrics.addr`, por defecto `:9464`). En el listener principal, solo a una solicitud con `Authorization: Bearer <metrics.token>`; sin token, ahí responde `404`. `metrics.enabled: false` lo desactiva. |
+
+</TableScroll>
+
+- `/healthz` y `/readyz` responden en el listener HTTP (`http.addr`, por defecto `:8080`), que solo se ejecuta en los
+  procesos con el rol `web` o `ingest`, y en el listener de métricas. Un proceso solo de worker (`reputecast worker` o
+  `serve --role=worker`) no tiene listener HTTP, pero siempre abre el listener de métricas, en `:9464` aunque
+  `metrics.addr` esté vacío o las métricas estén desactivadas, para que se pueda comprobar su estado. Consulta
+  [escalar con los roles web, ingest y worker](/es/self-hosting/scaling/).
+- El listener de métricas solo responde a estas tres rutas. Cuando su puerto está ocupado, por ejemplo por otro proceso
+  de ReputeCast en el mismo host, el proceso registra `metrics listener not started` y sigue funcionando: da a cada
+  proceso de un host su propio `metrics.addr`.
+- `/healthz` y `/readyz` no piden autenticación.
+
+<Aside type="caution" title="Mantén /metrics privado">
+  Sus etiquetas de ruta muestran qué partes de la aplicación se usan. No publiques el puerto 9464 ni lo enrutes a
+  través de tu [proxy inverso](/es/self-hosting/reverse-proxy/). Para hacer scraping a través de la dirección pública,
+  define `metrics.token` (`REPUTECAST_METRICS__TOKEN`, al menos 16 caracteres) y envíalo como bearer token. Antes de la
+  1.3.0, `/metrics` estaba abierto en el listener principal: después de actualizar, apunta Prometheus al puerto 9464 o
+  dale el token.
+</Aside>
+
+## Comprobación de estado del contenedor
+
+La imagen de la versión declara un `HEALTHCHECK` que ejecuta `reputecast healthcheck`, y el
+[archivo Compose](/es/self-hosting/docker/#el-archivo-compose-línea-por-línea) incluido lo repite para la aplicación.
+La imagen sigue sin tener shell ni `curl`; la comprobación ejecuta el propio binario de ReputeCast.
+
+`reputecast healthcheck` consulta `/readyz` en el listener HTTP local (`REPUTECAST_HTTP__ADDR`) y, si ahí no escucha
+nada, en el listener de métricas (`REPUTECAST_METRICS__ADDR`). Muestra la respuesta y termina con `0` cuando es `200`,
+y con `1` en caso contrario. `--live` consulta `/healthz` en su lugar, `--url` comprueba otra dirección y `--timeout`
+define cuánto espera (por defecto `3s`).
+
+```sh
+docker compose exec app /usr/local/bin/reputecast healthcheck
+```
+
+```txt title="Salida"
+http://127.0.0.1:8080/readyz: ready
+```
+
+Los balanceadores de carga y los monitores de disponibilidad que no pueden ejecutar un comando consultan `/readyz` por
+HTTP desde fuera.
+
+## Métricas
+
+<TableScroll label="Métricas de Prometheus">
+
+| Serie                                        | Tipo      | Etiquetas                    | Significado                                                                                                                   |
+| -------------------------------------------- | --------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `reputecast_http_requests_total`             | counter   | `method`, `route`, `status`  | Solicitudes HTTP. `route` es el patrón de ruta que coincide (`/api/v1/auth/password`), o `unmatched`; `status` es la clase: `2xx`, `4xx`, `5xx`. |
+| `reputecast_http_request_duration_seconds`   | histogram | `method`, `route`            | Latencia de las solicitudes. Intervalos: 0,005, 0,01, 0,025, 0,05, 0,1, 0,25, 0,5, 1, 2,5, 5 y 10 segundos.                   |
+| `reputecast_jobs`                            | gauge     | `queue`, `kind`, `state`     | Tareas en segundo plano por estado: `available`, `scheduled`, `retryable`, `running`, `discarded`.                            |
+| `reputecast_job_queue_lag_seconds`           | gauge     | `queue`                      | Cuánto ha esperado la tarea pendiente más antigua; `0` cuando no espera ninguna. Colas: `default`, `sending`, `events`, `system`, `maintenance`. |
+| `reputecast_job_failures_total`              | counter   | `kind`, `outcome`            | Intentos fallidos de tareas: `retry`, `discarded` (sin más intentos) o `panic`.                                              |
+| `reputecast_provider_messages_total`         | counter   | `provider`, `result`         | Mensajes entregados a los proveedores de envío, por adaptador: `accepted`, `rejected`, `deferred`, `failed`.                 |
+| `reputecast_provider_calls_total`            | counter   | `provider`, `result`         | Llamadas de envío a los proveedores de envío: `ok` o `error`.                                                                 |
+| `reputecast_ingest_requests_total`           | counter   | `channel`, `result`          | Webhooks recibidos en `/hooks/` (`email`, `sms`, `whatsapp`, `stripe`, `store`): `stored`, `rejected` (firma), `unknown`, `invalid`, `retry_later`. |
+| `reputecast_ingest_pending`, `reputecast_ingest_lag_seconds` | gauge | `channel`          | Eventos de proveedores guardados y aún sin procesar (`email`, `sms`, `whatsapp`), y la antigüedad del más antiguo.            |
+| `reputecast_webhook_deliveries_total`        | counter   | `result`                     | Intentos de webhooks salientes: `delivered`, `retrying`, `dead`.                                                              |
+| `reputecast_webhook_deliveries_pending`, `reputecast_webhook_deliveries_lag_seconds` | gauge | — | Entregas de webhooks salientes en espera, y cuánto ha esperado la pendiente más antigua.                          |
+| `reputecast_db_pool_*`                       | varios    | `state` en `_connections`    | El pool de la base de datos: conexiones (`acquired`, `idle`, `constructing`), su tamaño, adquisiciones, esperas y tiempo de espera. |
+| `reputecast_metrics_scrape_errors`           | gauge     | —                            | Lecturas de colas que fallaron en el último scrape (la base de datos iba lenta o estaba caída).                               |
+| `go_*`, `process_*`                          | varios    | —                            | Recolectores del runtime de Go y del proceso: goroutines, recolección de basura, memoria, tiempo de CPU, descriptores de archivo abiertos, hora de inicio. |
+
+</TableScroll>
+
+Las lecturas de tareas, ingesta y webhooks vienen de la base de datos, así que todos los procesos informan de los
+mismos valores: agrégalos con `max`, no con `sum`. La entregabilidad (tasas de rebote y de quejas, revisión previa)
+está en la aplicación, en <UiPath path="nav.deliverability" /> y <UiPath path="nav.providers" />.
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: reputecast
+    static_configs:
+      - targets: ['reputecast.internal:9464'] # the host and port of metrics.addr
+```
+
+```yaml title="prometheus.yml (a través de la dirección pública, con metrics.token)"
+scrape_configs:
+  - job_name: reputecast
+    scheme: https
+    authorization:
+      credentials: <the token>
+    static_configs:
+      - targets: ['news.example.com:443']
+```
+
+```txt title="Consultas PromQL de ejemplo"
+# Server errors per second, by route
+sum by (route) (rate(reputecast_http_requests_total{status="5xx"}[5m]))
+
+# 95th percentile latency, by route
+histogram_quantile(0.95, sum by (le, route) (rate(reputecast_http_request_duration_seconds_bucket[5m])))
+
+# Queues whose oldest due job has waited more than 5 minutes
+max by (queue) (reputecast_job_queue_lag_seconds) > 300
+
+# Messages sending providers rejected, per second, by adapter
+sum by (provider) (rate(reputecast_provider_messages_total{result="rejected"}[5m]))
+```
+
+## Logs
+
+| Opción       | Valores                                    | Valor predeterminado                          |
+| ------------ | ------------------------------------------ | --------------------------------------------- |
+| `log.level`  | `debug`, `info`, `warn`, `error`           | `info`; `--log-level` lo sustituye            |
+| `log.format` | `text` o `json` (un objeto JSON por línea) | `text`; la imagen de Docker define `json`     |
+
+Cada proceso escribe sus logs en la salida de error estándar. En Docker, léelos con `docker compose logs app`.
+
+```json title="docker compose logs app (formato json)"
+{"time":"2026-10-22T12:24:02.125352804Z","level":"INFO","msg":"http listening","addr":":8080","public_url":"http://localhost:8110","roles":["web","worker","ingest"]}
+```
+
+- Una línea `http` por solicitud, con `method`, `path`, `status`, `bytes` y `duration_ms`.
+- Cada línea registrada mientras se atiende una solicitud, incluida la línea `http`, lleva `request_id` y `route` (el
+  patrón de ruta que coincide); las solicitudes a la API añaden `workspace` (su slug) y `caller` (`user:<id>`,
+  `key:<id>` o `agent:<id>`). El mismo ID de solicitud se guarda con las entradas del
+  [registro de auditoría](/es/reference/glossary/#audit-log) de la solicitud. Las líneas que registra una tarea en
+  segundo plano llevan `job` (`kind:id`).
+- Las respuestas con código 500 o superior se registran en `error`, y las de 400 a 499, en `warn`. Las solicitudes a
+  `/healthz`, `/readyz` y a los recursos estáticos se registran en `debug`, para que las sondas no llenen el log.
+- Las partes secretas de las rutas se sustituyen por `{token}` antes de registrarlas: los enlaces de seguimiento de
+  aperturas y clics y el enlace oculto que llevan los correos con seguimiento para los bots, los enlaces de baja y de
+  preferencias, los informes compartidos, las direcciones de webhooks de los proveedores, las invitaciones, los enlaces
+  de restablecimiento de contraseña y los enlaces de revisión del editor. También la página de recompensas de los
+  referidos, los enlaces de recompensas y de recomendaciones, los códigos de socio, los enlaces de inicio de sesión del
+  sitio web, los enlaces de descarga y de regalos de suscripción de un comprador, los enlaces de facturación y de
+  cancelación de un suscriptor de pago, los códigos de regalo y las respuestas de las votaciones, bajo
+  `/p/<workspace>/` y en un dominio personalizado.
+
+Líneas que merece la pena vigilar con alertas:
+
+| Mensaje                                                                                   | Nivel | Significado                                                                                     |
+| ----------------------------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------- |
+| `generated a new secret key; back it up together with the database`                      | WARN  | No se encontró ninguna clave, así que se escribió una nueva. Es normal una vez en una instalación nueva; después de una restauración, falta la clave ([hacer copias de seguridad y restaurar](/es/self-hosting/backups/)). |
+| ``the database schema is behind this release: serving read-only and holding workers until `reputecast migrate up` applies the missing migrations`` | ERROR | El binario es más reciente que el esquema y funciona en solo lectura ([actualizar ReputeCast](/es/self-hosting/upgrades/#mientras-hay-migraciones-pendientes)). Cuando se aplican las migraciones, aparece `the database schema is current: writes and workers resume`. |
+| `the database has migrations from a newer release; downgrades are supported one minor release back (docs/deploy/backup-restore.md)` | WARN | Un binario más antiguo funciona sobre un esquema más reciente ([volver a la versión anterior](/es/self-hosting/upgrades/#volver-a-la-versión-anterior)). |
+| `waiting for another migrator to finish`                                                  | INFO  | Otro proceso tiene el bloqueo de migraciones; este lo espera.                                   |
+| `metrics listener not started`                                                            | ERROR | El puerto de `metrics.addr` está ocupado; el proceso funciona sin su listener de métricas.      |
+| `ignoring invalid trusted proxy`                                                          | WARN  | Un valor de `http.trusted_proxies` no es una IP ni un CIDR.                                     |
+| `http listening`                                                                          | INFO  | Arrancó el listener HTTP; muestra `addr`, `public_url` y `roles`.                               |
+| `metrics listening`                                                                       | INFO  | Arrancó el listener de métricas; muestra `addr`.                                                |
+| `workers started`                                                                         | INFO  | Arrancó un rol worker; muestra `concurrency`.                                                   |
+
+## Límites del servidor HTTP
+
+<LimitsTable area="server" />
+
+## Relacionado
+
+- [Referencia de configuración](/es/reference/configuration/): las claves `metrics.*`, `log.*` y `http.*`.
+- [Revisar las tareas fallidas y las colas en la aplicación](/es/self-hosting/instance-admin/#revisar-tareas-colas-y-almacenamiento),
+  en <UiPath path="shell.userMenuInstanceAdmin > admin.system" />.
+- [Solución de problemas](/es/self-hosting/troubleshooting/): síntomas, causas y soluciones.
+- [URL públicas y endpoints](/es/reference/public-urls/): todas las rutas que sirve ReputeCast, y qué rol sirve cada
+  una.

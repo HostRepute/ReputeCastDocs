@@ -1,0 +1,202 @@
+---
+title: So funktioniert ReputeCast
+description: 'Die Architektur für den Newsletter-Versand hinter ReputeCast: Arbeitsbereiche und Streams, Routen und Failover, Zustellereignisse und eine geteilte Sperrliste.'
+type: explanation
+audience: [publisher, admin, operator]
+primaryKeyword: Architektur für den Newsletter-Versand
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - README.md
+  - internal/providers/provider.go
+  - internal/routing/routing.go
+  - internal/ingest
+  - internal/suppressions
+  - internal/readiness
+  - internal/sending/engine
+  - internal/authz
+  - internal/mailbox
+  - internal/sending/rules
+  - internal/cadence
+  - internal/erasure
+  - internal/workspaces/retention.go
+sidebar:
+  order: 4
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Diese Seite erklärt die Architektur für den Newsletter-Versand hinter ReputeCast: wer wo arbeitet, welche Arten von
+E-Mails es gibt, wie jede E-Mail ihren Versandanbieter findet und wie Zustellergebnisse zurückkommen und Ihren nächsten
+Versand schützen. Die Begriffe dieser Seite begegnen Ihnen in der ganzen App und im Rest dieser Dokumentation.
+
+## Instanzen, Arbeitsbereiche und Mitglieder
+
+- Eine [Instanz](/de/reference/glossary/#instance) ist eine ReputeCast-Installation: der Server, seine
+  PostgreSQL-Datenbank und jeder Arbeitsbereich darauf. [Instanz-Admins](/de/reference/glossary/#instance-admin)
+  verwalten Konten, Anmeldemethoden, Single Sign-on und Updates für die ganze Instanz und behalten ihre
+  [Jobs, Warteschlangen und den Speicher](/de/self-hosting/instance-admin/) im Blick.
+- Ein [Arbeitsbereich](/de/reference/glossary/#workspace) ist ein abgetrennter Bereich mit eigenen Listen, Kampagnen,
+  Automationen, Versandanbietern und eigenem Team. Eine Instanz kann beliebig viele Arbeitsbereiche haben, zum Beispiel
+  einen je Publikation, Marke oder Kunde.
+- Ein [Mitglied](/de/reference/glossary/#member) ist eine Person in einem Arbeitsbereich, mit genau einer
+  [Rolle](/de/reference/glossary/#role) dort. Die integrierten Rollen sind Inhaber, Admin, Bearbeiter und Betrachter;
+  Sie können eigene Rollen mit Ihrer eigenen Auswahl an Berechtigungen hinzufügen. API-Schlüssel und KI-Agenten erhalten
+  Berechtigungen auf dieselbe Weise und können nie mehr haben als die Person, die sie erstellt hat. Lesen Sie
+  [Rollen und Berechtigungen](/de/team/roles-and-permissions/).
+
+## Versandanbieter und Postfachanbieter
+
+ReputeCast sagt immer, welchen der beiden es meint:
+
+- Ein [Versandanbieter](/de/reference/glossary/#sending-provider) stellt Ihre E-Mails zu: Amazon SES, Postmark,
+  Mailgun, ein Postal-Server, ein beliebiger SMTP-Server und die anderen unter
+  [Einen Versandanbieter auswählen](/de/providers/choose/).
+- Ein [Postfachanbieter](/de/reference/glossary/#mailbox-provider) ist der Ort, an dem Ihr Leser die E-Mail öffnet:
+  Gmail, Outlook, Yahoo, iCloud und andere.
+
+ReputeCast ermittelt den Postfachanbieter jedes Kontakts aus den MX-Einträgen der Domain der Adresse; ein Unternehmen
+mit Google Workspace zählt also als Gmail und eines mit Microsoft 365 als Outlook. Routing, Versandbereitschaft,
+Berichte und Warm-up lesen alle diese Antwort. Gmail und iCloud melden Beschwerden nie pro Nachricht, deshalb zeigen
+ihre Beschwerderaten „k. A.“ und fließen nicht in Summen der Beschwerderate ein.
+
+Berichte und der Live-Monitor zeigen Ergebnisse je Postfachanbieter und je Versandanbieter nebeneinander, weil ein
+Problem auf beiden Seiten liegen kann.
+
+## Vier Streams
+
+Ein [Stream](/de/reference/glossary/#stream) ist eine Art von E-Mails. Jeder Stream hat seine eigene Route und seine
+eigene Failover-Richtlinie, sodass eine schlechte Kampagne nie das Zurücksetzen eines Passworts blockiert.
+
+| Stream | Was er transportiert |
+| --- | --- |
+| Massenversand | Kampagnen. |
+| Automationen | E-Mails, die Automationsabläufe senden. |
+| System | Double-Opt-in-Bestätigungen, Links zum Präferenzcenter, Team-Einladungen und E-Mails zum Zurücksetzen des Passworts. |
+| Transaktional | Produkt-E-Mails, die Ihre eigene Anwendung über die Transaktions-API oder das SMTP relay sendet. |
+
+Einladungen, das Zurücksetzen von Passwörtern und E-Mail-Benachrichtigungen funktionieren erst, wenn ein
+Versandanbieter den Stream System übernimmt. Transaktions-E-Mails haben Vorrang, wenn sie sich einen Versandanbieter
+mit dem Massenversand teilen. Lesen Sie
+[Transaktions-E-Mails in ReputeCast](/de/transactional/overview/).
+
+## Routen, gewichtete Aufteilungen und Failover
+
+Eine [Route](/de/reference/glossary/#route) entscheidet, welcher Versandanbieter eine E-Mail zustellt. Jeder Stream hat
+eine Standardregel, und Sie können Regeln für bestimmte Listen, Absenderdomains oder den Postfachanbieter des
+Empfängers hinzufügen. Eine Regel kann alle ihre E-Mails über einen Anbieter senden oder sie als
+[gewichtete Aufteilung](/de/reference/glossary/#weighted-split) verteilen, etwa 90/10, während Sie zu einem neuen
+Anbieter wechseln oder eine neue IP-Adresse aufwärmen.
+
+Fällt ein Anbieter aus, entscheidet die [Failover](/de/reference/glossary/#failover)-Richtlinie des Streams, was
+passiert:
+
+- **Automatisch**: Die E-Mails wechseln zu einem Ersatzanbieter, der seine Prüfungen besteht, etwa verfügbar ist, diese
+  Art von E-Mails zulässt und eine verifizierte Absenderdomain hat. Das ist der Standard für Automationen, System und
+  Transaktional.
+- **Pausieren und nachfragen**: Die übrigen Empfänger warten, bis eine Person entscheidet. Das ist der Standard für
+  Massenversand, denn einen großen Versand mittendrin zu einem kalten Anbieter zu verschieben, kann Ihrer Reputation
+  schaden.
+- **Automatisch, nur aufgewärmte**: Die E-Mails wechseln nur zu einem Ersatzanbieter, der nicht im Warm-up ist; sonst
+  pausiert ReputeCast und fragt nach.
+
+Lesen Sie [E-Mails über mehrere Anbieter routen](/de/providers/routing/).
+
+## Ein Ereignismodell und eine Sperrliste
+
+Jeder Versandanbieter meldet Zustellungen, Bounces und Beschwerden in seinem eigenen Format. ReputeCast empfängt diese
+Meldungen unter seiner öffentlichen URL (`/hooks/<adapter>/<token>`), prüft die Signatur, speichert die rohe Payload und
+antwortet sofort; ein Hintergrundjob übersetzt dann jede Meldung in ein
+[normalisiertes Ereignis](/de/reference/glossary/#normalized-event): zugestellt, zurückgestellt, Hard Bounce, Soft
+Bounce, Beschwerde, abgelehnt, Öffnung, Klick oder Abmeldung. Der Originalcode des Anbieters bleibt beim Ereignis.
+SMTP-Server haben keine Webhooks, deshalb liest ReputeCast ihre Bounces stattdessen aus einem Bounce-Postfach.
+
+Hard Bounces, Beschwerden und Abmeldungen kommen auf eine [Sperrliste](/de/reference/glossary/#suppression-list), die
+sich alle Versandanbieter teilen: Ein Bounce bei einem Anbieter stoppt E-Mails an diese Adresse überall. Jeder Eintrag
+gilt für alle E-Mails oder nur für Marketing-E-Mails, und nur Hard Bounces und Beschwerden, die für alle E-Mails
+gelten, werden an die Anbieter übertragen. Lesen Sie
+[Zustellereignisse und Sperrlisten-Synchronisierung](/de/providers/events-and-sync/) und
+[Die Sperrliste](/de/audience/suppressions/).
+
+## Einwilligung
+
+ReputeCast erfasst die [Einwilligung](/de/reference/glossary/#consent) je Liste, mit ihrem Nachweis: wie und wann sich
+der Kontakt angemeldet hat und den genauen Text, dem er zugestimmt hat. Anmeldeformulare können
+[Double-Opt-in](/de/reference/glossary/#double-opt-in) nutzen, bestätigt mit einem Button auf der Seite, die der Link
+öffnet, sodass kein Link-Scanner für den Leser bestätigen kann. Importe behalten den Einwilligungsstatus der Plattform,
+die Sie verlassen: Abgemeldete Kontakte und Kontakte mit Bounce oder Beschwerde werden zu Sperren und nie wieder
+angemeldet. Lesen Sie [Listen, Einwilligung und Double-Opt-in](/de/audience/lists-and-consent/).
+
+Das endgültige Löschen eines Kontakts entfernt seine Daten aus jedem Teil von ReputeCast, der sie enthält, und die
+[Aufbewahrungsdauer](/de/team/workspaces/) des Arbeitsbereichs löscht nie bestätigte Anmeldungen endgültig und leert
+nach Zeitplan die IP-Adressen und User-Agents von Öffnungen und Klicks, ohne einen Bericht zu verändern. Lesen Sie
+[Grundlagen zu Einwilligung und Anti-Spam-Recht](/de/deliverability/compliance/).
+
+## Geschützter Versand von Anfang bis Ende
+
+<SendFlowDiagram />
+
+Die Versandbereitschaft prüft eine Kampagne vor dem Start, das Routing übergibt jeden Empfänger an einen
+Versandanbieter, Zustellereignisse kommen über Webhooks zurück, und Schwellenwerte entscheiden, ob der Versand
+weiterläuft oder pausiert.
+
+1. **Versandbereitschaft.** Die [Versandbereitschaft](/de/reference/glossary/#send-readiness) prüft Reputation,
+   Authentifizierung, Inhalt, Sprachen, Barrierefreiheit, bedingte Inhalte, Links, Compliance, Qualität der Zielgruppe
+   und Routing und gibt ein Ergebnis aus: Bereit, Bereit mit Warnungen oder Blockiert. Sie läuft erneut 15 Minuten vor
+   einem geplanten Versand und beim Start des Versands. Ein Block stoppt den Versand; neue Warnungen, eine Zielgruppe,
+   die sich um mehr als 10 % geändert hat, oder Änderungen nach der Planung halten ihn zurück, bis eine Person noch
+   einmal hinsieht.
+2. **Routing.** Der Versand baut seine Empfängerliste seitenweise auf, lässt die Kontakte aus, die die
+   Versandbereitschaft herausgerechnet hat (etwa gesperrte Kontakte, Kontakte ohne Interaktion und solche über dem
+   [Marketing-Limit](/de/campaigns/sending-rules/) des Arbeitsbereichs), und routet jeden Empfänger. Batches gehen an
+   jeden Anbieter innerhalb seines Ratenlimits und der Drosselung jedes Postfachanbieters, und
+   [Warm-up](/de/providers/warm-up/)-Limits halten zurück, was ein junger Anbieter noch nicht annehmen kann. Jede
+   Nachricht wird vor dem Versand reserviert, sodass nichts doppelt gesendet wird. Ein Versand kann mit einer
+   [Canary](/de/reference/glossary/#canary)-Phase beginnen: Die aktivsten wenigen Prozent und Ihre Testpostfächer
+   erhalten ihn zuerst.
+3. **Zustellereignisse.** Anbieter melden Zustellungen, Bounces und Beschwerden, und ReputeCast normalisiert sie.
+4. **Schwellenwerte.** Während des Versands prüft ReputeCast alle 2 Sekunden Bounce-, Beschwerde- und
+   Zurückstellungsraten. Eine Rate über ihrem Schwellenwert, mit genügend Daten,
+   [pausiert automatisch](/de/reference/glossary/#auto-pause) nur den betroffenen Postfachanbieter oder
+   Versandanbieter oder die ganze Kampagne, wenn Sie diesen Umfang gewählt haben. Zurückstellungen verlangsamen einen
+   Versand, bevor sie ihn pausieren, Beschwerden zählen nur dort, wo Postfachanbieter sie melden, und Antwortregeln für
+   Postfachanbieter können einen einzelnen Postfachanbieter verlangsamen. Eine Beschwerdebeobachtung begleitet den
+   Versand 72 Stunden lang.
+5. **Entscheidung.** Der Live-Monitor erklärt, was ausgelöst hat. Eine Person mit Berechtigung setzt den Versand fort,
+   setzt ihn mit Änderungen fort oder bricht ihn ab.
+
+## Standardwerte und Grenzen
+
+Dies sind die Standardwerte für die automatische Pause beim
+[geschützten Versand](/de/reference/glossary/#guarded-sending):
+
+<LimitsTable area="auto-pause" />
+
+Alle anderen Standardwerte stehen unter [Grenzen und Standardwerte](/de/reference/limits-and-defaults/).
+
+## Wann Sie sie ändern sollten
+
+- **Senken Sie die Schwellenwerte** für eine Liste, die Sie länger nicht angeschrieben haben, oder für eine neue
+  Versand-Domain, damit ein schlechtes Segment früher pausiert.
+- **Erhöhen Sie sie leicht** nur, wenn eine bekannte Ursache eine Rate in die Höhe treibt, etwa eine Liste, von der Sie
+  wissen, dass sie alte Adressen enthält, die Sie gezielt bereinigen.
+- **Pausieren Sie die ganze Kampagne** statt einer Route, wenn jedes Problem alles stoppen soll, zum Beispiel bei einer
+  Ankündigung, die alle oder niemanden erreichen muss.
+
+Ändern Sie die Standardwerte des Arbeitsbereichs unter <UiPath path="nav.settings > settings.providers" />, die
+Schwellenwerte nach Bounce-Art und die Antwortregeln unter
+<UiPath path="nav.providers > providers.tabTraffic" /> und die Werte einer einzelnen Kampagne unter
+<UiPath path="composer.reviewSend" />; lesen Sie
+[Versandstandards des Arbeitsbereichs](/de/providers/workspace-defaults/), [Traffic-Regeln](/de/providers/traffic-rules/)
+und [Einen Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/).
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="Was ist ReputeCast?" href="/de/getting-started/introduction/" />
+  <LinkCard title="Versandbereitschaft: vor dem Senden prüfen" href="/de/campaigns/send-readiness/" />
+  <LinkCard title="E-Mails über mehrere Anbieter routen" href="/de/providers/routing/" />
+  <LinkCard title="Glossar" href="/de/reference/glossary/" />
+</CardGrid>

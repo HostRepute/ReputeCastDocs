@@ -1,0 +1,340 @@
+---
+title: Protocole d’adaptateur v1
+description: 'Référence filaire du protocole d’adaptateur version 1 : requêtes et réponses JSON signées, opérations, types de données, codes d’erreur, délais et disjoncteur.'
+type: reference
+audience: [developer, operator]
+primaryKeyword: protocole d’adaptateur
+sources:
+  - docs/adapters.md
+  - internal/providers/remote/protocol.go
+  - internal/providers/remote/sign.go
+  - internal/providers/remote/client.go
+  - internal/providers/remote/breaker.go
+  - internal/providers/remote/provider.go
+  - internal/providers/remote/manifest.go
+  - internal/providers/remote/runtime.go
+  - internal/ingest/handler.go
+  - sdk/adapter-sdk/src
+sidebar:
+  order: 4
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Le protocole d’adaptateur version 1 est la façon dont ReputeCast appelle un [adaptateur communautaire](/fr/reference/glossary/#community-adapter) qui s’exécute dans son propre processus : du JSON signé sur HTTP, une opération par requête. Le SDK TypeScript (`@reputecast/adapter-sdk`) implémente toutes les règles de cette page ; lisez-la quand vous écrivez un adaptateur dans un autre langage ou que vous en déboguez un. Pour créer un adaptateur avec le SDK, suivez [écrire un adaptateur communautaire](/fr/adapters/community/).
+
+## Transport
+
+- ReputeCast envoie `POST <adapter URL>/v1/<operation>` avec un corps JSON (`Content-Type: application/json`, UTF-8) et attend une réponse JSON avec `Content-Type: application/json`.
+- HTTP/1.1 et HTTP/2 fonctionnent tous deux. Les redirections ne sont jamais suivies.
+- ReputeCast appelle un adaptateur en parallèle (jusqu’à 64 appels simultanés par adaptateur installé) : l’adaptateur doit donc gérer des requêtes concurrentes.
+- L’URL de l’adaptateur est définie par un exploitant (`reputecast adapter install --url` ou `reputecast adapter set-url`). Le simple `http://` n’est accepté que pour les adresses loopback et privées, qui nécessitent `providers.allow_private_networks`. Les adresses link-local et les adresses de métadonnées cloud sont toujours refusées.
+
+## En-têtes de la requête
+
+| En-tête                  | Valeur                                                                                                                       |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `X-ReputeCast-Protocol`  | `1`                                                                                                                          |
+| `X-ReputeCast-Timestamp` | Heure Unix en secondes.                                                                                                      |
+| `X-ReputeCast-Signature` | `v1=<hex>`. Dans les 24 heures qui suivent un renouvellement du secret, deux entrées séparées par une virgule, le nouveau secret en premier. |
+| `X-ReputeCast-Operation` | L’`operation` du corps, pour les journaux.                                                                                   |
+| `Idempotency-Key`        | L’`idempotencyKey` du corps.                                                                                                 |
+| `User-Agent`             | `ReputeCast/<version> (adapter-protocol 1)`                                                                                  |
+
+## Signatures
+
+Chaque entrée `v1` est le HMAC-SHA256 en hexadécimal minuscule de `<timestamp>.<raw body>`, avec pour clé le secret de signature de l’installation : la chaîne `rcas_…` entière, en octets. ReputeCast crée le secret à l’installation de l’adaptateur (`rcas_` suivi de 32 octets aléatoires), le scelle au repos et l’affiche une seule fois.
+
+L’adaptateur doit :
+
+1. Refuser une requête sans entrée `v1` correspondante, ou dont l’horodatage s’écarte de plus de 300 secondes de son horloge, avec HTTP 401 et le code d’erreur `unauthenticated`. Cette réponse peut ne pas être signée.
+2. Vérifier que l’`operation` du corps correspond au chemin de l’URL et que `adapter` est son propre id, sinon répondre `400 invalid_request`.
+3. Signer chaque réponse de la même façon, avec son secret actuel : `X-ReputeCast-Timestamp` et `X-ReputeCast-Signature: v1=<hex HMAC-SHA256 of "<timestamp>.<body>">`, et renvoyer l’`idempotencyKey` de la requête dans le corps.
+
+ReputeCast refuse les réponses non signées, signées avec un autre secret, décalées de plus de cinq minutes, d’un autre type de contenu, ou qui concernent une autre requête. Comme l’opération, la clé d’idempotence, la connexion et l’entrée figurent toutes dans le corps, la signature les couvre.
+
+```ts title="signing.ts"
+import { createHmac, timingSafeEqual } from 'node:crypto'
+
+const MAX_SKEW_SECONDS = 300
+
+/** Lowercase hex HMAC-SHA256 of "<timestamp>.<body>" with the whole rcas_… secret. */
+export function sign(secret: string, timestamp: number, body: Buffer | string): string {
+  return createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex')
+}
+
+/** True when one v1 entry of X-ReputeCast-Signature matches one of the secrets. */
+export function verify(
+  secrets: string[],
+  timestamp: string | undefined,
+  header: string | undefined,
+  rawBody: Buffer,
+  now = Date.now(),
+): boolean {
+  const ts = Number(timestamp)
+  if (!header || !/^\d+$/.test(timestamp ?? '') || Math.abs(now / 1000 - ts) > MAX_SKEW_SECONDS) return false
+  const got = header
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => p.startsWith('v1='))
+    .map((p) => Buffer.from(p.slice(3)))
+  return secrets.some((s) => {
+    const want = Buffer.from(sign(s, ts, rawBody))
+    return got.some((g) => g.length === want.length && timingSafeEqual(g, want))
+  })
+}
+```
+
+Pendant un renouvellement, conservez les deux secrets (`REPUTECAST_ADAPTER_SECRET=rcas_new,rcas_old` avec le SDK) et signez les réponses avec le nouveau.
+
+## Corps de la requête
+
+```json title="POST /v1/send"
+{
+  "protocol": 1,
+  "operation": "send",
+  "adapter": "example-esp",
+  "idempotencyKey": "send-8c3f0a6e2b9d4c71a5e0f3b6d2c1a9e8",
+  "deadline": "2026-10-13T09:00:30.000Z",
+  "connection": {
+    "providerId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+    "workspaceId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e00",
+    "settings": { "region": "eu" },
+    "credentials": { "api_key": "…", "webhook_signing_key": "…" },
+    "webhookSecret": "…"
+  },
+  "input": { "messages": [] }
+}
+```
+
+| Champ            | Règles                                                                                                                                                                                                                              |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deadline`       | Le moment où ReputeCast cesse d’attendre (le délai de l’opération). Arrêtez les appels au fournisseur d’ici là.                                                                                                                     |
+| `connection`     | Le fournisseur connecté concerné par l’appel ; absent pour `health`. `settings` contient les valeurs de connexion non secrètes, `credentials` les valeurs secrètes. Seules les clés que déclare la `config` du manifest sont envoyées. |
+| `webhookSecret`  | Le secret de webhook du fournisseur généré par ReputeCast. Envoyé uniquement aux adaptateurs qui déclarent `webhooks`, et uniquement si la connexion en a un.                                                                       |
+| Champs inconnus  | Ignorez-les, dans les requêtes comme dans les réponses : de nouveaux champs facultatifs ne changent pas la version du protocole.                                                                                                     |
+
+## Corps de la réponse
+
+```json title="Answers"
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "result": { "results": [] } }
+{ "protocol": 1, "idempotencyKey": "send-8c3f…", "error": { "code": "provider_unavailable", "message": "Example ESP answered 503.", "status": 503, "providerCode": "service_unavailable", "retryAfter": 30 } }
+```
+
+Un `result` s’accompagne de HTTP 200, une `error` du statut indiqué dans le tableau ci-dessous. `message` est une phrase pour le journal des événements (n’y mettez jamais d’identifiants ; les textes de plus de 2 000 caractères sont coupés). `status` et `providerCode` sont ce que le fournisseur a répondu, et `retryAfter` est en secondes.
+
+<TableScroll label="Codes d’erreur du protocole d’adaptateur">
+
+| `error.code`           | HTTP | Signification                                        | Ce que fait ReputeCast                                                       |
+| ---------------------- | ---- | ---------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `invalid_request`      | 400  | ReputeCast a envoyé quelque chose que l’adaptateur ne sait pas lire. | Fait échouer l’appel et compte un échec de l’adaptateur.     |
+| `unauthenticated`      | 401  | La signature ou l’horodatage a été refusé.           | Adaptateur indisponible : émettez un nouveau secret ou corrigez les horloges. |
+| `too_large`            | 413  | Le corps dépasse la limite de l’adaptateur.          | Fait échouer l’appel et compte un échec de l’adaptateur.                     |
+| `bad_signature`        | 422  | La signature du webhook du fournisseur n’est pas valide. | Refuse le webhook (répond 401 au fournisseur).                           |
+| `provider_throttled`   | 429  | Le fournisseur limite le débit.                      | Temporaire : réessayé plus tard.                                             |
+| `provider_auth`        | 502  | Le fournisseur a refusé les identifiants.            | Le fournisseur apparaît en panne avec une authentification en échec et demande de nouveaux identifiants. |
+| `provider_error`       | 502  | Le fournisseur a refusé la requête définitivement.   | Erreur permanente, avec le code du fournisseur.                              |
+| `provider_unavailable` | 503  | Le fournisseur est en panne ou ne répond pas à temps. | Panne du fournisseur : le basculement suit la politique de chaque flux.     |
+| `not_supported`        | 501  | L’adaptateur n’implémente pas l’opération.           | Traité comme « non pris en charge par ce fournisseur ».                      |
+| `internal`             | 500  | L’adaptateur a échoué.                               | Adaptateur indisponible, réessayé.                                           |
+
+</TableScroll>
+
+## Idempotence
+
+Chaque requête porte une `idempotencyKey` de 1 à 128 caractères parmi `A-Z a-z 0-9 . _ : -`. Pour `send`, la clé est dérivée des ID des messages : une nouvelle tentative du même lot porte donc la même clé. Les autres opérations reçoivent une nouvelle clé à chaque appel, conservée quand ReputeCast réessaie une requête après une connexion interrompue.
+
+Un adaptateur doit renvoyer le même résultat pour une clé à laquelle il a déjà répondu avec succès (pendant au moins 15 minutes) et ne doit pas traiter la même clé deux fois en même temps. C’est ce qui empêche qu’un lot réessayé soit envoyé deux fois. Les erreurs ne sont pas mémorisées : une nouvelle tentative après une erreur s’exécute de nouveau.
+
+## Opérations
+
+ReputeCast n’appelle que les opérations que déclarent les capacités du manifest installé. `health`, `verify` et `send` sont toujours disponibles.
+
+<TableScroll label="Opérations du protocole d’adaptateur">
+
+| Opération           | Nécessite                                  | Entrée                                             | Résultat                                                  | Réponse maximale |
+| ------------------- | ------------------------------------------ | -------------------------------------------------- | --------------------------------------------------------- | ---------------- |
+| `health`            | —                                          | `{}`                                               | `{ adapter, version, protocol, sdk?, capabilities? }`     | 64 Kio           |
+| `verify`            | —                                          | `{}`                                               | un [Quota](#objet-quota), tous les champs facultatifs     | 64 Kio           |
+| `send`              | —                                          | `{ messages: [Message] }`                          | `{ results: [SendResult] }`                               | 4 Mio            |
+| `webhooks/verify`   | `webhooks`                                 | `{ request: WebhookRequest }`                      | `{}` ou `{ handshake: { body } }`                         | 64 Kio           |
+| `webhooks/parse`    | `webhooks`                                 | `{ request: WebhookRequest, verified }`            | `{ events: [Event] }`                                     | 16 Mio           |
+| `webhooks/register` | `registerWebhooks`                         | `{ url }`                                          | `{}`                                                      | 64 Kio           |
+| `domains/add`       | `domainSetup`                              | `{ domain }`                                       | `{ records: [DNSRecord] }`                                | 1 Mio            |
+| `domains/status`    | `domainSetup`                              | `{ domain }`                                       | `{ records: [DNSRecord] }`                                | 1 Mio            |
+| `quota`             | `quotaDiscovery`                           | `{}`                                               | un [Quota](#objet-quota) avec `kind`, `max`, `used`       | 64 Kio           |
+| `suppressions/list` | `suppressionSync` `pull` ou `two-way`      | `{ since, cursor }` (chacun peut valoir `null`)    | `{ suppressions: [Suppression], nextCursor }`             | 8 Mio            |
+| `suppressions/add`  | `suppressionSync` `push` ou `two-way`      | `{ emails: [string] }`                             | `{}`                                                      | 64 Kio           |
+
+</TableScroll>
+
+Le délai de chaque opération figure dans les [limites](#limites). Toutes les opérations sauf `health` portent `connection`.
+
+### `health`
+
+Appelée par `reputecast adapter check` et par la vérification de l’API d’administration de l’instance. Elle passe même quand le disjoncteur est ouvert, et un succès le referme. ReputeCast vérifie que `adapter` est l’id installé et que `protocol` vaut `1`, et signale quand la `version` en cours d’exécution diffère du manifest installé.
+
+### `verify`
+
+Vérifie les identifiants de la connexion auprès du fournisseur : dans l’assistant de connexion, quand les identifiants sont remplacés, et depuis la tâche de vérification de l’état quand l’adaptateur n’a pas `quotaDiscovery`. Un adaptateur qui ne peut pas vérifier les identifiants sans envoyer renvoie `{}`.
+
+### `send`
+
+Envoie de 1 à `batch` messages. Le résultat contient exactement un SendResult par message, dans le même ordre, chacun renvoyant son `messageId`. Un destinataire que le fournisseur refuse est une erreur propre à ce message, et l’appel dans son ensemble réussit. Ne faites échouer l’appel entier (`provider_auth`, `provider_unavailable`, `provider_throttled`) que si aucun message du lot n’a été accepté ; sinon, signalez les autres comme des erreurs temporaires par message, pour qu’une nouvelle tentative n’envoie jamais un message deux fois.
+
+### `webhooks/verify`
+
+ReputeCast a reçu un webhook du fournisseur sur `/hooks/community:<id>/<token>` et demande s’il est authentique avant de l’enregistrer et de répondre au fournisseur. Répondez vite : le fournisseur attend.
+
+- `{}` : authentique. ReputeCast l’enregistre et répond 200 au fournisseur.
+- `{ "handshake": { "body": "<text>" } }` : un handshake d’abonnement que l’adaptateur a mené à bien (comme une `SubscriptionConfirmation` SNS). ReputeCast répond 200 au fournisseur avec `body` (au plus 16 Kio) et n’enregistre rien.
+- Erreur `bad_signature` : ReputeCast répond 401 au fournisseur et conserve les 2 premiers Kio pour le diagnostic.
+
+Quand l’adaptateur est injoignable, ReputeCast répond 429 au fournisseur avec `Retry-After: 30`, pour que le fournisseur réessaie. Une requête non vérifiée n’est jamais enregistrée comme vérifiée.
+
+### `webhooks/parse`
+
+Transforme un webhook enregistré en événements normalisés, dans la tâche d’arrière-plan qui suit `webhooks/verify`. Avec `"verified": true`, ne vérifiez pas de nouveau : la requête enregistrée a perdu les en-têtes que ReputeCast n’enregistre jamais (`Authorization`, `Cookie`), et les contrôles de fenêtre temporelle échoueraient. Avec `false`, vérifiez d’abord et répondez `bad_signature` en cas d’échec. Renvoyez `[]` pour les payloads sans rien à enregistrer. Si l’adaptateur est injoignable, la tâche réessaie plus tard ; aucun événement n’est perdu.
+
+### `webhooks/register`
+
+Enregistre l’URL de webhook de ReputeCast chez le fournisseur (par exemple `https://reputecast.acme.io/hooks/community:example-esp/<token>`). Utilisez `connection.webhookSecret` comme secret côté fournisseur quand le fournisseur vous laisse en choisir un. Enregistrez les événements de livraison, de rebond, de plainte et de désabonnement ; ReputeCast suit lui-même les ouvertures et les clics.
+
+### `domains/add` et `domains/status`
+
+Configure un domaine d’envoi chez le fournisseur et lit ses enregistrements DNS avec leur état.
+
+### `quota`
+
+L’allocation et la consommation du compte. La tâche de vérification de l’état l’appelle toutes les cinq minutes, et chaque minute tant que le fournisseur est en panne.
+
+### `suppressions/list` et `suppressions/add`
+
+`suppressions/list` importe les exclusions du fournisseur dans la [liste de suppression](/fr/audience/suppressions/) partagée : au plus 1 000 par page, et ReputeCast suit `nextCursor` sur 100 pages au maximum par synchronisation. `suppressions/add` exporte des adresses de la liste partagée, au plus 500 par appel.
+
+## Types de données
+
+### Objet `Message`
+
+```json title="Message"
+{
+  "id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40",
+  "stream": "broadcast",
+  "from": { "name": "Acme Newsletter", "address": "news@news.acme.io" },
+  "replyTo": { "name": "", "address": "help@acme.io" },
+  "to": { "name": "Linh Nguyen", "address": "linh@example.com" },
+  "subject": "October product notes",
+  "html": "<p>…</p>",
+  "text": "…",
+  "headers": {
+    "List-Unsubscribe": "<https://news.acme.io/p/acme/unsubscribe/…>",
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    "X-ReputeCast-Message": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40"
+  },
+  "tags": { "campaign": "0199…" }
+}
+```
+
+`stream` vaut `broadcast`, `automation` ou `system`. `replyTo`, `html`, `text` et `tags` peuvent être absents. Le message est déjà généré et personnalisé : envoyez-le tel quel avec chaque en-tête (les fournisseurs de messagerie exigent les en-têtes de [désabonnement en un clic](/fr/deliverability/one-click-unsubscribe/)), et renvoyez `id` ou l’en-tête `X-ReputeCast-Message` dans les événements pour qu’ils correspondent au message. Désactivez le suivi des ouvertures et des clics du fournisseur.
+
+### Objet `SendResult`
+
+```json title="SendResult"
+{ "messageId": "0199…40", "providerMessageId": "msg_7fa3" }
+{ "messageId": "0199…41", "error": { "code": "recipient_suppressed", "message": "The recipient is on Example ESP's suppression list.", "temporary": false, "throttled": false } }
+```
+
+`providerMessageId` est obligatoire en cas de succès. Les erreurs `temporary` (ou `throttled`) sont réessayées ; les erreurs permanentes ne le sont pas.
+
+### Objet `WebhookRequest`
+
+```json title="WebhookRequest"
+{
+  "method": "POST",
+  "url": "https://reputecast.acme.io/hooks/community:example-esp/9f2c…",
+  "headers": { "content-type": ["application/json"], "x-example-signature": ["t=1760346062,v1=5b1d…"] },
+  "body": "<base64 of the raw body>"
+}
+```
+
+Les noms d’en-têtes sont en minuscules. Les en-têtes hop-by-hop et `Cookie` sont omis.
+
+### Objet `Event`
+
+```json title="Event"
+{
+  "type": "hard_bounce",
+  "recipient": "john@example.com",
+  "providerMessageId": "msg_7fa3",
+  "messageId": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e41",
+  "occurredAt": "2026-10-12T13:41:02Z",
+  "originalType": "bounced · hard",
+  "originalCode": "550 5.1.1",
+  "diagnostic": "The email account that you tried to reach does not exist.",
+  "bounceClass": "mailbox_unknown",
+  "raw": { "event": "bounced" }
+}
+```
+
+| Champ                            | Règles                                                                                                                                                      |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`                           | `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` ou `unsubscribe`.                                          |
+| `recipient`                      | Obligatoire. Mis en minuscules par ReputeCast.                                                                                                              |
+| `providerMessageId`, `messageId` | L’ID du fournisseur, et l’ID ReputeCast quand le fournisseur le renvoie (un UUID). Les événements sont associés aux messages par l’un ou l’autre.           |
+| `occurredAt`                     | Obligatoire, RFC 3339.                                                                                                                                      |
+| `originalType`, `originalCode`, `diagnostic` | Le type et le code propres au fournisseur, et son explication. Conservés à côté de l’événement normalisé.                                       |
+| `bounceClass`                    | Facultatif : `mailbox_unknown`, `mailbox_full`, `domain_invalid`, `policy_block`, `spam_block`, `reputation`, `temporary` ou `other`. S’il est vide, ReputeCast classe les rebonds d’après `originalCode` et `diagnostic`. |
+| `url`, `userAgent`               | Pour les ouvertures et les clics.                                                                                                                           |
+| `raw`                            | Obligatoire : l’événement du fournisseur en JSON.                                                                                                           |
+
+Seul un problème d’adresse est un rebond définitif : les rebonds définitifs et les plaintes vont sur la liste de suppression partagée. Signalez un blocage causé par l’expéditeur (spam, réputation, politique) comme un rebond temporaire.
+
+### Objet `DNSRecord`
+
+```json title="DNSRecord"
+{ "purpose": "dkim", "type": "CNAME", "name": "rc1._domainkey.news.acme.io", "value": "rc1.dkim.example-esp.com", "status": "pending" }
+```
+
+`purpose` vaut `dkim`, `spf`, `return_path`, `dmarc` ou `verification`. `type` vaut `CNAME`, `TXT` ou `MX`. `status` est facultatif : `pending`, `verified`, `wrong_value` ou `missing`.
+
+### Objet `Quota`
+
+```json title="Quota"
+{ "kind": "monthly_plan", "max": 50000, "used": 1234, "maxRate": 14, "sandbox": false, "account": "Growth · 50,000 per month" }
+```
+
+`kind` vaut `rolling_24h` ou `monthly_plan`. `max` à 0 signifie inconnu ou illimité. `maxRate` est en messages par seconde (0 s’il est inconnu). `sandbox` vaut true tant que le compte ne peut envoyer qu’à des adresses vérifiées. Les valeurs ne peuvent pas être négatives.
+
+### Objet `Suppression`
+
+```json title="Suppression"
+{ "email": "john@example.com", "reason": "hard_bounce", "code": "bounce", "createdAt": "2026-10-11T08:00:00Z" }
+```
+
+`reason` vaut `hard_bounce`, `complaint`, `unsubscribe` ou `manual`. `code` est le motif propre au fournisseur.
+
+## Échecs et disjoncteur
+
+Les adaptateurs communautaires remontent par le même état des fournisseurs que les adaptateurs intégrés : chaque appel en échec est enregistré, la tâche de vérification de l’état marque le fournisseur en panne après des échecs répétés, le routage bascule selon la politique de chaque flux, et les Diffusions attendent une décision (voir [état et pannes des fournisseurs](/fr/providers/health-and-outages/)).
+
+Un adaptateur défaillant ne peut pas bloquer les envois :
+
+- Chaque appel a un délai et une taille maximale de réponse.
+- Chaque adaptateur installé a un disjoncteur. Cinq échecs de l’adaptateur d’affilée l’ouvrent : erreurs de connexion, délais dépassés, réponses `internal`, `unauthenticated`, `invalid_request` ou `too_large`, et réponses non signées ou non valides. Tant qu’il est ouvert, chaque appel échoue aussitôt comme « adaptateur indisponible », ce que l’état des fournisseurs traite comme une panne. Après la pause (30 secondes, doublée jusqu’à 5 minutes tant que les sondes échouent), un appel passe, et un succès referme le disjoncteur.
+- Les erreurs du fournisseur (`provider_*`), `bad_signature` et `not_supported` ne comptent pas : elles décrivent le fournisseur, pas l’adaptateur.
+- Au plus 64 appels s’exécutent en même temps sur un adaptateur ; un appel qui n’obtient pas de place avant son échéance échoue comme occupé.
+
+## Limites
+
+<LimitsTable area="adapters" />
+
+Une requête `send` porte au plus `batch` messages et au plus 24 Mio ; ReputeCast découpe un lot plus grand en plusieurs appels. Les webhooks transmis font au plus 5 Mio, la limite de l’endpoint d’ingestion. Des identifiants de plus de 512 caractères dans les réponses (`providerMessageId`, destinataires, URL, noms d’enregistrements) rendent la réponse non valide. Les textes plus longs (`message`, `diagnostic`, `originalType`) sont coupés à 2 000 caractères.
+
+## Modèle de sécurité
+
+- **Signé dans les deux sens** avec un secret propre à chaque installation, scellé au repos avec la clé secrète de l’instance et affiché une seule fois. Après un renouvellement, l’ancien secret reste valable pendant 24 heures.
+- **Une adresse que seul l’exploitant définit**, appelée par le même client protégé contre le SSRF que les adaptateurs intégrés : adresses loopback et privées uniquement avec `providers.allow_private_networks`, adresses de métadonnées et link-local jamais, aucune redirection. Tout ce qui est joignable par Internet doit utiliser `https://`, car les identifiants voyagent avec chaque appel.
+- **Moindre privilège.** ReputeCast n’appelle que les opérations déclarées et n’envoie que les valeurs de connexion déclarées du seul fournisseur concerné par l’appel. Le SDK refuse les appels réseau vers des hôtes que `permissions.network` du manifest ne liste pas.
+- **Identifiants en écriture seule.** Les identifiants du fournisseur et le secret de signature ne sont jamais renvoyés par l’API ni journalisés, ni par ReputeCast ni par le SDK.
+- **Les webhooks** ne sont enregistrés comme vérifiés qu’après leur vérification par l’adaptateur.

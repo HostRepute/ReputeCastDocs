@@ -1,0 +1,136 @@
+---
+title: Compte Amazon SES en cours d’examen
+description: Un compte Amazon SES en cours d’examen a un problème de rebonds, de plaintes ou autre à corriger pour AWS. Où ReputeCast l’affiche, que faire avant une pause.
+type: how-to
+audience: [admin]
+permissions: ['providers:view', 'deliverability:view', 'providers:manage']
+uiPath: 'nav.providers'
+primaryKeyword: compte Amazon SES en cours d’examen
+sources:
+  - internal/providers/ses/ses.go
+  - internal/providers/manage/health.go
+  - internal/providers/state/state.go
+  - internal/connect/connection.go
+  - internal/connect/streams.go
+  - internal/deliverability/providers.go
+  - internal/readiness/assemble.go
+  - web/src/features/providers/overview.messages.ts
+  - web/src/features/deliverability/messages.ts
+sidebar:
+  label: Amazon SES en cours d’examen
+  order: 8
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Un compte Amazon SES en cours d’examen n’est pas une erreur SMTP : c’est AWS qui vous indique que les e-mails envoyés
+par votre compte posent un problème, généralement trop de rebonds ou de plaintes, et que vous disposez d’une période
+d’examen pour le corriger. Vos e-mails continuent de partir pendant l’examen. Si le problème n’est pas corrigé à temps,
+AWS peut suspendre les envois du compte.
+
+## Ce que veut dire AWS
+
+AWS décrit cet état sur sa page des métriques de réputation :
+
+> **Under review** – Your account is under review. If the issues that caused us to place your account under review
+> aren't resolved by the end of the review period, we might pause your account's ability to send email.
+
+> **Sending paused** – We've paused your account's ability to send email. While your account's ability to send email
+> is paused, you won't be able to send email using Amazon SES.
+
+Pour les rebonds et les plaintes, AWS publie les niveaux :
+
+| Taux             | Compte placé en cours d’examen | Envoi susceptible d’être suspendu |
+| ---------------- | ------------------------------ | --------------------------------- |
+| Taux de rebond   | 5 % ou plus                    | 10 % ou plus                      |
+| Taux de plainte  | 0,1 % ou plus                  | 0,5 % ou plus                     |
+
+AWS calcule les deux sur un volume représentatif de vos e-mails, pas sur une période fixe, et son taux de rebond ne
+compte que les rebonds définitifs vers des domaines que vous n’avez pas vérifiés. Parmi les autres causes figurent les
+signalements d’organisations antispam, les pièges à spam, le listbombing et les liens vers des domaines listés sur des
+listes de blocage.
+
+Sources : [Reputation metrics messages](https://docs.aws.amazon.com/ses/latest/dg/reputationdashboardmessages.html) et
+[Amazon SES sending review process FAQs](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), Amazon SES
+Developer Guide. Vérifié en octobre 2026.
+
+## Où ReputeCast l’affiche
+
+ReputeCast lit l’état d’application des mesures du compte depuis l’API SES (`GetAccount`, champ `EnforcementStatus`)
+lors de sa vérification de l’état du fournisseur, toutes les 5 minutes :
+
+| État SES     | <UiPath path="providers.overview.factAccountStatus" /> dans ReputeCast |
+| ------------ | ---------------------------------------------------------------------- |
+| `HEALTHY`    | `Production ·` <UiPath path="ses.enforcementNone" />                   |
+| `PROBATION`  | `Production ·` <UiPath path="ses.enforcementProbation" />              |
+| `SHUTDOWN`   | `Production ·` <UiPath path="ses.enforcementShutdown" />               |
+
+- <UiPath path="nav.providers" /> l’affiche sur la carte SES, sous <UiPath path="providers.overview.factAccountStatus" />.
+- <UiPath path="nav.deliverability > placement.health" />, dans <UiPath path="deliverability.providerHealthTitle" />,
+  l’ajoute au badge SES et représente les taux de rebond et de plainte de SES par rapport aux mêmes niveaux d’examen et
+  de suspension.
+- Le [contrôle avant envoi](/fr/campaigns/send-readiness/) a un contrôle par fournisseur d’envoi dans son groupe
+  <UiPath path="review.groupReputation" />. Pour SES, il avertit quand le taux de rebond ou de plainte approche ou
+  dépasse le niveau d’examen, et bloque l’envoi au niveau de suspension (10 % de rebonds ou 0,5 % de plaintes).
+
+Les taux de ReputeCast couvrent les 7 derniers jours d’e-mails qu’il a envoyés via ce compte SES. AWS utilise son propre
+volume représentatif : les chiffres peuvent donc différer de ceux de la console SES.
+
+Quand AWS suspend les envois, SES refuse chaque envoi. ReputeCast marque le fournisseur en panne dès que la moitié de ses
+appels échouent sur 3 minutes (au moins 5 appels) et le traite comme une panne ; voir
+[état et pannes des fournisseurs](/fr/providers/health-and-outages/).
+
+## Avant de commencer
+
+- `providers:view` et `deliverability:view` pour voir l’état et les taux.
+- `providers:manage` pour modifier les routes.
+- Un accès au compte AWS, pour répondre au dossier d’examen dans AWS Support Center.
+
+## Répondre à l’examen
+
+<Steps>
+
+1. Lisez la notification qu’AWS a envoyée à l’adresse e-mail de votre compte AWS, et le dossier ouvert dans AWS Support
+   Center. Il nomme le problème, par exemple les rebonds ou les plaintes.
+2. Trouvez la cause dans ReputeCast. Dans <UiPath path="nav.deliverability > placement.health" />, comparez les taux de
+   SES aux niveaux d’examen. Dans les rapports des campagnes récentes, regardez la ligne
+   <UiPath path="reports.bounceType.unknownUser" /> et les plaintes, et notez de quelles listes ou de quels imports ils
+   proviennent.
+3. Réduisez le risque pendant que vous travaillez. AWS conseille d’arrêter d’envoyer jusqu’à la correction du problème si
+   vous le pouvez. Dans ReputeCast, ne programmez pas de nouvelles campagnes vers les listes concernées, ou faites passer
+   les Diffusions par un autre fournisseur d’envoi avec une [route](/fr/providers/routing/), pour que seuls les e-mails
+   Système et Transactionnel continuent d’utiliser SES.
+4. Corrigez la cause. Pour les rebonds, vérifiez les anciennes listes avant de leur écrire
+   ([vérifier les adresses e-mail](/fr/audience/verification/)) et laissez les
+   [niveaux de santé de la liste](/fr/audience/list-health/) arrêter les envois aux contacts inactifs. Pour les plaintes,
+   n’envoyez qu’aux contacts qui ont donné leur consentement et gardez le
+   [désabonnement en un clic](/fr/deliverability/one-click-unsubscribe/) dans chaque message. Pour le listbombing,
+   vérifiez la protection antispam de vos [formulaires d’inscription](/fr/forms/signup-forms/).
+5. Répondez au dossier AWS. AWS demande la cause première, les modifications que vous avez déjà faites, et la façon
+   dont elles empêchent le problème de se reproduire.
+
+</Steps>
+
+## Vérifier le résultat
+
+- Le champ <UiPath path="providers.overview.factAccountStatus" /> de la carte SES revient à `Production ·`
+  <UiPath path="ses.enforcementNone" />.
+- Le contrôle SES du contrôle avant envoi dans <UiPath path="review.groupReputation" /> réussit.
+
+## Dépannage
+
+- **L’état affiche `envoi suspendu par AWS`.** Les envois via SES se sont arrêtés. Faites passer les e-mails par un
+  autre fournisseur d’envoi, terminez les étapes ci-dessus et demandez un réexamen dans le dossier AWS.
+- **Les taux de ReputeCast semblent corrects, mais SES est en cours d’examen.** AWS compte un volume représentatif plus
+  long et d’autres signaux, comme les pièges à spam ou les signalements d’organisations antispam. Lisez la notification
+  d’AWS pour connaître la raison.
+- **Le compte est encore dans le sandbox.** C’est un autre état ; voir
+  [sortir Amazon SES du sandbox](/fr/deliverability/amazon-ses-production-access/).
+
+## Voir aussi
+
+- [Codes d’erreur SMTP](/fr/smtp-errors/)
+- [Envoyer avec Amazon SES](/fr/providers/amazon-ses/)
+- [Rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/)
+- [Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/)

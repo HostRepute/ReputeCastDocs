@@ -1,0 +1,255 @@
+---
+title: 'Inicio rápido: ejecutar ReputeCast con Docker'
+description: 'Inicio rápido de ReputeCast: monta una newsletter autoalojada con Docker, completa la configuración inicial y envía un correo de prueba en unos 15 minutos.'
+type: tutorial
+audience: [operator, admin]
+primaryKeyword: newsletter autoalojada con Docker
+sources:
+  - deploy/docker-compose.yml
+  - Dockerfile
+  - Makefile
+  - README.md
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/accounts/setup_state.go
+  - web/src/features/auth/SetupPage.tsx
+  - web/src/features/connect
+  - internal/connect
+  - internal/providers/smtp
+  - internal/config/config.go
+  - web/src/features/overview/FirstRun.tsx
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+En este tutorial montas una newsletter autoalojada con Docker: ejecutas la plataforma ReputeCast en tu propio equipo,
+completas la configuración inicial y envías un correo de prueba a un servidor de correo de prueba local. Lleva unos 15
+minutos. Todo se ejecuta en contenedores, y al final puedes quitarlo todo con un solo comando.
+
+## Antes de empezar
+
+- Docker con Compose v2 (Docker Desktop, o Docker Engine con el plugin de Compose). Compruébalo con
+  `docker compose version`.
+- Los puertos 8080 (ReputeCast) y 8025 (la bandeja de entrada del servidor de correo de prueba) libres en tu equipo.
+- Una llave de acceso (Touch ID, Face ID, Windows Hello o una llave de seguridad) o una aplicación de autenticación como
+  1Password, Google Authenticator o Authy. La verificación en dos pasos es obligatoria para el primer Propietario.
+
+ReputeCast solo necesita PostgreSQL junto a la aplicación; el archivo compose arranca los dos.
+
+## Iniciar ReputeCast
+
+<Steps>
+
+1. **Descarga el archivo compose** en una carpeta vacía:
+
+   ```sh
+   mkdir reputecast && cd reputecast
+   curl -fsSL https://raw.githubusercontent.com/hostrepute/reputecast/main/deploy/docker-compose.yml -o docker-compose.yml
+   ```
+
+   Define dos servicios: `postgres` (PostgreSQL 18) y `app` (ReputeCast). Al arrancar, la aplicación aplica sus
+   migraciones de base de datos y crea el primer Propietario, y su comprobación de estado la da por sana en cuanto la base
+   de datos responde y el esquema está al día.
+
+2. **Añade un servidor de correo de prueba para esta prueba.** Una instalación real envía a través de tu
+   [proveedor de envío](/es/reference/glossary/#sending-provider). Para esta prueba local, añade
+   [Mailpit](https://mailpit.axllent.org), un servidor de correo de prueba que guarda cada mensaje en una bandeja de
+   entrada web. ReputeCast lee los rebotes de un buzón a través de TLS, así que primero crea un certificado para Mailpit:
+
+   ```sh
+   docker run --rm -v "$PWD/mailpit-tls:/tls" alpine:3.22 sh -c 'apk add --no-cache openssl >/dev/null && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=mailpit" -addext "subjectAltName=DNS:mailpit" -keyout /tls/mailpit.key -out /tls/mailpit.crt'
+   ```
+
+   Después guarda este archivo junto a `docker-compose.yml`. Compose lo lee automáticamente:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     mailpit:
+       image: axllent/mailpit:v1.31.5
+       restart: unless-stopped
+       ports:
+         - "8025:8025" # Mailpit's inbox: http://localhost:8025
+       environment:
+         MP_SMTP_AUTH_ACCEPT_ANY: "1"
+         MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+         MP_SMTP_BIND_ADDR: 0.0.0.0:2525
+         MP_POP3_BIND_ADDR: 0.0.0.0:995
+         MP_POP3_AUTH: "bounces:bounces-password"
+         MP_POP3_TLS_CERT: /tls/mailpit.crt
+         MP_POP3_TLS_KEY: /tls/mailpit.key
+       volumes:
+         - ./mailpit-tls:/tls:ro
+
+     app:
+       environment:
+         # Mailpit runs on the private Docker network.
+         REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS: "true"
+         # Trust Mailpit's certificate next to the system certificates.
+         SSL_CERT_DIR: /etc/ssl/certs:/trust
+       volumes:
+         - ./mailpit-tls/mailpit.crt:/trust/mailpit.crt:ro
+   ```
+
+   <Aside type="caution">
+     Este archivo de sustitución es solo para una prueba en tu propio equipo. Quítalo antes de enviar correo real:
+     `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS` permite que ReputeCast se conecte a direcciones de redes privadas.
+   </Aside>
+
+3. **Arranca el stack** con tu dirección de correo como primer Propietario:
+
+   ```sh
+   REPUTECAST_ADMIN_EMAIL=you@company.com docker compose up -d
+   ```
+
+4. **Lee la contraseña temporal.** El primer arranque tarda unos 20 segundos mientras se ejecutan las migraciones.
+   Después:
+
+   ```sh
+   docker compose logs app | grep -A4 "ReputeCast is installed"
+   ```
+
+   ```text title="Salida"
+   app-1  |   ReputeCast is installed.
+   app-1  |
+   app-1  |   Sign in at  http://localhost:8080
+   app-1  |   Email       you@company.com
+   app-1  |   Password    aEkq-cFUR-E5js-vfyU   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Si el comando no muestra nada, espera unos segundos y vuelve a ejecutarlo. `docker compose ps` muestra la aplicación
+   como `healthy` cuando está lista.
+
+</Steps>
+
+<Aside type="note" title="Compilar la imagen tú mismo">
+  Para ejecutar tus propios cambios o una versión no publicada, compila la imagen desde una copia del repositorio de
+  ReputeCast y haz que el archivo compose apunte a ella:
+
+```sh
+make docker VERSION=local
+REPUTECAST_IMAGE=reputecast REPUTECAST_VERSION=local REPUTECAST_ADMIN_EMAIL=you@company.com \
+  docker compose -f deploy/docker-compose.yml up -d
+```
+
+`REPUTECAST_IMAGE` y `REPUTECAST_VERSION` también funcionan con el archivo compose descargado. `REPUTECAST_PORT` cambia
+el puerto en tu equipo y `REPUTECAST_PUBLIC_URL`, la dirección que ReputeCast pone en los enlaces (el único nombre de la
+URL pública, también para el binario).
+
+
+</Aside>
+
+## Completar la configuración inicial
+
+<Steps>
+
+1. **Inicia sesión.** Abre http://localhost:8080, escribe tu correo, selecciona **Continuar** y escribe la contraseña
+   temporal.
+
+   <Screenshot
+     id="sign-in"
+     alt="La página de inicio de sesión de ReputeCast pide primero un correo de trabajo, con el inicio de sesión con llave de acceso debajo y, donde quien administra lo activó, Google y GitHub."
+   />
+
+2. **Completa los seis pasos de la configuración.** ReputeCast guarda cada uno, así que puedes parar y volver más tarde.
+
+   <Screenshot
+     id="setup-password"
+     alt="Paso 1 de 6 de la configuración: reemplazar la contraseña temporal, con los pasos restantes a la izquierda."
+   />
+
+   - En <UiPath path="setup.stepPassword" />, escribe la contraseña temporal y una nueva de al menos 12 caracteres.
+   - <UiPath path="setup.stepSecondFactor" />: añade una llave de acceso, o escanea el código QR con tu aplicación de
+     autenticación y escribe el código que muestra.
+   - <UiPath path="setup.stepRecoveryCodes" />: descarga, imprime o copia los 10 códigos. Cada uno te permite iniciar
+     sesión una vez si pierdes tu llave de acceso o tu aplicación de autenticación; solo los ves ahora.
+   - <UiPath path="setup.instanceBasics" />: ponle nombre a la instancia, elige la zona horaria y el idioma
+     predeterminados y comprueba la URL pública. En tu propio equipo, la línea de TLS avisa del uso de `http` sin
+     cifrar, y la comprobación de accesibilidad puede fallar; puedes guardar de todos modos. Deja
+     <UiPath path="setup.updateCheck" /> activado o desactivado; solo consulta el número de la última versión.
+   - <UiPath path="setup.stepWorkspace" />: ponle nombre a tu primer
+     [espacio de trabajo](/es/reference/glossary/#workspace), por ejemplo el de tu boletín.
+   - <UiPath path="setup.stepProvider" />: selecciónalo para abrir el asistente de proveedores.
+
+</Steps>
+
+<Aside type="tip">
+  Para echar un vistazo antes de conectar nada, abre Resumen y elige <UiPath path="overview.exploreDemo" />. Carga los
+  datos de ejemplo de Acme en un espacio de trabajo de demostración aparte del que eres propietario; sus proveedores son
+  conexiones de demostración, así que no se envía nada. También puedes escribir campañas en tu propio espacio de trabajo
+  antes de conectar un proveedor.
+</Aside>
+
+## Conectar el servidor de correo de prueba y enviar una prueba
+
+<Steps>
+
+1. **Elige el proveedor.** El asistente muestra todos los proveedores de envío integrados con sus condiciones de
+   marketing masivo, su precio y su tiempo de configuración; <UiPath path="connect.catalog.chooseTitle" />, arriba,
+   recomienda uno para tu volumen. Para esta prueba, desplázate más allá y elige **Cualquier servidor SMTP**.
+
+   <Screenshot
+     id="providers-catalog"
+     alt="El catálogo de proveedores, paso 1 de los seis pasos del asistente que aparecen a la izquierda: Ayúdame a elegir recomienda Amazon SES para 50.000 correos al mes, y las tarjetas de Amazon SES, Postmark y Mailgun muestran sus condiciones de marketing masivo, su precio y su tiempo de configuración."
+   />
+
+2. **Conecta el servidor saliente.** Escribe el host `mailpit`, el puerto `2525` y el cifrado **Ninguno**; deja vacíos el
+   usuario y la contraseña. Selecciona <UiPath path="connect.connection.smtp.testConnection" />: el resultado dice
+   “Conectado a las … · Sin TLS · sin autenticación”.
+
+3. **Conecta el buzón de rebotes.** SMTP no tiene webhooks, así que ReputeCast lee los rebotes de un buzón. Escribe la
+   dirección return-path `bounces@example.com`, el protocolo **POP3**, el servidor de correo `mailpit`, el puerto
+   **995 · TLS**, el usuario `bounces` y la contraseña `bounces-password`. Selecciona
+   <UiPath path="connect.connection.smtp.testMailbox" /> y continúa hasta la verificación del dominio.
+
+4. **Escribe un dominio de envío.** Escribe `example.com`, selecciona **Mostrar los registros DNS** y continúa hasta el
+   envío de prueba. Con un dominio real, estos registros los añades en tu proveedor de DNS; consulta
+   [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/).
+
+5. **Añade un remitente.** La prueba necesita una dirección From. En una pestaña nueva del navegador, abre
+   <UiPath path="nav.settings > settings.senders" />, selecciona <UiPath path="senders.addSender" />, escribe un nombre y
+   `news@example.com`, marca Envíos masivos, Automatizaciones y Sistema, y añádelo. De vuelta en el asistente, recarga la
+   página.
+
+6. **Envía la prueba.** Selecciona <UiPath path="connect.steps.sendTest" />. La cronología de la entrega se completa a
+   medida que Mailpit acepta el mensaje. Abre http://localhost:8025 para leerlo en la bandeja de entrada de Mailpit.
+
+7. **Termina el asistente.** Deja los cuatro flujos en el servidor SMTP y elige **Empezar sin contactos y terminar** (o
+   importa contactos). El resumen enumera lo que se ha configurado.
+
+</Steps>
+
+## Lo que has creado
+
+ReputeCast y PostgreSQL se ejecutan en tu equipo, tu cuenta de Propietario está protegida con la verificación en dos
+pasos, la instancia y tu primer espacio de trabajo están configurados, y un correo de prueba ha ido de ReputeCast a una
+bandeja de entrada a través de un servidor SMTP.
+
+Para quitarlo todo, incluida la base de datos, ejecuta `docker compose down -v` en la carpeta.
+
+Para enviar de verdad, ejecuta ReputeCast en un servidor con una dirección HTTPS pública, para que los proveedores de
+envío puedan comunicarle las entregas, los rebotes y las quejas, y conecta tu propio proveedor. Consulta
+[Instalar con Docker Compose](/es/self-hosting/docker/) y [Conectar un proveedor de envío](/es/providers/connect/).
+
+## Próximos pasos
+
+<CardGrid>
+  <LinkCard
+    title="Enviar tu primer boletín"
+    description="Importa contactos, escribe una campaña y supera la revisión previa."
+    href="/es/getting-started/first-campaign/"
+  />
+  <LinkCard
+    title="Enviar con Amazon SES"
+    description="Conecta SES con un stack de CloudFormation o con claves de IAM."
+    href="/es/providers/amazon-ses/"
+  />
+  <LinkCard
+    title="Proxy inverso y TLS"
+    description="Pon ReputeCast detrás de Caddy, nginx o Traefik con HTTPS."
+    href="/es/self-hosting/reverse-proxy/"
+  />
+</CardGrid>

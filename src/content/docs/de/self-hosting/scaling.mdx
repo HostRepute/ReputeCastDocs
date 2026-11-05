@@ -1,0 +1,179 @@
+---
+title: Mit den Rollen web, ingest und worker skalieren
+description: 'ReputeCast skalieren: einen Prozess hinter Ihrem Proxy in die Rollen web, ingest und worker aufteilen, mit Compose-Beispiel, gemeinsamen Dateien und Poolgröße.'
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast skalieren
+sources:
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/app/metrics.go
+  - internal/app/register.go
+  - internal/app/wire_smtprelay.go
+  - internal/app/wire_publicurl.go
+  - internal/cli/serve.go
+  - internal/cli/seed.go
+  - internal/jobs/jobs.go
+  - internal/providers/remote/runtime.go
+  - internal/server/sessionlimit.go
+  - internal/loadtest
+  - deploy/docker-compose.yml
+  - docs/deploy/performance.md
+  - README.md
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ArchitectureDiagram from '~/components/diagrams/ArchitectureDiagram.astro'
+
+Um ReputeCast zu skalieren, führen Sie dieselbe Binärdatei als mehrere Prozesse aus, jeden mit einem Teil ihrer drei
+Rollen, alle mit einer gemeinsamen PostgreSQL-Datenbank. Ein Prozess mit allen Rollen ist der Standard und reicht für
+die meisten Instanzen; teilen Sie die Rollen auf, wenn Versand, Webhook-Verkehr oder die Web-App mehr Kapazität
+brauchen, als ein Rechner bietet.
+
+<ArchitectureDiagram />
+
+Eine Binärdatei bedient den Browser, die API, MCP-Agenten und die Webhooks der Anbieter und führt die Hintergrundjobs
+aus; PostgreSQL enthält die Daten und die Job-Warteschlange, und die Versandanbieter stellen die E-Mails zu.
+
+## Die Rollen
+
+| Rolle    | Was sie ausführt |
+| -------- | ---------------- |
+| `web`    | Die Web-App, die API unter `/api/`, öffentliche Seiten (`/p/…`, `/t/…`, `/r/…`), `/mcp`, Rückrufe bei der Anmeldung, Challenges von Let's Encrypt und das [SMTP-Relay](/de/transactional/smtp-relay/). |
+| `ingest` | Webhooks von Versandanbietern und verbundenen Diensten unter `/hooks/…`: Sie prüft jeden, speichert ihn und antwortet sofort mit `200`. |
+| `worker` | Die Job-Warteschlange in PostgreSQL: Versände, Verarbeitung von Ereignissen, Synchronisierungen, Zustandsprüfungen, Warm-up, Automationen, Importe, Berichte und Aufbewahrung. Geplante Jobs laufen nur in Worker-Prozessen. |
+
+- `reputecast serve` führt alle drei aus; `serve --role=web,ingest` (oder `REPUTECAST_ROLES=web,ingest`) führt einige
+  aus; `reputecast worker` entspricht `serve --role=worker`.
+- Nur ein Prozess, der `web` oder `ingest` ausführt, hat den HTTP-Listener. Jeder Prozess öffnet den Metrik-Listener
+  (`:9464`), auf dem ein reiner Worker-Prozess auch `/healthz` und `/readyz` beantwortet, sodass die Zustandsprüfung
+  des Images auch für ihn funktioniert.
+
+## Bevor Sie beginnen
+
+- ReputeCast läuft als ein Prozess, installiert mit [Docker Compose](/de/self-hosting/docker/) oder
+  [als Binärdatei](/de/self-hosting/binary/), und Sie haben eine [Sicherung](/de/self-hosting/backups/).
+- Ihr PostgreSQL nimmt die zusätzlichen Verbindungen an
+  ([Pool dimensionieren](/de/self-hosting/postgres/#verbindungspool-dimensionieren)).
+
+## Rollen aufteilen
+
+<Steps>
+
+1. Geben Sie jedem Prozess dieselbe Konfiguration: `database.url`, `http.public_url`, `http.trusted_proxies` und
+   denselben geheimen Schlüssel. Auf mehreren Rechnern setzen Sie auf allen `secrets.key` (`REPUTECAST_SECRETS__KEY`)
+   statt einer Schlüsseldatei; mit Docker kopieren Sie den vorhandenen Schlüssel mit
+   `docker compose cp app:/var/lib/reputecast/secret.key .` heraus und verwenden seinen Inhalt.
+
+2. Geben Sie Web- und Worker-Prozessen dasselbe `files.dir` (Produktdateien und Lead-Magneten), auf einem gemeinsamen
+   Volume oder einem Netzwerkdateisystem.
+
+3. Betreiben Sie einen oder mehrere Prozesse `serve --role=web,ingest` hinter Ihrem
+   [Reverse Proxy](/de/self-hosting/reverse-proxy/) und mindestens einen `worker`. Mehrere Worker teilen sich die
+   Warteschlange über PostgreSQL. Um die Kapazität für Webhooks getrennt zu erhöhen, betreiben Sie Prozesse mit
+   `--role=ingest` und leiten `/hooks/` im Proxy an sie weiter.
+
+4. Wenden Sie Migrationen von einer Stelle aus an: ein Prozess mit `--auto-migrate` oder `reputecast migrate up`,
+   bevor Sie die neue Version überall starten. Mehrere mit `--auto-migrate` gestartete Prozesse wechseln sich ab,
+   sodass jede Migration einmal läuft. Ein `worker` migriert nie; auf einem älteren Schema gestartet, wartet er, bis die
+   Migrationen angewendet sind.
+
+5. Betreiben Sie in jedem Prozess dieselbe ReputeCast-Version.
+
+</Steps>
+
+Die mitgelieferte `docker-compose.yml` enthält diese Aufteilung, auskommentiert. Als Override-Datei führt sie die
+Rollen web und ingest in `app` und die Jobs in einem separaten Container `worker` aus, auf einem Server, mit dem
+gemeinsamen Volume `appdata` (geheimer Schlüssel und Dateien):
+
+```yaml title="docker-compose.override.yml"
+services:
+  app:
+    command: ["serve", "--role=web,ingest", "--auto-migrate", "--auto-install"]
+
+  worker:
+    image: ${REPUTECAST_IMAGE:-ghcr.io/hostrepute/reputecast}:${REPUTECAST_VERSION:-latest}
+    restart: unless-stopped
+    command: ["worker"]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      REPUTECAST_DATABASE__URL: postgres://reputecast:${POSTGRES_PASSWORD:-reputecast}@postgres:5432/reputecast?sslmode=disable
+      REPUTECAST_PUBLIC_URL: ${REPUTECAST_PUBLIC_URL:-http://localhost:8080}
+    volumes:
+      - appdata:/var/lib/reputecast
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reputecast", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+```
+
+Der Worker startet, sobald `app` fehlerfrei läuft, damit der geheime Schlüssel und die Migrationen bereitstehen.
+
+<Aside type="caution">
+  Teilen Sie eine Instanz erst nach ihrem ersten Start auf, wenn die Datei mit dem geheimen Schlüssel existiert. Ein
+  Worker, der vor der App auf einem leeren Volume startet, könnte einen anderen Schlüssel anlegen.
+</Aside>
+
+## Was die Prozesse gemeinsam nutzen
+
+- **PostgreSQL**: Daten, die Job-Warteschlange und die Planung der Jobs. Jeder Prozess öffnet bis zu
+  `database.max_conns` Verbindungen (Standard 20), und `worker.concurrency` (Standard 50) legt fest, wie viele Jobs ein
+  Worker gleichzeitig ausführt.
+- **In der App gespeicherte Einstellungen**: Jeder Prozess liest die in der Instanzverwaltung gespeicherte öffentliche
+  URL alle 30 Sekunden neu ein, installierte Community-Adapter alle 15 Sekunden.
+- **Dateien**: `files.dir`, wie oben.
+- **Nicht die Ratenlimits**: Jeder Web-Prozess zählt Anfragen für sich, daher kann ein Aufrufer hinter einem Load
+  Balancer mit drei Web-Prozessen das Dreifache der [Limits](/de/self-hosting/security/#standardwerte-und-grenzen)
+  erreichen.
+
+## Gemessene Leistung
+
+Mit den Daten des Lasttests (eine Million Kontakte, 3,2 Millionen Zustellereignisse) beantworteten ReputeCast und
+PostgreSQL 16 auf einem Host mit 4 vCPUs eine Kontaktseite in 6–7 ms, eine Suche in 23 ms, den Bericht einer Kampagne
+an 975.000 Empfänger in 272 ms und die Zählung eines Segments mit zwei Bedingungen in 927 ms. Unter Last, auf einem
+GitHub-Runner mit 4 vCPUs, PostgreSQL 18 und k6 auf demselben Host, wurde jedes Ziel erreicht (1. November 2026):
+
+| Lasttest                                       | p95    | Ziel          |
+| ---------------------------------------------- | ------ | ------------- |
+| Kontaktseiten, 10 Personen, 278 Anfragen/s     | 35 ms  | unter 200 ms  |
+| Kontaktsuche, ebenso                           | 140 ms | unter 150 ms  |
+| Zehn Personen beim Navigieren                  | 140 ms | unter 200 ms  |
+| Segmentzählungen                               | 5 ms   | unter 2 s     |
+| Sende-API, 135 Nachrichten/s                   | 247 ms | unter 300 ms  |
+
+Um Ihre eigene Hardware zu messen, verwenden Sie eine Entwicklungsinstanz (`REPUTECAST_ENV=development`): Nach
+`reputecast seed` fügt `reputecast seed --sample load --contacts 1000000` einen Arbeitsbereich „Load test“ dieser Größe
+hinzu, in etwa 8 Minuten und mit 3 GB. Die k6-Skripte im Ordner `loadtest/k6` des Repositorys belasten damit die
+Kontaktliste, Segmentzählungen, die Sende-API und den Empfang von Webhooks.
+
+## Prüfen, ob es funktioniert hat
+
+- `curl http://<web process>:8080/readyz` antwortet auf jedem Web- und Ingest-Prozess `ready`.
+- `docker compose ps` zeigt `worker` als `healthy`: Sein `/readyz` auf Port 9464 antwortet, sobald seine Worker laufen.
+- Die Protokollzeile `http listening` jedes Web-Prozesses zeigt seine Rollen, und jeder Worker protokolliert
+  `workers started` mit seiner Parallelität.
+- Geplante Versände starten, und der Live-Monitor bewegt sich: Die Worker verarbeiten die Warteschlange.
+
+## Fehlerbehebung
+
+- **Nichts wird gesendet, und Importe werden nie fertig**: Kein Prozess führt die Rolle `worker` aus.
+- **Gespeicherte Zugangsdaten der Anbieter lassen sich in einem Prozess nicht entschlüsseln**: Sein geheimer Schlüssel
+  weicht ab; geben Sie jedem Prozess denselben `secrets.key` oder dieselbe Schlüsseldatei.
+- **Produkt-Downloads schlagen in manchen Prozessen fehl**: `files.dir` wird nicht gemeinsam genutzt.
+- **`FATAL: sorry, too many clients already`**: Senken Sie `database.max_conns` je Prozess.
+- **Ein Prozess protokolliert `metrics listener not started`**: Ein anderer Prozess auf dem Host belegt bereits
+  Port 9464. Geben Sie jedem Prozess auf einem Host eine eigene `metrics.addr`.
+- **Ein Worker bleibt mit `workers not started` oder `database schema behind this release` fehlerhaft**: Die
+  Migrationen sind noch nicht gelaufen; starten Sie `app` mit `--auto-migrate` oder führen Sie
+  `reputecast migrate up` aus.
+
+## Verwandte Themen
+
+- [Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)
+- [ReputeCast konfigurieren](/de/self-hosting/configuration/)
+- [So funktioniert ReputeCast](/de/getting-started/concepts/)

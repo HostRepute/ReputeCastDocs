@@ -1,0 +1,130 @@
+---
+title: Enviar con SendGrid
+description: 'Gestiona una newsletter autoalojada con SendGrid y ReputeCast: una clave de API configura el Event Webhook firmado, el dominio y las supresiones.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter autoalojada con SendGrid
+sources:
+  - internal/providers/sendgrid
+  - internal/connect
+  - internal/domains/attach.go
+  - internal/providers/manage/actions.go
+  - web/src/features/connect
+sidebar:
+  order: 6
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Para gestionar una newsletter autoalojada con SendGrid y ReputeCast, necesitas una clave de API de SendGrid. ReputeCast
+registra un Event Webhook firmado, autentica tu dominio de envío mediante la API de SendGrid, desactiva el seguimiento
+propio de SendGrid en cada mensaje y mantiene sincronizadas las listas de supresión de ambos lados.
+
+<ProviderMatrix family="email" id="sendgrid" />
+
+## Antes de empezar
+
+- **Una clave de API de SendGrid con Full Access** (SendGrid › Settings › API Keys). ReputeCast la usa para enviar,
+  registrar y firmar el Event Webhook, autenticar dominios, leer y escribir supresiones, y leer la configuración de
+  seguimiento y las estadísticas. Una clave limitada a menos ámbitos se conecta, pero después los pasos del webhook, del
+  dominio o de las supresiones fallan con "access forbidden". SendGrid muestra una clave nueva una sola vez, y una clave
+  no puede tener más permisos que la persona que la crea
+  ([Twilio SendGrid: API keys](https://www.twilio.com/docs/sendgrid/ui/account-and-settings/api-keys), consultado en
+  octubre de 2026).
+- **Permisos.** Para conectar necesitas `providers:manage`; para añadir un dominio de envío nuevo, `domains:manage`.
+- **Una dirección HTTPS pública** para el Event Webhook: `<public URL>/hooks/sendgrid/<token>`. SendGrid no tiene una
+  API de eventos que ReputeCast pueda consultar en su lugar, así que la dirección tiene que ser accesible desde
+  internet.
+
+## Conectar SendGrid
+
+<Steps>
+
+1. Abre <UiPath path="nav.providers" />, elige <UiPath path="providers.overview.addProvider" /> y selecciona SendGrid
+   en el catálogo. [Conectar un proveedor de envío](/es/providers/connect/) explica los pasos que comparten todos los
+   proveedores.
+
+2. Pega la <UiPath path="providers.fields.apiKey" />. Pon <UiPath path="providers.fields.region" /> en `eu` solo para
+   un subusuario de la UE; si no, déjalo en `global`. En la configuración adicional de SendGrid puedes indicar un
+   <UiPath path="providers.fields.ipPool" /> de IP dedicadas por el que enviar. Deja vacía la
+   <UiPath path="providers.fields.sendgrid.webhookVerificationKey" />: ReputeCast la lee de SendGrid para el webhook que
+   registra.
+
+3. Elige <UiPath path="connect.connection.connect" />. ReputeCast lee tus créditos y tu cuenta con la clave y después
+   la guarda cifrada.
+
+4. En <UiPath path="connect.connection.webhooksTitle" />, ReputeCast comprueba que su dirección de webhook es accesible
+   desde internet y después crea (o actualiza) un Event Webhook llamado "ReputeCast" para `delivered`, `bounce`,
+   `dropped`, `deferred`, `spamreport`, `unsubscribe` y `group_unsubscribe`, y activa su verificación de firma. Los
+   eventos processed, open y click siguen desactivados. Después pide a SendGrid un webhook de prueba, y
+   <UiPath path="connect.connection.continueDomain" /> se desbloquea cuando llega.
+
+5. Elige <UiPath path="connect.connection.continueDomain" /> y escribe tu dominio de envío. ReputeCast inicia la
+   autenticación del dominio en SendGrid (automated security) y muestra los registros CNAME que necesita SendGrid: el
+   return path, SPF y dos registros DKIM. También sugiere un registro DMARC si el dominio no tiene ninguno.
+
+6. En <UiPath path="connect.stepTest" />, envía una prueba y observa cómo vuelve el evento `delivered` a través del
+   webhook firmado.
+
+7. En <UiPath path="connect.stepStreams" /> y <UiPath path="connect.stepContacts" />, elige los flujos y deja marcada
+   la opción de recibir las supresiones que ya tiene SendGrid.
+
+</Steps>
+
+## Comprobar que funciona
+
+- La tarjeta de SendGrid en <UiPath path="nav.providers > providers.tabProviders" /> muestra
+  <UiPath path="providers.statusHealthy" />, los créditos del plan y la cifra de reputación de SendGrid.
+- En SendGrid › Settings › Mail Settings, el Event Webhook llamado "ReputeCast" apunta a `/hooks/sendgrid/…` con la
+  verificación de firma activada.
+- Las entregas y los rebotes aparecen en <UiPath path="nav.providers > providers.tabEvents" />.
+
+Cada solicitud del webhook se firma con ECDSA sobre su marca de tiempo y su cuerpo; ReputeCast comprueba la firma con la
+clave pública que devuelve SendGrid al activar la firma
+([Twilio SendGrid: Event Webhook security features](https://www.twilio.com/docs/sendgrid/for-developers/tracking-events/getting-started-event-webhook-security-features),
+consultado en octubre de 2026). ReputeCast envía una llamada a la API por mensaje, con el seguimiento de clics, aperturas
+y suscripciones desactivado en cada mensaje, diga lo que diga la configuración de la cuenta. La
+[sincronización de supresiones](/es/reference/glossary/#suppression-sync) recibe los rebotes, los correos no válidos, los
+informes de spam y las bajas globales de SendGrid (no los bloqueos) y envía a las bajas globales de SendGrid los rebotes
+permanentes y las quejas que se aplican a todo el correo, lo que detiene en SendGrid todo el correo a esas direcciones;
+una dirección que sale de la lista compartida también se quita allí.
+
+ReputeCast lee, al conectar y cada día, las IP asignadas a tu cuenta (solo las del grupo de IP, si configuraste uno), y
+las muestra como [IP de envío](/es/providers/senders-and-domains/#comprobar-las-ip-de-envío) de la tarjeta; una cuenta en
+las IP compartidas de SendGrid no tiene ninguna. Esto necesita acceso de lectura a IP Management en la clave; sin él, la
+tarjeta indica qué cambiar y conserva las IP que conocía.
+
+## Solución de problemas
+
+- **"SendGrid rechazó esta clave."** La clave es incorrecta o se eliminó. Crea una clave nueva con Full Access y pégala.
+- **"SendGrid no respondió a la comprobación"** justo después de pegar una clave válida. Puede que SendGrid esté
+  rechazando la llamada porque la cuenta ha agotado sus créditos; ReputeCast lo trata como un límite temporal. Revisa tu
+  plan y vuelve a intentarlo.
+- **El registro del webhook o el paso del dominio fallan con "access forbidden".** La clave está restringida. Dale Full
+  Access en SendGrid (o crea una nueva) y reemplázala en
+  <UiPath path="providers.overview.settings > providers.overview.credentials" />.
+- **La prueba falla con `sender_not_verified`.** SendGrid solo envía desde una Sender Identity verificada. Termina la
+  autenticación del dominio De (o verifica el remitente único en SendGrid) y envía otra prueba.
+- **Los eventos se detienen y la tarjeta muestra <UiPath path="providers.statusDegraded" /> con
+  <UiPath path="providers.health.webhooksSilent" />.** El webhook se eliminó, se desactivó o se desactivó su firma en
+  SendGrid. Elige <UiPath path="providers.incidents.reregister" /> en el incidente del proveedor; si configuraste tú
+  mismo el webhook, pega su clave de verificación en su lugar.
+- **Fallan los mensajes transaccionales con Cc, Bcc o archivos adjuntos.** El adaptador de SendGrid no puede enviar
+  copias ni adjuntos; enruta esas plantillas a través de otro proveedor.
+- **El catálogo muestra una insignia "Modo sandbox".** ReputeCast nunca activa el modo sandbox de SendGrid: todos los
+  mensajes que entrega se envían de verdad.
+- **Cambiaste la URL pública o desconectaste SendGrid.** Una URL pública nueva añade un segundo Event Webhook; elimina
+  el anterior en SendGrid. Al desconectar se elimina el webhook de la URL actual; los dominios autenticados, las
+  supresiones enviadas y la configuración de seguimiento se conservan.
+
+## Relacionado
+
+- [Conectar un proveedor de envío](/es/providers/connect/)
+- [Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)
+- [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)
+- [Estado de los proveedores y caídas](/es/providers/health-and-outages/)
+- [Elegir un proveedor de envío](/es/providers/choose/)

@@ -1,7 +1,16 @@
 // Pure rules for the content check (scripts/content/check.ts). Kept free of I/O so they can be unit tested.
 import { parse as parseYaml } from 'yaml'
+import { PREFIXED_LOCALES, localeOf, stripLocale, type Lang, type PrefixedLang } from '../../src/lib/locales.ts'
 
-export type Locale = 'en' | 'vi'
+export type Locale = Lang
+
+/** Each translated locale's name in English, for messages. */
+const LOCALE_NAMES: Record<PrefixedLang, string> = {
+  de: 'German',
+  es: 'Spanish',
+  fr: 'French',
+  vi: 'Vietnamese',
+}
 
 export type Page = {
   /** Repo-relative file path, used in messages. */
@@ -48,11 +57,9 @@ export function parseFrontmatter(source: string): { data: Record<string, unknown
 /** Splits a docs-collection file path (relative to src/content/docs) into locale and page path. */
 export function locateEntry(relativeFile: string): { locale: Locale; path: string } {
   const withoutExt = relativeFile.replace(/\\/g, '/').replace(/\.mdx?$/, '')
-  if (withoutExt === 'vi' || withoutExt.startsWith('vi/')) {
-    const rest = withoutExt === 'vi' ? 'index' : withoutExt.slice(3)
-    return { locale: 'vi', path: rest }
-  }
-  return { locale: 'en', path: withoutExt }
+  const locale = localeOf(withoutExt)
+  if (locale === 'en') return { locale, path: withoutExt }
+  return { locale, path: stripLocale(withoutExt) || 'index' }
 }
 
 export type Tag = {
@@ -202,11 +209,14 @@ export function checkPages(pages: Page[], ctx: CheckContext): Issue[] {
   }
 
   if (ctx.strictI18n) {
-    const en = new Set(pages.filter((p) => p.locale === 'en').map((p) => p.path))
-    const vi = new Set(pages.filter((p) => p.locale === 'vi').map((p) => p.path))
+    const byLocale = new Map<Locale, Set<string>>()
+    for (const p of pages) byLocale.set(p.locale, (byLocale.get(p.locale) ?? new Set()).add(p.path))
     for (const page of pages) {
-      if (page.locale === 'en' && !vi.has(page.path)) add(page.file, 'i18n', `missing Vietnamese page vi/${page.path}`)
-      if (page.locale === 'vi' && !en.has(page.path)) add(page.file, 'i18n', `no English page ${page.path}`)
+      if (page.locale === 'en') {
+        for (const l of PREFIXED_LOCALES)
+          if (!byLocale.get(l)?.has(page.path))
+            add(page.file, 'i18n', `missing ${LOCALE_NAMES[l]} page ${l}/${page.path}`)
+      } else if (!byLocale.get('en')?.has(page.path)) add(page.file, 'i18n', `no English page ${page.path}`)
     }
   }
 

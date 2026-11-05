@@ -1,0 +1,190 @@
+---
+title: 'Versandbereitschaft: vor dem Senden prüfen'
+description: 'Zustellbarkeit vor dem Versand prüfen mit der Versandbereitschaft von ReputeCast: bis zu 11 Prüfgruppen, ein Ergebnis, umkehrbare Korrekturen, erneute Prüfung.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:edit']
+uiPath: 'nav.campaigns > composer.reviewSend'
+primaryKeyword: Zustellbarkeit vor dem Versand prüfen
+sources:
+  - internal/readiness
+  - internal/contentcheck/blocklist.go
+  - internal/contentcheck/sources.go
+  - internal/approvals/jobs.go
+  - internal/approvals/send.go
+  - internal/hostrepute/httpclient.go
+  - internal/deliverability/reputation.go
+  - internal/sending/engine/estimate.go
+  - web/src/features/review
+  - web/src/features/placement/EntryPoints.tsx
+sidebar:
+  order: 11
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Mit der [Versandbereitschaft](/de/reference/glossary/#send-readiness) können Sie auf der Seite <UiPath path="composer.reviewSend" /> jeder Kampagne die Zustellbarkeit vor dem Versand prüfen. Sie prüft in einem Durchlauf Ihre Absenderreputation, die Authentifizierung, Inhalt, Links, Compliance, Zielgruppe, Route und die eigenen [Versandregeln](/de/campaigns/sending-rules/) Ihres Arbeitsbereichs, gibt ein [Ergebnis](/de/reference/glossary/#verdict) aus und bietet für die meisten gefundenen Probleme eine Korrektur an. Zum Versandzeitpunkt läuft sie erneut, sodass ein Problem, das nach dem Planen auftritt, den Versand zurückhält, statt Ihre Liste zu erreichen.
+
+<Screenshot
+  id="review-send"
+  eager
+  alt="Prüfen & senden für Weekly Digest #142, geplant für Mittwoch, 4. Nov., um 09:00 New Yorker Zeit an 31.192 Empfänger über SES und Postal, mit Kacheln für die verbleibende Zeit, den A/B-Test, die Auto-Pause und wer geplant hat. Handlungsbedarf · 2 listet eine Regel des Arbeitsbereichs zu UTM-Tags und eine bei UCEPROTECT gelistete Postal-IP auf, jeweils mit Korrekturen und deren Auswirkungen; rechts schließt die Zielgruppe 412 Kontakte ohne Interaktion aus, mit Einbeziehen, darunter folgt die Routenaufteilung."
+>
+
+1. Das Status-Banner: das Ergebnis vor dem Senden; sobald die Kampagne geplant ist, Zeitpunkt, Zielgruppe, Route und wann die Prüfungen erneut laufen.
+2. Handlungsbedarf: zuerst die Probleme, jeweils mit Ergebnis, Korrektur-Buttons samt deren Auswirkungen und <UiPath path="review.technicalDetails" />.
+3. Die Karte <UiPath path="review.audience" />: die Listen abzüglich Sperrliste, Rollenadressen, Duplikaten und der Kontakte ohne Interaktion, die der Versand auslässt (mit <UiPath path="review.includeThem" />), bis zu den endgültigen Empfängern.
+4. Die Aktionen des Banners für einen geplanten Versand: <UiPath path="review.unschedule" /> und <UiPath path="review.openLive" />.
+
+</Screenshot>
+
+## Ergebnisse und Prüfergebnisse
+
+Jede Prüfung liefert ein Ergebnis, und diese Ergebnisse bestimmen das Gesamtergebnis:
+
+| Prüfergebnis                           | Bedeutung                                                                                                                             |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="review.statusPass" />    | Nichts zu tun.                                                                                                                        |
+| <UiPath path="review.statusWarn" />    | Der Versand kann starten, aber Sie bestätigen die Warnung beim Senden.                                                                |
+| <UiPath path="review.statusBlock" />   | Der Versand kann erst starten, wenn das Problem behoben ist.                                                                          |
+| <UiPath path="review.statusUnknown" /> | Die Prüfung konnte nicht laufen, etwa weil DNS nicht geantwortet hat. Nichtwissen zählt nie als unbedenklich und nie als Blockiert. |
+
+| Ergebnis                                 | Wann                                                                                               |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| <UiPath path="review.verdictBlocked" />  | Eine Prüfung blockiert. Der Senden-Button bleibt deaktiviert, bis jede Blockade behoben ist.       |
+| <UiPath path="review.verdictWarnings" /> | Nichts blockiert, aber etwas warnt.                                                                |
+| <UiPath path="review.verdictReady" />    | Nichts blockiert oder warnt.                                                                       |
+
+Das Banner ergänzt, was noch zu tun ist: „Bereit mit Warnungen · 2 zu prüfen“, „Blockiert · 3 zu beheben“. Solange eine Prüfung Unbekannt ist, kann das Ergebnis nicht Bereit sein, und das Senden bleibt deaktiviert, bis Sie die Prüfungen wiederholen oder sich entscheiden, ohne sie fortzufahren (siehe [wenn Prüfungen nicht laufen können](#wenn-prüfungen-nicht-laufen-können)).
+
+## Aufbau von Prüfen & senden
+
+Die Seite stellt an den Anfang, was Ihre Aufmerksamkeit braucht:
+
+- **Das Banner** zeigt das Ergebnis, wie viele Prüfungen bestanden, warnen und blockieren und wann die Prüfungen gelaufen sind. Sobald die Kampagne geplant ist, nennt es, wann sie hinausgeht, an wie viele Empfänger, über welche Versandanbieter und wann die Prüfungen erneut laufen, mit Kacheln für die verbleibende Zeit, den A/B-Test, die Schwellenwerte für Auto-Pause und wer geplant hat.
+- **Handlungsbedarf** listet die Probleme. Wenn etwas blockiert, stehen zuerst die blockierenden Probleme, dann die Warnungen, dann die Prüfungen, die nicht laufen konnten. Jede Zeile ist ein einfacher Satz mit ihren Korrektur-Buttons; unter jedem Button sagt eine kurze Zeile, was das Anwenden ändert, etwa „+3 Min. · +0,31 $“, „Zielgruppe umfasst dann 31.192“ oder „Ändert 2 Links · vorher Vorschau ansehen“. <UiPath path="review.technicalDetails" /> enthält, was der Satz weglässt: SPF- und DMARC-Einträge, wie DNS sie liefert, DKIM-Schlüssel und MAIL FROM je Versandanbieter, die `List-Unsubscribe`-Header, wie sie gesendet werden, den HTTP-Status von Links und Bildern, DNS-Antworten wie `SERVFAIL`, Fehlercodes der Anbieter und bei einer Regel des Arbeitsbereichs die Regel selbst.
+- **Im Editor verworfene Warnungen** bleiben in der Liste, mit wer sie verworfen hat und warum, und gelten als bereits bestätigt. Wer die Kampagne bearbeiten darf, kann das Verwerfen dort rückgängig machen. Siehe [Inhaltswarnungen vor dem Senden beheben](/de/campaigns/content-checks/).
+- **Bestanden** fasst alle bestandenen Prüfungen zu einem Chip je Gruppe mit ihrer Anzahl zusammen; ist der Versand blockiert, zeigt es stattdessen eine Zusammenfassungszeile je Gruppe. Klappen Sie es auf, um jede Prüfung nach Gruppen zu lesen.
+- **<UiPath path="placement.entryTitle" />** zeigt den neuesten [Platzierungstest](/de/deliverability/placement-tests/) der Kampagne je Postfachanbieter und startet einen neuen. Er ist optional und ändert das Ergebnis nie.
+- **Die rechte Spalte** enthält die Schätzungen (Zielgruppe, <UiPath path="review.routeBreakdown" />, <UiPath path="review.throttling" />), die Schwellenwerte unter <UiPath path="review.thresholdsTitle" />, <UiPath path="review.scheduling" />, <UiPath path="review.testSends" /> und die Hauptaktion. Die Hauptaktion nennt den Zeitplan, zum Beispiel „Für So., 1. Nov., 09:00 ET planen“ oder „Jetzt an 31.192 senden“.
+
+Testversände funktionieren auch, während die Kampagne Blockiert ist, sodass Sie eine Korrektur in Ihrem Posteingang prüfen können, bevor die Prüfungen sie freigeben.
+
+<Screenshot
+  id="review-send-blocked"
+  alt="Flash sale: 48 hours only ist Blockiert mit 2 Blockaden, 8 Warnungen und 24 bestandenen Prüfungen, und das Senden bleibt deaktiviert, bis jede Blockade behoben ist. Die blockierenden Probleme stehen zuerst, jeweils mit ihrer Korrektur: kein Abmeldelink und keine Postanschrift (Fußzeilen-Block einfügen, fügt etwa 1 KB hinzu) und go.acme-promo.link, gelistet bei SURBL und Spamhaus DBL (Link bearbeiten); die Warnungen folgen."
+/>
+
+Auf einem Smartphone stehen die Korrektur-Buttons unter jeder Beschreibung, und die Hauptaktion bleibt in einer Leiste am unteren Bildschirmrand, mit dem Ergebnis darüber.
+
+<Screenshot
+  id="review-send-mobile"
+  alt="Prüfen & senden auf einem Smartphone: Weekly Digest #142 ist für Mittwoch, 4. Nov., um 09:00 New Yorker Zeit an 31.192 Empfänger über SES und Postal geplant, die Prüfungen laufen um 08:45 erneut, mit Planung aufheben, Live-Monitor öffnen und Kacheln für die verbleibende Zeit, den A/B-Test des Betreffs, die Auto-Pause und wer geplant hat."
+/>
+
+## Die Prüfgruppen
+
+Ein Durchlauf hat bis zu 11 Gruppen. Eine Gruppe ohne etwas zu prüfen entfällt: Sprachen erscheint nur bei einer E-Mail mit Sprachversionen, Bedingte Inhalte nur bei einer E-Mail mit bedingten Blöcken und Regeln des Arbeitsbereichs nur, wenn eine Regel greift. Die bestandenen Prüfungen und die vollständige Liste zeigen die Gruppen in dieser Reihenfolge.
+
+1. **<UiPath path="review.groupReputation" />.**
+   - Einträge auf Blocklisten für die Absenderdomain, ihre übergeordnete Domain (`acme.io` für `news.acme.io`), die Return-Path-Domains (MAIL FROM) der Versandanbieter, die den Versand übernehmen, und die Tracking-Domain. Domains, die die [Zustellbarkeit](/de/deliverability/blocklists/) bereits prüft, nutzen deren Ergebnisse; die übrigen werden live bei Spamhaus DBL und SURBL abgefragt. Ein Eintrag bei jeder davon zählt: Eine Liste mit hoher Wirkung blockiert, andere warnen. Eine fehlgeschlagene Abfrage ist Unbekannt und nennt den Grund.
+   - Die dedizierten IPs auf der Route: Ein Eintrag auf einer Liste mit hoher Wirkung blockiert, andere warnen. Eine IP, die die täglichen Prüfungen der Zustellbarkeit noch nicht erreicht haben, ist Unbekannt, mit einem Link, um die Prüfungen jetzt zu starten.
+   - Reverse DNS dieser dedizierten IPs: Fehlt er oder zeigt er auf einen Namen, der nicht auf die IP zurückverweist, blockiert das; eine fehlgeschlagene Abfrage ist Unbekannt.
+   - Bounce- und Beschwerderate jedes Versandanbieters der letzten 7 Tage, gemessen an den eigenen Limits des Anbieters: eine Warnung ab 80 % eines Limits, eine Blockade auf dem Niveau, bei dem der Anbieter Konten pausiert. Die Raten werden erst bewertet, wenn der Anbieter genug E-Mails übernommen hat (siehe [Standardwerte und Grenzen](#standardwerte-und-grenzen)). Die Beschwerderate zählt nur E-Mails, die an Postfachanbieter zugestellt wurden, die Beschwerden melden; Gmail und iCloud tun das nie, daher zeigt sie bei ausschließlich deren E-Mails „k. A.“.
+   - Ein [Warm-up](/de/providers/warm-up/)-Limit am Versandtag unterhalb der Empfänger, die zu diesem Anbieter geroutet werden, warnt: Der Rest wartet auf das Limit des nächsten Tages.
+2. **<UiPath path="review.groupAuthentication" />.** Ein Absender ist festgelegt; SPF autorisiert jeden Versandanbieter; DKIM ist verifiziert (ein Schlüssel unter 1024 Bit warnt); DMARC existiert und ist gültig (unter 90 % ausgerichteter E-Mails in den letzten 7 Tagen warnt); E-Mails über einen Anbieter ohne verifiziertes DKIM und ohne ausgerichteten Return-Path blockieren, weil sie DMARC nicht bestehen; die MAIL-FROM-Domain hält SPF ausgerichtet (sonst warnt sie); ein ungültiger BIMI-Eintrag warnt. Eine nie geprüfte Domain warnt. Eine DNS-Abfrage, die in einem Durchlauf zweimal fehlschlägt, ist Unbekannt, nie eine Blockade, die den Eintrag für ungültig erklärt. Siehe [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/).
+3. **<UiPath path="review.groupContent" />.** Geprüft in jeder Sprachversion und jeder [A/B-Variante](/de/campaigns/ab-testing/). Ein leerer Betreff blockiert, ebenso ein defektes Liquid-Tag, weil die E-Mail dann nicht gerendert werden kann. Spam-Trigger in Betreff, Vorschautext oder Text, ein Tag, das kein Kontaktfeld ist, ein Vornamen-Tag ohne Ersatzwert für Empfänger ohne Vornamen, Bilder über 60 % der E-Mail, HTML ab 85 KB mit für das Tracking umgeschriebenen Links (Gmail kürzt ab 102 KB), Bilder, die nicht oder nur über einfaches HTTP laden, fehlender Alternativtext und ein leerer Nur-Text-Teil warnen. Unvollständige Abstimmungen, Sponsor- und Upgrade-Blöcke und entfernte Shop-Produkte werden hier ebenfalls geprüft. Siehe [Inhaltswarnungen vor dem Senden beheben](/de/campaigns/content-checks/).
+4. **<UiPath path="review.groupLanguages" />.** Welche Version jede Gruppe von Kontakten erhält, und Warnungen für veraltete Versionen und Entwürfe. Diese Gruppe blockiert nie. Siehe [Jedem Leser seine Sprache senden](/de/campaigns/languages/).
+5. **<UiPath path="review.groupAccessibility" />.** Schwerwiegende Probleme (fehlender Alternativtext, Links ohne Text, geringer Kontrast) warnen oder blockieren, wenn die Richtlinie des Arbeitsbereichs auf Blockieren steht. Mittlere Probleme warnen. Siehe [Barrierefreiheit von E-Mails prüfen](/de/campaigns/accessibility/).
+6. **<UiPath path="review.groupConditional" />.** Eine Bedingung, die auf ein gelöschtes Segment, eine gelöschte Liste oder ein gelöschtes Feld verweist, blockiert, ebenso eine Version ohne Inhalt zwischen Kopf- und Fußzeile. Eine Version über 102 KB warnt. Bei mehr als 50 Versionen werden die 50 mit den größten Zielgruppen sowie die größte und die kleinste E-Mail geprüft. Siehe [Blöcke nur bestimmten Lesern zeigen](/de/campaigns/conditional-content/).
+7. **<UiPath path="review.groupLinks" />.** Link-Domains werden live bei Spamhaus DBL und SURBL abgefragt, mit denselben Abfragen wie im Editor: Eine gelistete Domain blockiert, eine Domain, die nicht abgefragt werden konnte, ist Unbekannt. Jeder Link wird geöffnet: Ein 404, 410, eine 5xx-Antwort oder keine Antwort warnt, und die Zeile zählt ehrlich („40 von 60 Links erreichbar; 20 konnten nicht geprüft werden“), wenn eine Website automatisierte Anfragen ablehnt (LinkedIn antwortet mit 999) oder die E-Mail mehr Links hat, als ein Durchlauf öffnet, was sie Unbekannt macht. URL-Kürzer und Buttons ohne Link warnen. Eine Tracking-Domain, die nicht auflöst, blockiert; getrackte Links über einfaches HTTP warnen.
+8. **<UiPath path="review.groupCompliance" />.** Der Text jeder Version und Variante braucht einen Abmeldelink und eine Postanschrift, sonst blockiert der Versand. Der Header `List-Unsubscribe` für die Abmeldung mit einem Klick braucht eine öffentliche HTTPS-URL, und ein Versandanbieter, der diese Header nicht mit DKIM signiert, warnt. Die Zeile zu Massenabsendern deckt die [Regeln von Gmail und Yahoo für Massenabsender](/de/deliverability/bulk-sender-requirements/) ab: Nicht bestandenes DMARC warnt; die Beschwerderate der Route über 7 Tage und die Spamrate von Gmail aus den Postmaster Tools warnen ab 0,1 % und blockieren ab 0,3 %; mit Postmaster-Daten für die Absenderdomain zeigt die Zeile den eigenen Status von Google, Konform oder Verbesserung nötig (was warnt).
+9. **<UiPath path="review.groupAudience" />.** Eine Zielgruppe ohne Empfänger blockiert. [Kontakte ohne Interaktion](/de/reference/glossary/#unengaged-contact) werden standardmäßig ausgelassen; einbezogen warnen sie ab 1 % der Zielgruppe oder 500 Kontakten. Kontakte mit einem Soft Bounce in den letzten 30 Tagen, Segmente, die nicht gezählt werden konnten, riskante Adressen aus der [Adressprüfung](/de/audience/verification/) und inaktive Kontakte, die seit 90 Tagen nicht geprüft wurden, warnen.
+10. **<UiPath path="review.groupRouting" />.** Ein Stream ohne Versandanbieter oder ein Anbieter auf der Route, der ausgefallen oder pausiert ist oder keine Ereignisse meldet, blockiert. Es warnt nur, wenn die Failover-Richtlinie des Streams nicht „pausieren und nachfragen“ ist und ein anderer Anbieter den Anteil übernehmen kann. Ein Anbieter im Sandbox-Modus oder einer, dessen Bedingungen keine Massen-E-Mails erlauben, blockiert. Ein 24-Stunden-Kontingent unter dem Anteil, Öffnungs- oder Klick-Tracking beim Anbieter (doppeltes Tracking) und ein Ersatzanbieter, der diesen Versand nicht übernehmen konnte, warnen. Siehe [E-Mails über mehrere Anbieter routen](/de/providers/routing/).
+11. **<UiPath path="review.groupRules" />.** Eine Zeile je [Versandregel](/de/campaigns/sending-rules/), die für Massenversand aktiv ist: Eine verletzte Regel warnt oder blockiert, wie die Regel es festlegt.
+
+## Korrekturen mit einem Klick
+
+Die meisten Warnungen und Blockaden haben einen Button, der sie direkt behebt, zum Beispiel <UiPath path="composer.canvas.insertFooter" />, „Nur über SES senden“, „412 ohne Interaktion ausschließen“, „utm_campaign=weekly-digest-142 hinzufügen“ oder „Als dekorativ markieren“. Unter jedem Button sagt eine Zeile, was er ändert, bevor Sie ihn anwenden.
+
+Der Button über den Problemen („3 Korrekturen prüfen“) öffnet eine Seitenleiste, die jede Korrektur mit einem Klick mit Kontrollkästchen und ihren Folgen auflistet: Route, Versandzeit, Kosten und Warm-up, die sie ändert, jeden Link vorher und nachher und was unverändert bleibt. Wählen Sie <UiPath path="review.applyFixes" />, um die angehakten Korrekturen gemeinsam anzuwenden.
+
+- **Links werden nie geraten.** Für einen gelisteten oder gekürzten Link wird „Durch Ziel-URL ersetzen“ nur angeboten, wenn der Link auf eine Seite weiterleitet, deren Domain bei Spamhaus DBL und SURBL nicht gelistet ist; sonst besteht die Korrektur darin, den Link zu bearbeiten. Stellt sich das Ziel als gelistet heraus oder kann es nicht geprüft werden, wird der Link nicht geändert.
+- **HTML bleibt unangetastet.** Eine in HTML geschriebene Kampagne erhält keine Korrektur, die MJML bearbeitet, und das Speichern eines leeren Inhalts über einen vorhandenen wird abgelehnt.
+- **Das Senden ist gesperrt**, während eine Korrektur gespeichert wird und während die Prüfungen danach erneut laufen.
+- **Korrekturen lassen sich rückgängig machen.** Gemeinsam angewendete Korrekturen werden als ein Paket aufbewahrt. Wählen Sie <UiPath path="review.undoFixes" /> in der Meldung, unter dem laufenden Banner oder unter dem Ergebnis, um Inhalt (als neue Version wiederhergestellt), Inhaltseinstellungen, Route und Zielgruppe zurückzusetzen, solange sich die Kampagne seitdem nicht geändert hat. Korrekturen, die Sprachversionen geändert haben oder zusammen mit der Bearbeitung einer anderen Person gespeichert wurden, machen Sie stattdessen im Versionsverlauf rückgängig.
+- Korrekturen erfordern `campaigns:edit`, und eine Korrektur (oder ein Rückgängigmachen), die die Route ändert, erfordert zusätzlich `campaigns:send`; ein deaktivierter Button nennt, wer helfen kann. Korrekturen, Rückgängigmachen und Verwerfen sind Aktionen von Menschen: API-Schlüssel und Agenten können sie nicht ausführen.
+- Jede Korrektur und jedes Rückgängigmachen wird im Audit-Protokoll festgehalten (`readiness.fixes_undone` für ein Rückgängigmachen), und eine Korrektur, die die Kampagne ändert, macht außerdem eine offene [Freigabe](/de/campaigns/approvals/) ungültig.
+
+## Wann die Prüfungen laufen
+
+Ein Durchlauf ist ein Hintergrundjob, einer pro Kampagne gleichzeitig. Während er läuft, zeigt das Banner, wie viele Prüfungen erledigt sind, und jede Gruppe zeigt ihren eigenen Fortschritt, etwa „9 von 14 Links“ oder „24.310 von 31.988 Kontakten“; das Senden bleibt gesperrt, bis er fertig ist. Die Prüfungen laufen:
+
+- **Wenn Sie Prüfen & senden öffnen**, falls die Kampagne noch nie einen Durchlauf hatte, sich seit dem letzten geändert hat oder auf sofortigen Versand gestellt ist und der letzte Durchlauf älter als 15 Minuten ist. Das erfordert `campaigns:edit`. Das Bearbeiten der Kampagne startet die Prüfungen nicht von selbst neu; es markiert den letzten Durchlauf als veraltet. Wenn Sie nur den Zeitplan ändern, bleibt der Durchlauf gültig.
+- **Wenn Sie** <UiPath path="review.rerun" /> **wählen** sowie nach einer Korrektur mit einem Klick oder einem Rückgängigmachen.
+- **Wenn Sie eine Freigabe anfragen**, falls der letzte Durchlauf die Kampagne nicht in ihrem aktuellen Zustand beschreibt; die Anfrage wartet auf den Durchlauf.
+- **15 Minuten vor einem geplanten Versand** und erneut beim Start des Versands. Ein Versand zur Ortszeit jedes Empfängers beginnt dort, wo diese Uhrzeit zuerst erreicht wird (UTC+14), daher läuft seine erneute Prüfung 15 Minuten davor. Ein sofortiger Versand stützt sich auf den von Ihnen bestätigten Durchlauf, der aktuell sein muss; ein älterer läuft zuerst erneut.
+
+### Zurückgehaltene Versände
+
+Wenn Sie einen Versand planen, bewahrt ReputeCast auf, was Sie bestätigt haben: den Durchlauf, seine Warnungen, die Prüfungen, ohne die Sie fortgefahren sind, die Empfängerzahl sowie Inhalt, Zielgruppe, Absender und Route in ihrem damaligen Zustand. Die Prüfung beim Versand vergleicht den neuen Durchlauf damit und hält den Versand zurück ([Zurückhaltung beim Versand](/de/reference/glossary/#send-time-hold)), wenn:
+
+- eine Prüfung blockiert;
+- eine Warnung erscheint, die niemand bestätigt hat, oder eine Prüfung Unbekannt ist, ohne die niemand senden wollte (im Editor verworfene Warnungen gelten als bestätigt);
+- die Zielgruppe um mehr als 10 % gewachsen oder geschrumpft ist;
+- Inhalt, Definition der Zielgruppe, Absender oder Route nach dem Planen geändert wurden.
+
+Ein zurückgehaltener Versand zeigt auf Prüfen & senden <UiPath path="review.heldRecheckTitle" />, mit dem Grund, der geprüften Anzahl im Vergleich zur aktuellen, wer benachrichtigt wurde und wann er abläuft. ReputeCast benachrichtigt, wer ihn geplant (oder die Freigabe angefragt) hat, und die freigebenden Personen, vermerkt `campaign.send_held` im Audit-Protokoll und sendet den [Webhook](/de/developers/webhooks/) `campaign.paused` mit `paused_by: send_readiness`. Es wird nichts gesendet.
+
+- Wählen Sie <UiPath path="review.reviewAgain" />, um den Versand anhand der neuen Prüfungen und Anzahl zu bestätigen. Hat sich die Zielgruppe um mehr als 10 % geändert, werden Sie gebeten, die neue Anzahl einzugeben.
+- Solange er zurückgehalten wird, wird der Versand alle 15 Minuten erneut geprüft. Hält ihn nichts mehr zurück, etwa nachdem ein Blocklisten-Eintrag entfernt wurde, startet er, sofort, wenn sein Zeitpunkt vorbei ist.
+- Ein zurückgehaltener Versand, den niemand prüft, wird 3 Stunden nach seinem Versandzeitpunkt wieder zum Entwurf (oder zu Freigegeben, wenn seine Freigabe ihn noch abdeckt), mit erhaltenem Zeitplan und A/B-Test, und alle Benachrichtigten erhalten die Benachrichtigung „Zurückgehaltener Versand abgelaufen“.
+
+Ein freigegebener Versand, den eine Blockade stoppt, zeigt stattdessen <UiPath path="review.heldTitle" /> mit <UiPath path="review.cancelSend" />: Eine Korrektur der Blockade in der Kampagne macht die Freigabe ungültig und fordert sie mit den angehängten Unterschieden neu an; eine Korrektur außerhalb der Kampagne, etwa das Delisting einer Domain, lässt die Freigabe bestehen.
+
+## Wenn Prüfungen nicht laufen können
+
+Manche Prüfungen hängen von Antworten von außen ab: DNS, den Websites, auf die Ihre Links zeigen, und [HostRepute](/de/reference/glossary/#hostrepute). Eine Prüfung, deren Antwort nicht kam, ist Unbekannt, und das Banner zeigt <UiPath path="review.incompleteHostRepute" />, wenn Blocklisten für den Absender darunter sind, sonst <UiPath path="review.incompleteTitle" />.
+
+- Die Versandbereitschaft ruft HostRepute während eines Durchlaufs nicht auf. Sie liest die Blocklisten-Ergebnisse, die die stündliche HostRepute-Synchronisierung und die integrierten DNS-Blocklisten-Prüfungen gespeichert haben, und nennt, wann die stündliche Prüfung von HostRepute gelaufen ist. Eine Anfrage an HostRepute gibt nach 30 Sekunden und 3 Versuchen auf. Wenn sich die HostRepute-Daten nicht aktualisieren lassen und kein neueres integriertes Ergebnis vorliegt, sind die Blocklisten-Prüfungen für Domains und IPs Unbekannt, nie Blockiert.
+- Domains, die die Zustellbarkeit nicht prüft, und Link-Domains werden während des Durchlaufs live per DNS abgefragt. Eine Abfrage, die in eine Zeitüberschreitung läuft oder die die Listen ablehnen, weil der Server einen öffentlichen DNS-Resolver nutzt, ist Unbekannt. Siehe [Blocklisten-Einträge prüfen und beheben](/de/deliverability/blocklists/).
+- Bounce- und Beschwerderaten stammen von jedem Versandanbieter selbst und sind nicht betroffen.
+
+Sie haben dann die Wahl:
+
+- Wählen Sie <UiPath path="review.retryBlocklist" /> (oder <UiPath path="review.retryChecks" />, wenn die unbekannten Prüfungen keine Blocklisten sind), um die Prüfungen erneut auszuführen.
+- Oder fahren Sie ohne sie fort: <UiPath path="review.continueProvider" />, wenn alle unbekannten Prüfungen Daten zur Absenderreputation sind, sonst <UiPath path="review.continueSkipped" />. Das erfordert `campaigns:edit`. ReputeCast vermerkt die übersprungenen Prüfungen im Audit-Verlauf der Kampagne und fragt sie bei der Prüfung zum Versandzeitpunkt erneut ab; dort hält ein neues Unbekannt oder eine übersprungene Prüfung, die jetzt blockiert, den Versand zurück.
+
+Nachdem Sie fortgefahren sind, nennt das Ergebnis, was übersprungen wurde, zum Beispiel „Bereit · Blocklisten-Prüfungen übersprungen“ oder „Bereit mit Warnungen · 2 Prüfungen übersprungen“, im Banner, auf der Freigabekarte und in der Bestätigung. Ein blockierter Versand bleibt Blockiert.
+
+## Schätzungen
+
+Neben den Prüfungen zeigt Prüfen & senden, was der Versand bewirken wird, berechnet nach den Regeln der Versand-Engine selbst:
+
+- **<UiPath path="review.audience" />:** die Listen oder Segmente abzüglich der gemeinsamen Sperrliste, der Rollenadressen, der Duplikate (Plus-Tags und Punkte bei Gmail werden ignoriert), der Leser, deren gewählten wöchentlichen oder monatlichen Rhythmus die Kampagne nicht erreicht (siehe [wie der Versandrhythmus funktioniert](/de/campaigns/schedule-and-send/)), der durch die Auslaufregel gestoppten Kontakte, der ausgelassenen Kontakte ohne Interaktion und, mit einem [Marketing-Limit](/de/campaigns/sending-rules/), der Kontakte darüber, bis zu <UiPath path="review.finalRecipients" />. Wählen Sie <UiPath path="review.includeThem" /> in der Zeile zu den Kontakten ohne Interaktion, um diesmal auch an sie zu senden; die Gruppe Zielgruppe warnt dann. Mit Sprachversionen zeigt sie außerdem die Empfänger je Version.
+- **<UiPath path="review.routeBreakdown" />:** der Anteil jedes Versandanbieters, seine Kosten zum Preis des Anbieters pro 1.000 und wie lange er braucht. Routen laufen parallel. Die Schätzung berücksichtigt das Ratenlimit jedes Anbieters (oder seine Standardrate, wenn er keines veröffentlicht), [Warm-up](/de/providers/warm-up/)-Limits, die einen Anteil auf mehrere Tage verteilen, ein 24-Stunden-Kontingent, das Nachrichten warten lässt, die Wartezeit des A/B-Tests auf einen Gewinner, den Versand zur besten Zeit über 24 Stunden, den Versand zur Ortszeit über etwa 26 Stunden und die unten genannte Drosselung, und ein Satz unter der Tabelle sagt, was davon angewendet wurde. Ein ausgefallener Anbieter zeigt seinen Anteil als zurückgehalten, mit den Kosten einer Verschiebung.
+- **<UiPath path="review.throttling" />:** die Versandrate für Gmail, Outlook, Yahoo, iCloud und andere Postfachanbieter, aus den [Versandstandards des Arbeitsbereichs](/de/providers/workspace-defaults/).
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="send-readiness" />
+
+## Wann Sie sie ändern sollten
+
+Die Schwellenwerte der Prüfungen sind fest. Ändern können Sie, wie streng das Ergebnis ausfällt:
+
+- Fügen Sie [Versandregeln des Arbeitsbereichs](/de/campaigns/sending-rules/) für Ihre eigenen Anforderungen hinzu, etwa UTM-Tags oder eine Pflichtzeile in der Fußzeile, mit Warnung oder Blockiert.
+- Legen Sie unter <UiPath path="nav.settings > settings.sendingRules" /> fest, wann ein Absender die Empfängerzahl eingeben muss, lassen Sie Kontakte ohne Interaktion nicht mehr standardmäßig aus oder legen Sie ein Marketing-Limit dafür fest, wie viele Kampagnen- und Automations-E-Mails ein Kontakt erhält.
+- Stellen Sie die [Richtlinie für Barrierefreiheit](/de/campaigns/accessibility/) des Arbeitsbereichs auf Blockieren, damit schwerwiegende Probleme der Barrierefreiheit einen Versand stoppen.
+- Stellen Sie die Failover-Richtlinie eines Streams auf „pausieren und nachfragen“, wenn ein ausgefallener Anbieter einen Versand blockieren soll, statt seinen Anteil zu verschieben.
+- Passen Sie die Auslaufregel in der [Listenqualität](/de/audience/list-health/) an: Sie legt fest, welche Kontakte als ohne Interaktion gelten.
+- Aktivieren Sie die Freigaberegel für Bereit mit Warnungen, wenn jede Warnung ein zweites Paar Augen bekommen soll.
+
+## Verwandte Themen
+
+- [Kampagne planen und senden](/de/campaigns/schedule-and-send/) behandelt das Bestätigen von Warnungen, die Canary-Auswahl und die Versandzeit.
+- [Versand überwachen und automatisch pausieren](/de/campaigns/live-monitor/) erklärt, was den Versand nach dem Start absichert.
+- [Anforderungen von Gmail, Yahoo und Microsoft an Massenabsender](/de/deliverability/bulk-sender-requirements/) ordnet jede Regel der Prüfung zu, die sie durchsetzt.
+- [Limits und Standardwerte](/de/reference/limits-and-defaults/) listet jeden festen Wert an einer Stelle auf.

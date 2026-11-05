@@ -1,0 +1,190 @@
+---
+title: 'Contrôle avant envoi : vérifier avant d’envoyer'
+description: 'Vérification de délivrabilité avant envoi dans ReputeCast : jusqu’à 11 groupes de contrôles, un verdict, des corrections annulables et un contrôle à l’envoi.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:edit']
+uiPath: 'nav.campaigns > composer.reviewSend'
+primaryKeyword: vérification de délivrabilité avant envoi
+sources:
+  - internal/readiness
+  - internal/contentcheck/blocklist.go
+  - internal/contentcheck/sources.go
+  - internal/approvals/jobs.go
+  - internal/approvals/send.go
+  - internal/hostrepute/httpclient.go
+  - internal/deliverability/reputation.go
+  - internal/sending/engine/estimate.go
+  - web/src/features/review
+  - web/src/features/placement/EntryPoints.tsx
+sidebar:
+  order: 11
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Le [contrôle avant envoi](/fr/reference/glossary/#send-readiness) est la vérification de délivrabilité avant envoi de chaque campagne, sur sa page <UiPath path="composer.reviewSend" />. Il vérifie en une seule exécution la réputation de l’expéditeur, l’authentification, le contenu, les liens, la conformité, l’audience, la route et les [règles d’envoi](/fr/campaigns/sending-rules/) propres à votre espace de travail, rend un [verdict](/fr/reference/glossary/#verdict) et propose une correction pour la plupart des problèmes qu’il trouve. Il s’exécute de nouveau à l’heure d’envoi : un problème apparu après la programmation retient l’envoi au lieu d’atteindre votre liste.
+
+<Screenshot
+  id="review-send"
+  eager
+  alt="Vérifier et envoyer pour Weekly Digest #142, programmée le mercredi 4 nov. à 09:00, heure de New York, pour 31 192 destinataires via SES et Postal, avec des tuiles pour le temps restant, le test A/B, la pause automatique et la personne qui a programmé l’envoi. À examiner · 2 liste une règle de l’espace de travail sur les balises UTM et une IP Postal listée sur UCEPROTECT, chacune avec ses corrections et leur effet ; à droite, l’audience exclut 412 contacts non engagés, avec Les inclure, et la répartition entre routes suit."
+>
+
+1. Le bandeau d’état : le verdict avant l’envoi ; une fois la campagne programmée, l’heure, l’audience, la route et l’heure du prochain contrôle.
+2. À examiner : les problèmes d’abord, chacun avec son résultat, ses boutons de correction avec l’effet de chacun, et <UiPath path="review.technicalDetails" />.
+3. La carte <UiPath path="review.audience" /> : les listes, moins la liste de suppression, les adresses génériques, les doublons et les contacts non engagés que l’envoi laisse de côté (avec <UiPath path="review.includeThem" />), jusqu’aux destinataires finaux.
+4. Les actions du bandeau pour un envoi programmé : <UiPath path="review.unschedule" /> et <UiPath path="review.openLive" />.
+
+</Screenshot>
+
+## Verdicts et résultats des contrôles
+
+Chaque contrôle renvoie un résultat, et les résultats déterminent le verdict :
+
+| Résultat du contrôle                   | Signification                                                                                                                                         |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="review.statusPass" />    | Rien à faire.                                                                                                                                         |
+| <UiPath path="review.statusWarn" />    | L’envoi peut partir, mais vous confirmez l’avertissement au moment d’envoyer.                                                                         |
+| <UiPath path="review.statusBlock" />   | L’envoi ne peut pas partir tant que le problème n’est pas corrigé.                                                                                    |
+| <UiPath path="review.statusUnknown" /> | Le contrôle n’a pas pu s’exécuter, par exemple parce que le DNS n’a pas répondu. Ne pas savoir n’est jamais compté comme sain ni comme Bloquant.       |
+
+| Verdict                                  | Quand                                                                                                     |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| <UiPath path="review.verdictBlocked" />  | Un contrôle bloque. Le bouton d’envoi reste désactivé jusqu’à la correction de chaque blocage.            |
+| <UiPath path="review.verdictWarnings" /> | Rien ne bloque, mais quelque chose avertit.                                                               |
+| <UiPath path="review.verdictReady" />    | Rien ne bloque ni n’avertit.                                                                              |
+
+Le bandeau ajoute ce qu’il reste à faire : « Prête, avec avertissements · 2 à examiner », « Bloquée · 3 à corriger ». Tant qu’un contrôle est Inconnu, le verdict ne peut pas être Prête et l’envoi reste désactivé jusqu’à ce que vous relanciez les contrôles ou choisissiez de continuer sans eux (voir [quand les contrôles ne peuvent pas s’exécuter](#quand-les-contrôles-ne-peuvent-pas-sexécuter)).
+
+## Comment est organisée la page Vérifier et envoyer
+
+La page place d’abord ce qui demande votre intervention :
+
+- **Le bandeau** affiche le verdict, le nombre de contrôles réussis, en avertissement et bloquants, et l’heure des contrôles. Une fois la campagne programmée, il indique quand elle part, à combien de destinataires, par quels fournisseurs d’envoi et quand les contrôles se relancent, avec des tuiles pour le temps restant, le test A/B, les seuils de pause automatique et la personne qui a programmé l’envoi.
+- **À examiner** liste les problèmes. Quand quelque chose bloque, la liste montre les problèmes bloquants, puis les avertissements, puis les contrôles qui n’ont pas pu s’exécuter. Chaque ligne est une phrase simple avec ses boutons de correction ; sous chaque bouton, une courte ligne indique ce que change son application, comme « +3 min · +0,31 $US », « L’audience passe à 31 192 » ou « Modifie 2 liens · aperçu d’abord ». <UiPath path="review.technicalDetails" /> contient ce que la phrase omet : les enregistrements SPF et DMARC tels que le DNS les renvoie, les clés DKIM et le MAIL FROM par fournisseur d’envoi, les en-têtes `List-Unsubscribe` tels qu’envoyés, le statut HTTP des liens et des images, les réponses DNS comme `SERVFAIL`, les codes d’erreur des fournisseurs et, pour une règle de l’espace de travail, la règle elle-même.
+- **Les avertissements ignorés dans l’éditeur** restent dans la liste avec qui les a ignorés et pourquoi, et comptent comme déjà confirmés. Toute personne qui peut modifier la campagne peut y annuler l’action. Voir [corriger les avertissements de contenu avant l’envoi](/fr/campaigns/content-checks/).
+- **Réussis** regroupe chaque contrôle réussi en une puce par groupe, avec son nombre ; quand l’envoi est bloqué, une ligne de synthèse par groupe s’affiche à la place. Dépliez-le pour lire chaque contrôle, par groupe.
+- **<UiPath path="placement.entryTitle" />** affiche le dernier [test de placement](/fr/deliverability/placement-tests/) de la campagne par fournisseur de messagerie et en lance un nouveau. Il est facultatif et ne change jamais le verdict.
+- **La colonne de droite** contient les estimations (audience, <UiPath path="review.routeBreakdown" />, <UiPath path="review.throttling" />), les seuils de <UiPath path="review.thresholdsTitle" />, <UiPath path="review.scheduling" />, <UiPath path="review.testSends" /> et l’action principale. L’action principale énonce la programmation, par exemple « Programmer pour le dim. 1 nov., 09:00 ET » ou « Envoyer maintenant à 31 192 ».
+
+Les envois de test fonctionnent même quand la campagne est Bloquée : vous pouvez ainsi vérifier une correction dans votre boîte de réception avant que les contrôles ne passent.
+
+<Screenshot
+  id="review-send-blocked"
+  alt="Flash sale: 48 hours only est Bloquée avec 2 blocages, 8 avertissements et 24 contrôles réussis, et l’envoi reste désactivé jusqu’à la correction de chaque blocage. Les problèmes bloquants viennent d’abord, chacun avec sa correction : l’absence de lien de désabonnement et d’adresse postale (Insérer le bloc de pied de page, qui ajoute environ 1 Ko) et go.acme-promo.link listé sur SURBL et Spamhaus DBL (Modifier le lien) ; les avertissements suivent."
+/>
+
+Sur un téléphone, les boutons de correction se placent sous chaque description et l’action principale reste dans une barre en bas de l’écran, avec le verdict au-dessus.
+
+<Screenshot
+  id="review-send-mobile"
+  alt="Vérifier et envoyer sur un téléphone : Weekly Digest #142 est programmée le mercredi 4 nov. à 09:00, heure de New York, pour 31 192 destinataires via SES et Postal, les contrôles se relancent à 08:45, avec Déprogrammer, Ouvrir le suivi en direct et des tuiles pour le temps restant, le test A/B de l’objet, la pause automatique et la personne qui a programmé l’envoi."
+/>
+
+## Les groupes de contrôles
+
+Une exécution compte jusqu’à 11 groupes. Un groupe qui n’a rien à vérifier est omis : Langues n’apparaît que pour un e-mail avec des versions linguistiques, Contenu conditionnel que pour un e-mail avec des blocs conditionnels, et Règles de l’espace que lorsqu’une règle s’applique. Les contrôles réussis et la liste complète affichent les groupes dans cet ordre.
+
+1. **<UiPath path="review.groupReputation" />.**
+   - Les inscriptions sur des listes de blocage du domaine d’envoi, de son domaine parent (`acme.io` pour `news.acme.io`), des domaines de return-path (MAIL FROM) des fournisseurs d’envoi qui portent l’envoi, et du domaine de suivi. Les domaines que [Délivrabilité](/fr/deliverability/blocklists/) vérifie déjà utilisent ses résultats ; les autres sont consultés en direct sur Spamhaus DBL et SURBL. Une inscription de l’un d’eux compte : une liste à fort impact bloque, les autres avertissent. Une consultation qui échoue est Inconnu et indique pourquoi.
+   - Les IP dédiées de la route : une inscription sur une liste à fort impact bloque, les autres avertissent. Une IP que les contrôles quotidiens de Délivrabilité n’ont pas encore atteinte est Inconnu, avec un lien pour lancer les contrôles maintenant.
+   - Le DNS inverse de ces IP dédiées : absent, ou pointant vers un nom qui ne se résout pas vers l’IP, il bloque ; une consultation en échec est Inconnu.
+   - Les taux de rebond et de plainte de chaque fournisseur d’envoi sur les 7 derniers jours, comparés aux limites propres au fournisseur : un avertissement à partir de 80 % d’une limite, un blocage au niveau où le fournisseur suspend les comptes. Les taux ne sont pas jugés tant que le fournisseur n’a pas porté assez d’e-mails (voir [valeurs par défaut et limites](#valeurs-par-défaut-et-limites)). Le taux de plainte ne compte que les e-mails délivrés aux fournisseurs de messagerie qui signalent les plaintes ; Gmail et iCloud ne le font jamais : avec leurs seuls e-mails, il affiche « n/d ».
+   - Un plafond de [chauffe](/fr/providers/warm-up/) le jour de l’envoi inférieur au nombre de destinataires routés vers ce fournisseur avertit : le reste attend le plafond du lendemain.
+2. **<UiPath path="review.groupAuthentication" />.** Un expéditeur est défini ; SPF autorise chaque fournisseur d’envoi ; DKIM est vérifié (une clé de moins de 1024 bits avertit) ; DMARC existe et est valide (moins de 90 % d’e-mails alignés sur les 7 derniers jours avertit) ; les e-mails passant par un fournisseur sans DKIM vérifié ni return-path aligné bloquent, car ils ne passeront pas DMARC ; le domaine MAIL FROM garde SPF aligné (avertit sinon) ; un enregistrement BIMI non valide avertit. Un domaine jamais vérifié avertit. Une consultation DNS qui échoue deux fois au cours d’une exécution est Inconnu, jamais un Bloquant qui déclarerait l’enregistrement non valide. Voir [configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/).
+3. **<UiPath path="review.groupContent" />.** Vérifié dans chaque version linguistique et chaque [variante A/B](/fr/campaigns/ab-testing/). Un objet vide bloque, tout comme une balise Liquid cassée, car l’e-mail ne peut pas être rendu. Les signaux de spam dans l’objet, le texte d’aperçu ou le corps, une variable qui n’est pas un champ de contact, une variable de prénom sans valeur de repli pour les destinataires sans prénom, des images au-delà de 60 % de l’e-mail, un HTML à partir de 85 Ko avec les liens réécrits pour le suivi (Gmail tronque à 102 Ko), des images qui ne se chargent pas ou se chargent en HTTP simple, un texte alternatif manquant et une partie texte brut vide avertissent. Les sondages incomplets, les blocs Sponsor et Passage au payant et les produits de boutique supprimés sont aussi vérifiés ici. Voir [corriger les avertissements de contenu avant l’envoi](/fr/campaigns/content-checks/).
+4. **<UiPath path="review.groupLanguages" />.** Quelle version reçoit chaque groupe de contacts, et des avertissements pour les versions Obsolète et Brouillon. Ce groupe ne bloque jamais. Voir [envoyer à chaque lecteur sa langue](/fr/campaigns/languages/).
+5. **<UiPath path="review.groupAccessibility" />.** Les problèmes graves (texte alternatif manquant, liens sans texte, contraste faible) avertissent, ou bloquent quand la politique de l’espace de travail est Bloquer. Les problèmes modérés avertissent. Voir [vérifier l’accessibilité des e-mails](/fr/campaigns/accessibility/).
+6. **<UiPath path="review.groupConditional" />.** Une condition qui pointe vers un segment, une liste ou un champ supprimé bloque, tout comme une version sans rien entre l’en-tête et le pied de page. Une version de plus de 102 Ko avertit. Au-delà de 50 versions, les 50 ayant les plus grandes audiences, plus le plus gros et le plus petit e-mail, sont vérifiées. Voir [afficher des blocs à certains lecteurs](/fr/campaigns/conditional-content/).
+7. **<UiPath path="review.groupLinks" />.** Les domaines des liens sont consultés en direct sur Spamhaus DBL et SURBL, avec les mêmes requêtes que l’éditeur : un domaine listé bloque, un domaine qui n’a pas pu être consulté est Inconnu. Chaque lien est ouvert : un 404, un 410, une réponse 5xx ou une absence de réponse avertit, et la ligne compte honnêtement (« 40 liens sur 60 répondent ; 20 n’ont pas pu être vérifiés ») quand un site refuse les requêtes automatisées (LinkedIn répond 999) ou que l’e-mail contient plus de liens qu’une exécution n’en ouvre, ce qui le rend Inconnu. Les raccourcisseurs d’URL et les boutons sans lien avertissent. Un domaine de suivi qui ne se résout pas bloque ; les liens suivis en HTTP simple avertissent.
+8. **<UiPath path="review.groupCompliance" />.** Le corps de chaque version et de chaque variante doit contenir un lien de désabonnement et une adresse postale, sinon l’envoi est bloqué. L’en-tête `List-Unsubscribe` en un clic demande une URL publique HTTPS, et un fournisseur d’envoi qui ne signe pas ces en-têtes avec DKIM avertit. La ligne des expéditeurs de gros volumes couvre les [règles de Gmail et Yahoo pour les envois en masse](/fr/deliverability/bulk-sender-requirements/) : un DMARC qui ne passe pas avertit ; le taux de plainte de la route sur 7 jours, et le taux de spam de Gmail issu de Postmaster Tools, avertissent à partir de 0,1 % et bloquent à partir de 0,3 % ; avec les données Postmaster du domaine d’envoi, la ligne affiche le statut propre à Google, Conforme ou À améliorer (qui avertit).
+9. **<UiPath path="review.groupAudience" />.** Une audience sans personne à qui envoyer bloque. Les [contacts non engagés](/fr/reference/glossary/#unengaged-contact) sont exclus par défaut ; inclus, ils avertissent à partir de 1 % de l’audience ou de 500 contacts. Les contacts en rebond temporaire au cours des 30 derniers jours, les segments qui n’ont pas pu être comptés, les adresses à risque issues de la [vérification des adresses](/fr/audience/verification/) et les contacts inactifs non vérifiés depuis 90 jours avertissent.
+10. **<UiPath path="review.groupRouting" />.** Un flux sans fournisseur d’envoi, ou un fournisseur de la route en panne, en pause ou qui ne signale pas les événements, bloque. Cela n’avertit que lorsque la politique de basculement du flux n’est pas « mettre en pause et demander » et qu’un autre fournisseur peut prendre la part. Un fournisseur en mode sandbox ou dont les conditions n’autorisent pas l’envoi en masse bloque. Un quota sur 24 heures inférieur à la part, un suivi des ouvertures ou des clics côté fournisseur (suivi en double) et un fournisseur de secours qui n’a pas pu prendre cet envoi avertissent. Voir [router les e-mails entre fournisseurs](/fr/providers/routing/).
+11. **<UiPath path="review.groupRules" />.** Une ligne par [règle d’envoi](/fr/campaigns/sending-rules/) activée pour les Diffusions : une règle non respectée avertit ou bloque, selon la règle.
+
+## Corrections en un clic
+
+La plupart des avertissements et des blocages s’accompagnent d’un bouton qui les corrige sur place, par exemple <UiPath path="composer.canvas.insertFooter" />, « Envoyer uniquement via SES », « Exclure 412 non engagés », « Ajouter utm_campaign=weekly-digest-142 » ou « Marquer comme décorative ». Sous chaque bouton, une ligne indique ce qu’il change avant que vous l’appliquiez.
+
+Le bouton au-dessus des problèmes (« Examiner les 3 corrections ») ouvre un volet qui liste chaque correction en un clic avec une case à cocher et ses conséquences : la route, l’heure d’envoi, le coût et la chauffe qu’elle modifie, chaque lien avant et après, et ce qui reste inchangé. Sélectionnez <UiPath path="review.applyFixes" /> pour appliquer ensemble celles que vous avez cochées.
+
+- **Les liens ne sont jamais devinés.** « Remplacer par l’URL de destination » n’est proposé pour un lien listé ou raccourci que lorsque le lien redirige vers une page dont le domaine est sain sur Spamhaus DBL et SURBL ; sinon, la correction consiste à modifier le lien. Si la destination s’avère listée, ou ne peut pas être vérifiée, le lien n’est pas modifié.
+- **Le HTML reste intact.** Une campagne rédigée en HTML ne reçoit aucune correction qui modifie le MJML, et l’enregistrement d’un corps vide par-dessus un corps est refusé.
+- **L’envoi est verrouillé** pendant l’enregistrement d’une correction et pendant que les contrôles se relancent ensuite.
+- **Les corrections peuvent être annulées.** Les corrections appliquées ensemble sont conservées comme un seul lot. Sélectionnez <UiPath path="review.undoFixes" /> dans la notification, sous le bandeau d’exécution ou sous le verdict pour rétablir le contenu (restauré comme nouvelle version), les réglages du contenu, la route et l’audience, tant que la campagne n’a pas changé depuis. Les corrections qui ont modifié des versions linguistiques, ou qui ont été enregistrées avec la modification d’une autre personne, s’annulent plutôt depuis l’historique des versions.
+- Les corrections demandent `campaigns:edit`, et une correction (ou une annulation) qui modifie la route demande aussi `campaigns:send` ; un bouton désactivé nomme qui peut aider. Les corrections, les annulations et les avertissements ignorés sont des actions de personnes : les clés d’API et les agents ne peuvent pas les effectuer.
+- Chaque correction et chaque annulation est consignée dans le journal d’audit (`readiness.fixes_undone` pour une annulation), et une correction qui modifie la campagne invalide aussi une [approbation](/fr/campaigns/approvals/) en cours.
+
+## Quand les contrôles s’exécutent
+
+Une exécution est une tâche en arrière-plan, une seule à la fois par campagne. Pendant qu’elle s’exécute, le bandeau indique combien de contrôles sont terminés et chaque groupe affiche sa propre progression, comme « 9 liens sur 14 » ou « 24 310 contacts sur 31 988 » ; l’envoi reste verrouillé jusqu’à la fin. Les contrôles s’exécutent :
+
+- **Quand vous ouvrez Vérifier et envoyer**, si la campagne n’a jamais eu d’exécution, a changé depuis la dernière, ou est réglée pour un envoi immédiat et que la dernière exécution date de plus de 15 minutes. Cela demande `campaigns:edit`. Modifier la campagne ne relance pas les contrôles de soi-même ; cela marque la dernière exécution comme obsolète. Ne modifier que la programmation garde l’exécution valide.
+- **Quand vous sélectionnez** <UiPath path="review.rerun" />, et après une correction en un clic ou une annulation.
+- **Quand vous demandez une approbation**, si la dernière exécution ne décrit pas la campagne telle qu’elle est ; la demande attend l’exécution.
+- **15 minutes avant un envoi programmé**, et de nouveau au démarrage de l’envoi. Un envoi à l’heure locale de chaque destinataire démarre là où cette heure arrive en premier (UTC+14) : son nouveau contrôle s’exécute donc 15 minutes avant. Un envoi immédiat s’appuie sur l’exécution que vous avez confirmée, qui doit être récente ; une exécution plus ancienne est d’abord relancée.
+
+### Envois retenus
+
+Quand vous programmez un envoi, ReputeCast conserve ce que vous avez confirmé : l’exécution, ses avertissements, les contrôles sans lesquels vous avez continué, le nombre de destinataires, et le contenu, l’audience, l’expéditeur et la route tels qu’ils étaient. Le nouveau contrôle à l’heure d’envoi compare l’exécution récente à tout cela, et retient l’envoi ([retenue à l’heure d’envoi](/fr/reference/glossary/#send-time-hold)) quand :
+
+- un contrôle bloque ;
+- un avertissement apparaît sans que personne l’ait confirmé, ou un contrôle est Inconnu sans que personne ait choisi d’envoyer sans lui (les avertissements ignorés dans l’éditeur comptent comme confirmés) ;
+- l’audience a augmenté ou diminué de plus de 10 % ;
+- le contenu, la définition de l’audience, l’expéditeur ou la route ont changé après la programmation.
+
+Un envoi retenu affiche <UiPath path="review.heldRecheckTitle" /> dans Vérifier et envoyer, avec la raison, le nombre examiné face au nombre actuel, les personnes prévenues et l’heure d’expiration. ReputeCast avertit la personne qui l’a programmé (ou qui a demandé l’approbation) et les approbateurs, consigne `campaign.send_held` dans le journal d’audit et envoie le [webhook](/fr/developers/webhooks/) `campaign.paused` avec `paused_by: send_readiness`. Rien n’est envoyé.
+
+- Sélectionnez <UiPath path="review.reviewAgain" /> pour confirmer l’envoi sur la base des nouveaux contrôles et du nouveau nombre. Une audience qui a varié de plus de 10 % vous demande de saisir le nouveau nombre.
+- Tant qu’il est retenu, l’envoi est revérifié toutes les 15 minutes. Quand plus rien ne le retient, par exemple après la levée d’une inscription sur une liste de blocage, il démarre, immédiatement si son heure est passée.
+- Un envoi retenu que personne n’examine repasse en Brouillon (ou en Approuvée quand son approbation le couvre toujours) 3 heures après son heure d’envoi, avec sa programmation et son test A/B conservés, et toutes les personnes prévenues reçoivent une notification « Envoi retenu expiré ».
+
+Un envoi approuvé qu’un blocage arrête affiche <UiPath path="review.heldTitle" /> à la place, avec <UiPath path="review.cancelSend" /> : corriger le blocage dans la campagne invalide l’approbation et la redemande avec la différence jointe ; le corriger en dehors de la campagne, par exemple en faisant retirer un domaine d’une liste de blocage, conserve l’approbation.
+
+## Quand les contrôles ne peuvent pas s’exécuter
+
+Certains contrôles dépendent de réponses extérieures : le DNS, les sites vers lesquels pointent vos liens et [HostRepute](/fr/reference/glossary/#hostrepute). Un contrôle dont la réponse n’est pas arrivée est Inconnu, et le bandeau indique <UiPath path="review.incompleteHostRepute" /> quand des listes de blocage de l’expéditeur en font partie, sinon <UiPath path="review.incompleteTitle" />.
+
+- Le contrôle avant envoi n’appelle pas HostRepute pendant une exécution. Il lit les résultats de listes de blocage enregistrés par la synchronisation horaire de HostRepute et par les contrôles DNS de listes de blocage intégrés, et indique quand le contrôle horaire de HostRepute a eu lieu. Une requête à HostRepute abandonne après 30 secondes et 3 tentatives. Quand les données de HostRepute ne peuvent pas être actualisées et qu’aucun résultat intégré plus récent n’existe, les contrôles de listes de blocage des domaines et des IP sont Inconnu, jamais Bloquant.
+- Les domaines que Délivrabilité ne vérifie pas, ainsi que les domaines des liens, sont consultés en direct par DNS pendant l’exécution. Une consultation qui expire, ou que les listes refusent parce que le serveur utilise un résolveur DNS public, est Inconnu. Voir [vérifier et corriger les inscriptions sur les listes de blocage](/fr/deliverability/blocklists/).
+- Les taux de rebond et de plainte des fournisseurs proviennent de chaque fournisseur d’envoi et ne sont pas affectés.
+
+Vous choisissez alors :
+
+- Sélectionnez <UiPath path="review.retryBlocklist" /> (ou <UiPath path="review.retryChecks" /> quand les contrôles inconnus ne sont pas des listes de blocage) pour relancer les contrôles.
+- Ou continuez sans eux : <UiPath path="review.continueProvider" /> quand chaque contrôle inconnu porte sur des données de réputation de l’expéditeur, sinon <UiPath path="review.continueSkipped" />. Cela demande `campaigns:edit`. ReputeCast consigne les contrôles ignorés dans l’historique d’audit de la campagne et les consulte de nouveau lors du nouveau contrôle à l’heure d’envoi, où un nouvel Inconnu, ou un contrôle ignoré qui bloque désormais, retient l’envoi.
+
+Une fois que vous avez continué, le verdict nomme ce qui a été ignoré, par exemple « Prête · contrôles de listes de blocage ignorés » ou « Prête, avec avertissements · 2 contrôles ignorés », sur le bandeau, la carte d’approbation et la confirmation. Un envoi Bloquée reste Bloquée.
+
+## Estimations
+
+À côté des contrôles, Vérifier et envoyer montre ce que fera l’envoi, calculé avec les règles propres au moteur d’envoi :
+
+- **<UiPath path="review.audience" /> :** les listes ou segments, moins la liste de suppression partagée, les adresses génériques, les doublons (les tags plus et les points Gmail sont ignorés), les lecteurs dont le rythme hebdomadaire ou mensuel choisi n’est pas atteint par la campagne (voir [comment fonctionne la cadence](/fr/campaigns/schedule-and-send/)), les contacts arrêtés par la politique d’arrêt progressif, les contacts non engagés exclus et, avec un [plafond marketing](/fr/campaigns/sending-rules/), les contacts qui le dépassent, jusqu’aux <UiPath path="review.finalRecipients" />. Sélectionnez <UiPath path="review.includeThem" /> sur la ligne des non-engagés pour leur envoyer cette fois ; le groupe Audience avertit alors. Avec des versions linguistiques, la carte indique aussi les destinataires par version.
+- **<UiPath path="review.routeBreakdown" /> :** la part de chaque fournisseur d’envoi, son coût au prix du fournisseur pour 1 000 et sa durée. Les routes s’exécutent en parallèle. L’estimation tient compte de la limite de débit de chaque fournisseur (ou de son débit par défaut quand il n’en publie pas), des plafonds de [chauffe](/fr/providers/warm-up/) qui étalent une part sur plusieurs jours, d’un quota sur 24 heures qui fait attendre des messages, de l’attente du gagnant d’un test A/B, de l’envoi à la meilleure heure sur 24 heures, de l’envoi à l’heure locale sur environ 26 heures et des limitations ci-dessous, et une phrase sous le tableau indique ce qui s’est appliqué. Un fournisseur en panne affiche sa part comme retenue, avec ce que coûterait son transfert.
+- **<UiPath path="review.throttling" /> :** le débit d’envoi pour Gmail, Outlook, Yahoo, iCloud et les autres fournisseurs de messagerie, d’après les [paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/).
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="send-readiness" />
+
+## Quand les modifier
+
+Les seuils des contrôles sont fixes. Ce que vous pouvez modifier, c’est la sévérité du résultat :
+
+- Ajoutez des [règles d’envoi de l’espace de travail](/fr/campaigns/sending-rules/) pour vos propres exigences, comme les balises UTM ou une mention obligatoire dans le pied de page, en Avertissement ou en Bloquant.
+- Dans <UiPath path="nav.settings > settings.sendingRules" />, changez le moment où un expéditeur doit saisir le nombre de destinataires, cessez d’exclure par défaut les contacts non engagés, ou définissez un plafond marketing sur le nombre d’e-mails de campagne et d’automatisation qu’un contact reçoit.
+- Passez la [politique d’accessibilité](/fr/campaigns/accessibility/) de l’espace de travail à Bloquer pour que les problèmes d’accessibilité graves arrêtent un envoi.
+- Réglez la politique de basculement d’un flux sur « mettre en pause et demander » si un fournisseur en panne doit bloquer un envoi au lieu de transférer sa part.
+- Ajustez la politique d’arrêt progressif dans la [santé de la liste](/fr/audience/list-health/) : elle définit quels contacts comptent comme non engagés.
+- Activez la règle d’approbation pour Prête, avec avertissements si chaque avertissement doit passer sous un second regard.
+
+## Voir aussi
+
+- [Programmer et envoyer une campagne](/fr/campaigns/schedule-and-send/) traite de la confirmation des avertissements, du choix du canari et de l’heure d’envoi.
+- [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/) explique ce qui protège l’envoi une fois lancé.
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/) relie chaque règle au contrôle qui l’applique.
+- [Limites et valeurs par défaut](/fr/reference/limits-and-defaults/) liste toutes les valeurs fixes en un seul endroit.

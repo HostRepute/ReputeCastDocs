@@ -1,0 +1,252 @@
+---
+title: ReputeCast aktualisieren
+description: 'ReputeCast aktualisieren: mit Docker Compose oder der Binärdatei auf ein neues Release wechseln, Migrationen anwenden, Ergebnis prüfen und sicher zurückrollen.'
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast aktualisieren
+uiPath: 'shell.userMenuInstanceAdmin > admin.instance'
+sources:
+  - README.md
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - .goreleaser.yaml
+  - internal/cli/migrate.go
+  - internal/cli/serve.go
+  - internal/db/db.go
+  - internal/db/partition.go
+  - internal/app/schema.go
+  - internal/version/version.go
+  - internal/instance/updates.go
+  - web/src/features/admin/instance/InstancePage.tsx
+  - web/src/lib/systemStatus.ts
+  - internal/config/config.go
+  - internal/jobs/jobs.go
+  - internal/mailbox
+  - internal/app/wire_mailbox.go
+  - migrations/{03208_r05_share_expiry.sql,03256_m39_contacts_live_idx.sql,03312_m40_default_reply_rules.sql}
+  - docs/deploy/{README.md,backup-restore.md,partitioning.md}
+sidebar:
+  order: 10
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Um ReputeCast zu aktualisieren, ersetzen Sie das Image oder die Binärdatei durch ein neueres Release und lassen es seine
+Datenbankmigrationen anwenden; alles andere (Konfiguration, geheimer Schlüssel, Daten) bleibt, wie es ist.
+
+## Installierte Version ansehen
+
+Ein [Instanz-Admin](/de/reference/glossary/#instance-admin) sieht die installierte Version, das neueste Release und
+dessen Changelog unter <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> in der Karte
+<UiPath path="admin.versionCard" />. Auf der Kommandozeile gibt `reputecast version` dasselbe aus:
+`reputecast <version> (<commit>) <Go version>`.
+
+<Screenshot
+  id="instance-settings"
+  alt="Die Karte Version & Updates: installierte Version, das neueste Release v1.3.0 als Auf dem neuesten Stand gekennzeichnet mit Link zum Changelog, Neu in v1.3.0, der Befehl für das Upgrade mit dem Hinweis, zuerst PostgreSQL zu sichern, und die eingeschaltete tägliche Release-Prüfung."
+/>
+
+- Das Badge <UiPath path="admin.updateAvailable" /> erscheint, wenn das neueste Release neuer ist als die installierte
+  Version. Builds ohne Release-Versionsnummer (etwa `dev`) zeigen es nie.
+- Unter <UiPath path="admin.upgradeOnServer" /> zeigt die Karte den Befehl für Docker Compose
+  `cd /opt/reputecast && docker compose pull && docker compose up -d`. Ersetzen Sie `/opt/reputecast` durch den Ordner,
+  der Ihre `docker-compose.yml` enthält.
+- Der Schalter <UiPath path="admin.updateCheck" /> ruft einmal täglich das neueste Release von `api.github.com` ab. Die
+  Anfrage enthält keine Versionsnummer und keine Instanz-ID; es ist der einzige ausgehende Aufruf, den ReputeCast von
+  sich aus macht. Schalten Sie ihn hier ab, oder setzen Sie `updates.check: false` in der
+  [Konfiguration](/de/reference/configuration/), um ihn für die ganze Instanz abzuschalten (der Schalter ist dann
+  gesperrt).
+
+## Bevor Sie beginnen
+
+- Lesen Sie die [Versionshinweise](/de/reference/release-notes/) jeder Version zwischen Ihrer und der neuen, auch auf
+  der [Release-Seite von GitHub](https://github.com/hostrepute/reputecast/releases).
+- [Sichern Sie die Datenbank und den geheimen Schlüssel](/de/self-hosting/backups/). Migrationen ändern das Schema, und
+  eine Sicherung ist der verlässliche Weg zurück.
+- Planen Sie eine kurze Unterbrechung ein, während die App neu startet. Beim Stoppen (`SIGTERM`, ein erneutes
+  Deployment) holt ein Worker keinen neuen Job mehr und gibt laufenden Jobs 10 Sekunden zum Abschließen; ein Versand
+  stoppt zwischen zwei Batches, wobei der gerade laufende Batch gesendet und erfasst wird.
+
+## Upgrade durchführen
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Wechseln Sie in den Ordner mit Ihrer `docker-compose.yml` und erstellen Sie eine Sicherung:
+
+   ```sh
+   docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
+   ```
+
+2. Wenn Sie in `.env` eine Version festlegen (`REPUTECAST_VERSION=v1.4.2`), ändern Sie sie auf das Tag des neuen
+   Releases. Die Image-Tags sind die Release-Tags mit ihrem führenden `v`, dazu `latest`. Ohne `REPUTECAST_VERSION`
+   verwendet die Compose-Datei `latest`.
+
+3. Laden Sie das neue Image und erstellen Sie den App-Container neu:
+
+   ```sh
+   docker compose pull && docker compose up -d
+   ```
+
+   Das Image startet mit `serve --auto-migrate` und wendet daher ausstehende Migrationen an, bevor es Anfragen
+   beantwortet. Die Protokolle zeigen eine Zeile `migration applied` pro Migration, und `docker compose ps` zeigt `app`
+   als `healthy`, sobald die App bereit ist.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binärdatei">
+
+<Steps>
+
+1. Erstellen Sie eine Sicherung (siehe [Sichern und wiederherstellen](/de/self-hosting/backups/)).
+
+2. Laden Sie das Archiv für Ihre Plattform und `checksums.txt` von der
+   [Release-Seite](https://github.com/hostrepute/reputecast/releases) herunter und prüfen Sie den Download:
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   ```
+
+3. Stoppen Sie jeden ReputeCast-Prozess, zum Beispiel mit `sudo systemctl stop reputecast`.
+
+4. Ersetzen Sie die Binärdatei (zum Beispiel `/usr/local/bin/reputecast`) durch die neue.
+
+5. Wenden Sie die Migrationen einmal an, mit derselben Umgebung, die der Dienst verwendet:
+
+   ```sh
+   reputecast migrate up
+   ```
+
+   Der Befehl wendet die Migrationen von ReputeCast an, danach die der Job-Warteschlange, und endet mit
+   `Database is up to date.`
+
+6. Starten Sie jeden Prozess wieder. Wenn Sie [mehrere Rollen](/de/self-hosting/scaling/) betreiben, aktualisieren Sie
+   alle auf dieselbe Version.
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Solange Migrationen ausstehen
+
+Ein Prozess, dessen Datenbank Migrationen fehlen, die er braucht, etwa eine Binärdatei, die ersetzt wurde, bevor
+`reputecast migrate up` lief, schreibt nicht in sie:
+
+- Seiten und die API lesen wie gewohnt. Die App zeigt vor jeder Bearbeitung das Banner
+  <UiPath path="shell.bannerMaintenance" />.
+- Schreibvorgänge antworten mit `503` und dem Code `maintenance`. An- und Abmelden funktioniert weiterhin, und die
+  Webhooks der Versandanbieter werden weiterhin gespeichert.
+- Die Worker warten, daher wird nichts gesendet.
+- `/readyz` antwortet mit `503`, sodass ein Load Balancer oder Orchestrator den Datenverkehr weiter an das vorherige
+  Release schickt.
+
+Der Prozess prüft alle 5 Sekunden erneut und macht von selbst weiter, sobald `reputecast migrate up` oder das
+`--auto-migrate` eines anderen Prozesses sie angewendet hat. Browser-Tabs, die über ein Upgrade hinweg offen bleiben,
+bieten <UiPath path="shell.bannerReload" /> an, um die neue Version zu laden.
+
+Migrationen halten eine Sperre in PostgreSQL: Starten mehrere Prozesse mit `--auto-migrate`, wendet einer sie an,
+während die anderen auf ihn warten (bis zu 15 Minuten), sodass jede Migration einmal läuft. Führen Sie sie über eine
+direkte Verbindung oder eine Verbindung im Session-Modus aus, nicht über PgBouncer im Transaktionsmodus.
+
+## Upgrade auf 1.3.0
+
+Version 1.3.0 ändert auf dem Server Folgendes; die [Versionshinweise](/de/reference/release-notes/#130) listen den
+Rest auf.
+
+- **23 neue Migrationen** (`03360` bis `03388`); einige bauen Indizes nebenläufig (concurrently) auf. Eine legt die
+  Extension `pg_trgm` für die Kontaktsuche an, die der Besitzer der Datenbank anlegen darf
+  ([PostgreSQL](/de/self-hosting/postgres/#verwaltetes-postgresql)).
+- **`delivery_events` wird in monatliche Partitionen aufgeteilt.** Nach den Migrationen wandeln `migrate up` und
+  `serve --auto-migrate` die Tabelle mit jedem Versand, jeder Zustellung, jedem Bounce, jeder Öffnung und jedem Klick
+  um, sofern `reputecast migrate partition-events` das nicht schon getan hat. Nichts wird kopiert, und
+  Schreibvorgänge laufen weiter, aber zwei Schritte lesen die ganze Tabelle: Bei einer sehr großen Tabelle führen Sie
+  `reputecast migrate partition-events` vorher selbst aus, zu einer ruhigen Stunde
+  ([monatliche Partitionen](/de/self-hosting/postgres/#monatliche-partitionen-von-delivery_events)).
+- **Schreibgeschützt bis zur Migration, und gesperrte Migrationen**, wie [oben](#solange-migrationen-ausstehen)
+  beschrieben.
+- **`/metrics` ist umgezogen** auf einen eigenen Listener, `:9464`. Hat Prometheus den Hauptport abgefragt, richten Sie
+  es auf 9464 aus oder setzen Sie `metrics.token`
+  ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)).
+- **Eine Zustandsprüfung für den Container.** Das Image führt `reputecast healthcheck` aus, sodass Docker die App als
+  `healthy` meldet, sobald `/readyz` antwortet.
+- **Ratenlimits pro Browsersitzung.** Jeder angemeldete Browser hat eigene 600 Anfragen pro Minute; die Browser hinter
+  einer Adresse teilen sich 6.000 ([Sicherheit und Härtung](/de/self-hosting/security/)).
+- **nginx mit HTTP/2.** Das [Beispiel für nginx](/de/self-hosting/reverse-proxy/) schaltet jetzt HTTP/2 ein, wodurch
+  die App auf Smartphones deutlich schneller lädt.
+
+## Upgrade auf 1.2.0
+
+Version 1.2.0 ändert auf dem Server Folgendes; die [Versionshinweise](/de/reference/release-notes/#120) listen den
+Rest auf.
+
+- **45 neue Migrationen** (`03000` bis `03350`) laufen beim ersten Start oder mit `reputecast migrate up`. Drei Indizes
+  auf den Tabellen `contacts` und `messages` werden nebenläufig aufgebaut, sodass Importe, Anmeldungen und Versände
+  weiterlaufen, während sie in einer großen Datenbank entstehen.
+- **Ein Name für die öffentliche URL.** `REPUTECAST_PUBLIC_URL` setzt jetzt `http.public_url` für jede Art, ReputeCast
+  zu betreiben, auch für die Binärdatei, und die mitgelieferte `docker-compose.yml` übergibt sie unverändert an die
+  App. `REPUTECAST_HTTP__PUBLIC_URL`, ihr früherer Name, funktioniert weiterhin, wenn `REPUTECAST_PUBLIC_URL` nicht
+  gesetzt ist.
+- **DNS-Abfragen für Postfachanbieter.** ReputeCast ermittelt den Postfachanbieter eines Kontakts aus den MX-Einträgen
+  seiner Domain, sodass Google Workspace als Gmail und Microsoft 365 als Outlook zählt. Nach dem Upgrade fragt ein
+  Hintergrunddurchlauf alle 2 Minuten die Firmendomains bestehender Kontakte ab. Der Server braucht einen
+  funktionierenden Resolver: den des Systems oder die Server in `dns.servers`
+  ([Konfigurationsreferenz](/de/reference/configuration/)). Eine Domain, die noch nicht abgefragt wurde, zählt als
+  Andere.
+- **Geteilte Berichtslinks laufen ab.** Ansichtslinks für Berichte, die vor 1.2.0 erstellt wurden, liefen nie ab; jeder,
+  der noch funktioniert, läuft jetzt 30 Tage nach dem Upgrade ab.
+- **Standard-Antwortregeln.** Arbeitsbereiche ohne eigene Antwortregel erhalten unter
+  <UiPath path="nav.providers > providers.tabTraffic" /> die Standard-Antwortregeln für Postfachanbieter (siehe
+  [Traffic-Regeln](/de/providers/traffic-rules/)).
+
+## Prüfen, ob es funktioniert hat
+
+- <UiPath path="admin.versionCard" /> zeigt die neue Version als installiert.
+- `reputecast migrate status` listet jede Migration mit einem Anwendungsdatum und keine als `pending`. In Docker:
+  `docker compose exec app /usr/local/bin/reputecast migrate status`.
+- `/readyz` antwortet `ready` ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)), und
+  `reputecast doctor` meldet das Schema als `current`.
+
+## Rollback durchführen
+
+Die Rückkehr zum vorherigen Image oder zur vorherigen Binärdatei macht Migrationen nicht rückgängig: Die Datenbank
+behält das neuere Schema. Innerhalb eines Minor-Releases (1.3.0 bis 1.3.2) fügen Migrationen nur hinzu, und über ein
+Minor-Release hinweg (1.3 zu 1.2) läuft die ältere Binärdatei auf dem neueren Schema. Lesen Sie zuerst die
+Versionshinweise: Ein Release, das etwas entfernt oder umbenennt, sagt das. Für weiter zurückliegende Versionen stellen
+Sie die Sicherung wieder her.
+
+- **Stellen Sie die Sicherung wieder her**, um exakt zum Zustand vor dem Upgrade zurückzukehren: Stoppen Sie
+  ReputeCast, stellen Sie den erstellten Dump wieder her (siehe
+  [Wiederherstellen](/de/self-hosting/backups/#wiederherstellen)) und starten Sie dann die Version, die Sie vorher
+  betrieben haben. Nach dem Upgrade vorgenommene Änderungen gehen verloren.
+- **Legen Sie die vorherige Version fest** (`REPUTECAST_VERSION` in `.env`, dann `docker compose up -d`), wie es die
+  Karte <UiPath path="admin.versionCard" /> vorschlägt, wenn Sie die seit dem Upgrade geschriebenen Daten behalten
+  wollen. 1.2 funktioniert auch mit dem partitionierten `delivery_events`.
+- `reputecast migrate down` macht nur die neueste ReputeCast-Migration rückgängig, eine pro Aufruf, und lässt die
+  Tabellen der Job-Warteschlange unberührt. Der Befehl ist für die Entwicklung gedacht: Down-Migrationen löschen Daten,
+  führen Sie ihn daher nicht auf einer Produktionsdatenbank aus.
+
+## Fehlerbehebung
+
+- **Der neue Container beendet sich beim Start**: Lesen Sie `docker compose logs app`. Eine fehlgeschlagene Migration
+  bricht den Start mit `migrate: …` ab; stellen Sie die Sicherung wieder her und melden Sie den Fehler mit der
+  Release-Version.
+- **Die App bleibt fehlerhaft, und `/readyz` antwortet `database schema behind this release`**: Kein Prozess hat die
+  Migrationen angewendet. Führen Sie `reputecast migrate up` aus oder starten Sie einen Prozess mit `--auto-migrate`.
+- **`migrate: another migrator held the lock for 15m0s`**: Ein anderer Prozess hat noch migriert, zum Beispiel ein
+  großes `delivery_events` umgewandelt. Lassen Sie ihn fertig werden und starten Sie diesen dann erneut.
+- **Die Versionskarte meldet, dass die Update-Prüfung fehlgeschlagen ist**: Der Server erreicht `api.github.com` nicht,
+  oder GitHub hat mit einem Fehler geantwortet. Sonst ist nichts betroffen; die nächste Prüfung läuft am folgenden Tag.
+- **Das neueste Release zeigt einen Strich**: Die Prüfung ist ausgeschaltet oder noch nicht gelaufen.
+
+## Verwandte Themen
+
+- [Versionshinweise](/de/reference/release-notes/): was jedes Release geändert hat.
+- [Sichern und wiederherstellen](/de/self-hosting/backups/)
+- [Instanzverwaltung](/de/self-hosting/instance-admin/): der Rest von <UiPath path="admin.instance" />.
+- [CLI-Referenz](/de/reference/cli/): `migrate`, `version` und jeder andere Befehl.

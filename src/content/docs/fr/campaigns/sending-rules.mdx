@@ -1,0 +1,170 @@
+---
+title: Ajouter des règles d’envoi à l’espace de travail
+description: 'Ajouter des règles d’envoi de l’espace de travail, vérifiées sur chaque campagne par le contrôle avant envoi : balises UTM, domaines, longueur d’objet, texte.'
+type: how-to
+audience: [admin]
+permissions: ['workspace:manage']
+uiPath: 'nav.settings > settings.sendingRules'
+primaryKeyword: règles d’envoi de l’espace de travail
+sources:
+  - web/src/features/sending-rules
+  - internal/readiness/rules.go
+  - internal/readiness/rules_api.go
+  - internal/readiness/confirm.go
+  - internal/readiness/composer.go
+  - internal/store/queries/{readiness_rules,readiness}.sql
+  - internal/sending/engine/audience.go
+  - web/src/features/automations/complete.messages.ts
+  - migrations/03152_r04_sending_rules.sql
+  - migrations/03379_m44_automations.sql
+sidebar:
+  order: 11.5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Les règles d’envoi de l’espace de travail ajoutent vos propres contrôles au [contrôle avant envoi](/fr/reference/glossary/#send-readiness), à côté des contrôles intégrés : une balise UTM sur chaque lien, aucun raccourcisseur d’URL, un objet sous une certaine longueur, une mention que votre pied de page doit afficher. Chaque [règle d’envoi](/fr/reference/glossary/#sending-rules) avertit ou bloque, selon votre choix, sur chaque campagne à laquelle elle s’applique. La même page définit comment chaque envoi compte et confirme son audience, ainsi qu’un [plafond marketing](/fr/reference/glossary/#marketing-cap) sur le nombre d’e-mails que reçoit chaque contact.
+
+## Avant de commencer
+
+- Modifier les règles, les valeurs par défaut de l’audience et le plafond marketing demande `workspace:manage`, dont disposent les rôles Propriétaire et Admin. Toutes les personnes qui peuvent voir les campagnes peuvent lire la page ; elle nomme qui peut la modifier. Seules des personnes peuvent les modifier ; les clés d’API et les agents ne le peuvent pas.
+- Le contrôle avant envoi s’exécute sur les campagnes, y compris les numéros de [récapitulatif récurrent](/fr/campaigns/recurring-digests/), qui partent sur le flux Diffusions. Il vérifie les règles qui s’appliquent aux Diffusions ou aux deux flux. Les e-mails d’automatisation ne passent pas par le contrôle avant envoi : ReputeCast ne vérifie donc pas encore une règle réglée sur Automatisations uniquement.
+- Les contrôles intégrés comme l’authentification, les listes de blocage et la conformité ne peuvent pas être désactivés ici. Voir le [contrôle avant envoi](/fr/campaigns/send-readiness/) pour ce qu’ils couvrent.
+
+## Ce qu’une règle peut vérifier
+
+Une règle lit les liens web sur lesquels cliquent les lecteurs (http et https, chacun une fois ; les liens `mailto:`, les balises de fusion et les liens de désabonnement ajoutés par ReputeCast sont exclus), l’objet, le pied de page ou le texte de l’e-mail.
+
+<TableScroll label="Ce qu’une règle d’envoi peut vérifier">
+
+| <UiPath path="sendingRules.check" />       | <UiPath path="sendingRules.operator" />                                                                                                                                                    | Valeur et exemple                                                                                                                                         | Correction proposée par le contrôle avant envoi                                                                                                 |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="sendingRules.kindParam" />   | <UiPath path="sendingRules.opOnEvery" />, <UiPath path="sendingRules.opOnNone" />                                                                                                          | Un paramètre de requête, comme `utm_campaign`, sans `=`, `&`, `?`, `#` ni espaces.                                                                        | Avec <UiPath path="sendingRules.opOnEvery" /> : « Ajouter utm_campaign=weekly-digest-142 » ajoute le paramètre, nommé d’après la campagne, à chaque lien qui ne l’a pas. |
+| <UiPath path="sendingRules.kindDomain" />  | <UiPath path="sendingRules.opNotOneOf" />, <UiPath path="sendingRules.opOneOf" />                                                                                                          | Des domaines séparés par des virgules, comme `acme.io, acme.com` ; les sous-domaines comptent. Ou la liste intégrée des raccourcisseurs d’URL.             | <UiPath path="readiness.fix.openInEditor" />.                                                                                                   |
+| <UiPath path="sendingRules.kindSubject" /> | <UiPath path="sendingRules.opAtMost" />, <UiPath path="sendingRules.opAtLeast" />                                                                                                          | Un nombre de caractères ; un emoji compte pour un.                                                                                                        | <UiPath path="readiness.fix.editSubject" />.                                                                                                    |
+| <UiPath path="sendingRules.kindText" />    | <UiPath path="sendingRules.opFooterContains" />, <UiPath path="sendingRules.opFooterLacks" />, <UiPath path="sendingRules.opBodyContains" />, <UiPath path="sendingRules.opSubjectContains" /> | Le texte à rechercher, sans tenir compte des majuscules ni des espaces en trop. Le pied de page est le bloc de pied de page de l’éditeur, ou la fin du texte de l’e-mail en son absence. | <UiPath path="readiness.fix.editSubject" /> pour <UiPath path="sendingRules.opSubjectContains" />, sinon <UiPath path="readiness.fix.openInEditor" />. |
+
+</TableScroll>
+
+## Ajouter une règle
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.sendingRules" />.
+
+2. Sélectionnez <UiPath path="sendingRules.addRule" />. Le formulaire sous le tableau s’ouvre sur une nouvelle règle.
+
+3. Donnez-lui un <UiPath path="sendingRules.ruleName" /> qui dit ce qu’elle exige, comme « Les liens doivent avoir des balises UTM ». Le contrôle avant envoi affiche ce nom sur le contrôle.
+
+4. Sous la condition, choisissez la <UiPath path="sendingRules.check" />, l’<UiPath path="sendingRules.operator" /> et la valeur (voir [ce qu’une règle peut vérifier](#ce-quune-règle-peut-vérifier)).
+
+5. Choisissez la <UiPath path="sendingRules.severity" /> :
+   - <UiPath path="sendingRules.warn" /> : l’expéditeur la confirme avant d’envoyer.
+   - <UiPath path="sendingRules.block" /> : l’envoi reste désactivé jusqu’à la correction.
+
+6. Choisissez à quoi elle <UiPath path="sendingRules.appliesTo" /> : <UiPath path="sendingRules.broadcasts" />, <UiPath path="sendingRules.automations" /> ou <UiPath path="sendingRules.both" /> (par défaut).
+
+7. Si vous le souhaitez, rédigez un <UiPath path="sendingRules.message" />, par exemple la raison d’être de la règle. Il apparaît dans le contrôle avant envoi à côté du contrôle et dans les contrôles de l’éditeur. L’aperçu sous le formulaire montre la ligne telle que le contrôle avant envoi l’affichera.
+
+8. Sélectionnez <UiPath path="sendingRules.addRule" />. La règle est activée, et le journal d’audit consigne `sending_rule.created`.
+
+</Steps>
+
+<Screenshot
+  id="sending-rules"
+  alt="Paramètres › Règles d’envoi avec quatre règles de l’espace de travail, Links need UTM tags, No URL shorteners, Subject under 70 characters et Footer must include the postal address, chacune avec sa gravité, son périmètre, son interrupteur et son dernier déclenchement, et en dessous le formulaire Ajouter une règle et la carte Valeurs par défaut de l’audience."
+/>
+
+## Modifier, désactiver ou supprimer une règle
+
+- Chaque ligne du tableau des règles modifie sur place la <UiPath path="sendingRules.severity" /> et ce à quoi elle <UiPath path="sendingRules.appliesTo" />, et son interrupteur sous <UiPath path="sendingRules.colStatus" /> active ou désactive la règle immédiatement. Si la modification ne peut pas être enregistrée, l’interrupteur revient en arrière et un message explique pourquoi.
+- Sélectionnez <UiPath path="common.edit" /> sur une ligne pour modifier le reste dans le formulaire, puis <UiPath path="sendingRules.saveRule" />, ou <UiPath path="sendingRules.deleteRule" /> pour la retirer.
+- Les modifications s’appliquent dès le contrôle suivant. Un envoi programmé les prend en compte lors de son nouveau contrôle à l’heure d’envoi, 15 minutes avant son départ. Chaque modification figure dans le journal d’audit (`sending_rule.updated`, `sending_rule.deleted`).
+- <UiPath path="sendingRules.colTriggered" /> indique quand une exécution a trouvé la règle non respectée pour la dernière fois, sur quelle campagne et pour combien de liens, ou « corrigé avant l’envoi » quand une exécution ultérieure de cette campagne l’a trouvée respectée.
+
+## Comment les règles apparaissent dans le contrôle avant envoi
+
+Les règles forment le groupe <UiPath path="review.groupRules" />, le dernier des [groupes de contrôles](/fr/campaigns/send-readiness/#les-groupes-de-contrôles). Il s’exécute une fois les liens récupérés : il voit donc les mêmes liens que le groupe Liens.
+
+- Une règle respectée par la campagne est réussie, par exemple « Pas de raccourcisseurs d’URL : aucun des 14 liens n’en utilise ».
+- Une règle non respectée avertit ou bloque, selon sa gravité : « Règle de l’espace de travail : les liens doivent avoir des balises UTM · 2 liens sur 14 n’ont pas d’utm_campaign ». Votre message apparaît en dessous.
+- <UiPath path="review.technicalDetails" /> nomment la règle avec sa gravité, son périmètre et la personne qui l’a ajoutée, ce qu’elle vérifie, et les liens qui ne la respectent pas.
+- Une règle Avertir non respectée se confirme dans la confirmation de l’envoi comme tout autre avertissement.
+- L’onglet <UiPath path="composer.chrome.tabChecks" /> de l’éditeur affiche les règles de l’espace de travail issues du dernier contrôle avant envoi de la campagne, sans les exécuter de nouveau.
+
+## Définir les valeurs par défaut de l’audience
+
+La carte <UiPath path="sendingRules.defaultsTitle" /> décide de deux choses pour chaque envoi.
+
+<Steps>
+
+1. **Contacts non engagés.** L’interrupteur qui exclut les contacts non engagés selon la politique d’arrêt progressif est activé par défaut : chaque campagne laisse de côté les contacts du niveau Arrêt progressif, ceux qui n’ont aucune ouverture ni aucun clic humain depuis le nombre de jours de la politique d’arrêt progressif. Un expéditeur peut les inclure pour un envoi avec <UiPath path="review.includeThem" /> dans Vérifier et envoyer, ce qui ajoute un avertissement. Le nombre de jours provient de la politique d’arrêt progressif définie dans la [santé de la liste](/fr/audience/list-health/).
+
+2. **Confirmation par saisie.** Sous <UiPath path="sendingRules.typedLabel" />, définissez le multiple de l’audience habituelle, la médiane des 5 derniers envois aux mêmes listes. Un expéditeur saisit le nombre de destinataires pour confirmer uniquement quand l’audience dépasse ce seuil, ou quand l’envoi est un premier envoi à une liste, depuis un domaine d’envoi ou par un fournisseur d’envoi, ou qu’une inscription sur une liste de blocage d’impact plus que faible s’applique. Tout autre envoi se confirme par des cases à cocher.
+
+3. Sélectionnez <UiPath path="sendingRules.save" />. Le journal d’audit consigne `send_defaults.updated`.
+
+</Steps>
+
+<Aside type="note">
+Le champ <UiPath path="senders.providers.confirmOver" /> de <UiPath path="nav.settings > settings.providers" /> est toujours enregistré mais n’est pas utilisé : la confirmation par saisie suit cette carte.
+</Aside>
+
+## Plafonner les e-mails marketing par contact
+
+La carte <UiPath path="automations.complete.capTitle" /> fixe le nombre maximal d’e-mails marketing qu’un contact reçoit sur un nombre de jours, campagnes et automatisations confondues. Les e-mails transactionnels et Système ne comptent jamais. Un espace de travail n’a pas de plafond tant que vous n’en fixez pas.
+
+<Steps>
+
+1. Dans <UiPath path="nav.settings > settings.sendingRules" />, activez l’interrupteur <UiPath path="automations.complete.capTitle" />.
+
+2. Saisissez le nombre maximal d’e-mails, de 1 à 50, et le nombre de jours, de 1 à 90. Un nouveau plafond démarre à 3 e-mails sur 7 jours.
+
+3. Sélectionnez <UiPath path="automations.complete.capSave" />. Le journal d’audit consigne `marketing_cap.updated`.
+
+</Steps>
+
+<Screenshot
+  id="sending-rules-cap"
+  alt="La carte Plafond marketing activée : au plus 3 e-mails marketing sur 7 jours par contact, campagnes et automatisations confondues, une note indiquant que les campagnes écartent les contacts au-delà du plafond tandis que les e-mails d’automatisation attendent ou sont ignorés, et Enregistrer le plafond."
+/>
+
+- Chaque e-mail de campagne et d’automatisation envoyé ou mis en file d’attente pour le contact pendant ces jours compte ; les messages en échec, annulés et rejetés ne comptent pas.
+- Une campagne laisse de côté les contacts déjà au plafond. L’audience de Vérifier et envoyer les affiche sur leur propre ligne, comme « Au-delà du plafond marketing (3 en 7 jours) », et l’envoi les écarte quand il construit son audience.
+- Un e-mail d’automatisation destiné à un contact au plafond attend qu’il repasse en dessous, ou est ignoré, selon son [étape e-mail](/fr/automations/triggers-and-steps/).
+- Une modification s’applique aux campagnes à partir de leur prochain comptage de l’audience et aux e-mails d’automatisation à partir de leur prochaine étape. Une campagne programmée est recomptée lors de son nouveau contrôle à l’heure d’envoi, où une audience qui a varié de plus de 10 % retient l’envoi.
+- Pour retirer le plafond, désactivez l’interrupteur et sélectionnez <UiPath path="automations.complete.capSave" />.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="sending-rules" />
+
+## Vérifier le résultat
+
+- La règle affiche <UiPath path="sendingRules.on" /> dans le tableau.
+- Sur la page <UiPath path="composer.reviewSend" /> d’une campagne, une fois les contrôles relancés, le groupe <UiPath path="review.groupRules" /> liste la règle, réussie ou avec son constat.
+- Une fois qu’une campagne a enfreint la règle, <UiPath path="sendingRules.colTriggered" /> la nomme.
+- Avec un plafond marketing, l’audience de Vérifier et envoyer liste sur leur propre ligne les contacts qui le dépassent.
+
+## Dépannage
+
+- **« Votre rôle ne permet pas de modifier les règles d’envoi »** : les modifier demande `workspace:manage`. Demandez à l’une des personnes que la page nomme.
+- **La règle n’apparaît pas dans Vérifier et envoyer.** Elle est désactivée, réglée sur Automatisations uniquement, ou les contrôles n’ont pas été relancés depuis son ajout : sélectionnez <UiPath path="review.rerun" />.
+- **« Nommez le paramètre de requête, par exemple utm_campaign. »** Saisissez uniquement le nom du paramètre, sans `=`, `&`, `?`, `#` ni espaces.
+- **« “acme” n’est pas un domaine. »** Chaque domaine doit contenir un point et aucun `/`, `:`, `@` ni espace. `https://` et `www.` sont retirés pour vous.
+- **« Saisissez un nombre de caractères compris entre 1 et 998. »** Une règle de longueur d’objet accepte un nombre entier dans cette plage.
+- **« Saisissez un multiple compris entre 1,1 et 20. »** Le multiple de la confirmation par saisie est arrondi à une décimale et doit rester dans cette plage.
+- **« Saisissez entre 1 et 50 e-mails et entre 1 et 90 jours. »** Le plafond marketing accepte des nombres entiers dans ces plages. Pour ne pas avoir de plafond, désactivez l’interrupteur au lieu de saisir 0.
+- **Une règle de pied de page échoue alors que le texte figure dans l’e-mail.** Sans le bloc de pied de page de l’éditeur, la règle ne lit que la fin du texte de l’e-mail. Insérez le bloc de pied de page, ou vérifiez plutôt le texte avec <UiPath path="sendingRules.opBodyContains" />.
+
+## Voir aussi
+
+- [Contrôle avant envoi : vérifier avant d’envoyer](/fr/campaigns/send-readiness/) explique chaque contrôle intégré.
+- [Programmer et envoyer une campagne](/fr/campaigns/schedule-and-send/) montre où les règles sont confirmées.
+- [Garder une liste saine](/fr/audience/list-health/) définit la politique d’arrêt progressif à l’origine des contacts non engagés.
+- [Déclencheurs et étapes des automatisations](/fr/automations/triggers-and-steps/) explique ce que fait une étape e-mail face au plafond marketing.
+- [Rôles et autorisations](/fr/team/roles-and-permissions/) traite de `workspace:manage`.

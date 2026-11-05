@@ -1,0 +1,135 @@
+---
+title: Enviar con Resend
+description: 'Envía una newsletter con Resend a través de ReputeCast con una clave de API Full access: webhooks, registros del dominio y supresiones se configuran solos.'
+type: how-to
+audience: [admin]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter con Resend
+sources:
+  - internal/providers/resend
+  - internal/providers/webhookauth
+  - internal/connect
+  - internal/domains/attach.go
+  - web/src/features/connect
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Una newsletter con Resend sale de ReputeCast a través de los endpoints de correo y de lotes de Resend, hasta 100
+mensajes por llamada. Conectas una clave de API Full access; ReputeCast registra los webhooks, añade tu dominio de envío
+en la región que elijas, lee la cuota mensual y mantiene las supresiones sincronizadas en ambos sentidos.
+
+<ProviderMatrix family="email" id="resend" />
+
+## Antes de empezar
+
+- **Una clave de API de Resend con Full access**
+  ([Resend: API keys](https://resend.com/docs/dashboard/api-keys/introduction), consultado en octubre de 2026). Una
+  clave Sending access se conecta, pero solo puede enviar: los webhooks, los dominios y las supresiones fallan. La
+  tarjeta indica "Clave Sending access · la cuota y los dominios necesitan una clave Full access".
+- **Un dominio verificado en Resend, o uno que ReputeCast añada por ti.** Hasta que la cuenta tiene un dominio
+  verificado, ReputeCast muestra Resend como <UiPath path="providers.statusSandbox" />: Resend solo envía correo de
+  prueba a tu propia dirección.
+- **Permisos.** Para conectar necesitas `providers:manage`; para añadir un dominio de envío nuevo, `domains:manage`.
+- **Una dirección HTTPS pública** para los webhooks: `<public URL>/hooks/resend/<token>`. Una vez aceptada la clave,
+  ReputeCast puede consultar Resend una vez por minuto mientras la dirección aún no es accesible.
+
+## Conectar Resend
+
+<Steps>
+
+1. Abre <UiPath path="nav.providers" />, elige <UiPath path="providers.overview.addProvider" /> y selecciona Resend en
+   el catálogo. [Conectar un proveedor de envío](/es/providers/connect/) explica los pasos que comparten todos los
+   proveedores.
+
+2. Pega la <UiPath path="providers.fields.apiKey" /> y elige la <UiPath path="providers.fields.region" /> donde deben
+   alojarse los dominios de envío nuevos (`us-east-1`, `eu-west-1`, `sa-east-1` o `ap-northeast-1`). En la
+   configuración adicional de Resend puedes escribir tu <UiPath path="providers.fields.monthlyLimit" /> para la barra de
+   cuota. Deja vacío el <UiPath path="providers.fields.webhookSigningSecret" />: ReputeCast lee el secreto del webhook
+   que registra.
+
+3. Elige <UiPath path="connect.connection.connect" />. ReputeCast lista tus dominios con la clave y la guarda cifrada.
+
+4. En <UiPath path="connect.connection.webhooksTitle" />, ReputeCast comprueba que su dirección de webhook es accesible
+   desde internet y después crea (o vuelve a activar) un webhook para `email.delivered`, `email.delivery_delayed`,
+   `email.bounced`, `email.complained`, `email.failed` y `email.suppressed`. Las aperturas y los clics no se suscriben:
+   ReputeCast hace ese seguimiento por sí mismo. Si el endpoint aún no es accesible, elige
+   <UiPath path="connect.connection.usePolling" />.
+
+5. Elige <UiPath path="connect.connection.continueDomain" /> y escribe tu dominio de envío. ReputeCast lo añade en
+   Resend (en la región del paso 2) y muestra el registro TXT de DKIM en `resend._domainkey`, los registros MX y SPF en
+   `send.<your domain>`, y los registros SPF y DMARC del propio dominio. Los registros de seguimiento y de recepción de
+   Resend se dejan fuera.
+
+6. En <UiPath path="connect.stepTest" />, envía una prueba. Para probar resultados sin tocar buzones reales, envía a
+   las direcciones de prueba de Resend: `delivered@resend.dev`, `bounced@resend.dev`, `complained@resend.dev` o
+   `suppressed@resend.dev` (las etiquetas como `delivered+test1@resend.dev` funcionan, salvo en la dirección
+   suppressed). Los correos de prueba cuentan para tu cuota de Resend
+   ([Resend: Send test emails](https://resend.com/docs/dashboard/emails/send-test-emails), consultado en octubre de
+   2026).
+
+7. En <UiPath path="connect.stepStreams" /> y <UiPath path="connect.stepContacts" />, elige los flujos y deja marcada
+   la opción de recibir las supresiones que ya tiene Resend.
+
+</Steps>
+
+<Aside type="note">
+  Un rebote de `bounced@resend.dev` es un rebote permanente real para ReputeCast: la dirección pasa a tu
+  [lista de supresión](/es/reference/glossary/#suppression-list) compartida como cualquier otra.
+</Aside>
+
+## Comprobar que funciona
+
+- La tarjeta de Resend en <UiPath path="nav.providers > providers.tabProviders" /> muestra
+  <UiPath path="providers.statusHealthy" /> y el número de dominios verificados.
+- En Resend › Webhooks, un webhook apunta a `/hooks/resend/…` para los seis eventos.
+- Las entregas y los rebotes aparecen en <UiPath path="nav.providers > providers.tabEvents" />.
+
+Los webhooks se verifican con la firma de Standard Webhooks (Svix) y el secreto de firma `whsec_` del webhook, y se
+rechazan las solicitudes de hace más de 5 minutos. Un mensaje va a `POST /emails`; dos o más van al endpoint de lotes,
+hasta 100 por llamada. Cada llamada lleva una clave de idempotencia creada a partir de los ID de mensaje de ReputeCast,
+que Resend conserva 24 horas, así que la misma llamada repetida se atiende una sola vez. Sin embargo, una clave cubre
+toda su llamada, así que ReputeCast nunca vuelve a enviar un mensaje cuya respuesta se perdió: el mensaje queda retenido
+como dudoso y el [monitor en tiempo real](/es/campaigns/live-monitor/) pide a una persona que decida. Si Resend rechaza
+un mensaje de un lote, ReputeCast envía el resto de uno en uno para que solo falle ese mensaje.
+
+Resend hace el seguimiento de aperturas y clics por dominio cuando el dominio tiene el seguimiento activado, y no se
+puede desactivar por mensaje. La <UiPath path="providers.events.trackingTitle" /> de la pestaña de eventos y
+sincronización lo indica y puede desactivarlo para tus dominios; hasta entonces, la
+[revisión previa](/es/reference/glossary/#send-readiness) avisa del doble recuento.
+
+## Solución de problemas
+
+- **"Resend rechazó esta clave."** La clave se eliminó o se escribió mal. Crea una clave Full access en Resend y
+  pégala.
+- **El registro del webhook falla con `restricted_api_key`.** La clave solo tiene Sending access. Reemplázala por una
+  clave Full access en <UiPath path="providers.overview.settings > providers.overview.credentials" /> y elige
+  <UiPath path="connect.connection.registerAgain" />.
+- **Resend aparece como <UiPath path="providers.statusSandbox" />.** La cuenta no tiene ningún dominio verificado.
+  Completa los registros del dominio del paso 5; el estado desaparece en la siguiente comprobación de estado (cada 5
+  minutos). Resend no tiene solicitud de acceso de producción: la solución es verificar un dominio.
+- **La prueba falla con `validation_error`.** El dominio De no está verificado en Resend. Usa un remitente de un
+  dominio verificado.
+- **Las firmas dejan de verificarse después de volver a crear el webhook en Resend.** Si alguna vez pegaste un secreto
+  de firma del webhook, ReputeCast lo sigue usando. Reemplázalo por el secreto del nuevo webhook o vuelve a conectar
+  Resend.
+- **Fallan los mensajes transaccionales con Cc, Bcc o archivos adjuntos.** El adaptador de Resend no puede enviar
+  copias ni adjuntos; enruta esas plantillas a través de otro proveedor.
+- **La insignia del catálogo dice "Masivo mediante la Broadcasts API".** ReputeCast no usa Resend Broadcasts; envía
+  cada mensaje por sí mismo a través de los endpoints de correo y de lotes.
+- **Cambiaste la URL pública o desconectaste Resend.** Una URL pública nueva añade un segundo webhook; elimina el
+  anterior en Resend. Al desconectar se elimina el webhook de la URL actual; los dominios y las supresiones enviadas se
+  conservan.
+
+## Relacionado
+
+- [Conectar un proveedor de envío](/es/providers/connect/)
+- [Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)
+- [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)
+- [Correo transaccional en ReputeCast](/es/transactional/overview/)
+- [Elegir un proveedor de envío](/es/providers/choose/)

@@ -1,0 +1,152 @@
+---
+title: Entregabilidad del correo para remitentes autoalojados
+description: "Entregabilidad del correo si te autoalojas: qué decide la llegada a la bandeja de entrada, cómo la vigila ReputeCast antes, durante y tras enviar, y una lista."
+type: explanation
+audience: [publisher, admin]
+primaryKeyword: entregabilidad del correo
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - internal/readiness/types.go
+  - internal/readiness/assemble.go
+  - internal/approvals/jobs.go
+  - internal/sending/engine/engine.go
+  - internal/deliverability
+  - internal/placement
+sidebar:
+  order: 1
+---
+
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+La entregabilidad del correo indica si tus mensajes llegan a la bandeja de entrada en lugar de a la carpeta de spam o de
+rebotar. Los proveedores de buzón, como Gmail, Yahoo y Outlook.com, lo deciden para cada mensaje a partir de las señales
+que se describen a continuación. Cuando te autoalojas, eliges los proveedores de envío y controlas el DNS, así que
+gestionar estas señales te corresponde a ti; ReputeCast las comprueba antes, durante y después de cada envío.
+
+ReputeCast determina qué [proveedor de buzón](/es/reference/glossary/#mailbox-provider) filtra cada dirección a partir
+de los registros MX de su dominio, no solo de su nombre: un dominio de empresa en Google Workspace cuenta como Gmail, y
+uno en Microsoft 365, como Outlook. El enrutamiento, el calentamiento, el envío protegido, la revisión previa y los
+informes usan todos esa misma respuesta.
+
+## Qué decide la llegada a la bandeja de entrada
+
+<TableScroll label="Señales que deciden la llegada a la bandeja de entrada">
+
+| Señal                   | Qué miran los proveedores de buzón                                                              | Dónde trabajarla                                                                                                         |
+| ----------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Autenticación           | SPF, DKIM y DMARC, alineados con el dominio de la dirección From                                | [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)                                                       |
+| Reputación              | El historial de tus dominios e IP de envío, las inclusiones en listas de bloqueo y las tasas de rebote y de quejas | [Supervisar el estado de los dominios y los proveedores](/es/deliverability/health/), [calentamiento](/es/providers/warm-up/) |
+| Interacción             | Cómo reaccionan los destinatarios: abren, responden, eliminan sin leer o marcan como spam       | [Mantener sana tu lista](/es/audience/list-health/)                                                                      |
+| Contenido               | Tamaño, enlaces, imágenes, una parte en texto sin formato y un asunto que no parezca spam       | [Corregir los avisos de contenido antes de enviar](/es/campaigns/content-checks/)                                        |
+| Calidad de la lista     | Direcciones que rebotan, trampas de spam, direcciones genéricas, contactos que nunca se suscribieron | [La lista de supresión](/es/audience/suppressions/), [verificar direcciones](/es/audience/verification/)            |
+| Cumplimiento            | Consentimiento, una baja que funcione, una dirección postal y los requisitos para remitentes masivos | [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)          |
+
+</TableScroll>
+
+## Qué hace ReputeCast antes, durante y después del envío
+
+<SendFlowDiagram />
+
+La revisión previa comprueba una campaña antes de que empiece, el enrutamiento entrega cada destinatario a un proveedor
+de envío, los eventos de entrega vuelven desde los proveedores de envío y los umbrales deciden si el envío sigue o se
+pausa.
+
+1. **Antes de enviar.** Los registros del dominio se comprueban en tiempo real mientras los publicas y después cada 30
+   minutos. La [revisión previa](/es/reference/glossary/#send-readiness) comprueba cada campaña en hasta 11 grupos:
+   reputación del remitente (el dominio de envío, su dominio padre, los dominios de return-path y de seguimiento, y las
+   IP dedicadas), autenticación, contenido, idiomas, accesibilidad, contenido condicional, enlaces, cumplimiento,
+   calidad de la audiencia, enrutamiento y las [reglas de envío](/es/campaigns/sending-rules/) de tu propio espacio de
+   trabajo. Su veredicto es Preparada, Preparada, con avisos o Bloqueada, y un Bloqueo impide que el envío empiece. Una
+   comprobación que no pudo ejecutarse, como una consulta DNS que falló, es <UiPath path="review.statusUnknown" />, nunca
+   un <UiPath path="review.statusBlock" />. Se ejecuta cuando abres <UiPath path="composer.reviewSend" />, otra vez 15
+   minutos antes de un envío programado y cuando empieza el envío. En esa nueva comprobación, un bloqueo, un aviso que
+   nadie confirmó, un cambio grande en la audiencia o una edición hecha después de programar retienen el envío
+   ([retención en el momento del envío](/es/reference/glossary/#send-time-hold)) hasta que alguien lo revise. Una
+   [prueba de ubicación](/es/deliverability/placement-tests/) muestra dónde llegan copias reales en buzones de prueba,
+   por proveedor de buzón.
+2. **Durante el envío.** Un envío puede empezar con un [envío canario](/es/reference/glossary/#canary): lo reciben
+   primero los destinatarios con más interacción y tus buzones de prueba, y todos los demás esperan hasta que lo supere.
+   Después, el [envío protegido](/es/reference/glossary/#guarded-sending) vigila cada 2 segundos los rebotes por tipo,
+   las quejas y los aplazamientos por proveedor de buzón y por proveedor de envío, ralentiza un proveedor de buzón ante
+   los aplazamientos antes de pausarlo y [pausa automáticamente](/es/campaigns/live-monitor/) solo la parte que superó
+   un umbral. Las tasas de quejas solo cuentan el correo entregado a proveedores de buzón que notifican quejas: Gmail e
+   iCloud no lo hacen, así que las suyas muestran <UiPath path="live.model.notAvailable" />. Los umbrales, las tasas por
+   proveedor de buzón y las reglas de respuesta, como la de `TSS04` de Yahoo, se definen en las
+   [reglas de tráfico](/es/providers/traffic-rules/). Cuando un proveedor de envío falla, la política de conmutación por
+   error de la ruta decide si su parte pasa a uno que funcione o espera tu decisión.
+3. **Después del envío.** Los eventos de entrega de todos los proveedores de envío se normalizan, y los rebotes y las
+   quejas van a una única [lista de supresión](/es/reference/glossary/#suppression-list) que se aplica a todos los
+   proveedores de envío. Una vigilancia de quejas sigue contando quejas después de que termine el envío y avisa a las
+   personas que pueden reanudar envíos cuando un proveedor de buzón o el envío completo supera su límite de quejas. Los
+   [informes de campaña](/es/campaigns/reports/) separan las aperturas en humanas,
+   [protegidas por privacidad](/es/reference/glossary/#privacy-protected-open) y automáticas, y el
+   [estado de la entregabilidad](/es/deliverability/health/) sigue vigilando tus dominios, IP, cuentas de proveedores
+   de envío, listas de bloqueo, informes DMARC e incidentes.
+
+## Valores predeterminados y límites
+
+Estos plazos y umbrales de la revisión previa se aplican a todas las campañas:
+
+<LimitsTable area="send-readiness" />
+
+## Cuándo cambiarlos
+
+Los límites de la revisión previa son fijos. Lo que decides tú es cómo responder a cada resultado: corrige un Bloqueo, y
+corrige o confirma cada aviso antes de enviar. Los umbrales que terminan un envío antes de tiempo sí los ajustas tú: las
+tasas de pausa automática por espacio de trabajo y por campaña ([Supervisar un envío y la pausa automática](/es/campaigns/live-monitor/))
+y los límites de rebotes y quejas de cada proveedor de envío ([Estado de los proveedores y caídas](/es/providers/health-and-outages/)).
+Bájalos cuando un proveedor de buzón empiece a aplazar o filtrar tu correo; subirlos solo deja que se haga más daño
+antes de la pausa.
+
+## Lista de comprobación de entregabilidad
+
+### Configurar una vez
+
+1. Publica SPF, DKIM y DMARC para cada dominio de envío:
+   [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/).
+2. Recopila los informes DMARC y pasa a una política aplicada:
+   [Leer los informes agregados de DMARC](/es/deliverability/dmarc-reports/).
+3. Revisa las reglas de los grandes proveedores de buzón:
+   [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/).
+4. Asegúrate de que la baja con un clic funciona, lo que necesita una URL pública HTTPS:
+   [Baja con un clic (RFC 8058)](/es/deliverability/one-click-unsubscribe/).
+5. Recoge el consentimiento con evidencia y mantén una dirección postal en el pie:
+   [Nociones básicas de consentimiento y leyes antispam](/es/deliverability/compliance/).
+6. Con Amazon SES, sal del sandbox antes de la primera campaña:
+   [Sacar Amazon SES del sandbox](/es/deliverability/amazon-ses-production-access/).
+7. Calienta un proveedor de envío o una IP nuevos antes de enviar todo el volumen:
+   [Calentar un proveedor o una IP nuevos](/es/providers/warm-up/).
+8. Opcional: muestra tu logo con [BIMI](/es/deliverability/bimi/) y
+   [conecta HostRepute](/es/deliverability/hostrepute/) para comprobar las listas de bloqueo cada hora y tener Postmaster
+   Tools, SNDS y la recopilación de informes DMARC.
+
+### Antes de cada envío
+
+9. Corrige cada Bloqueo y lee cada aviso de la [revisión previa](/es/campaigns/send-readiness/).
+10. En los envíos importantes, ejecuta antes una [prueba de ubicación](/es/deliverability/placement-tests/).
+
+### Seguir vigilando
+
+11. Abre el [estado de la entregabilidad](/es/deliverability/health/) con regularidad y actúa ante las tarjetas ámbar y
+    rojas.
+12. Consigue que te excluyan rápido de las listas:
+    [Comprobar y resolver inclusiones en listas de bloqueo](/es/deliverability/blocklists/).
+13. Mantente por debajo de los límites de cada proveedor de envío:
+    [Rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/).
+14. Deja de enviar a los contactos que nunca interactúan: [Mantener sana tu lista](/es/audience/list-health/) y
+    [La lista de supresión](/es/audience/suppressions/).
+
+### Cuando el correo rebota
+
+15. Busca el código que devolvió un proveedor de buzón: [Códigos de error SMTP](/es/smtp-errors/).
+16. Averigua a qué proveedores de buzón y de envío afecta en los [informes de campaña](/es/campaigns/reports/).
+
+## Relacionado
+
+- [Cómo funciona ReputeCast](/es/getting-started/concepts/)
+- [Revisión previa: comprobar antes de enviar](/es/campaigns/send-readiness/)
+- [Supervisar un envío y la pausa automática](/es/campaigns/live-monitor/)
+- [Glosario](/es/reference/glossary/)

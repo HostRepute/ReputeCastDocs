@@ -1,0 +1,204 @@
+---
+title: Publicar cambios en automatizaciones con seguridad
+description: 'Cómo publicar automatizaciones de correo en ReputeCast: cambios frente a la versión publicada, contactos ya en el recorrido, comprobaciones y aprobación.'
+type: how-to
+audience: [publisher]
+permissions: ['automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: publicar automatizaciones de correo
+sources:
+  - internal/automations/{publish.go,diff.go,accessibility.go,edit.go,channels.go,languages.go}
+  - internal/approvals/automation.go
+  - internal/accessibility/automations.go
+  - web/src/features/automations/{dialogs.tsx,FlowEditor.tsx,flow.messages.ts,manage.tsx,complete.messages.ts}
+  - web/src/features/approvals/policy.messages.ts
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Puedes publicar automatizaciones de correo sin sorprender a los contactos que ya están en el recorrido: lee qué ha
+cambiado desde la versión publicada, decide dónde continúan esos contactos y deja que las comprobaciones previas a la
+publicación detengan una versión rota antes de que se publique.
+
+## Antes de empezar
+
+- Necesitas `automations:publish`, un [permiso delicado](/es/reference/glossary/#sensitive-permission) que tienen los
+  roles Propietario, Administrador y Editor. Restaurar una versión antigua como borrador solo requiere
+  `automations:edit`.
+- Un recorrido con un paso <UiPath path="automations.graph.typeSms" />, <UiPath path="automations.graph.typePush" /> o
+  <UiPath path="automations.graph.typeWhatsapp" /> también requiere `sms:send`, `push:send` o `whatsapp:send`. Sin él,
+  la publicación pasa a la [aprobación](/es/reference/glossary/#approval) de un miembro que lo tenga.
+- Dos opciones del espacio de trabajo cambian lo que hace la publicación. Las configura un miembro con
+  `workspace:manage`:
+  - En <UiPath path="nav.settings > settings.approvals" />, la regla
+    <UiPath path="approvals.policy.automationTitle" /> envía cada publicación a aprobación. Mientras está desactivada,
+    la publicación solo queda registrada. Consulta
+    [exigir aprobación para los envíos de riesgo](/es/campaigns/approvals/).
+  - En <UiPath path="nav.settings > settings.general > accessibility.policyTitle" />, la política es
+    <UiPath path="accessibility.warn" /> o <UiPath path="accessibility.block" />. Con
+    <UiPath path="accessibility.block" />, los problemas de accesibilidad graves en los correos del recorrido impiden
+    publicar. Consulta [comprobar la accesibilidad del correo](/es/campaigns/accessibility/).
+
+## Publicar una versión nueva
+
+<Steps>
+
+1. Abre el recorrido desde <UiPath path="nav.automations" />. La cabecera muestra la versión publicada y su fecha, como
+   Publicada · v3 desde el 11 oct, y cuántos cambios tiene el borrador que no tiene la versión publicada.
+
+2. Selecciona <UiPath path="automations.flow.publish" /> en la cabecera; el botón lleva la versión del borrador, como
+   v4. ReputeCast guarda primero el borrador y después abre el cuadro de diálogo de publicación.
+
+3. Lee las diferencias. El cuadro de diálogo cuenta los cambios desde que se publicó la versión publicada, con la fecha y
+   quién la publicó, y los enumera bajo la comparación de versiones, como v3 → v4. Cada fila es
+   <UiPath path="automations.flow.kindAdded" />, <UiPath path="automations.flow.kindChanged" /> o
+   <UiPath path="automations.flow.kindRemoved" />, con lo que significa para los contactos. En el espacio de trabajo de
+   demostración, el borrador de Welcome series dice:
+   - Añadido: una división A/B después del paso 2, 50 / 50, con dos pasos de correo nuevos que superan las
+     comprobaciones de contenido.
+   - Modificado: la espera antes del paso 2 pasa de 1 día a 2 días; los contactos que ya están esperando conservan su
+     temporizador salvo que los muevas.
+   - Eliminado: un webhook que devolvía 404 desde el 8 oct, con sus llamadas fallidas aún en el registro del webhook.
+
+   La última fila, <UiPath path="automations.flow.kindUnchanged" />, enumera lo que no cambia. Mover pasos por el lienzo
+   nunca es un cambio. Un disparador cambiado indica que los contactos nuevos entran por el nuevo disparador desde el
+   momento en que se publica la versión, y cuántos contactos que ya están en el recorrido no se ven afectados. La primera
+   publicación de un recorrido no tiene diferencias: el cuadro de diálogo dice que todos los pasos se validan antes de
+   publicarse.
+
+4. Decide qué pasa con los contactos del recorrido. En <UiPath path="automations.flow.migrationLabel" />, el cuadro de
+   diálogo dice cuántos contactos hay en el recorrido en este momento y ofrece dos opciones:
+   - **Dejar que terminen en la versión publicada** (la predeterminada, marcada como recomendada). Los contactos nuevos
+     empiezan en la versión nueva; los que ya están en el recorrido terminan en la antigua, así que nadie recibe un paso
+     dos veces ni se salta ninguno. La versión antigua se retira cuando sale su último contacto, y el cuadro de diálogo
+     estima cuándo, como “unos 5 días”.
+   - **Moverlos a la versión nueva en su paso actual.** Cada contacto continúa desde el mismo paso en la versión nueva.
+     Un contacto en un paso eliminado pasa al siguiente paso que aún existe; un contacto en una espera cambiada recibe la
+     nueva espera, contada desde que llegó a ella. El cuadro de diálogo detalla el efecto, como “612 contactos que
+     esperan antes del paso 2 recibirían la espera de 2 días”. ReputeCast mueve juntos los contactos de cada paso, así
+     que incluso decenas de miles de contactos en espera se mueven en segundos.
+
+5. Lee las <UiPath path="automations.flow.checks" />. Verde es correcto, ámbar avisa y rojo bloquea:
+
+   | Comprobación | Bloquea la publicación |
+   | --- | --- |
+   | La ruta Automatizaciones: operativa, en su respaldo o sin ningún proveedor operativo (los correos esperan hasta que haya uno) | No |
+   | Cada paso de correo supera las comprobaciones de contenido de la [revisión previa](/es/reference/glossary/#send-readiness) | Sí, cuando falla algún correo |
+   | Ningún paso hace referencia a una lista, etiqueta, formulario, correo o proveedor eliminados | Sí |
+   | Todas las ramas de las bifurcaciones y de las divisiones A/B están conectadas | Sí |
+   | Cualquier otro problema de <UiPath path="automations.flow.beforePublish" /> | Sí |
+   | Pasos de SMS: horas de silencio y si un remitente puede enviar SMS a cada país | No |
+   | Versiones de idioma desactualizadas | No |
+   | Problemas de accesibilidad graves, una insignia por paso de correo, como “Paso 3 B: 1 problema grave, contraste del botón” | Solo con la política <UiPath path="accessibility.block" />; la versión publicada sigue enviando |
+
+   Mientras una comprobación bloquea, el botón de publicar está desactivado y dice por qué.
+
+6. Publica. Selecciona el botón de publicar con el número de la versión nueva. La versión se publica, un mensaje lo
+   confirma y vuelves a la lista. <UiPath path="automations.flow.saveDraftOnly" /> conserva el borrador sin publicarlo, y
+   <UiPath path="automations.flow.backToCanvas" /> cierra el cuadro de diálogo.
+
+</Steps>
+
+<Aside type="note">
+  La publicación pasa a aprobación en lugar de publicarse cuando la regla del espacio de trabajo
+  <UiPath path="approvals.policy.automationTitle" /> está activada, cuando el visto bueno del cliente de una agencia
+  cubre las automatizaciones o cuando un paso de canal requiere un permiso de envío que no tienes. El mensaje dice entonces
+  que la versión está pendiente de aprobación y nombra a quienes pueden aprobarla: los miembros con `campaigns:approve`
+  que no seas tú y que, cuando ese es el motivo, también tengan el permiso de envío que falta. Una vez aprobada,
+  ReputeCast publica esa versión con la opción que elegiste en el paso 4. Si el borrador cambió después de la aprobación,
+  no se publica: recibes una notificación, y al volver a publicar se pide una aprobación nueva.
+</Aside>
+
+## Restaurar una versión anterior
+
+<Steps>
+
+1. En la cabecera del recorrido, selecciona <UiPath path="automations.flow.versionHistory" />. Cada versión publicada
+   muestra su fecha, quién la publicó y qué cambió. La versión publicada muestra cuántos contactos hay en ella; una
+   anterior aparece como retirándose mientras aún terminan contactos en ella, o como retirada con la fecha en que se
+   vació.
+
+2. Para ver qué cambia el borrador, selecciona <UiPath path="automations.flow.compare" />: muestra
+   <UiPath path="automations.flow.changesSinceLive" />.
+
+3. Junto a la versión que quieres recuperar, selecciona <UiPath path="automations.flow.restoreAsDraft" />. Si el borrador
+   tiene cambios sin publicar, ReputeCast pregunta si quieres reemplazarlos: selecciona
+   <UiPath path="automations.flow.replace" /> o <UiPath path="automations.flow.keep" />.
+
+4. La versión antigua es ahora el borrador, con un número de versión nuevo. Revísala en el lienzo y publícala como
+   cualquier otro cambio.
+
+</Steps>
+
+## Pausar y reanudar un recorrido
+
+<Steps>
+
+1. En la cabecera de un recorrido publicado, selecciona <UiPath path="automations.flow.pause" />. El cuadro de diálogo
+   dice cuántos contactos hay en el recorrido.
+
+2. Si quieres, escribe un <UiPath path="automations.flow.reason" /> de hasta 200 caracteres, como “la beta está
+   completa”; la lista de automatizaciones lo muestra en la fila del recorrido. Selecciona
+   <UiPath path="automations.flow.pauseAutomation" />, o <UiPath path="automations.flow.keepRunning" /> para cancelar.
+
+   Mientras el recorrido está en pausa, no entran contactos nuevos. Los contactos que están en él se quedan donde están,
+   las esperas siguen contando y no se envía nada.
+
+3. Para volver a ponerlo en marcha, selecciona <UiPath path="automations.flow.resume" />. Vuelven a entrar contactos
+   nuevos y los pasos en espera continúan. Si las esperas de algunos contactos terminaron durante la pausa, un cuadro de
+   diálogo dice cuántos son y pregunta qué hacer con ellos:
+   - <UiPath path="automations.complete.sendNow" /> (predeterminado): siguen adelante al momento, dentro de los límites
+     de calentamiento y las horas de silencio.
+   - <UiPath path="automations.complete.skipOverdue" />: se omite el correo que se perdieron, y continúan en el paso
+     siguiente.
+   - Repartirlos entre 1 y 72 horas (6 para empezar): cada hora sigue adelante aproximadamente el mismo número, para que
+     la acumulación no llegue de golpe.
+
+   Selecciona <UiPath path="automations.flow.resume" /> en el cuadro de diálogo para volver a poner en marcha el
+   recorrido con esa opción.
+
+</Steps>
+
+## Comprobar que funciona
+
+- La cabecera muestra la versión nueva como publicada con la fecha de hoy, y la fila de la lista dice que se publicó hoy.
+- En <UiPath path="automations.flow.versionHistory" />, la versión nueva aparece como publicada y, si dejaste que los
+  contactos terminaran, la versión antigua aparece como retirándose con el número de contactos que aún están en ella.
+- Un recorrido en pausa muestra <UiPath path="automations.statusPaused" /> en su fila de la lista, con quién lo pausó y
+  el motivo.
+- Cada publicación, solicitud de aprobación, pausa y reanudación, con la opción elegida para los contactos con esperas
+  vencidas, está en el registro de auditoría del espacio de trabajo.
+
+## Solución de problemas
+
+- **El botón de publicar está desactivado y dice que no hay nada que publicar.** El borrador es igual que la versión
+  publicada, o solo mueve pasos por el lienzo. Cambia la configuración o las conexiones de un paso para publicar.
+- **La publicación falla con “El borrador ahora es la v5. Vuelve a revisar los cambios antes de publicar.”** Alguien
+  guardó el borrador después de que abrieras el cuadro de diálogo. Ciérralo y vuelve a abrirlo para revisar las nuevas
+  diferencias.
+- **Una comprobación en rojo dice que hay correos que no superan las comprobaciones de contenido.** Abre el paso de
+  correo, corrige el correo en el editor (la comprobación nombra el primer problema, como la falta de un enlace de baja)
+  y vuelve a publicar.
+- **La política de accesibilidad bloquea la publicación.** El mensaje de bloqueo nombra cada problema y cada paso.
+  Corrígelos en los correos o pide a un miembro con `workspace:manage` que cambie la política a
+  <UiPath path="accessibility.warn" />. Mientras tanto, la versión publicada sigue enviando.
+- **La publicación falla aunque tu espacio de trabajo exige aprobación.** La aprobación requiere un miembro distinto de
+  ti con `campaigns:approve` (y el permiso de envío que falta, cuando ese es el motivo). Dáselo al rol de otro miembro en
+  <UiPath path="nav.settings > settings.roles" />; quien crea una solicitud no puede aprobarla.
+- **Recibiste una notificación “Aprobada, pero no publicada”.** El borrador cambió después de la aprobación, o ahora
+  falla una comprobación. Corrige el recorrido y vuelve a publicar para solicitar una aprobación nueva.
+- **Pausar y reanudar están desactivados.** Requieren `automations:publish`. Solo se puede pausar un recorrido publicado,
+  y solo se puede reanudar uno en pausa.
+
+## Relacionado
+
+- [Crear automatizaciones](/es/automations/overview/) trata el lienzo, el borrador y las estadísticas.
+- [Disparadores y pasos](/es/automations/triggers-and-steps/) enumera las opciones con las que se valida cada paso.
+- [Exigir aprobación para los envíos de riesgo](/es/campaigns/approvals/) define la política de aprobación y quién
+  aprueba.
+- [Comprobar la accesibilidad del correo](/es/campaigns/accessibility/) explica los problemas graves y las políticas
+  Avisar y Bloquear.
+- [Permisos y roles](/es/reference/permissions/) enumera `automations:publish` y los permisos de envío de los canales.

@@ -1,0 +1,207 @@
+---
+title: Eventos de entrega y sincronización de supresiones
+description: Cómo recibe ReputeCast los eventos de rebote de correo por webhook de cada proveedor, los normaliza, conserva el código original y sincroniza las supresiones.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: eventos de rebote de correo por webhook
+sources:
+  - internal/ingest
+  - internal/suppressions/sync.go
+  - internal/providers/eventqueue
+  - internal/providers/ses/queue.go
+  - internal/providers/smtp
+  - internal/providers/manage/review_health.go
+  - internal/providers/provider.go
+  - internal/providers/manage/health.go
+  - internal/app/wire_providers.go
+  - internal/app/wire_sending.go
+  - internal/app/wire_automations.go
+  - web/src/features/providers/EventsPage.tsx
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  order: 17
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Cada proveedor de envío informa de lo que le pasó a tu correo en su propio formato: Amazon SES mediante notificaciones
+de SNS (entregadas en un webhook o en una cola SQS), Postmark y Mailgun mediante webhooks, y un servidor SMTP mediante
+mensajes de rebote en un buzón. ReputeCast convierte estos eventos de rebote de correo por webhook, las entregas y las
+quejas en un único modelo de [evento normalizado](/es/reference/glossary/#normalized-event), conserva a su lado el código
+original del proveedor y comparte cada rebote y cada queja a través de una sola
+[lista de supresión](/es/reference/glossary/#suppression-list).
+
+## Cómo llegan los eventos
+
+1. **El proveedor llama a ReputeCast.** Cada proveedor conectado tiene su propia dirección de webhook,
+   `https://<public URL>/hooks/<adapter>/<token>`. El asistente de conexión la registra por ti en el proveedor, o te la
+   muestra para que la pegues, y demuestra desde fuera que el proveedor puede llegar a ella. Lee
+   [Conectar un proveedor de envío](/es/providers/connect/).
+2. **ReputeCast comprueba la firma.** Cada adaptador verifica la solicitud tal como la firma su proveedor (una firma de
+   SNS para Amazon SES, un HMAC para Mailgun, una firma ECDSA para SendGrid, un secreto compartido para los proveedores
+   que no firman). Una solicitud que no pasa la comprobación recibe `401` y nunca se procesa; se conservan sus primeros
+   2 KB para el diagnóstico.
+3. **Guarda el payload sin procesar y responde de inmediato.** Un payload verificado se guarda tal como llegó y el
+   proveedor recibe `200` al momento, así que un procesamiento lento nunca hace que un proveedor reintente o se rinda.
+   Si ReputeCast no puede guardarlo, responde `429` con `Retry-After: 30` en lugar de un `5xx`, porque algunos
+   proveedores descartan eventos después de un error del servidor.
+4. **Una tarea en segundo plano lo normaliza.** El payload se convierte en uno o varios eventos normalizados, asociados
+   al mensaje que envió ReputeCast. Los eventos que llegan repetidos se reconocen y se cuentan una sola vez.
+5. **El evento surte efecto.** Actualiza el estado del mensaje, los contadores de la campaña por proveedor de buzón y
+   por proveedor de envío, las cifras del paso de automatización que lo envió y las estadísticas diarias del proveedor.
+   Los rebotes permanentes, las quejas y las bajas de los que informa el proveedor añaden la dirección a la lista de
+   supresión compartida, y el contacto se marca con rebote o con queja. En el correo de campañas y automatizaciones, las
+   entregas, los aplazamientos, los rebotes y las quejas también van a los
+   [endpoints de webhook](/es/developers/webhooks/) del espacio de trabajo como `email.delivered`, `email.deferred`,
+   `email.bounced` y `email.complained`.
+
+Los eventos que no llegan por un webhook siguen el mismo camino desde el paso 4:
+
+- **Amazon SES con la opción de cola**: SNS entrega los eventos en una cola SQS de tu cuenta de AWS, y ReputeCast la
+  consulta con long polling usando el propio acceso de la conexión. Nada tiene que llegar a ReputeCast desde internet.
+  Lee [Enviar con Amazon SES](/es/providers/amazon-ses/).
+- **Servidores SMTP**: ReputeCast lee cada minuto los rebotes y los informes de spam del
+  [buzón de rebotes](/es/reference/glossary/#bounce-mailbox) del servidor. Si el buzón no se puede leer durante 15
+  minutos, el proveedor pasa a Degradado ("Buzón de rebotes inaccesible") y se avisa al equipo, porque los rebotes de
+  ese servidor no llegan a la lista de supresión hasta que se pueda volver a leer.
+- **Consulta periódica**: ReputeCast consulta cada minuto la API de eventos de Mailgun o SparkPost cuando elegiste la
+  consulta periódica en el asistente de conexión.
+
+Un proveedor cuyos eventos dejan de llegar mientras sale correo se señala como proveedor con webhooks silenciosos, y uno
+que nunca informó de un evento se señala cuando el correo lleva 30 minutos de retraso;
+[Estado de los proveedores y caídas](/es/providers/health-and-outages/) explica cuándo ocurre y qué pasa con el envío.
+
+## Eventos normalizados
+
+<TableScroll label="Tipos de eventos normalizados">
+
+| Evento        | Significado                                                                         | Suprime la dirección |
+| ------------- | ----------------------------------------------------------------------------------- | -------------------- |
+| `delivered`   | El servidor de correo receptor aceptó el mensaje.                                    | No                   |
+| `deferred`    | La entrega se retrasó con un error temporal; el proveedor lo reintenta.              | No                   |
+| `hard_bounce` | La entrega falló de forma permanente, por ejemplo porque el buzón no existe.         | Sí                   |
+| `soft_bounce` | La entrega falló por un motivo que puede ser temporal, como un buzón lleno.          | No                   |
+| `complaint`   | El destinatario marcó el mensaje como spam (un informe del bucle de retroalimentación). | Sí                |
+| `rejected`    | El proveedor se negó a enviar el mensaje.                                            | No                   |
+| `open`        | Una apertura registrada por el proveedor.                                            | No                   |
+| `click`       | Un clic registrado por el proveedor.                                                 | No                   |
+| `unsubscribe` | Una baja que recibió el proveedor.                                                   | Sí                   |
+
+</TableScroll>
+
+Cada evento conserva el tipo de evento original del proveedor (como `Bounce · Permanent · General` o `HardFail`), su
+código original (como `550 5.1.1`) y el texto del diagnóstico. Los rebotes también reciben una
+[clase de rebote](/es/reference/glossary/#bounce-class): `mailbox_unknown`, `mailbox_full`, `domain_invalid`,
+`policy_block`, `spam_block`, `reputation`, `temporary` u `other`. La clase te dice por qué falló el correo,
+independientemente de cómo lo exprese cada proveedor; lee
+[Rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/) y los
+[códigos de error SMTP](/es/smtp-errors/).
+
+Los servidores SMTP no informan de entregas. ReputeCast cuenta un mensaje como entregado (deducido) en cuanto el
+servidor lo acepta con su respuesta `250`, y pide notificaciones de estado de entrega (éxito, fallo y retraso, solo
+cabeceras) cuando el servidor anuncia que admite DSN; los rebotes y las quejas siguen llegando como informes al buzón de
+rebotes. Lee [Enviar a través de cualquier servidor SMTP](/es/providers/smtp/).
+
+ReputeCast hace por sí mismo el seguimiento de aperturas y clics. Los eventos `open` y `click` propios de un proveedor
+solo cuentan cuando elegiste mantener el seguimiento de ese proveedor (consulta
+[Comprobación del seguimiento del proveedor](#comprobación-del-seguimiento-del-proveedor)). En ese caso se cuentan
+como los de ReputeCast: cada apertura se clasifica como de una persona, de un proxy de privacidad (como la precarga de
+Apple Mail) o de un escáner, y un clic se estabiliza antes de contar y se asocia al enlace del correo.
+
+## El registro de eventos
+
+<UiPath path="nav.providers > providers.tabEvents" /> empieza por el <UiPath path="providers.events.logTitle" />: cada
+evento sin procesar del proveedor junto a su forma normalizada, su código original y su diagnóstico, el destinatario
+enmascarado y la campaña, la automatización o el correo de sistema al que pertenece. Filtra por proveedor de envío o por
+tipo de evento, o busca un destinatario o un ID del mensaje.
+
+<Screenshot
+  id="providers-events"
+  alt="El registro de eventos: eventos sin procesar de Postmark, Amazon SES y Postal junto a sus tipos normalizados (entregado, rebote permanente, aplazado, queja, rebote temporal, rechazado), cada uno con su código SMTP original y su diagnóstico."
+/>
+
+<UiPath path="providers.events.exportCsv" /> descarga los eventos filtrados. Los destinatarios siguen enmascarados
+salvo que tengas el permiso `subscribers:export`, y cada exportación queda en el
+[registro de auditoría](/es/team/audit-log/).
+
+## Sincronización de supresiones
+
+Un rebote permanente o una queja en un proveedor detiene el correo a esa dirección en todos los proveedores. La tarjeta
+<UiPath path="providers.events.syncTitle" /> indica qué va a dónde:
+
+- **Enviadas a los proveedores**: solo los rebotes permanentes y las quejas que se aplican a todo el correo. Se envían
+  entrada por entrada, en el orden en que se unieron a la lista compartida, incluidos los rebotes tardíos y el historial
+  importado.
+- **Se quedan en ReputeCast**: las bajas y otras supresiones solo de marketing, para que los restablecimientos de
+  contraseña y los recibos sigan llegando, porque la lista de un proveedor detiene todos los mensajes. Las entradas
+  manuales y otras supresiones que se aplican a todo el correo también se quedan en ReputeCast, y ReputeCast las sigue
+  bloqueando para todo el correo antes de entregar un mensaje.
+- **Las salidas de la lista también se sincronizan**: una dirección que sale de la lista compartida sale de la lista del
+  proveedor.
+
+La fila de cada proveedor indica la lista con la que se sincroniza y cómo participa:
+
+- **Bidireccional**: ReputeCast recibe las supresiones propias del proveedor en la lista compartida y le envía de vuelta
+  los rebotes permanentes y las quejas. Amazon SES se sincroniza con la lista del tenant propio del espacio de trabajo,
+  nunca con toda tu cuenta de AWS; sin un tenant, todas las aplicaciones de la cuenta de AWS comparten la lista de nivel
+  de cuenta de SES, así que ReputeCast solo la lee. Postmark mantiene una lista por flujo de mensajes, y Mailgun una por
+  dominio de envío.
+- **Solo recibir**: el proveedor muestra sus supresiones, pero su API no acepta otras nuevas (Brevo). ReputeCast las
+  recibe.
+- **Solo local** (se muestra como Aplicada localmente): el proveedor no tiene API de supresiones (Postal, SMTP, Azure
+  Communication Services, el adaptador HTTP genérico). ReputeCast comprueba la lista compartida antes de cada envío.
+
+La sincronización se ejecuta cada 15 minutos para todos los proveedores, y poco después de que un evento añada
+supresiones nuevas. Para ejecutarla ahora, elige <UiPath path="providers.events.syncAll" /> (necesita
+`providers:manage`). La tarjeta muestra lo que cada proveedor recibió y envió, cuántas entradas siguen pendientes, la
+última sincronización y cualquier error. Lee [La lista de supresión](/es/audience/suppressions/) para añadir, subir o
+quitar direcciones a mano.
+
+## Comprobación del seguimiento del proveedor
+
+Algunos proveedores añaden su propio píxel de apertura o reescriben los enlaces para el seguimiento de clics. Con el
+seguimiento de ReputeCast encima, las aperturas se cuentan dos veces y los enlaces se reescriben dos veces. Una vez al
+día, ReputeCast lee la configuración de seguimiento de cada proveedor, y la tarjeta
+<UiPath path="providers.events.trackingTitle" /> muestra lo que encontró. Con un proveedor que hace seguimiento, puedes:
+
+- desactivar su seguimiento mediante la API del proveedor (cuando la API lo permite),
+- mantener el seguimiento del proveedor e ignorar el de ReputeCast, o
+- volver al seguimiento de ReputeCast.
+
+Brevo añade su propio seguimiento por defecto; lee [Enviar con Brevo](/es/providers/brevo/).
+
+## Valores predeterminados y límites
+
+<LimitsTable area="providers" />
+
+## Cuándo cambiarlos
+
+- **Los eventos dejan de llegar**: ReputeCast marca un proveedor como Degradado cuando sus webhooks siguen en silencio
+  mientras acepta correo. Los webhooks silenciosos por sí solos generan una alarma, no una conmutación por error. Lee
+  [Estado de los proveedores y caídas](/es/providers/health-and-outages/).
+- **Tu servidor no puede recibir webhooks desde internet**: en Amazon SES, cambia la conexión a la cola SQS.
+- **Rotaste los secretos de los webhooks**: los proveedores cuyo webhook configuraste a mano necesitan el secreto nuevo,
+  o sus eventos se rechazan. Lee
+  [Valores de envío predeterminados del espacio de trabajo](/es/providers/workspace-defaults/).
+- **Vienes de otra plataforma**: recibe las supresiones de tu proveedor anterior antes de tu primer envío. Lee
+  [Pasar a ReputeCast sin perder el consentimiento](/es/migrate/overview/).
+
+<Aside type="note">
+Los payloads sin procesar de los proveedores se conservan 90 días, y el registro de eventos muestra los eventos de los
+últimos 90 días.
+</Aside>
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="La lista de supresión" href="/es/audience/suppressions/" />
+  <LinkCard title="Rebotes, quejas y límites de los proveedores" href="/es/deliverability/bounces-and-complaints/" />
+  <LinkCard title="Leer los informes de campaña" href="/es/campaigns/reports/" />
+  <LinkCard title="Recibir webhooks" href="/es/developers/webhooks/" />
+</CardGrid>

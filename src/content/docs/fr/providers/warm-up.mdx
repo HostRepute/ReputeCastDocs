@@ -1,0 +1,197 @@
+---
+title: Chauffer un nouveau fournisseur ou une nouvelle IP
+description: Suivez un plan de chauffe d’IP dans ReputeCast, avec un plafond quotidien appliqué à l’envoi, les contacts engagés d’abord et un ralentissement automatique.
+type: how-to
+audience: [admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabWarmup'
+primaryKeyword: plan de chauffe d’IP
+sources:
+  - internal/warmup
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/audience.go
+  - internal/sending/engine/automation.go
+  - internal/sending/engine/transactional.go
+  - internal/automations/engine.go
+  - internal/routing/routing.go
+  - web/src/features/providers/WarmupPage.tsx
+  - web/src/features/providers/warmup-model.ts
+  - web/src/features/providers/warmup.messages.ts
+  - web/src/features/live/States.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Une nouvelle [IP dédiée](/fr/reference/glossary/#dedicated-ip), un nouveau fournisseur d’envoi ou votre propre serveur
+Postal n’ont aucun historique d’envoi : les fournisseurs de messagerie se méfient donc d’un afflux soudain d’e-mails
+venant d’eux. Un plan de [chauffe](/fr/reference/glossary/#warm-up) leur donne un plan de chauffe d’IP : un plafond
+quotidien qui augmente sur quelques semaines et s’applique à mesure que les e-mails partent, les e-mails d’abord envoyés
+à vos contacts les plus engagés, et un ralentissement automatique quand les rebonds ou les plaintes augmentent.
+
+## Avant de commencer
+
+- Connectez le fournisseur. Lisez [Connecter un fournisseur d’envoi](/fr/providers/connect/).
+- Pour que sa part des Diffusions augmente selon le calendrier, placez-le dans une répartition pondérée sur la route
+  Diffusions à côté d’un fournisseur dont la chauffe est déjà terminée, par exemple 90 % Amazon SES et 10 % Postal. Vous
+  le configurez à l’étape Flux de l’assistant de connexion (rôle Répartition pondérée) ou sur la page de routage. Lisez
+  [Router les e-mails entre fournisseurs](/fr/providers/routing/).
+- Il vous faut l’autorisation `providers:manage`. Avec `providers:view`, vous pouvez suivre un plan.
+- Les niveaux d’engagement viennent de la [santé de la liste](/fr/audience/list-health/) : Actif, En baisse, À risque et
+  Arrêt progressif.
+
+## Lancer un plan
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.providers > providers.tabWarmup" /> et choisissez <UiPath path="providers.warmup.newPlan" />.
+
+2. Choisissez le <UiPath path="providers.warmup.provider" /> et la <UiPath path="providers.warmup.length" />. Saisissez
+   son <UiPath path="providers.warmup.dedicatedIp" /> s’il en a une ; laissez le champ vide pour chauffer le pool d’IP
+   partagé du fournisseur pour votre domaine.
+
+3. Choisissez <UiPath path="providers.warmup.startWarmup" />. L’état du fournisseur passe à En chauffe · jour 1 sur N,
+   le plafond de son premier jour est de 200 e-mails, et sa part des Diffusions démarre à 10 %. Un nouveau plan envoie
+   d’abord aux contacts engagés, plafonne chaque fournisseur de messagerie séparément et fait passer ce qui dépasse le
+   plafond par un fournisseur à chauffe terminée. Chaque fournisseur ne peut avoir qu’un plan à la fois.
+
+4. Ajustez les <UiPath path="providers.warmup.settingsTitle" /> si nécessaire, puis choisissez
+   <UiPath path="providers.warmup.savePlan" />. Le plafond du jour reste inchangé ; les modifications s’appliquent aux
+   jours suivants.
+   - <UiPath path="providers.warmup.length" /> : 14 jours comptés (rapide), 21 (recommandé pour une nouvelle IP dédiée)
+     ou 30 (prudent). Une nouvelle durée recalcule les jours à venir depuis le plafond du jour jusqu’au même volume
+     final : le plafond du jour ne fait donc jamais de saut. Un plan ne peut pas être plus court que les jours qu’il a
+     déjà comptés.
+   - <UiPath path="providers.warmup.ordering" /> : <UiPath path="providers.warmup.orderEngaged" />, ou
+     <UiPath path="providers.warmup.orderRandom" />, qui envoie à tous les niveaux d’engagement dès le premier jour.
+   - <UiPath path="providers.warmup.slowIfBounces" /> un taux de rebond,
+     <UiPath path="providers.warmup.orComplaints" /> un taux de plainte.
+   - <UiPath path="providers.warmup.whenTrips" /> : maintenir le plafond jusqu’à 2 jours sains d’affilée (par défaut),
+     <UiPath path="providers.warmup.actionStepBack" /> ou <UiPath path="providers.warmup.actionPause" />.
+   - <UiPath path="providers.warmup.spread" />.
+
+</Steps>
+
+<Screenshot
+  id="providers-warmup"
+  alt="Une IP dédiée Postal au jour 9 sur 21 avec 8 jours comptés sur 21 : l’encadré qui explique comment le plan avance, le plafond du jour de 6 000 sans rien d’envoyé un jour sans diffusion, si bien que le jour 9 se répète demain, les taux de rebond et de plainte sur 7 jours sous leurs seuils de protection, un ralentissement, la montée en charge du volume quotidien et les plafonds du jour par fournisseur de messagerie."
+/>
+
+## Comment fonctionne le calendrier
+
+1. **La montée en charge.** Le jour 1 compte 200 e-mails. Le plafond augmente chaque jour du même facteur jusqu’à ce que
+   le dernier jour atteigne la cible : la plus grande audience de campagne à ce jour, ou 48 000 si l’espace de travail
+   n’a encore envoyé aucune campagne. La limite de cadence du jour étale le plafond sur environ une heure et ne dépasse
+   jamais la cadence maximale propre au fournisseur.
+2. **Le plafond s’applique à mesure que les e-mails partent.** Chaque flux envoyé par le fournisseur compte dans le
+   plafond du jour, dans le fuseau horaire de l’espace de travail. Avec des plafonds par fournisseur de messagerie,
+   chacun reçoit sa part du plafond, si bien que les fournisseurs de messagerie stricts ont des plafonds plus bas ;
+   Gmail inclut les destinataires Google Workspace et Outlook ceux de Microsoft 365, identifiés grâce aux enregistrements
+   MX.
+3. **Qui reçoit les e-mails en premier.** Avec l’ordre engagés d’abord, le premier quart des jours n’envoie qu’aux
+   contacts Actif, les contacts En baisse s’ajoutent jusqu’à la moitié du plan, les contacts À risque après, et le dernier
+   jour envoie à tous les niveaux. Un destinataire de Diffusions hors des niveaux du jour passe par la plus grande part à
+   chauffe terminée de la même route, ou à défaut par le secours de la route.
+4. **Ce qui dépasse le plafond.** Cela dépend du flux :
+   - **Diffusions** passe par un fournisseur à chauffe terminée de la route quand le plan y fait passer ce qui dépasse le
+     plafond (débordement). Sans débordement, ou sans fournisseur à chauffe terminée, la part du fournisseur dans l’envoi
+     est retenue au plafond : une [route retenue](/fr/reference/glossary/#held-route) qui reprend d’elle-même avec le
+     plafond du lendemain. La page du plan et le [suivi en direct](/fr/campaigns/live-monitor/) montrent la campagne en
+     attente, avec trois choix : <UiPath path="providers.warmup.holdWait" /> pour le prochain plafond, transférer les
+     destinataires retenus vers un fournisseur qui réussit les contrôles de basculement, ou
+     <UiPath path="providers.warmup.holdCancel" /> de cette part. Attendre et transférer demandent `campaigns:send` ;
+     annuler demande `campaigns:pause`.
+   - **Automatisations** attend au plafond et pendant que le plan est en pause, ou passe par le secours à chauffe
+     terminée du flux quand le plan autorise le débordement. Rien n’est perdu, et un embranchement qui attend une
+     ouverture ou un clic d’un e-mail retenu ne démarre sa fenêtre qu’une fois l’e-mail parti.
+   - **Transactionnel** n’attend jamais : les e-mails passent par un fournisseur à chauffe terminée de leur route, ou
+     sont envoyés et comptés au-delà du plafond du jour. La carte des plafonds indique combien l’ont dépassé.
+5. **La part des Diffusions.** Si le fournisseur fait partie d’une répartition pondérée des Diffusions avec un autre
+   fournisseur, sa part passe de 10 % à 15 %, 25 % et enfin 40 % au fil du plan ; la part est prise au plus grand autre
+   fournisseur de la répartition. La répartition est stable : les destinataires déjà passés au fournisseur en chauffe y
+   restent.
+6. **Les jours comptés.** Un plan compte des jours comptés, pas des jours calendaires. ReputeCast vérifie chaque plan en
+   cours toutes les heures. Quand un jour se termine, il compte si au moins 80 % de son plafond est parti et si les seuils
+   de protection ont tenu ; sinon, le même jour se répète le lendemain. Les seuils de protection ne jugent un jour qu’une
+   fois 500 messages envoyés : une plainte sur 200 ne bloque donc jamais la montée en charge. Le taux de rebond est le
+   nombre de rebonds par message envoyé ; le taux de plainte ne compte que les fournisseurs de messagerie qui signalent
+   les plaintes, ce que Gmail et iCloud ne font pas.
+7. **Les ralentissements.** Quand le taux de rebond ou de plainte d’un jour jugé dépasse son seuil de protection, le jour
+   ne compte pas et le plan fait ce que vous avez choisi. Avec le maintien, le plafond est maintenu jusqu’à 2 jours sains
+   d’affilée pendant que le plan reste sur son jour ; la montée en charge reprend ensuite un cran au-dessus du plafond
+   maintenu. Avec le retour en arrière, le plafond recule d’abord d’un jour, est maintenu de la même façon, puis la
+   montée en charge reprend au jour qui a déclenché le seuil. Avec la pause, le plan attend que quelqu’un le relance.
+   Chaque étape est inscrite dans le <UiPath path="providers.warmup.logTitle" />.
+8. **La fin.** Après le dernier jour compté, le plan est terminé, l’état du fournisseur redevient Opérationnel et il peut
+   recevoir le basculement des Diffusions avec la politique réservée aux fournisseurs à chauffe terminée.
+
+### Lire le plan
+
+Le titre indique le jour (« jour 9 sur 21 »), les jours comptés jusqu’ici et la date de fin la plus proche du plan. Sous
+<UiPath path="providers.warmup.howTitle" />, il indique ce qui fait compter le jour, par exemple « Aujourd’hui compte dès
+que 4 800 sont envoyés ; 1 200 pour l’instant », ou que le jour se répète demain parce que trop peu d’e-mails sont partis.
+Viennent ensuite le plafond du jour et ce qui a été envoyé aujourd’hui, tout ce qui a été envoyé pendant la chauffe, les
+taux de rebond et de plainte sur 7 jours à côté de leurs seuils de protection, les ralentissements jusqu’ici et la limite
+de cadence du jour.
+
+Le graphique <UiPath path="providers.warmup.rampTitle" /> et le tableau en dessous affichent le plafond de chaque jour
+(les plafonds maintenus l’indiquent), ce qui a été envoyé, ses taux de rebond et de plainte, les niveaux auxquels il a
+envoyé et s’il a compté : <UiPath path="providers.warmup.badgeCounted" />,
+<UiPath path="providers.warmup.badgeNotCounted" /> avec la raison, <UiPath path="providers.warmup.badgeHeld" /> (un jour
+sain pendant le maintien d’un ralentissement), Aujourd’hui, Prévu ou En pause. <UiPath path="providers.warmup.capsTitle" />
+liste le plafond du jour et ce qui a été envoyé par fournisseur de messagerie, avec l’interrupteur
+<UiPath path="providers.warmup.overflowLabelNone" /> et les e-mails transactionnels envoyés au-delà du plafond
+aujourd’hui.
+
+Pour suspendre la montée en charge un temps, choisissez <UiPath path="providers.warmup.pause" />. La pause fige le plan :
+le fournisseur n’envoie rien, les Diffusions passent par un fournisseur à chauffe terminée de la route ou attendent, les
+Automatisations attendent, les e-mails Transactionnel vont vers un fournisseur à chauffe terminée ou comptent au-delà du
+plafond, et les jours de pause ne comptent pas. <UiPath path="providers.warmup.resume" /> reprend le plan au jour où il
+s’est arrêté.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="warm-up" />
+
+## Vérifier le résultat
+
+- <UiPath path="nav.providers > providers.tabProviders" /> affiche le fournisseur comme En chauffe · jour N sur M, avec
+  le plafond de chauffe du jour.
+- <UiPath path="nav.providers > providers.tabRouting" /> affiche les hausses de part prévues sous la répartition
+  pondérée, et l’onglet Campagne du testeur de routes montre ce que la prochaine diffusion envoie par le fournisseur en
+  chauffe, au-delà de son plafond et retenu.
+- Après le premier jour complet, le journal de chauffe contient une entrée « Jour 1 compté » avec ce qui a été envoyé et
+  le taux de rebond, ou indique pourquoi le jour s’est répété.
+
+## Dépannage
+
+- **« Tous les fournisseurs connectés ont déjà un plan de chauffe »** : chaque fournisseur n’a qu’un plan à la fois.
+  Modifiez plutôt les paramètres du plan en cours.
+- **Le plan reste sur le même jour** : moins de 80 % du plafond du jour est parti, par exemple un jour sans diffusion. Le
+  jour se répète jusqu’à ce que suffisamment d’e-mails partent ; le tableau et le journal indiquent les jours qui n’ont
+  pas compté.
+- **Une campagne attend au plafond de chauffe** : aucun fournisseur à chauffe terminée ne partage la route Diffusions, ou
+  le débordement est désactivé. Choisissez d’attendre, de transférer ou d’annuler le reste sur la page du plan ou dans le
+  suivi en direct, ou activez le débordement et ajoutez un fournisseur à chauffe terminée à la répartition.
+- **La part des Diffusions n’augmente pas** : le fournisseur doit faire partie de la répartition pondérée des Diffusions
+  avec au moins un autre fournisseur dont la part peut céder la différence. Une part que vous avez augmentée à la main
+  au-dessus de la part prévue reste telle quelle.
+- **Un ralentissement dès les premiers jours** : des rebonds sur une nouvelle IP signifient en général des adresses
+  anciennes ou non vérifiées. Vérifiez la [santé de la liste](/fr/audience/list-health/) et les codes de rebond dans le
+  [journal des événements](/fr/providers/events-and-sync/).
+- **Le plan s’est mis en pause tout seul** : le seuil de protection s’est déclenché et le plan est réglé pour se mettre
+  en pause jusqu’à ce que vous le relanciez. Lisez dans le journal de chauffe le jour et le fournisseur de messagerie qui
+  a le plus de rebonds, corrigez la cause, puis choisissez <UiPath path="providers.warmup.resume" />.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Router les e-mails entre fournisseurs" href="/fr/providers/routing/" />
+  <LinkCard title="Garder votre liste en bonne santé" href="/fr/audience/list-health/" />
+  <LinkCard title="Envoyer avec votre propre serveur Postal" href="/fr/providers/postal/" />
+  <LinkCard title="Suivre un envoi et la pause automatique" href="/fr/campaigns/live-monitor/" />
+</CardGrid>

@@ -1,0 +1,159 @@
+---
+title: API-Fehler
+description: "API-Fehler nach RFC 9457 in ReputeCast: die Felder von problem+json, Beispiele für Berechtigungs-, Validierungs- und Rate-Limit-Fehler und jeder Fehlercode."
+type: reference
+audience: [developer]
+primaryKeyword: API-Fehler nach RFC 9457
+sources:
+  - internal/api/errors.go
+  - internal/api/auth.go
+  - internal/api/integrations.go
+  - internal/api/lang.go
+  - internal/api/messages/en.json
+  - internal/api/messages/vi.json
+  - internal/authz/messages/en.json
+  - internal/authz/messages/vi.json
+  - internal/authz/authz.go
+  - internal/server/ratelimit.go
+  - internal/app/app.go
+  - internal/app/schema.go
+sidebar:
+  order: 4
+---
+
+import ErrorCodesTable from '~/components/ErrorCodesTable.astro'
+
+Jeder fehlgeschlagene Aufruf der REST-API von ReputeCast antwortet mit einem Problem-Dokument nach RFC 9457: Die
+API-Fehler nach RFC 9457 unten haben alle dieselbe JSON-Form, ausgeliefert als `application/problem+json`, mit einem
+stabilen `code`, nach dem Ihr Programm verzweigen kann. Das Format ist in
+[RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) definiert (geprüft im Oktober 2026).
+
+## Felder des Problem-Dokuments
+
+| Feld         | Typ      | Bedeutung                                                                                                                                                                                       |
+| ------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`     | integer  | Der HTTP-Statuscode, derselbe wie der der Antwort.                                                                                                                                              |
+| `title`      | string   | Der HTTP-Statustext, etwa `Forbidden`.                                                                                                                                                          |
+| `detail`     | string   | Ein Satz, nach dem eine Person handeln kann. Er kann sich zwischen Releases ändern und in der Sprache der lesenden Person sein; zeigen Sie ihn also an, statt ihn auszuwerten.                 |
+| `code`       | string   | Der stabile, maschinenlesbare Code, etwa `permission_denied`. Siehe [Fehlercodes](#fehlercodes).                                                                                                |
+| `permission` | string   | Der fehlende [Berechtigungsschlüssel](/de/reference/glossary/#permission), bei `permission_denied` und bei `escalation_denied`, wenn eine Berechtigung fehlt.                                   |
+| `helpers`    | string[] | Bis zu zwei Mitglieder, die die fehlende Berechtigung haben, Inhaber zuerst, damit eine Person weiß, wen sie fragen kann.                                                                      |
+| `errors`     | object[] | Bei ungültigen Anfragen: ein Eintrag je Problem, mit `message`, `location` (etwa `body.email` oder `query.pageSize`) und `value`.                                                               |
+| `meta`       | object   | Zusätzliche Angaben bei einigen Codes, zum Beispiel `lockedUntil` und `failures` bei `locked`, `attemptsLeft` bei Anmeldefehlern, `retryAfter` bei Rate-Limits von Shops, `rules` bei `approval_required`, `version` und `startedAt` bei `maintenance`, `reference` bei `internal_error`. |
+
+`type` und `instance` gehören zum Modell von RFC 9457, aber ReputeCast lässt sie weg. Ohne `type` ist der Problemtyp
+`about:blank`, was bedeutet, dass der HTTP-Status alles sagt. Einige Fehler, die das Framework selbst erzeugt, haben
+keinen `code`: Verwenden Sie für diese `status`.
+
+Ein unerwarteter Serverfehler antwortet mit `500`, dem Code `internal_error` und einer Referenz in `meta.reference`,
+etwa `err_7KQ2M4XA`, nie mit dem Text des Fehlers selbst. Der Server protokolliert den Fehler unter dieser Referenz mit
+der Anfrage-ID, sodass ein Betreiber ihn findet, indem er die Protokolle nach der Referenz durchsucht.
+
+Unbekannte Pfade unter `/api/` antworten mit `404`, dem Code `not_found` und dem Detail „No such API endpoint.“
+
+## Beispiel-Bodys
+
+### Fehlende Berechtigung
+
+Ein Schlüssel oder Mitglied ohne die Berechtigung, die eine Operation braucht, erhält `403`. `detail` sagt, was der
+Aufrufer nicht tun kann und wer helfen kann, nie den Schlüssel; der Schlüssel steht in `permission`, und bis zu zwei
+Mitglieder, die ihn haben (zuerst Inhaber, dann Admins), stehen in `helpers`:
+
+```json title="403 Forbidden"
+{
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "Sending needs a permission you don't have. Ask Marcus Chen or Linh Nguyen.",
+  "code": "permission_denied",
+  "permission": "campaigns:send",
+  "helpers": ["Marcus Chen", "Linh Nguyen"]
+}
+```
+
+Erstellen Sie einen Schlüssel, der die Berechtigung hat, oder fragen Sie eines der Mitglieder in `helpers`. Ein
+Schlüssel hat nie mehr Berechtigungen als das Mitglied, das ihn erstellt hat (siehe
+[Authentifizierung und API-Schlüssel](/de/developers/api-authentication/)).
+
+### Ungültige Anfrage
+
+Ein Parameter oder Body-Feld, das gegen das Schema verstößt, antwortet mit `422` und einem Eintrag je Problem in
+`errors`. Fehlerhafte Anfragen, etwa JSON, das sich nicht parsen lässt, antworten mit `400` und demselben Code.
+
+```json title="422 Unprocessable Entity"
+{
+  "title": "Unprocessable Entity",
+  "status": 422,
+  "detail": "validation failed",
+  "errors": [{ "message": "expected number <= 100", "location": "query.pageSize", "value": 500 }],
+  "code": "validation_failed"
+}
+```
+
+Prüfungen, die ReputeCast selbst vornimmt, setzen den Satz in `detail` und das Feld in `errors`, zum Beispiel
+`"detail": "Use a work email."` mit `"location": "body.email"`.
+
+### Rate-Limit erreicht
+
+Oberhalb der Anfragerate pro Schlüssel antwortet die API mit `429` und einem Header `Retry-After`:
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Die „1,000 items“ in dieser Meldung gelten für das Hinzufügen von Sperrlisteneinträgen; die Batch-Operation für
+Transaktions-E-Mails nimmt bis zu 100 Nachrichten. Warten Sie die Sekunden in `Retry-After` ab und senden Sie dann
+erneut. [Rate-Limits](/de/developers/api-rate-limits/) listet jedes Limit auf.
+
+## Sprache von `detail`
+
+Die Sätze, die ReputeCast in `detail` schreibt (etwa fehlende Berechtigungen, Anmeldeprobleme, nicht Gefundenes und
+seine eigenen Validierungsprüfungen), sind in der Sprache der Anfrage, wenn ReputeCast sie hat (`en` oder `vi` und ab
+dem nächsten Release nach 1.3.1 auch `de`, `es` und `fr`): die Sprache, die der Header `Accept-Language` anfordert,
+sonst die eigene App-Sprache des angemeldeten Mitglieds, sonst
+Englisch. API-Schlüssel erhalten Englisch, sofern Sie den Header nicht senden. Was das Framework schreibt, bleibt
+Englisch, etwa `validation failed` und Meldungen in `errors` wie `expected number <= 100`. Mit `Accept-Language: vi`
+lautet das Detail einer fehlenden Kampagne `Không tìm thấy chiến dịch.`, und das Detail einer fehlenden Berechtigung
+lautet zum Beispiel:
+
+```json title="403 Forbidden, Accept-Language: vi"
+{
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "Bạn chưa có quyền quản lý khóa API. Hãy hỏi Marcus Chen hoặc Linh Nguyen.",
+  "code": "permission_denied",
+  "permission": "apikeys:manage",
+  "helpers": ["Marcus Chen", "Linh Nguyen"]
+}
+```
+
+`code`, `permission` und die anderen Felder ändern sich nie mit der Sprache.
+
+## Fehler behandeln
+
+- Verzweigen Sie nach `status` und `code`. Behandeln Sie `detail` als Text für eine Person.
+- `401`: Der Schlüssel fehlt, ist unbekannt, widerrufen oder abgelaufen. Korrigieren Sie den Schlüssel; ein erneuter
+  Versuch hilft nicht.
+- `403`: Eine Berechtigung fehlt (`permission_denied`), die Operation braucht eine angemeldete Person (`humans_only`),
+  oder ein Integrationsschlüssel hat etwas aufgerufen, das seine Integration nicht verwendet
+  (`integration_operation_denied`).
+- `404`, `409`, `410`, `422`: Korrigieren Sie die Anfrage. Codes bei `409` wie `version_conflict` und
+  `idempotency_key_reused` sagen, was sich geändert hat.
+- `429`: Warten Sie `Retry-After` ab. Bei Transaktions-E-Mails versuchen Sie es mit demselben `Idempotency-Key` erneut,
+  damit eine Nachricht nur einmal gesendet wird (siehe
+  [Transaktions-E-Mails mit der API senden](/de/developers/transactional-api/)).
+- `502` und `503`: Ein externer Dienst oder ein Teil des Servers hat nicht geantwortet. Versuchen Sie es mit wachsender
+  Verzögerung erneut.
+- `503` mit `maintenance`: Der Server wird aktualisiert und wartet auf seine Datenbankmigrationen. Lesezugriffe
+  funktionieren weiter; wiederholen Sie eine Änderung nach `Retry-After` (30 Sekunden).
+
+## Fehlercodes
+
+Die Codes sind nach Bereich gruppiert. Ein Code kann in manchen Operationen mit einem anderen HTTP-Status antworten;
+die Tabelle nennt den üblichen.
+
+<ErrorCodesTable headingLevel={3} />

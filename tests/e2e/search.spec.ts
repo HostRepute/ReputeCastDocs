@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test'
+import { PREFIXED_LOCALES } from '../../src/lib/locales.ts'
 
 for (const [home, prefix] of [
   ['/', '/deliverability/'],
-  ['/vi/', '/vi/deliverability/'],
+  ...PREFIXED_LOCALES.map((l) => [`/${l}/`, `/${l}/deliverability/`] as const),
 ] as const) {
   test(`search finds the DMARC pages from ${home}`, async ({ page }) => {
     await page.goto(home)

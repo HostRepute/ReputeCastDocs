@@ -1,9 +1,10 @@
 import type { Loc } from '../data/schemas.ts'
+import { isLang, localizedPath } from './locales.ts'
 
-/** Vietnamese text when the page is Vietnamese and a translation exists, else English. */
+/** The page's language when a translation exists, else English. */
 export function pick(text: Loc | undefined, lang: string): string {
   if (!text) return ''
-  return lang === 'vi' ? (text.vi ?? text.en) : text.en
+  return (lang !== 'en' && isLang(lang) ? text[lang] : undefined) ?? text.en
 }
 
 /** Stable heading/anchor id from English text (identical anchors in every locale). */
@@ -37,7 +38,7 @@ function escapeHtml(text: string): string {
 
 /**
  * Renders the small Markdown subset used in catalog text (`code`, **bold**, [text](/path/)) to HTML.
- * Everything else is escaped. Root-relative links get the `/vi` prefix on Vietnamese pages.
+ * Everything else is escaped. Root-relative links get the page's locale prefix (`/vi`, `/de`, …).
  */
 export function inline(text: string, lang = 'en'): string {
   const parts = text.split(/(`[^`]+`)/g)
@@ -48,7 +49,7 @@ export function inline(text: string, lang = 'en'): string {
       return escapeHtml(part)
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label: string, href: string) => {
-          const target = lang === 'vi' && href.startsWith('/') && !href.startsWith('/vi/') ? `/vi${href}` : href
+          const target = href.startsWith('/') ? localizedPath(href, lang) : href
           return `<a href="${target}">${label}</a>`
         })
     })

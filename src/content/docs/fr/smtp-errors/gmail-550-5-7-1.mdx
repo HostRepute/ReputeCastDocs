@@ -1,0 +1,138 @@
+---
+title: 'Gmail 550 5.7.1 : bloqué pour spam, réputation ou politique'
+description: L’erreur Gmail 550 5.7.1 signifie un blocage du message comme spam probable, pour faible réputation ou par politique. Trouvez la cause et corrigez-la.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'deliverability:view', 'reports:view']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: erreur Gmail 550 5.7.1
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/readiness/assemble.go
+  - internal/contentcheck/contentcheck.go
+  - internal/dnscheck/dnsbl.go
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  label: Gmail 550 5.7.1
+  order: 3
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+L’erreur Gmail 550 5.7.1 est un refus permanent que Gmail utilise pour plusieurs raisons : le message semble non
+sollicité, l’adresse IP ou le domaine d’envoi a une très faible réputation, ou une politique interdit le message. Le
+texte de Gmail indique de quel cas il s’agit, et chacun demande une correction différente.
+
+## Ce que veut dire Gmail
+
+Voici les textes que les expéditeurs de newsletters rencontrent le plus souvent avec 550 5.7.1 :
+
+> This message is likely unsolicited email. To reduce the amount of spam sent to Gmail, this message has been blocked.
+
+> This message is likely suspicious due to the very low reputation of the sending IP address. To best protect our users
+> from spam, the message has been blocked.
+
+Le même texte existe pour « the very low reputation of the sending domain ». Parmi les autres textes de 550 5.7.1 :
+
+- « The user or domain that you are sending to (or from) has a policy that prohibits the email that you sent. » Gmail
+  ajoute `gcdp` aux erreurs qui viennent d’une règle personnalisée créée par un administrateur Google Workspace.
+- « The IP you're using to send email is not authorized to send email directly to our servers. Use the SMTP relay at
+  your service provider instead. »
+- « This message is not RFC 5322 compliant », avec l’en-tête manquant, en double ou mal formé.
+- « This email has been rate limited. »
+
+Source : [Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+aide Google Workspace. Vérifié en octobre 2026.
+
+## Pourquoi cela arrive
+
+- **Probablement non sollicité.** Les filtres de Gmail jugent les e-mails indésirables : des contacts qui n’ont pas
+  donné leur consentement ou qui ont cessé de lire, un taux de spam élevé, ou un contenu qui ressemble à du spam.
+- **Faible réputation.** L’adresse IP ou le domaine d’envoi a un historique d’e-mails indésirables, ou est nouveau et
+  envoie beaucoup d’un coup.
+- **Politique.** L’administrateur Google Workspace du destinataire bloque le message (`gcdp`), ou Gmail n’accepte pas la
+  livraison directe depuis l’adresse IP, ce qui peut arriver quand vous envoyez depuis votre propre serveur.
+- **En-têtes.** Le message ne respecte pas la RFC 5322, par exemple avec un en-tête From manquant ou en double.
+
+## Comment ReputeCast la classe
+
+La [classe de rebond](/fr/reference/glossary/#bounce-class) suit le texte de Gmail :
+
+| Texte de Gmail                                                                                        | Classe de rebond |
+| ----------------------------------------------------------------------------------------------------- | ---------------- |
+| E-mail probablement non sollicité, ou non conforme à la RFC 5322 (les deux mentionnent le spam)       | `spam_block`     |
+| Très faible réputation de l’adresse IP ou du domaine d’envoi                                          | `reputation`     |
+| Une politique interdit l’e-mail, l’IP n’est pas autorisée, débit limité, ou le code seul               | `policy_block`   |
+
+Les trois classes partagent la ligne de rapport <UiPath path="reports.bounceType.blocked" />. Le refus concerne
+l’expéditeur, pas l’adresse : ReputeCast n’exclut donc jamais l’adresse pour ce motif, que le fournisseur d’envoi
+enregistre un rebond temporaire ou définitif (voir
+[quand ReputeCast exclut une adresse](/fr/smtp-errors/#quand-reputecast-exclut-une-adresse)). Dans le rapport de
+campagne, <UiPath path="reports.investigate" /> sur cette ligne montre ce qu’a dit chaque fournisseur d’envoi, et
+<UiPath path="reports.retryTitle" /> crée de nouveau un brouillon du numéro pour ces adresses une fois la cause corrigée.
+
+Pendant un envoi, les rebonds définitifs comptent dans le seuil de rebonds de blocage/politique de Gmail, qui met Gmail
+en pause par défaut. Il demande moins de preuves que les autres taux, et une rafale de blocages en quelques minutes le
+déclenche aussi ; les [valeurs par défaut de la pause automatique](/fr/campaigns/live-monitor/#valeurs-par-défaut-et-limites)
+en donnent les chiffres, et les [règles de trafic](/fr/providers/traffic-rules/) permettent de les modifier.
+
+## Avant de commencer
+
+- `providers:view` pour lire le journal des événements.
+- `deliverability:view` pour les contrôles des domaines, des IP et des listes de blocage.
+- `reports:view` pour comparer les campagnes.
+
+## Trouver la cause et la corriger
+
+<Steps>
+
+1. Lisez le texte de Gmail. Ouvrez <UiPath path="nav.providers > providers.tabEvents" />, filtrez
+   <UiPath path="providers.events.typeFilter" /> sur <UiPath path="providers.events.optionSoftBounce" /> ou
+   <UiPath path="providers.events.optionHardBounce" />, et recherchez un destinataire Gmail.
+   <UiPath path="providers.events.colCode" /> indique quel 550 5.7.1 vous avez reçu.
+2. Pour **probablement non sollicité**, regardez qui a reçu la campagne. N’envoyez qu’aux contacts qui ont donné leur
+   consentement, excluez ceux qui n’ouvrent plus ([garder une liste saine](/fr/audience/list-health/)), et vérifiez les
+   [avertissements de contenu](/fr/campaigns/content-checks/) que l’éditeur affiche.
+3. Pour une **faible réputation**, ouvrez <UiPath path="nav.deliverability > placement.health" /> : vérifiez la santé
+   du domaine et de l’IP, et si l’adresse IP ou le domaine figure [sur une liste de blocage](/fr/deliverability/blocklists/).
+   Si l’adresse IP ou le domaine est nouveau, ralentissez et [faites-le chauffer](/fr/providers/warm-up/).
+4. Pour une **politique** avec `gcdp`, l’organisation du destinataire bloque le message. Rien dans votre configuration
+   n’en est la cause ; le destinataire peut demander à son administrateur d’autoriser vos e-mails.
+5. Pour une **IP non autorisée**, envoyez via un fournisseur d’envoi au lieu de livrer directement depuis votre propre
+   serveur, ou relayez les e-mails de votre serveur par l’un d’eux.
+6. Pour **non conforme à la RFC 5322**, examinez l’en-tête que nomme Gmail. Si vous envoyez via
+   l’[adaptateur HTTP générique](/fr/adapters/generic-http/) ou un adaptateur communautaire, vérifiez les en-têtes
+   qu’ajoute sa correspondance.
+
+</Steps>
+
+## Vérifier le résultat
+
+- Le rapport de la campagne suivante contient moins d’entrées 550 5.7.1, voire aucune, dans
+  <UiPath path="reports.colCodes" />.
+- La Délivrabilité n’affiche aucune inscription en liste de blocage pour vos adresses IP et domaines d’envoi.
+
+## Dépannage
+
+- **Seuls les e-mails d’un fournisseur d’envoi sont bloqués.** Ses adresses IP sont la cause probable. Faites passer la
+  part Gmail par un autre fournisseur d’envoi avec une [route](/fr/providers/routing/) pendant que vous corrigez le
+  problème.
+- **Vous voyez à la fois le texte « non sollicité » et le texte « faible réputation ».** Traitez l’étape 2 avant
+  l’étape 3 : les deux textes disent que Gmail protège ses utilisateurs du spam.
+- **Les plaintes chez Gmail sont élevées elles aussi.** Lisez
+  [rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/).
+- **Un envoi a mis Gmail en pause pour des rebonds de blocage/politique.** Trouvez la cause avec les étapes ci-dessus
+  avant de reprendre Gmail dans le [suivi en direct](/fr/campaigns/live-monitor/) : chaque nouveau message vers Gmail
+  risque d’être refusé de la même façon.
+
+## Voir aussi
+
+- [Codes d’erreur SMTP](/fr/smtp-errors/)
+- [Gmail 421 4.7.28](/fr/smtp-errors/gmail-421-4-7-28/), la limitation de débit temporaire de Gmail
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)
+- [Vérifier et corriger les inscriptions en liste de blocage](/fr/deliverability/blocklists/)

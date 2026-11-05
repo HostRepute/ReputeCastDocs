@@ -1,0 +1,141 @@
+---
+title: 'Yahoo 421 4.7.0 [TSS04] : messages temporairement différés'
+description: L’erreur Yahoo TSS04 (421 4.7.0) signifie que Yahoo diffère vos messages pour plaintes, contenu, réputation IP ou trafic inhabituel. Ralentir et récupérer.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: erreur Yahoo TSS04
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
+  - internal/sending/engine/analysis.go
+  - internal/ingest/normalize.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+sidebar:
+  label: Yahoo 421 4.7.0 TSS04
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+L’erreur Yahoo TSS04 est un report temporaire : les serveurs de Yahoo répondent `421 4.7.0` avec la balise `[TSS04]`
+quand ils veulent recevoir moins d’e-mails de votre part pour l’instant, le plus souvent à cause de plaintes
+d’utilisateurs Yahoo ou d’une hausse soudaine du volume. Votre fournisseur d’envoi réessaie plus tard. Cette page
+explique ce que regarde Yahoo et comment faire baisser les reports.
+
+## Ce que veut dire Yahoo
+
+Les serveurs de Yahoo répondent avec une ligne comme celle-ci :
+
+```text title="Réponse SMTP"
+421 4.7.0 [TSS04] Messages from 203.0.113.25 temporarily deferred due to unexpected volume or user complaints - 4.16.55.1; see https://postmaster.yahooinc.com/error-codes
+```
+
+Le Sender Hub de Yahoo décrit ces erreurs « TS » comme des messages temporairement différés :
+
+> This is a temporary error and your mail server may automatically re-try sending the email at a later time. Your message
+> may have been deferred due to one or more of the following:
+>
+> - Emails from your mail server are generating substantial complaints from Yahoo users.
+> - The message contained objectionable content or exhibited characteristics indicative of spam.
+> - The IP (`x.x.x.x` or its subnet, i.e., .255 ) has a poor reputation.
+> - We are seeing unusual traffic patterns from your mail servers.
+
+Source : [SMTP Error Codes](https://senders.yahooinc.com/smtp-error-codes/), Yahoo Sender Hub. Vérifié en octobre 2026.
+
+## Pourquoi cela arrive
+
+- Des utilisateurs Yahoo signalent vos e-mails comme spam. Yahoo demande à chaque expéditeur de garder le taux de spam
+  sous 0,3 % ([Sender Requirements & Recommendations](https://senders.yahooinc.com/best-practices/), vérifié en octobre
+  2026).
+- Le volume bondit, par exemple lors de la première grosse campagne depuis une nouvelle adresse IP ou un nouveau
+  fournisseur d’envoi.
+- L’adresse IP d’envoi, ou sa plage, a une mauvaise réputation.
+- Le contenu ressemble à du spam.
+
+## Comment ReputeCast la classe
+
+- Tant que le fournisseur d’envoi réessaie, chaque tentative refusée est un [report](/fr/reference/glossary/#deferral) :
+  un événement <UiPath path="providers.events.optionDeferred" /> dans le journal des événements. Les reports
+  n’apparaissent pas dans le tableau des rebonds du rapport de campagne.
+- Chaque espace de travail démarre avec une [règle de réponse](/fr/reference/glossary/#reply-rule) pour ce code : quand
+  10 réponses de Yahoo contiennent `TSS04` en 10 minutes, ReputeCast met Yahoo en pause pendant 2 heures sur toutes les
+  routes, avant tout seuil de taux. Une deuxième règle par défaut fait de même pour l’ancien `TS04`. Le reste de l’envoi
+  continue, et Yahoo reprend tout seul au bout des 2 heures. Modifiez ou désactivez les règles dans les
+  [règles de trafic](/fr/providers/traffic-rules/).
+- Les reports et les rebonds temporaires comptent aussi dans les seuils de reports de Yahoo, chaque message une fois, sur
+  les 10 dernières minutes. À 15 % des e-mails envoyés à Yahoo, ReputeCast réduit le débit vers Yahoo de moitié ; à
+  40 %, il [met en pause automatiquement](/fr/reference/glossary/#auto-pause) la part Yahoo de la campagne, ou la
+  campagne entière quand la portée de la pause est réglée sur la campagne. Chaque niveau attend 500 messages vers Yahoo
+  sur cette durée et au moins 5 reports.
+- Si le fournisseur d’envoi cesse de réessayer, la [classe de rebond](/fr/reference/glossary/#bounce-class) est
+  `reputation`, d’après la balise `TSS04`, et la ligne du rapport <UiPath path="reports.bounceType.blocked" />. Un
+  blocage lié à la réputation de l’expéditeur n’exclut jamais l’adresse, même quand le fournisseur d’envoi le qualifie
+  de permanent (voir [quand ReputeCast exclut une adresse](/fr/smtp-errors/#quand-reputecast-exclut-une-adresse)).
+- Quand un fournisseur d’envoi ne transmet que `421 4.7.0` sans la balise, la classe est `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+## Avant de commencer
+
+- `providers:view` pour lire le journal des événements.
+- `providers:manage` pour modifier les limitations de débit dans <UiPath path="nav.settings > settings.providers" /> et
+  les règles de réponse dans <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` pour reprendre un envoi mis en pause automatiquement ou modifier ses débits.
+
+## Faire baisser les reports
+
+<Steps>
+
+1. Confirmez le code. Ouvrez <UiPath path="nav.providers > providers.tabEvents" />, réglez
+   <UiPath path="providers.events.typeFilter" /> sur <UiPath path="providers.events.optionDeferred" /> et recherchez un
+   destinataire Yahoo. <UiPath path="providers.events.colCode" /> affiche la balise `[TSS04]` et l’adresse IP que Yahoo
+   a différée.
+2. Ralentissez vers Yahoo. Par défaut, ReputeCast limite Yahoo à 4 messages par seconde sur toutes les routes ;
+   abaissez ce débit dans <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />. Pendant
+   un envoi, abaissez le débit Yahoo avec <UiPath path="live.adjustRates" /> dans le
+   [suivi en direct](/fr/campaigns/live-monitor/). Après une pause automatique, le suivi en direct recommande un débit
+   plus bas pour la part Yahoo ; reprenez avec cette modification.
+3. Faites baisser les plaintes. N’envoyez qu’aux contacts qui ont demandé vos e-mails, excluez ceux qui n’ouvrent plus
+   ([garder une liste saine](/fr/audience/list-health/)), et gardez le
+   [désabonnement en un clic](/fr/deliverability/one-click-unsubscribe/) fonctionnel pour que les lecteurs se
+   désabonnent au lieu de signaler du spam.
+4. Si l’adresse IP ou le fournisseur d’envoi est nouveau, suivez un [plan de chauffe](/fr/providers/warm-up/).
+5. Si les reports durent longtemps, le Sender Hub de Yahoo propose une
+   [Sender Support Request](https://senders.yahooinc.com/contact/#sender-support-request) avec les codes d’erreur et de
+   diagnostic de vos journaux. L’export CSV du journal des événements les contient.
+
+</Steps>
+
+## Vérifier le résultat
+
+- Le taux de reports Yahoo du suivi en direct reste bas pendant l’envoi suivant, et sa ligne
+  <UiPath path="live.model.thresholdReplies" /> montre la règle `TSS04` bien en dessous de son seuil.
+- Le journal des événements montre des événements de livraison pour les destinataires Yahoo au lieu de nouveaux reports
+  `[TSS04]`.
+
+## Dépannage
+
+- **L’envoi se met sans cesse en pause chez Yahoo.** Quand c’est la règle `TSS04` qui l’a mis en pause, laissez Yahoo
+  reprendre tout seul au bout de 2 heures, ou reprenez à un débit plus bas avec <UiPath path="live.adjustRates" />.
+  Abaissez la limitation de débit de Yahoo pour les envois futurs.
+- **Les plaintes chez Yahoo sont élevées.** Lisez
+  [rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/) ; par défaut, un envoi en
+  cours met Yahoo en pause automatiquement quand son taux de plainte dépasse 0,10 %.
+- **Vous envoyez depuis une adresse IP partagée.** Le Sender Hub de Yahoo indique que sur une adresse IP partagée, les
+  e-mails d’autres domaines peuvent nuire à la réputation de votre IP, et suggère de demander des adresses IP dédiées à
+  votre fournisseur. Une nouvelle adresse IP dédiée a besoin d’un plan de chauffe.
+
+## Voir aussi
+
+- [Codes d’erreur SMTP](/fr/smtp-errors/)
+- [Gmail 421 4.7.28](/fr/smtp-errors/gmail-421-4-7-28/), la limitation de débit temporaire de Gmail
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)
+- [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/)

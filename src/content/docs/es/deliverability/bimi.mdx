@@ -1,0 +1,139 @@
+---
+title: Configurar BIMI
+description: "Configurar BIMI para un dominio de envío: aplica DMARC, prepara un logo SVG Tiny PS y un certificado VMC o CMC, publica el registro y revísalo en ReputeCast."
+type: how-to
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: configurar BIMI
+sources:
+  - internal/dnscheck/auth.go
+  - internal/domains/cells.go
+  - internal/domains/check.go
+  - internal/readiness/assemble.go
+  - web/src/features/connect/DomainRecords.tsx
+  - web/src/features/connect/domain.messages.ts
+  - web/src/features/senders/SendersPage.tsx
+sidebar:
+  order: 5
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+[BIMI](/es/reference/glossary/#bimi) (Brand Indicators for Message Identification) permite que las aplicaciones de
+correo compatibles muestren tu logo junto a tus mensajes. Esta guía para configurar BIMI explica qué exigen los
+proveedores de buzón, cómo publicar el registro y qué comprueba ReputeCast: confirma que existe un registro BIMI válido
+para el dominio de envío y lo muestra en <UiPath path="nav.settings > settings.senders" />. BIMI es opcional: que falte
+el registro nunca cambia el veredicto de la [revisión previa](/es/reference/glossary/#send-readiness), y un registro no
+válido solo genera un aviso.
+
+## Qué necesita BIMI
+
+<TableScroll label="Requisitos de BIMI según la fuente">
+
+| Requisito       | BIMI Group                                                   | Gmail                                                                     | Yahoo                                         |
+| --------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------- | --------------------------------------------- |
+| Política DMARC  | `p=quarantine` o `p=reject`, también para los subdominios (`sp=`); `pct` 100 | `p=quarantine` o `p=reject`, `pct=100`                   | `p=quarantine` o `p=reject`                   |
+| Logo            | SVG Tiny PS, el perfil que define el estándar BIMI           | SVG Tiny PS (`baseProfile="tiny-ps"`, `version="1.2"`), al menos 96 px, tamaño en píxeles absolutos | Un logo SVG válido              |
+| Certificado     | VMC o CMC muy recomendado; los logos sin certificado tienen una compatibilidad limitada | Obligatorio: un Verified Mark Certificate (VMC) o un Common Mark Certificate (CMC) | No se menciona   |
+| Otros           | SPF, DKIM y DMARC alineados para todo el correo              | Archivos servidos por HTTPS                                               | Correo masivo con suficiente reputación e interacción |
+
+</TableScroll>
+
+Fuentes, comprobadas en octubre de 2026: [BIMI Group, "Implementation Guide"](https://bimigroup.org/implementation-guide/),
+[Ayuda de Google Workspace Admin, "Set up BIMI"](https://support.google.com/a/answer/10911320) y
+[Yahoo Sender Hub, FAQ](https://senders.yahooinc.com/faqs/). Un VMC necesita una marca registrada para el logo; Google
+indica que el registro de una marca puede tardar de 6 a 12 meses. Un CMC cubre logos sin marca registrada. Ambos los
+emiten las [Mark Verifying Authorities](https://bimigroup.org/vmc-issuers/) que enumera el BIMI Group.
+
+## Antes de empezar
+
+- El dominio de envío tiene SPF, DKIM y DMARC funcionando ([Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)),
+  y los informes DMARC muestran que tu correo legítimo los supera ([Leer los informes agregados de DMARC](/es/deliverability/dmarc-reports/)).
+  Pasar a una política aplicada antes de eso manda correo real a spam.
+- Puedes publicar registros DNS para el dominio y archivos en un servidor web con HTTPS.
+- Para ver el estado de BIMI en ReputeCast necesitas `providers:view`, que tienen los roles Propietario, Administrador,
+  Editor y Lector.
+
+## Publicar tu registro BIMI
+
+<Steps>
+
+1. Pasa DMARC a una política aplicada: `p=quarantine` o `p=reject`, sin `pct` (su valor predeterminado es 100) o con
+   el valor 100. Si el registro está en el dominio organizativo, define también `sp=` para los subdominios.
+
+   ```txt title="_dmarc.acme.io TXT"
+   v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:dmarc-reports@acme.io
+   ```
+
+2. Prepara el logo como archivo SVG Tiny PS. Para Gmail, céntralo en un cuadrado sobre un fondo de color liso y que no
+   pase de 32 KB ([Google, "Set up BIMI"](https://support.google.com/a/answer/10911320), comprobado en octubre de 2026).
+
+3. Solicita un VMC o un CMC para el logo a una Mark Verifying Authority. Recibirás un archivo PEM con el certificado y
+   el logo.
+
+4. Sube el SVG y el archivo PEM a un servidor web de tu dominio que los sirva por HTTPS.
+
+5. Publica un registro TXT en `default._bimi.<sending domain>`, por ejemplo `default._bimi.news.acme.io`:
+
+   ```txt title="default._bimi.news.acme.io TXT"
+   v=BIMI1; l=https://acme.io/brand/bimi-logo.svg; a=https://acme.io/brand/bimi-certificate.pem
+   ```
+
+   Rellena `l=` con la dirección del SVG aunque también publiques un certificado en `a=`: ReputeCast considera no válido
+   un registro sin una dirección de logo `https://`. Sin certificado, omite `a=`.
+
+6. Espera a que los proveedores de buzón lo detecten. Google indica que el logo puede tardar hasta 48 horas en
+   aparecer.
+
+</Steps>
+
+## Qué comprueba ReputeCast
+
+ReputeCast lee el registro TXT de `default._bimi.<sending domain>` cada vez que comprueba los registros del dominio:
+cada 30 minutos y cuando abres la página de registros del dominio.
+
+- Solo mira el propio dominio de envío. Un registro publicado solo en `default._bimi.acme.io` no cuenta para
+  `news.acme.io`.
+- El registro debe empezar por `v=BIMI1` y tener una dirección `l=` que empiece por `https://`.
+- ReputeCast no descarga el logo ni el certificado, y no comprueba la política DMARC para BIMI. Eso lo comprueban los
+  propios proveedores de buzón.
+
+El resultado aparece en tres sitios:
+
+- **La tabla de dominios** en <UiPath path="nav.settings > settings.senders" />, columna BIMI: `Configurado`,
+  `No válido`, `Sin configurar`, o `Sin comprobar` antes de la primera comprobación.
+- **La página de registros del dominio** (selecciona <UiPath path="senders.records" />): la tarjeta
+  <UiPath path="connect.domain.optionalTitle" /> indica si el registro está publicado.
+- **La revisión previa**, grupo Autenticación: "Registro BIMI encontrado" cuando existe y, si no, "BIMI no es
+  obligatorio"; ambos son correctos. Un registro no válido genera un aviso ("El registro BIMI de news.acme.io no es
+  válido"), porque los proveedores de buzón no muestran ningún logo hasta que se corrige. Una consulta DNS que falla da
+  <UiPath path="review.statusUnknown" />. BIMI nunca bloquea un envío.
+
+## Comprobar que funciona
+
+- La columna BIMI del dominio muestra `Configurado`.
+- Después de un envío, tu logo aparece junto a tus mensajes en Gmail y en Yahoo Mail en la web. Solo aparece donde se
+  cumplen las condiciones propias del proveedor de buzón, así que puede tardar y quizá no se muestre en todos los
+  mensajes.
+
+## Solución de problemas
+
+- **BIMI muestra No válido.** El registro no tiene la etiqueta `l=`, la tiene vacía o tiene una dirección de logo que no
+  es `https://`. Corrige el registro; ReputeCast vuelve a comprobarlo en un plazo de 30 minutos.
+- **BIMI muestra Sin configurar, pero el registro existe.** Está publicado en el dominio organizativo o con otro
+  selector. Publícalo en `default._bimi.<sending domain>`.
+- **No aparece el logo en Gmail.** Gmail necesita un VMC o un CMC, DMARC en `quarantine` o `reject` con `pct=100` y un
+  logo SVG Tiny PS. Consulta [Troubleshoot BIMI issues](https://support.google.com/admin/security/troubleshoot-bimi-issues)
+  de Google (comprobado en octubre de 2026).
+- **No aparece el logo en Yahoo Mail.** Yahoo solo muestra logos en el correo masivo de remitentes con suficiente
+  reputación e interacción. Compruébalo en Yahoo Mail en la web con la caché vacía.
+
+## Relacionado
+
+- [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)
+- [Leer los informes agregados de DMARC](/es/deliverability/dmarc-reports/)
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Añadir dominios de envío y remitentes](/es/providers/senders-and-domains/)

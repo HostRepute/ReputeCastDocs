@@ -1,0 +1,133 @@
+---
+title: Paginierung
+description: "Paginierung der REST-API in ReputeCast: Listen mit page und pageSize, Cursor-, zeitbasierte und Offset-Listen, ihre Standard- und Höchstwerte und leere Seiten."
+type: reference
+audience: [developer]
+primaryKeyword: Paginierung der REST-API
+sources:
+  - internal/api/api.go
+  - internal/api/errors.go
+  - internal/audience/contacts.go
+  - internal/audience/suppressions.go
+  - internal/approvals/inbox.go
+  - internal/automations/people.go
+  - internal/campaigns/api.go
+  - web/openapi.json
+sidebar:
+  order: 5
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+
+Die Paginierung der REST-API in ReputeCast hängt von der Liste ab: Die meisten Listen nehmen `page` und `pageSize`, die
+Listen der Kontakte und Sperrlisteneinträge, Protokolle und Aktivitäts-Feeds nehmen einen Cursor, und einige wenige
+nehmen eine Zeit oder einen Offset. Die Seite jeder Operation in der [API-Referenz](/api/) zeigt ihre Parameter; diese
+Seite gruppiert sie nach Art. Listen in Antworten sind nie `null`: Eine leere Liste ist `[]`.
+
+## Seitenlisten: `page` und `pageSize`
+
+Senden Sie `page` (ab 1, Standard 1) und `pageSize`. Die Antwort enthält `items`, `total` (Einträge, die Ihren Filtern
+entsprechen), `page` und `pageSize`, oft neben Übersichtsfeldern wie `counts`.
+
+```sh title="Terminal"
+curl -s -H "Authorization: Bearer $RC_KEY" \
+  "$RC_URL/api/v1/workspaces/acme-newsletter/campaigns?status=sent&page=2&pageSize=50"
+```
+
+- Sie haben alle Einträge, wenn `page × pageSize ≥ total`.
+- Eine Seite hinter dem Ende antwortet mit `200` und `"items": []`.
+- Senden Sie bei jeder Seite dieselben Filter.
+
+| Operation                                                         | Standard für `pageSize` | Größter Wert für `pageSize` |
+| ----------------------------------------------------------------- | ----------------------- | --------------------------- |
+| [`list-campaigns`](/api/operations/list-campaigns/)               | 25                      | 100                         |
+| [`list-contacts`](/api/operations/list-contacts/)                 | 10                      | 100                         |
+| [`list-suppressions`](/api/operations/list-suppressions/)         | 10                      | 100                         |
+| [`list-provider-events`](/api/operations/list-provider-events/)   | 25                      | 100                         |
+| [`list-product-orders`](/api/operations/list-product-orders/)     | 10                      | 100                         |
+| [`list-paid-members`](/api/operations/list-paid-members/)         | 8                       | 100                         |
+| [`list-payment-events`](/api/operations/list-payment-events/)     | 8                       | 100                         |
+
+Einige Listen nehmen nur `page` und wählen die Seitengröße selbst:
+[`list-gifts`](/api/operations/list-gifts/) (20 Geschenke pro Seite), [`list-referrers`](/api/operations/list-referrers/),
+[`get-partner-requests`](/api/operations/get-partner-requests/), [`list-sms-suppressions`](/api/operations/list-sms-suppressions/)
+und [`list-sms-events`](/api/operations/list-sms-events/).
+
+[`list-contacts`](/api/operations/list-contacts/) und [`list-suppressions`](/api/operations/list-suppressions/)
+paginieren außerdem per Cursor, was auch tief in einer großen Zielgruppe schnell bleibt: Übergeben Sie `nextCursor`
+(oder `prevCursor`, um zurückzugehen) aus der Antwort als `cursor`, mit denselben Filtern und derselben `pageSize`;
+`page` wird dann ignoriert. Auf der letzten Seite fehlt `nextCursor`, auf der ersten `prevCursor`. Ihr `total` ist bis
+10.000 genau; darüber lautet es 10.000 mit `"totalCapped": true`, es sei denn, Sie senden `exact=true`, was bei großen
+Zielgruppen langsamer ist. Bei einem gekappten Gesamtwert hören Sie auf, sobald `nextCursor` fehlt.
+
+## Cursor-Listen: `cursor` und `limit`
+
+Senden Sie `limit` und übergeben Sie dann den Cursor aus der vorherigen Antwort als `cursor`, um die nächste Seite zu
+erhalten. Der Cursor ist undurchsichtig: Speichern Sie ihn unverändert. Auf der letzten Seite fehlt das Cursor-Feld.
+
+```sh title="Terminal"
+curl -s -H "Authorization: Bearer $RC_KEY" \
+  "$RC_URL/api/v1/workspaces/acme-newsletter/audit?limit=200&cursor=<nextCursor from the previous page>"
+```
+
+<TableScroll label="Cursor-Listen">
+
+| Operation                                                                         | Cursor-Feld in der Antwort          | Standard für `limit` | Größter Wert für `limit` |
+| --------------------------------------------------------------------------------- | ----------------------------------- | -------------------- | ------------------------ |
+| [`list-audit-events`](/api/operations/list-audit-events/)                         | `nextCursor`, mit `total`           | 50                   | 200                      |
+| [`list-approvals`](/api/operations/list-approvals/)                               | `nextCursor`                        | 50                   | 100                      |
+| [`list-automation-step-contacts`](/api/operations/list-automation-step-contacts/) | `next`, mit `total`                 | 25                   | 100                      |
+| [`contact-activity`](/api/operations/contact-activity/)                           | `nextCursor`, mit `total`           | 8                    | 100                      |
+| [`list-ai-activity`](/api/operations/list-ai-activity/)                           | `next`                              | 50                   | 100                      |
+| [`list-store-activity`](/api/operations/list-store-activity/)                     | `next`                              | 25                   | 100                      |
+| [`list-store-products`](/api/operations/list-store-products/)                     | `next` (eine Zahl), mit `total`     | 48                   | 100                      |
+
+</TableScroll>
+
+## Zeitbasierte Listen: `before` und `limit`
+
+Protokolle, die wachsen, während Sie sie lesen, paginieren rückwärts in der Zeit, die neuesten zuerst.
+
+<TableScroll label="Zeitbasierte Listen">
+
+| Operation                                                                     | So erhalten Sie die nächste Seite                                          | Standard für `limit` | Größter Wert für `limit` |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------- | ------------------------ |
+| [`list-transactional-messages`](/api/operations/list-transactional-messages/) | `next` aus der Antwort als `before` übergeben                              | 25                   | 100                      |
+| [`list-conversions`](/api/operations/list-conversions/)                       | `next` (eine Zeit) aus der Antwort als `before` übergeben                  | 50                   | 200                      |
+| [`list-whatsapp-events`](/api/operations/list-whatsapp-events/)               | `next` (eine Zeit) aus der Antwort als `before` übergeben                  | 50                   | 200                      |
+| [`list-push-events`](/api/operations/list-push-events/)                       | Ist `more` gleich `true`, die Zeit des letzten Ereignisses als `before` übergeben | 50            | 200                      |
+
+</TableScroll>
+
+`list-transactional-messages` nimmt außerdem `after`: Übergeben Sie den Wert `newest` einer Seite, um für eine
+Live-Ansicht nur die Nachrichten zu erhalten, die seitdem eingegangen sind.
+
+## Offset-Listen: `offset` und `limit`
+
+Senden Sie `offset` (die Zahl der zu überspringenden Einträge, ab 0) und `limit`.
+
+| Operation                                                                   | Standard für `limit` | Größter Wert für `limit`       |
+| --------------------------------------------------------------------------- | -------------------- | ------------------------------ |
+| [`list-integration-calls`](/api/operations/list-integration-calls/)         | 20                   | 100 (`offset` bis 10.000)      |
+| [`list-poll-comments`](/api/operations/list-poll-comments/)                 | 20                   | 100                            |
+| [`list-survey-responses`](/api/operations/list-survey-responses/)           | 20                   | 100                            |
+| [`list-survey-text-answers`](/api/operations/list-survey-text-answers/)     | 20                   | 100                            |
+| [`list-sms-replies`](/api/operations/list-sms-replies/)                     | 50                   | 100                            |
+
+## Listen nur mit `limit`
+
+Diese liefern bis zu `limit` Einträge und haben keine weiteren Seiten:
+[`list-webhook-deliveries`](/api/operations/list-webhook-deliveries/) (50, bis 200),
+[`list-media`](/api/operations/list-media/) (200, bis 500),
+[`list-campaign-versions`](/api/operations/list-campaign-versions/) (50, bis 300) und
+[`list-agent-actions`](/api/operations/list-agent-actions/) (20, bis 100). Listen, die gar keinen Paginierungsparameter
+nehmen, etwa [`list-lists`](/api/operations/list-lists/) und [`list-segments`](/api/operations/list-segments/),
+liefern alle Einträge auf einmal.
+
+## Hinweise
+
+- Ein Wert über dem größten erlaubten antwortet mit `422`, dem Code `validation_failed` und dem Parameter in
+  `errors[].location`, zum Beispiel `query.pageSize` (siehe [API-Fehler](/de/developers/api-errors/)).
+- Jede Seite zählt als eine Anfrage gegen die [Rate-Limits](/de/developers/api-rate-limits/). Fordern Sie die größte
+  Seite an, die Sie verwenden können, statt vieler kleiner.
+- Um Änderungen zu verfolgen, ohne Listen erneut durchzublättern, [empfangen Sie Webhooks](/de/developers/webhooks/).

@@ -1,0 +1,155 @@
+---
+title: Délivrabilité e-mail pour expéditeurs auto-hébergés
+description: La délivrabilité e-mail en auto-hébergement. Ce qui décide du placement en boîte de réception, ce que ReputeCast contrôle avant, pendant et après l’envoi.
+type: explanation
+audience: [publisher, admin]
+primaryKeyword: délivrabilité e-mail
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - internal/readiness/types.go
+  - internal/readiness/assemble.go
+  - internal/approvals/jobs.go
+  - internal/sending/engine/engine.go
+  - internal/deliverability
+  - internal/placement
+sidebar:
+  order: 1
+---
+
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+La délivrabilité e-mail, c’est la capacité de vos messages à atteindre la boîte de réception plutôt que le dossier spam
+ou un rebond. Les fournisseurs de messagerie comme Gmail, Yahoo et Outlook.com en décident pour chaque message, à partir
+des signaux ci-dessous. En auto-hébergement, vous choisissez les fournisseurs d’envoi et vous gérez le DNS : ces signaux
+sont donc à votre charge, et ReputeCast les contrôle avant, pendant et après chaque envoi.
+
+ReputeCast détermine quel [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider) filtre chaque adresse à
+partir des enregistrements MX de son domaine, et pas seulement de son nom : un domaine d’entreprise sur Google Workspace
+compte comme Gmail, un domaine sur Microsoft 365 comme Outlook. Le routage, la chauffe, l’envoi protégé, le contrôle avant
+envoi et les rapports s’appuient tous sur cette même réponse.
+
+## Ce qui décide du placement en boîte de réception
+
+<TableScroll label="Signaux qui décident du placement en boîte de réception">
+
+| Signal                 | Ce que regardent les fournisseurs de messagerie                                                          | Où agir                                                                                                                   |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Authentification       | SPF, DKIM et DMARC, alignés sur le domaine de l’adresse From                                             | [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)                                                       |
+| Réputation             | L’historique de vos domaines et IP d’envoi, les inscriptions sur des listes de blocage, les taux de rebond et de plainte | [Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/), [chauffe](/fr/providers/warm-up/) |
+| Engagement             | La réaction des destinataires : ouverture, réponse, suppression sans lecture, signalement comme spam      | [Garder une liste saine](/fr/audience/list-health/)                                                                       |
+| Contenu                | Taille, liens, images, une partie en texte brut, un objet qui ne ressemble pas à du spam                 | [Corriger les avertissements de contenu avant l’envoi](/fr/campaigns/content-checks/)                                     |
+| Qualité de la liste    | Adresses qui rebondissent, pièges à spam, adresses génériques, contacts qui ne se sont jamais inscrits   | [La liste de suppression](/fr/audience/suppressions/), [vérifier les adresses](/fr/audience/verification/)                |
+| Conformité             | Consentement, désabonnement fonctionnel, adresse postale, règles pour les expéditeurs de gros volumes    | [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)                  |
+
+</TableScroll>
+
+## Ce que fait ReputeCast avant, pendant et après l’envoi
+
+<SendFlowDiagram />
+
+Le contrôle avant envoi vérifie une campagne avant son démarrage, le routage confie chaque destinataire à un fournisseur
+d’envoi, les événements de livraison reviennent des fournisseurs d’envoi, et des seuils décident si l’envoi continue ou
+se met en pause.
+
+1. **Avant l’envoi.** Les enregistrements du domaine sont vérifiés en direct pendant que vous les publiez, puis toutes
+   les 30 minutes. Le [contrôle avant envoi](/fr/reference/glossary/#send-readiness) vérifie chaque campagne dans
+   11 groupes au plus : réputation de l’expéditeur (le domaine d’envoi, son domaine parent, les domaines de return-path
+   et de suivi, et les IP dédiées), authentification, contenu, langues, accessibilité, contenu conditionnel, liens,
+   conformité, qualité de l’audience, routage et les [règles d’envoi](/fr/campaigns/sending-rules/) propres à votre
+   espace de travail. Son verdict est « Prête », « Prête, avec avertissements » ou « Bloquée », et un contrôle bloquant
+   empêche l’envoi de démarrer. Un contrôle qui n’a pas pu s’exécuter, par exemple une requête DNS en échec, donne
+   <UiPath path="review.statusUnknown" />, jamais <UiPath path="review.statusBlock" />. Il s’exécute quand vous ouvrez
+   <UiPath path="composer.reviewSend" />, de nouveau 15 minutes avant un envoi programmé, et au démarrage de l’envoi. Lors
+   de cette nouvelle vérification, un blocage, un avertissement que personne n’a confirmé, une forte variation de
+   l’audience ou une modification faite après la programmation retient l’envoi ([envoi
+   retenu](/fr/reference/glossary/#send-time-hold)) jusqu’à ce que quelqu’un le vérifie. Un [test de
+   placement](/fr/deliverability/placement-tests/) montre où arrivent de vraies copies dans des boîtes témoins, par
+   fournisseur de messagerie.
+2. **Pendant l’envoi.** Un envoi peut commencer par un [envoi canari](/fr/reference/glossary/#canary) : les
+   destinataires les plus engagés et vos boîtes témoins le reçoivent d’abord, et tous les autres attendent qu’il soit
+   validé. L’[envoi protégé](/fr/reference/glossary/#guarded-sending) surveille ensuite toutes les 2 secondes les rebonds
+   par type, les plaintes et les reports, par fournisseur de messagerie et par fournisseur d’envoi. Il ralentit un
+   fournisseur de messagerie qui diffère avant de le mettre en pause, et [met en pause
+   automatiquement](/fr/campaigns/live-monitor/) uniquement la part qui a franchi un seuil. Les taux de plainte ne
+   comptent que les e-mails délivrés aux fournisseurs de messagerie qui signalent les plaintes : Gmail et iCloud ne le
+   font pas, leur taux affiche donc <UiPath path="live.model.notAvailable" />. Les seuils, les débits par fournisseur de
+   messagerie et les règles de réponse comme le `TSS04` de Yahoo se règlent dans les [règles de
+   trafic](/fr/providers/traffic-rules/). Quand un fournisseur d’envoi tombe en panne, la politique de basculement de la
+   route décide si sa part passe à un fournisseur opérationnel ou vous attend.
+3. **Après l’envoi.** Les événements de livraison de tous les fournisseurs d’envoi sont normalisés, et les rebonds et
+   les plaintes alimentent une seule [liste de suppression](/fr/reference/glossary/#suppression-list), appliquée à tous
+   les fournisseurs d’envoi. Une surveillance des plaintes continue de les compter après la fin de l’envoi et alerte les
+   personnes qui peuvent reprendre les envois quand un fournisseur de messagerie ou l’envoi entier dépasse sa limite de
+   plaintes. Les [rapports de campagne](/fr/campaigns/reports/) classent les ouvertures en ouvertures humaines, à la
+   [confidentialité protégée](/fr/reference/glossary/#privacy-protected-open) et automatiques, et la [santé de la
+   délivrabilité](/fr/deliverability/health/) continue de surveiller vos domaines, vos IP, vos comptes de fournisseurs
+   d’envoi, les listes de blocage, les rapports DMARC et les incidents.
+
+## Valeurs par défaut et limites
+
+Ces délais et seuils du contrôle avant envoi s’appliquent à chaque campagne :
+
+<LimitsTable area="send-readiness" />
+
+## Quand les modifier
+
+Les limites du contrôle avant envoi sont fixes. Ce que vous décidez, c’est la réponse à chaque résultat : corrigez un
+blocage, et corrigez ou confirmez chaque avertissement avant d’envoyer. Les seuils qui arrêtent un envoi plus tôt se
+règlent : les taux de pause automatique par espace de travail et par campagne ([Suivre un envoi et la pause
+automatique](/fr/campaigns/live-monitor/)), et les limites de rebonds et de plaintes de chaque fournisseur d’envoi
+([État et pannes des fournisseurs](/fr/providers/health-and-outages/)). Abaissez-les quand un fournisseur de messagerie
+commence à différer ou à filtrer vos e-mails ; les relever ne fait que laisser plus de dégâts se produire avant la pause.
+
+## Liste de contrôle de la délivrabilité
+
+### À configurer une fois
+
+1. Publiez SPF, DKIM et DMARC pour chaque domaine d’envoi :
+   [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/).
+2. Collectez les rapports DMARC et passez à une politique appliquée :
+   [Lire les rapports agrégés DMARC](/fr/deliverability/dmarc-reports/).
+3. Vérifiez les règles des grands fournisseurs de messagerie :
+   [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/).
+4. Assurez-vous que le désabonnement en un clic fonctionne, ce qui exige une URL publique en HTTPS :
+   [Désabonnement en un clic (RFC 8058)](/fr/deliverability/one-click-unsubscribe/).
+5. Recueillez le consentement avec une preuve et gardez une adresse postale dans le pied de page :
+   [Les bases du consentement et des lois antispam](/fr/deliverability/compliance/).
+6. Avec Amazon SES, sortez du sandbox avant la première campagne :
+   [Sortir Amazon SES du sandbox](/fr/deliverability/amazon-ses-production-access/).
+7. Faites chauffer un nouveau fournisseur d’envoi ou une nouvelle IP avant le plein volume :
+   [Chauffer un nouveau fournisseur ou une nouvelle IP](/fr/providers/warm-up/).
+8. Facultatif : affichez votre logo avec [BIMI](/fr/deliverability/bimi/), et
+   [connectez HostRepute](/fr/deliverability/hostrepute/) pour des contrôles horaires des listes de blocage, Postmaster
+   Tools, SNDS et la collecte DMARC.
+
+### Avant chaque envoi
+
+9. Corrigez chaque blocage et lisez chaque avertissement du [contrôle avant envoi](/fr/campaigns/send-readiness/).
+10. Pour les envois importants, lancez d’abord un [test de placement](/fr/deliverability/placement-tests/).
+
+### Surveiller en continu
+
+11. Ouvrez régulièrement la [santé de la délivrabilité](/fr/deliverability/health/) et agissez sur les cartes orange et
+    rouges.
+12. Faites retirer rapidement les inscriptions :
+    [Vérifier et corriger les inscriptions en liste de blocage](/fr/deliverability/blocklists/).
+13. Restez sous les limites de chaque fournisseur d’envoi :
+    [Rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/).
+14. Arrêtez d’écrire aux contacts qui ne s’engagent jamais : [Garder une liste saine](/fr/audience/list-health/) et
+    [La liste de suppression](/fr/audience/suppressions/).
+
+### Quand des e-mails rebondissent
+
+15. Recherchez le code renvoyé par un fournisseur de messagerie : [Codes d’erreur SMTP](/fr/smtp-errors/).
+16. Voyez quels fournisseurs de messagerie et fournisseurs d’envoi sont touchés dans les
+    [rapports de campagne](/fr/campaigns/reports/).
+
+## Voir aussi
+
+- [Comment fonctionne ReputeCast](/fr/getting-started/concepts/)
+- [Contrôle avant envoi : vérifier avant d’envoyer](/fr/campaigns/send-readiness/)
+- [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/)
+- [Glossaire](/fr/reference/glossary/)

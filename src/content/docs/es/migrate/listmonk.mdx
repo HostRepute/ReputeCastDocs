@@ -1,0 +1,100 @@
+---
+title: Migrar desde listmonk
+description: 'Cómo migrar desde listmonk a ReputeCast con su API: listas, atributos y estado de suscripción; las direcciones bloqueadas y dadas de baja siguen suprimidas.'
+type: how-to
+audience: [publisher, admin]
+permissions: ['subscribers:import']
+uiPath: 'shell.importContacts'
+primaryKeyword: migrar desde listmonk
+sources:
+  - internal/imports/listmonk.go
+  - internal/imports/connect.go
+  - internal/imports/sources.go
+  - internal/imports/consent.go
+  - web/src/features/imports/SourceStep.tsx
+sidebar:
+  order: 5
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Para migrar desde listmonk, le das a ReputeCast la dirección de tu servidor de listmonk y un usuario de API, e importas cada lista de listmonk en una lista de ReputeCast con los atributos y los estados de sus suscriptores. ReputeCast solo lee de la API de listmonk; no cambia nada en tu servidor de listmonk.
+
+## Antes de empezar
+
+- Necesitas el permiso `subscribers:import` (lo tienen Propietario, Administrador y Editor).
+- Crea un usuario de API en listmonk 4.0 o posterior, en **Admin** › **Users**. Los usuarios de API reciben un token generado en lugar de una contraseña. Asigna al usuario un rol que pueda leer todas las listas y todos los suscriptores (`lists:get_all` y `subscribers:get_all`). Fuentes: [listmonk, User roles and permissions](https://listmonk.app/docs/roles-and-permissions/) y [listmonk API introduction](https://listmonk.app/docs/apis/apis/) (comprobado en octubre de 2026).
+- ReputeCast debe poder llegar al servidor de listmonk por HTTP o HTTPS. Un servidor de una red privada o interna (por ejemplo, `10.0.0.5` o un nombre `.internal` que se resuelva a una de esas direcciones) se rechaza, salvo que la instancia active `providers.allow_private_networks` (consulta la [referencia de configuración](/es/reference/configuration/)).
+- Lee [cómo conserva el consentimiento una migración](/es/migrate/overview/) si es tu primera importación.
+
+## Importar tus listas de listmonk
+
+<Steps>
+
+1. Abre <UiPath path="shell.importContacts" /> y elige **listmonk**.
+
+2. En <UiPath path="imports.serverAddress" />, introduce la dirección en la que abres listmonk, como `https://lists.example.com`, sin credenciales, consulta ni fragmento; ReputeCast añade `/api` por su cuenta. Introduce el nombre del usuario de API en <UiPath path="imports.apiUser" /> y su token en <UiPath path="imports.apiToken" />, y selecciona <UiPath path="imports.connect" />.
+
+   El asistente muestra todas las listas de listmonk con sus recuentos de suscritos, dados de baja y pendientes.
+
+3. Marca las listas que quieres importar y elige la lista de ReputeCast a la que va cada una. Deja activada la opción de traer las supresiones de tus proveedores de envío y continúa a la asignación de campos.
+
+4. Asigna los campos. `email` es obligatorio; `name` va al nombre y al apellido, y cada atributo se convierte en un campo con el nombre de su clave.
+
+5. En el paso de consentimiento, revisa en qué se convierte cada estado (consulta la siguiente sección).
+
+6. Ejecuta la vista previa e inicia la importación.
+
+</Steps>
+
+## Lo que se trae de listmonk
+
+- **Las listas** se convierten en las listas de ReputeCast que elegiste.
+- **El nombre** se divide en nombre y apellido.
+- **Los atributos** (`attribs`) se convierten en campos del contacto. El asistente ofrece las claves de atributo que encuentra en los 100 primeros suscriptores de cada lista elegida; una clave que solo aparece en suscriptores posteriores no se ofrece.
+- **Fechas:** la fecha de creación del suscriptor pasa a ser la fecha de creación del contacto. listmonk no guarda la IP de suscripción, así que no se almacena ninguna.
+
+| Estado en listmonk                                       | Se convierte en ReputeCast en                                                                     |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `confirmed` en la lista                                  | Suscrito · confirmado (o pendiente, u Omitir)                                                     |
+| `unconfirmed` en una lista de suscripción simple         | Suscrito · confirmado (o pendiente, u Omitir)                                                     |
+| `unconfirmed` en una lista con doble confirmación        | Suscrito · pendiente, con un correo de reconfirmación (u Omitir)                                  |
+| `unsubscribed` de la lista                               | Suprimido · dado de baja: sin Envíos masivos ni Automatizaciones, correo de Sistema permitido (bloqueado) |
+| Suscriptor `blocklisted` en listmonk                     | Suprimido · dado de baja (bloqueado)                                                              |
+
+Una supresión pertenece a la dirección: un suscriptor dado de baja de una lista de listmonk no recibe Envíos masivos ni Automatizaciones en ninguna lista de ReputeCast.
+
+listmonk no tiene un estado propio para las direcciones rebotadas, así que una dirección que bloqueó tras varios rebotes llega como baja, lo que sigue permitiendo el correo de Sistema. Para bloquear esas direcciones en todos los flujos, añádelas con <UiPath path="audience.suppressions.addAddress" /> en la [lista de supresión](/es/audience/suppressions/) después de la importación: las direcciones que se añaden ahí no reciben correo en ningún flujo.
+
+### Lo que se queda en listmonk
+
+Las campañas y sus estadísticas, las plantillas, los registros de rebotes, los archivos multimedia y la configuración no se importan. Vuelve a crear las plantillas en el [editor](/es/campaigns/composer/).
+
+## Límites de velocidad
+
+listmonk se ejecuta en tu propio servidor, así que la rapidez con la que responde depende de ese servidor. ReputeCast lee 1000 suscriptores por solicitud, una solicitud cada vez, y reduce el ritmo cuando el servidor responde 429 o un error 5xx:
+
+<LimitsTable area="imports" />
+
+## Comprobar que funciona
+
+- El resumen muestra cuántos contactos se importaron, se combinaron, se suprimieron, quedaron pendientes y se omitieron, y cuántos tiene ahora cada lista. <UiPath path="imports.downloadReport" /> enumera cada fila con lo que pasó con ella.
+- Abre <UiPath path="nav.audience > audience.tabSuppressions" /> y comprueba que las direcciones dadas de baja y bloqueadas están ahí.
+
+## Solución de problemas
+
+- **"Usa la dirección completa, como https://lists.example.com."**: a la dirección le falta `http://` o `https://`.
+- **"Usa solo la dirección del servidor … sin credenciales, consulta ni fragmento."**: quita `user:password@`, `?…` o `#…` de la dirección.
+- **"Esa dirección está en una red privada o interna."**: el servidor se resuelve a una dirección privada, de loopback, de enlace local o de metadatos. Usa su dirección pública, o pide a quien opera la instancia que active `providers.allow_private_networks`. La comprobación se repite en cada conexión, así que también se rechaza un nombre público que más adelante se resuelva a una dirección privada.
+- **"listmonk redirige a otra dirección (301). Introduce la dirección en la que responde."**: ReputeCast no sigue las redirecciones. Introduce la dirección final, a menudo la que empieza por `https://`.
+- **"listmonk rechazó la clave de API"**: el usuario de API o el token no son correctos, o el rol del usuario no puede leer listas y suscriptores.
+- **"No se pudo acceder a listmonk: …"**: ReputeCast no puede abrir una conexión con el servidor. Revisa el DNS, el cortafuegos y el certificado TLS.
+
+## Relacionado
+
+- [Migrar a ReputeCast sin perder el consentimiento](/es/migrate/overview/)
+- [Importar contactos desde CSV o XLSX](/es/audience/import/)
+- [Listas, consentimiento y doble confirmación](/es/audience/lists-and-consent/)
+- [Seguridad y protección](/es/self-hosting/security/)

@@ -1,0 +1,101 @@
+---
+title: Adapter für Versandanbieter
+description: 'Wie ReputeCast jeden Versandanbieter über einen Adapter für E-Mail-Anbieter erreicht: integriert, ohne Code per HTTP zugeordnet oder als eigener Prozess.'
+type: explanation
+audience: [developer, operator, admin]
+uiPath: 'nav.providers > providers.tabAdapters'
+primaryKeyword: Adapter für E-Mail-Anbieter
+sources:
+  - docs/adapters.md
+  - internal/providers/provider.go
+  - internal/providers/optional.go
+  - internal/providers/runtime.go
+  - internal/providers/httpgeneric
+  - internal/providers/remote
+  - internal/providers/manage/adapters.go
+  - internal/connect/catalog.go
+  - web/src/features/providers/AdaptersPage.tsx
+  - web/src/features/providers/adapters.messages.ts
+sidebar:
+  order: 1
+---
+
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Ein Adapter für E-Mail-Anbieter ist der Code, der mit einem [Versandanbieter](/de/reference/glossary/#sending-provider) kommuniziert: Er versendet E-Mails, verifiziert und normalisiert die Webhooks des Anbieters und deklariert, was der Anbieter kann. Der Kern von ReputeCast ruft nie direkt einen Anbieter auf. Er findet Adapter in einer Registry und nutzt sie über einen einheitlichen Contract, sodass Routing, Failover, [Versandbereitschaft](/de/reference/glossary/#send-readiness), automatische Pause und die gemeinsame Sperrliste bei jedem Anbieter gleich funktionieren.
+
+## Wie Adapter funktionieren
+
+1. **Registrierung.** Jeder Adapter registriert sich unter einem Schlüssel, mit einem Deskriptor: Name, Fähigkeiten, Bedingungen des Anbieters und Verbindungsformular. Integrierte Adapter verwenden kurze Schlüssel (`ses`, `postmark`), installierte Adapter `community:<id>`. Jeder ReputeCast-Prozess liest die installierten Adapter alle 15 Sekunden neu ein.
+2. **Katalog.** Der Einrichtungskatalog, der Verbindungsassistent und <UiPath path="nav.providers > providers.tabAdapters" /> lesen die Registry, sodass ein neuer Adapter an allen drei Stellen erscheint.
+3. **Verbindung.** Ein Admin des Arbeitsbereichs verbindet über einen Adapter einen Anbieter unter <UiPath path="nav.providers > providers.overview.addProvider" />. Die Zugangsdaten werden versiegelt gespeichert und nie zurückgegeben.
+4. **Versand.** Die Versand-Engine rendert und personalisiert jede Nachricht und übergibt dem Adapter jeweils so viele, wie seine Batch-Größe zulässt. Der Adapter gibt pro Nachricht ein Ergebnis zurück.
+5. **Ereignisse.** Der Anbieter sendet Webhooks an `/hooks/<adapter key>/<token>`. ReputeCast verifiziert jede Anfrage über den Adapter, bevor es sie speichert; danach ordnet der Adapter sie [normalisierten Ereignissen](/de/providers/events-and-sync/) zu. Hard Bounces und Beschwerden kommen auf die gemeinsame Sperrliste.
+6. **Zustand.** Die Zustandsprüfung kontrolliert über den Adapter die Zugangsdaten oder das Kontingent jedes Anbieters. Wiederholte Fehler markieren den Anbieter als ausgefallen, und das Routing schaltet je Stream um (siehe [Zustand und Ausfälle von Anbietern](/de/providers/health-and-outages/)).
+
+<Screenshot id="providers-adapters" alt="Der Tab Adapter listet 11 integrierte Adapter von Amazon SES bis Generic SMTP mit Version, Maintainer, Ereignissen, Domain-Einrichtung, Sperrlisten-Synchronisierung und Status auf, darunter Community-Adapter wie Scaleway Transactional Email 0.6.1 mit verfügbarem Update." />
+
+## Drei Arten von Adaptern
+
+<TableScroll label="Arten von Adaptern für Versandanbieter">
+
+| Art              | Läuft als                                                                         | Geschrieben von                                     | Registry-Schlüssel                                    | Installiert über                                                                            |
+| ---------------- | --------------------------------------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Integriert       | Go-Code im ReputeCast-Binary, gegen die gemeinsame Contract-Suite getestet        | HostRepute und Mitwirkende, mit ReputeCast veröffentlicht | `ses`, `postmark`, `mailgun`, …                  | Jedes Release                                                                               |
+| Generisches HTTP | Eine JSON-Zuordnung der HTTP-API eines Anbieters, ausgeführt im Binary            | Jeder Instanz-Admin, ohne Code                      | `httpgeneric`, oder nach dem Speichern `community:<name>` | Das Formular im Tab Adapter oder ein Manifest vom Typ `http`                            |
+| Community        | Eigener Prozess in einer beliebigen Sprache (TypeScript mit dem SDK)              | Alle                                                | `community:<id>`                                      | `reputecast adapter install` oder <UiPath path="providers.adapters.installFromRegistry" /> |
+
+</TableScroll>
+
+Integrierte Adapter gibt es für Amazon SES, Postmark, Postal, Mailgun, SendGrid, Resend, SparkPost, Mailjet, Brevo, Azure Communication Services und jeden SMTP-Server; [Versandanbieter auswählen](/de/providers/choose/) vergleicht sie. Jeder installierte Community-Adapter zeigt seine Version, seinen Maintainer, die Fähigkeiten, die sein Manifest deklariert, und seinen Update-Status. Ein Adapter ohne Release seit einem Jahr wird als „Nicht mehr gepflegt“ markiert und für neue Verbindungen nicht mehr angeboten.
+
+## Was ein Adapter deklariert
+
+Jeder Adapter gibt an, was der Anbieter kann. Aus diesen Angaben entstehen die Badges im Katalog und auf dem Routing-Bildschirm:
+
+- **Bedingungen für Massenmarketing:** erlaubt, nur Broadcast-Streams, nicht erlaubt oder „eigene Richtlinie“ für selbst gehostete Server und zugeordnete APIs. Routing und Versandbereitschaft nutzen sie.
+- **Webhooks:** ob der Anbieter Zustellungen, Bounces und Beschwerden meldet. Ohne Webhooks erhält ReputeCast von diesem Anbieter keine Bounces oder Beschwerden (Generic SMTP liest stattdessen ein Bounce-Postfach).
+- **Domain-Einrichtung:** über die API des Anbieters oder mit manuellen DNS-Einträgen.
+- **Sperrlisten-Synchronisierung:** beidseitig, nur abrufen oder nur lokal. Bei „nur lokal“ setzt ReputeCast die gemeinsame Sperrliste vor dem Versand selbst durch.
+- **Batch-Größe:** wie viele verschiedene Nachrichten in einem API-Aufruf übertragen werden.
+- **Sandbox, Kontingent- und Raten-Erkennung, dedizierte IPs und Preise** sowie die Angabe, ob der Anbieter Öffnungen und Klicks standardmäßig trackt.
+- **Sende-IPs, Ereigniswarteschlange und Tenants:** ob ReputeCast die dedizierten IPs des Kontos über die API des Anbieters liest (sonst tragen Teammitglieder sie von Hand ein), Ereignisse statt über Webhooks aus einer Warteschlange abrufen kann (Amazon SES über SQS) und jedem Arbeitsbereich einen eigenen Tenant mit eigener Sperrliste gibt (Amazon SES). Bei einem Anbieter, der keine Zustellungen meldet (einfaches SMTP), gilt eine Nachricht als zugestellt, sobald der Server sie annimmt.
+
+## Adapter auswählen
+
+- **Für Ihren Anbieter gibt es einen integrierten Adapter:** Verwenden Sie ihn. Integrierte Adapter decken die Domain-, Webhook- und Sperrlisten-APIs des Anbieters ab, soweit es sie gibt, und werden mit jedem Release getestet.
+- **Der Anbieter nimmt eine HTTP-Anfrage pro Nachricht an und sendet JSON-Webhooks** mit HMAC-Signatur, Standard Webhooks, Basic Auth oder einem geheimen Header: Ordnen Sie ihn mit dem [generischen HTTP-Adapter](/de/adapters/generic-http/) zu. Eine Zuordnung sendet eine Nachricht pro Anfrage, nutzt manuelles DNS und eine nur lokale Sperrliste und hat keine Kontingent-Erkennung. Die Anleitung dazu finden Sie unter [Beliebige HTTP-E-Mail-API verbinden](/de/providers/generic-http/).
+- **Sie brauchen Batches, eine Domain-API, Sperrlisten-Synchronisierung, Kontingent-Erkennung, Subscription-Handshakes oder Logik, die eine Zuordnung nicht abbilden kann:** [Schreiben Sie einen Community-Adapter](/de/adapters/community/). Er läuft in einem eigenen Prozess, erreicht nur die Hosts, die sein Manifest deklariert, und kommuniziert mit ReputeCast über das signierte [Adapter-Protokoll](/de/adapters/protocol/).
+- **Der Anbieter soll für alle mit ReputeCast ausgeliefert werden:** Tragen Sie [einen integrierten Adapter in Go](/de/adapters/built-in/) bei.
+
+## Wer was tut
+
+- **Wer den Adapter schreibt**, veröffentlicht sein Image und seine `manifest.json`.
+- **Der Betreiber** des ReputeCast-Servers führt den Adapterprozess aus und teilt ReputeCast mit, wo er lauscht und welchen Signaturschlüssel er hat.
+- **Ein Instanz-Admin** installiert den Adapter. Installierte Adapter gelten für jeden Arbeitsbereich, daher können nur Instanz-Admins sie installieren, aktualisieren oder entfernen.
+- **Ein Admin des Arbeitsbereichs** mit `providers:manage` verbindet darüber einen Anbieter, wie bei jedem integrierten Adapter.
+
+## Standardwerte und Grenzen
+
+Diese Limits gelten für Community-Adapter, die in einem eigenen Prozess laufen:
+
+<LimitsTable area="adapters" />
+
+## Wann Sie sie ändern sollten
+
+- Deklarieren Sie `capabilities.batch` (1 bis 1.000) im Manifest, wenn die API des Anbieters mehrere verschiedene, personalisierte Nachrichten in einem Aufruf annimmt.
+- Aktivieren Sie `providers.allow_private_networks` nur, wenn ein Adapterprozess oder eine zugeordnete API auf einer Loopback- oder privaten Adresse läuft, etwa in einem Sidecar-Container. Link-local- und Cloud-Metadaten-Adressen bleiben gesperrt.
+- Das SDK merkt sich erfolgreiche Antworten 15 Minuten lang (`serve({ idempotencyTtlMs })`). Das Protokoll verlangt mindestens 15 Minuten, senken Sie den Wert also nicht.
+
+Alle anderen Limits sind fest vorgegeben.
+
+## Verwandte Themen
+
+- [Referenz zum generischen HTTP-Adapter](/de/adapters/generic-http/) listet jedes Feld einer Zuordnung auf.
+- Unter [Community-Adapter schreiben](/de/adapters/community/) erstellen, testen und installieren Sie einen Adapter aus der Vorlage.
+- [Adapter-Protokoll v1](/de/adapters/protocol/) ist die Protokollreferenz für Community-Adapter.
+- [Integrierten Adapter beitragen](/de/adapters/built-in/) behandelt den Go-Contract und die Contract-Suite.
+- [Unterstützte Dienste](/de/reference/supported-services/) listet jeden Anbieter auf, mit dem ReputeCast arbeitet.

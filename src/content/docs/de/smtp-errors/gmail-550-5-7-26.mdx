@@ -1,0 +1,145 @@
+---
+title: 'Gmail 550 5.7.26: nicht authentifizierte E-Mail blockiert'
+description: Gmail 550 5.7.26 blockiert E-Mails, die SPF und DKIM oder die DMARC-Richtlinie der From-Domain nicht bestehen. Warum das passiert und wie Sie es beheben.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: Gmail 550 5.7.26
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/audience/suppressions.go
+  - internal/providers/{ses,resend,postal,smtp,postmark,sendgrid,mailjet,sparkpost,mailgun,brevo,azureacs,httpgeneric}
+  - web/src/features/senders
+sidebar:
+  label: Gmail 550 5.7.26
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 550 5.7.26 ist eine dauerhafte Ablehnung: Die Nachricht hat die E-Mail-Authentifizierung nicht bestanden, daher
+hat Gmail sie blockiert. Die Lösung liegt in Ihren DNS-Einträgen, nicht in Ihrer Liste. Diese Seite zeigt, wie Sie die
+Antwort lesen und SPF, DKIM und DMARC für jeden Versandanbieter, den Sie nutzen, zum Bestehen bringen.
+
+## Was Gmail damit meint
+
+Gmail sendet den Code mit einem von drei Texten:
+
+> This email has been blocked because the sender is unauthenticated. Gmail requires all senders to authenticate with
+> either SPF or DKIM. Authentication results: DKIM = did not pass SPF [_domain-name_] with ip: [_ip-address_] = did not
+> pass.
+
+> The (E)MAIL FROM domain [_domain-name_] has an SPF record with a hard fail policy (-all) but it fails to pass SPF checks
+> with the ip: [_ip-address_]. To best protect our users from spam and phishing, the message has been blocked.
+
+> Unauthenticated email from _domain-name_ is not accepted due to domain's DMARC policy. Contact the administrator of
+> _domain-name_ domain if this was legitimate email.
+
+Das heißt: Im ersten Fall ist der Absender nicht authentifiziert, weil weder DKIM noch SPF bestanden hat. Im zweiten
+Fall hat die (E)MAIL-FROM-Domain einen SPF-Eintrag mit Hard-Fail-Richtlinie (`-all`), besteht die SPF-Prüfung mit der
+genannten IP aber nicht. Im dritten Fall nimmt Gmail die nicht authentifizierte E-Mail wegen der DMARC-Richtlinie der
+Domain nicht an.
+
+Gmail hat auch vorübergehende Versionen: 421 4.7.26 begrenzt nicht authentifizierte E-Mails, statt sie zu blockieren,
+und 451 4.7.26 bedeutet, dass vorübergehende DNS-Fehler die DMARC-Prüfung verhindert haben. Quelle:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Google Workspace Help. Geprüft im Oktober 2026.
+
+## Warum es passiert
+
+- **Weder SPF noch DKIM hat bestanden.** Die DKIM-Einträge des Versandanbieters sind nicht veröffentlicht, oder SPF
+  führt den Versandanbieter nicht auf.
+- **SPF ist hart fehlgeschlagen.** Ihr SPF-Eintrag endet auf `-all` und enthält den Server nicht, der die Nachricht
+  gesendet hat, zum Beispiel einen Versandanbieter, den Sie später zu einer [Route](/de/reference/glossary/#route)
+  hinzugefügt haben.
+- **DMARC ist fehlgeschlagen.** Ihre DMARC-Richtlinie ist `quarantine` oder `reject`, und weder SPF noch DKIM ist mit
+  der From-Domain [ausgerichtet](/de/reference/glossary/#alignment). Das passiert, wenn der Versandanbieter DKIM mit
+  seiner eigenen Domain signiert und seinen eigenen Return-Path nutzt.
+
+## Wie ReputeCast den Code einordnet
+
+- [Bounce-Klasse](/de/reference/glossary/#bounce-class): `policy_block` für den ersten und dritten Text. Der Text zum
+  SPF-Hard-Fail erwähnt Spam, daher ist er `spam_block`. Der bloße Code ohne Text ist `policy_block`.
+- Zeile im Bericht: <UiPath path="reports.bounceType.blocked" />.
+- Sperre: Die Ablehnung betrifft Ihre Domain, nicht die Adresse, daher wird die Adresse nicht gesperrt, egal ob der
+  Versandanbieter einen Soft oder einen Hard Bounce erfasst (siehe
+  [Wann ReputeCast eine Adresse sperrt](/de/smtp-errors/#wann-reputecast-eine-adresse-sperrt)). Im Kampagnenbericht
+  zeigt <UiPath path="reports.investigate" /> in dieser Zeile, was jeder Versandanbieter gemeldet hat, und
+  <UiPath path="reports.retryTitle" /> legt die Ausgabe für diese Adressen erneut als Entwurf an, sobald Sie die
+  Ursache behoben haben.
+- Während eines Versands: Ein harter zählt zum Schwellenwert für Block- und Richtlinien-Bounces von Gmail, der Gmail
+  standardmäßig pausiert; siehe die [Standardwerte für Auto-Pause](/de/campaigns/live-monitor/#standardwerte-und-grenzen)
+  und die [Traffic-Regeln](/de/providers/traffic-rules/).
+
+Die Versandbereitschaft prüft dieselben Einträge vor jeder Kampagne. In ihrer Gruppe
+<UiPath path="review.groupAuthentication" /> blockieren ein fehlender SPF-Eintrag, ein SPF-Eintrag, der einen der
+Versandanbieter der Kampagne nicht autorisiert, nicht verifiziertes DKIM oder ein fehlender oder ungültiger
+DMARC-Eintrag den Versand. Weniger als 90 % der E-Mails, die in den letzten 7 Tagen mit DMARC ausgerichtet waren,
+ergeben eine Warnung.
+
+## Bevor Sie beginnen
+
+- `domains:manage`, um die DNS-Einträge einer Versand-Domain zu sehen und zu prüfen.
+- Zugriff auf den DNS-Hoster Ihrer Domain.
+- `providers:view`, um das Ereignisprotokoll zu lesen.
+
+## Authentifizierung reparieren
+
+<Steps>
+
+1. Lesen Sie den Text von Gmail. Öffnen Sie <UiPath path="nav.providers > providers.tabEvents" />, filtern Sie
+   <UiPath path="providers.events.typeFilter" /> nach <UiPath path="providers.events.optionSoftBounce" /> oder
+   <UiPath path="providers.events.optionHardBounce" /> und suchen Sie nach einem Gmail-Empfänger.
+   <UiPath path="providers.events.colCode" /> zeigt, welche Prüfung fehlgeschlagen ist, und im ersten Text die Domain und
+   IP-Adresse, die Gmail getestet hat.
+2. Öffnen Sie <UiPath path="nav.settings > settings.senders" /> und die Versand-Domain. Ihre Seite mit den Einträgen
+   listet die genauen DNS-Einträge auf, die jeder Versandanbieter für die Domain braucht, jeweils mit einem Status
+   (<UiPath path="connect.domain.statusVerified" />, <UiPath path="connect.domain.statusPending" /> oder
+   <UiPath path="connect.domain.statusMissing" />), und prüft sie alle 30 Sekunden, solange sie geöffnet ist.
+3. Veröffentlichen Sie die fehlenden oder falschen Einträge bei Ihrem DNS-Hoster. Ein Domainname darf nur einen
+   SPF-Eintrag haben ([RFC 7208, Abschnitt 3.2](https://www.rfc-editor.org/rfc/rfc7208#section-3.2), geprüft im Oktober
+   2026), führen Sie also das, was die Seite mit den Einträgen verlangt, in den vorhandenen Eintrag zusammen. Die genauen
+   Schritte stehen unter [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/).
+4. Wo der Versandanbieter eine eigene MAIL-FROM-Domain (Return-Path) unterstützt, richten Sie sie ein, damit neben DKIM
+   auch SPF mit Ihrer From-Domain ausgerichtet ist.
+5. Warten Sie, bis die Einträge <UiPath path="connect.domain.statusVerified" /> zeigen. ReputeCast prüft das DNS
+   außerdem alle 30 Minuten, und eine Änderung erscheint innerhalb einer Stunde in der Versandbereitschaft. Öffnen Sie
+   dann <UiPath path="composer.reviewSend" /> der nächsten Kampagne: Die Gruppe
+   <UiPath path="review.groupAuthentication" /> der [Versandbereitschaft](/de/campaigns/send-readiness/) muss bestehen.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Jeder Eintrag auf der Seite der Versand-Domain zeigt <UiPath path="connect.domain.statusVerified" />.
+- Die Gruppe <UiPath path="review.groupAuthentication" /> der Versandbereitschaft besteht für die Kampagne.
+- Der Bericht der nächsten Kampagne enthält in <UiPath path="reports.colCodes" /> kein 550 5.7.26.
+
+## Fehlerbehebung
+
+- **Nur ein Versandanbieter löst den Fehler aus.** Seine DKIM-Einträge oder sein SPF-`include:` fehlen. Routen teilen
+  E-Mails auf mehrere Anbieter auf, prüfen Sie also jeden Versandanbieter auf der Route der Kampagne.
+- **DMARC besteht bei einem Teil der E-Mails und schlägt beim Rest fehl.** Lesen Sie die
+  [DMARC-Sammelberichte](/de/deliverability/dmarc-reports/), um die Quellen zu finden, deren Ausrichtung fehlschlägt.
+- **Eine frühere Version hat Adressen wegen dieses Bounces gesperrt.** Nachdem Sie die Authentifizierung repariert
+  haben, können Sie sie unter <UiPath path="nav.audience > audience.tabSuppressions" /> mit
+  <UiPath path="audience.suppressions.removeButton" /> entfernen.
+
+<Aside type="caution">
+Ein Kontakt, der nach einem Hard Bounce von der Sperrliste entfernt wird, kehrt zur ausstehenden Einwilligung zurück.
+Er erhält erst nach einem neuen Opt-in wieder E-Mails.
+</Aside>
+
+## Verwandte Themen
+
+- [SMTP-Fehlercodes](/de/smtp-errors/)
+- [Outlook 550 5.7.515](/de/smtp-errors/outlook-550-5-7-515/), die Authentifizierungsanforderung von Microsoft
+- [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)
+- [Versand-Domains und Absender hinzufügen](/de/providers/senders-and-domains/)

@@ -1,0 +1,349 @@
+---
+title: Référence de l’adaptateur HTTP générique
+description: 'Chaque champ de l’adaptateur e-mail HTTP générique : requête d’envoi, filtres de modèle, chemins JSON, authentification du webhook et types d’événements.'
+type: reference
+audience: [developer, admin]
+permissions: ['providers:manage']
+uiPath: 'nav.providers > providers.tabAdapters > providers.adapters.httpTitle'
+primaryKeyword: adaptateur e-mail HTTP générique
+sources:
+  - docs/adapters.md
+  - internal/providers/httpgeneric
+  - internal/providers/text.go
+  - internal/providers/webhookauth/webhookauth.go
+  - internal/providers/manage/adapters.go
+  - internal/providers/runtime.go
+  - internal/connect/catalog.go
+  - web/src/features/providers/AdaptersPage.tsx
+  - web/src/features/providers/adapters.messages.ts
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Cette page liste chaque champ de la correspondance de l’adaptateur e-mail HTTP générique : l’objet `http` qui indique à ReputeCast comment appeler l’API HTTP d’un [fournisseur d’envoi](/fr/reference/glossary/#sending-provider) et lire ses webhooks, sans écrire de code. Pour les étapes dans l’application, voir [connecter n’importe quelle API e-mail HTTP](/fr/providers/generic-http/).
+
+Une correspondance parvient à ReputeCast de l’une de ces trois façons :
+
+- **Le formulaire** de <UiPath path="nav.providers > providers.tabAdapters > providers.adapters.httpTitle" />. <UiPath path="providers.adapters.saveAsAdapter" /> l’enregistre comme adaptateur installé de type `http` pour tous les espaces de travail de l’instance. Il couvre l’endpoint d’envoi, les en-têtes de la requête, le modèle du corps, le chemin de l’ID du message, la correspondance du webhook et l’authentification du webhook. Tous les autres champs de cette page nécessitent un manifest.
+- **Un manifest** de type `http`, installé depuis son URL `https://` avec <UiPath path="nav.providers > providers.tabAdapters > providers.adapters.installFromRegistry" />. `reputecast adapter install` n’installe que des [adaptateurs communautaires](/fr/adapters/community/) de type `remote`.
+- **Les paramètres propres d’un fournisseur** (`{"http": {…}}`), pour un fournisseur connecté par l’adaptateur intégré `httpgeneric`.
+
+Enregistrer, installer et tester une correspondance exige un [admin de l’instance](/fr/reference/glossary/#instance-admin) disposant de `providers:manage`. Les espaces de travail connectent ensuite des fournisseurs par son intermédiaire depuis <UiPath path="nav.providers > providers.overview.addProvider" />, avec leurs propres identifiants.
+
+## Manifest
+
+Un adaptateur HTTP installé est un manifest JSON dont l’objet `http` est la correspondance.
+
+| Champ                                         | Règles                                                                                                                                                                                                                                                      |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                                        | Obligatoire. La clé dans le registre est `community:` suivi du nom en lettres minuscules et chiffres reliés par des tirets : « Example ESP » devient `community:example-esp`. La clé apparaît dans les URL de webhook. Le formulaire accepte de 2 à 60 caractères. |
+| `version`                                     | Obligatoire pour une installation depuis une URL. Affiché dans l’onglet Adaptateurs. Le formulaire enregistre `0.1.0`.                                                                                                                                      |
+| `maintainer`                                  | Affiché sous la forme `community · <maintainer>` ; `unknown` s’il est vide. Le formulaire enregistre `local · <your name>`.                                                                                                                              |
+| `kind`                                        | `"http"`.                                                                                                                                                                                                                                                   |
+| `capabilities`                                | Liste facultative de libellés pour l’onglet Adaptateurs, comme `["webhooks"]`. Les badges du catalogue proviennent de la correspondance elle-même.                                                                                                          |
+| `source_url`, `latest_version`, `last_release` | Facultatifs. Une `latest_version` plus récente affiche une mise à jour. Un `last_release` (RFC 3339) datant de plus de 365 jours marque l’adaptateur Non maintenu, et il n’est plus proposé pour de nouvelles connexions.                                  |
+| `terms`                                       | `bulk` vaut `allowed`, `broadcast_streams_only`, `forbidden` ou `your_policy` (par défaut). `note` et `url` (la politique d’utilisation acceptable du fournisseur) s’affichent à côté. Avec `forbidden` ou `broadcast_streams_only`, le fournisseur n’est proposé que pour les flux Automatisations et Système. |
+| `pricing`                                     | Texte facultatif pour le catalogue, comme « $0.80 per 1,000 ». Par défaut : « set by your provider ».                                                                                                                                                     |
+| `http`                                        | La correspondance : tous les champs ci-dessous.                                                                                                                                                                                                            |
+
+ReputeCast ne peut pas lire les conditions d’un fournisseur décrit par correspondance : sans `terms`, l’écran de routage vous demande donc de vérifier la politique d’utilisation acceptable du fournisseur avant de lui router des Diffusions. Un manifest installé depuis une URL doit se trouver à une adresse `https://` publique et peser au plus 256 Kio.
+
+Les textes du manifest (`name`, `terms.note`, `pricing`, et les `label` et `help` de ses `fields`) s’affichent tels que vous
+les avez écrits, dans toutes les langues. Sans `terms.note` ni `pricing`, c’est le texte de ReputeCast qui s’affiche, dans la
+langue de chaque lecteur, comme tout ce qu’il dit d’autre sur la correspondance.
+
+## Requête d’envoi
+
+| Champ                | Règles                                                                                                                                                                                                                                                                                                          |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `method`             | `POST` (par défaut), `PUT` ou `PATCH`.                                                                                                                                                                                                                                                                          |
+| `url`                | Une URL `https://`. Écrivez l’hôte en toutes lettres ; les champs de modèle ne peuvent apparaître que dans le chemin et la chaîne de requête. Pas de `#fragment`. Un manifest peut utiliser `http://` pour un serveur de test en loopback (`localhost`, `127.0.0.1`), que l’instance ne joint qu’avec `providers.allow_private_networks`. Le formulaire n’accepte que `https://`. |
+| `headers`            | Nom d’en-tête → modèle de valeur, comme `"Authorization": "Bearer {{ secrets.api_key }}"`. `Content-Type` vaut `application/json` par défaut. `Host`, `Content-Length`, `Transfer-Encoding` et `Connection` ne peuvent pas être définis. Le formulaire accepte jusqu’à 20 en-têtes.                        |
+| `body`               | Obligatoire. Le modèle du corps JSON. Il doit être un JSON valide une fois ses champs remplis : l’enregistrement le vérifie avec un message d’exemple, et un message dont le corps ne donne pas un JSON est refusé avec le code `Template`. Le formulaire accepte jusqu’à 20 000 caractères.               |
+| `message_id_path`    | Chemin de l’ID du message du fournisseur dans un corps de réponse 2xx, comme `$.data.id`.                                                                                                                                                                                                                       |
+| `message_id_header`  | Un en-tête de réponse qui porte l’ID du message à la place. Utilisez l’un des deux, pas les deux. Les chevrons autour de l’ID sont retirés. Sans aucun des deux, l’ID du message ReputeCast le remplace.                                                                                                       |
+| `error_code_path`    | Chemin du code d’erreur du fournisseur dans une réponse en échec.                                                                                                                                                                                                                                               |
+| `error_message_path` | Chemin du message d’erreur du fournisseur. Sans ces deux chemins, le corps de la réponse sert de message d’erreur.                                                                                                                                                                                              |
+| `check.url`          | `GET` facultatif qui répond 2xx tant que les identifiants sont bons. ReputeCast l’appelle quand un fournisseur est connecté et depuis la tâche de vérification de l’état du fournisseur. Sans lui, l’état ne repose que sur les résultats des envois.                                                       |
+| `check.headers`      | En-têtes de la requête de vérification. Par défaut : les en-têtes de la requête d’envoi.                                                                                                                                                                                                                        |
+| `fields`             | Champs de connexion supplémentaires : `key`, `label`, `secret`, `required`, `options`, `help`. Les modèles lisent un champ secret sous la forme `secrets.<key>` et tout autre champ sous la forme `settings.<key>`.                                                                                            |
+
+Le formulaire de connexion a toujours deux champs secrets facultatifs : **Clé API** (`secrets.api_key`) et **Secret de signature du webhook** (`secrets.webhook_signing_key`). Les secrets sont en écriture seule : ils sont scellés au repos et ne sont jamais renvoyés.
+
+ReputeCast envoie une requête par message et lit la réponse ainsi :
+
+| Réponse         | Ce que fait ReputeCast                                                                                                   |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| 2xx             | Accepté. L’ID du message provient de `message_id_path` ou de `message_id_header`.                                       |
+| 401, 403        | Les identifiants ont été refusés : l’envoi échoue et l’état du fournisseur le signale.                                   |
+| 429             | Limitation de débit : ce message est réessayé plus tard.                                                                 |
+| 408, 5xx        | Une panne du fournisseur : voir [état et pannes des fournisseurs](/fr/providers/health-and-outages/).                   |
+| Tout autre 4xx  | Ce message a définitivement échoué, avec le code et le message que lisent les chemins d’erreur.                          |
+
+## Champs de modèle
+
+Les modèles n’utilisent que des balises de sortie de style Liquid : `{{ name }}`, avec des filtres facultatifs. Il n’y a pas de balises `{% %}` ; une correspondance décrit une seule requête fixe.
+
+| Champ                                                | Valeur                                                                                                                      |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `sender`                                             | From sous la forme `"Name" <address>`, ou l’adresse seule s’il n’y a pas de nom.                                            |
+| `sender_email`, `sender_name`                        | L’adresse et le nom de From.                                                                                                |
+| `recipient`, `recipient_name`, `recipient_formatted` | L’adresse et le nom de To, et `"Name" <address>`.                                                                           |
+| `reply_to`, `reply_to_name`                          | L’adresse et le nom de Reply-To, vides s’il n’y en a pas.                                                                   |
+| `subject`, `html`, `text`                            | Le message généré et personnalisé.                                                                                          |
+| `headers`, `headers_json`                            | Les en-têtes du message sous forme d’objet : `List-Unsubscribe`, `List-Unsubscribe-Post` et les autres que définit ReputeCast, plus `X-ReputeCast-Message`. |
+| `headers_list`                                       | Les mêmes en-têtes sous la forme `[{"name": …, "value": …}]`, triés par nom.                                                |
+| `tags`                                               | Les tags du message sous forme d’objet.                                                                                     |
+| `message_id`                                         | L’ID du message ReputeCast. Envoyez-le au fournisseur pour que ses webhooks puissent le renvoyer.                          |
+| `stream`                                             | `broadcast`, `automation` ou `system`.                                                                                      |
+| `settings.<key>`, `secrets.<key>`                    | Les paramètres et les identifiants du fournisseur connecté.                                                                 |
+
+Envoyez chaque en-tête de `headers_json` ou de `headers_list` : les fournisseurs de messagerie exigent les en-têtes de [désabonnement en un clic](/fr/deliverability/one-click-unsubscribe/). Désactivez dans le corps le suivi des ouvertures et des clics du fournisseur si son API le permet, car ReputeCast suit lui-même les ouvertures et les clics.
+
+### Filtres
+
+Écrivez un filtre après une barre verticale : `{{ settings.region | default: 'eu' }}`. Les filtres s’appliquent de gauche à droite, et un argument est une chaîne entre guillemets (`'…'` ou `"…"`) ou un nom de champ.
+
+| Filtre          | Argument | Résultat                                                                              |
+| --------------- | -------- | ------------------------------------------------------------------------------------- |
+| `default`       | 1        | L’argument quand la valeur manque, est une chaîne vide, ou un objet ou une liste vides. |
+| `prepend`       | 1        | L’argument, puis la valeur.                                                           |
+| `append`        | 1        | La valeur, puis l’argument.                                                           |
+| `base64_encode` | aucun    | Base64 standard.                                                                      |
+| `url_encode`    | aucun    | Encodage de chaîne de requête d’URL.                                                  |
+| `downcase`      | aucun    | Minuscules.                                                                           |
+| `upcase`        | aucun    | Majuscules.                                                                           |
+| `strip`         | aucun    | Espaces de début et de fin retirées.                                                  |
+| `json`          | aucun    | La valeur encodée en texte JSON.                                                      |
+
+Tout autre filtre est refusé à l’enregistrement. Cet en-tête construit une valeur d’authentification Basic à partir de la clé API :
+
+```json title="Basic auth header"
+"Authorization": "Basic {{ 'api:' | append: secrets.api_key | base64_encode }}"
+```
+
+### Échappement
+
+Les valeurs sont échappées selon l’endroit où elles apparaissent, pour que les données ne puissent pas casser la requête :
+
+- **Dans une chaîne JSON** (`"subject": "{{ subject }}"`), la valeur est échappée pour JSON.
+- **Hors d’une chaîne** (`"headers": {{ headers_json }}`), la valeur est encodée en JSON : les objets restent des objets, et une valeur manquante devient `null`.
+- **Dans l’URL**, les valeurs sont échappées pour le chemin, ou pour la chaîne de requête après `?`.
+- **Dans les en-têtes**, les sauts de ligne deviennent des espaces.
+
+Pour envoyer un `{{` littéral dans une chaîne JSON (les propres variables d’une API), écrivez `\{{` : `"Hi \{{first_name}}"` envoie `"Hi {{first_name}}"`. `{{ '{{' }}` fait la même chose n’importe où.
+
+<UiPath path="providers.adapters.testSample" /> génère la requête pour un message d’exemple (d’Acme Newsletter à Linh Nguyen), avec chaque secret affiché sous la forme `••••`. Rien n’est envoyé.
+
+## Syntaxe des chemins
+
+Les champs `*_path` utilisent un sous-ensemble de JSONPath :
+
+| Syntaxe                        | Sélectionne                            |
+| ------------------------------ | -------------------------------------- |
+| `$`                            | La racine.                             |
+| `.name`, `['name']`, `["name"]` | Un membre.                             |
+| `[0]`                          | Un élément de tableau (0 ou plus).     |
+| `[*]`, `.*`                    | Chaque élément d’un tableau ou d’un objet. |
+
+Les filtres (`[?(…)]`), la descente récursive (`..`), les tranches et les index négatifs sont refusés à l’enregistrement. Quand un chemin sélectionne plusieurs valeurs, la première est utilisée, sauf pour `events_path`. Les nombres sont lus exactement : les ID de fournisseur supérieurs à 2^53 gardent donc tous leurs chiffres.
+
+## Authentification du webhook
+
+`webhook.auth` indique comment une requête de webhook prouve qu’elle vient du fournisseur. Le formulaire propose les mêmes cinq modes sous <UiPath path="providers.adapters.webhookAuth" />.
+
+| `auth`           | La requête est acceptée quand                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hmac` (par défaut) | `signature_header` (par défaut `X-Signature`) contient le HMAC de `signed_payload` calculé avec le secret. `signed_payload` utilise `{body}` et `{timestamp}` ; il vaut par défaut `{body}`, ou `{timestamp}.{body}` quand `timestamp_header` est défini. `algorithm` vaut `sha256` (par défaut), `sha1` ou `sha512`. `encoding` vaut `hex` (par défaut) ou `base64`. `signature_prefix` (comme `sha256=`) est retiré d’abord. L’en-tête peut lister plusieurs signatures séparées par des virgules ou des espaces ; une seule correspondance suffit. |
+| `standard`       | La requête porte une signature [Standard Webhooks](https://www.standardwebhooks.com/) valide (`webhook-id`, `webhook-timestamp`, `webhook-signature`, ou les en-têtes `svix-`) calculée avec un secret `whsec_`.                                                                                                                                                                              |
+| `basic`          | Son utilisateur d’authentification Basic est `username` (par défaut `reputecast`) et son mot de passe est le secret.                                                                                                                                                                                                                                                                           |
+| `header`         | `token_header` contient le secret tel quel. ReputeCast n’enregistre jamais cet en-tête avec l’événement brut.                                                                                                                                                                                                                                                                                   |
+| `none`           | Rien d’autre que l’URL du webhook, impossible à deviner. Ne l’utilisez que si le fournisseur ne propose rien de ce qui précède.                                                                                                                                                                                                                                                                  |
+
+Avec `hmac` et un `timestamp_header`, ou avec `standard`, un horodatage (en secondes ou millisecondes Unix) en retard ou en avance de plus de cinq minutes est refusé comme rejeu.
+
+Le secret est le modèle `secret` quand il est défini (il peut lire `secrets.<key>` et `settings.<key>`). Sinon, c’est le **Secret de signature du webhook** de la connexion, et à défaut le secret de webhook que ReputeCast a généré pour le fournisseur. Quand il n’y a aucun secret, chaque requête est refusée.
+
+Faites pointer le webhook du fournisseur vers l’URL affichée sur la carte du fournisseur : `<public URL>/hooks/community:<name>/<token>` pour un fournisseur connecté par un adaptateur HTTP installé, ou `<public URL>/hooks/httpgeneric/<token>`. Les corps de webhook sont limités à 5 Mio.
+
+## Payloads de webhook
+
+`webhook_mapping` choisit comment les événements sont lus : `status` (par défaut) ou `jsonpath`. Dans le formulaire, <UiPath path="providers.adapters.webhookMapping" /> propose `status → delivered | bounced | complained` et <UiPath path="providers.adapters.mappingJsonpath" />.
+
+Une correspondance sans aucun champ de webhook (`webhook_mapping`, `webhook.auth`, `webhook.signature_header`, `webhook.type_path`, `webhook.types`) n’a pas de webhooks : le fournisseur envoie, mais ne signale ni livraisons, ni rebonds, ni plaintes.
+
+| Champ                        | Lit                                                     | Par défaut avec `status`       |
+| ---------------------------- | ------------------------------------------------------- | ------------------------------ |
+| `webhook.events_path`        | Les événements d’une requête                            | `$` (les deux modes)           |
+| `webhook.type_path`          | Le type d’événement (obligatoire avec `jsonpath`)       | `$.status`                     |
+| `webhook.recipient_path`     | Le destinataire                                         | `$.recipient`, puis `$.email`  |
+| `webhook.message_id_path`    | L’ID du message du fournisseur                          | `$.message_id`                 |
+| `webhook.reputecast_id_path` | L’ID du message ReputeCast renvoyé                      | `$.reputecast_id`              |
+| `webhook.code_path`          | La réponse SMTP, ou le code propre au fournisseur       | `$.code`                       |
+| `webhook.diagnostic_path`    | Le texte de diagnostic                                  | `$.reason`                     |
+| `webhook.time_path`          | Le moment de l’événement                                | `$.timestamp`                  |
+| `webhook.url_path`           | Le lien d’un clic                                       | `$.url`                        |
+| `webhook.user_agent_path`    | L’agent utilisateur d’une ouverture ou d’un clic        | `$.user_agent`                 |
+
+Avec `jsonpath`, seuls les chemins que vous définissez sont lus. La correspondance personnalisée du formulaire définit <UiPath path="providers.adapters.pathEvents" />, <UiPath path="providers.adapters.pathType" />, <UiPath path="providers.adapters.pathRecipient" /> et <UiPath path="providers.adapters.pathMessageId" />.
+
+`events_path` peut sélectionner un événement, un tableau d’événements, ou plusieurs de l’un ou de l’autre ; les tableaux sont aplatis. Le destinataire est mis en minuscules. L’ID ReputeCast renvoyé doit être un ID de message ReputeCast (un UUID) pour correspondre. Les heures sont en secondes ou millisecondes Unix, en RFC 3339 ou en `YYYY-MM-DD hh:mm:ss` ; sans heure, c’est l’heure d’arrivée de l’événement qui est utilisée.
+
+### Types d’événements
+
+Avec `status`, la valeur du type (sans distinction de casse) correspond à un [événement normalisé](/fr/providers/events-and-sync/) :
+
+| Valeur du fournisseur                                                 | Événement                      |
+| --------------------------------------------------------------------- | ------------------------------ |
+| `delivered`, `delivery`                                               | `delivered`                    |
+| `deferred`, `delayed`, `delivery_delayed`                             | `deferred`                     |
+| `bounced`, `bounce`, `failed`                                         | selon son code (ci-dessous)    |
+| `hard_bounce`, `hard_bounced`, `hardbounce`, `permanent_failure`      | `hard_bounce`                  |
+| `soft_bounce`, `soft_bounced`, `softbounce`, `temporary_failure`      | `soft_bounce`                  |
+| `complained`, `complaint`, `spam`, `spam_report`, `spamreport`        | `complaint`                    |
+| `rejected`, `dropped`, `blocked`                                      | `rejected`                     |
+| `opened`, `open`                                                      | `open`                         |
+| `clicked`, `click`                                                    | `click`                        |
+| `unsubscribed`, `unsubscribe`                                         | `unsubscribe`                  |
+
+Toute autre valeur est ignorée. Avec `jsonpath`, `webhook.types` fait correspondre les types du fournisseur (sans distinction de casse) à `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `bounce`, `complaint`, `rejected`, `open`, `click`, `unsubscribe` ou `ignore`. Un type que vous ne listez pas se rabat sur le tableau ci-dessus, et il est ignoré sinon.
+
+### Rebonds
+
+ReputeCast n’exclut une adresse que sur preuve, car les [rebonds définitifs](/fr/reference/glossary/#hard-bounce) et les plaintes vont sur la [liste de suppression](/fr/audience/suppressions/) partagée :
+
+- Un rebond simple (`bounced` ou `bounce`) est définitif, sauf si son code dit le contraire. Une réponse SMTP décide selon sa classe : 5xx est définitif, 4xx temporaire. Un code propre au fournisseur (`invalid_recipient`, `mailbox_full`) n’est définitif que s’il désigne une boîte ou un domaine inconnus, ou s’il dit « hard » ou « permanent » ; tout autre code est temporaire. Sans code, il est définitif.
+- Un `hard_bounce` avec une réponse SMTP 4xx devient temporaire.
+- Un rebond définitif causé par l’expéditeur (classé comme blocage pour spam, réputation ou politique) devient temporaire, quel que soit son code.
+
+Les rebonds, les reports et les rejets reçoivent une [classe de rebond](/fr/reference/glossary/#bounce-class) d’après leur code et leur diagnostic.
+
+## Exemple complet
+
+Ce manifest décrit un fournisseur fictif, Example ESP. Il envoie un message par `POST`, lit l’ID du message dans la réponse, vérifie les identifiants sur un endpoint de compte, demande un ID de compte quand un fournisseur est connecté, et lit des webhooks signés par HMAC avec une correspondance de types personnalisée.
+
+```json title="example-esp.manifest.json"
+{
+  "name": "Example ESP",
+  "version": "1.0.0",
+  "maintainer": "you@example.com",
+  "kind": "http",
+  "source_url": "https://github.com/you/example-esp-mapping",
+  "terms": {
+    "bulk": "allowed",
+    "note": "Opted-in lists only.",
+    "url": "https://example-esp.com/aup"
+  },
+  "pricing": "$0.80 per 1,000",
+  "http": {
+    "method": "POST",
+    "url": "https://api.example-esp.com/v1/{{ settings.account }}/messages",
+    "headers": {
+      "Authorization": "Bearer {{ secrets.api_key }}"
+    },
+    "body": "{\"from\": \"{{ sender }}\", \"to\": [{\"email\": \"{{ recipient }}\", \"name\": \"{{ recipient_name }}\"}], \"reply_to\": {{ reply_to | default: sender_email }}, \"subject\": \"{{ subject }}\", \"html\": \"{{ html }}\", \"text\": \"{{ text }}\", \"headers\": {{ headers_json }}, \"metadata\": {\"reputecast_id\": \"{{ message_id }}\", \"stream\": \"{{ stream }}\"}, \"tracking\": {\"opens\": false, \"clicks\": false}}",
+    "message_id_path": "$.data.id",
+    "error_code_path": "$.error.code",
+    "error_message_path": "$.error.message",
+    "check": {
+      "url": "https://api.example-esp.com/v1/{{ settings.account }}/me"
+    },
+    "fields": [
+      {
+        "key": "account",
+        "label": "Account ID",
+        "required": true,
+        "help": "Example ESP › Settings › Account."
+      }
+    ],
+    "webhook_mapping": "jsonpath",
+    "webhook": {
+      "auth": "hmac",
+      "signature_header": "X-Example-Signature",
+      "signature_prefix": "sha256=",
+      "timestamp_header": "X-Example-Timestamp",
+      "events_path": "$.events[*]",
+      "type_path": "$.event",
+      "recipient_path": "$.recipient",
+      "message_id_path": "$.message_id",
+      "reputecast_id_path": "$.metadata.reputecast_id",
+      "code_path": "$.smtp.code",
+      "diagnostic_path": "$.smtp.message",
+      "time_path": "$.ts",
+      "url_path": "$.link",
+      "types": {
+        "delivered": "delivered",
+        "delayed": "deferred",
+        "bounce_permanent": "hard_bounce",
+        "bounce_temporary": "soft_bounce",
+        "complaint": "complaint",
+        "click": "click",
+        "sent": "ignore"
+      }
+    }
+  }
+}
+```
+
+Pour le message d’exemple, le corps donne ceci :
+
+```json title="Rendered request body"
+{
+  "from": "\"Acme Newsletter\" <news@news.acme.io>",
+  "to": [{ "email": "linh@example.com", "name": "Linh Nguyen" }],
+  "reply_to": "news@news.acme.io",
+  "subject": "Your October update",
+  "html": "<p>Hello \"Linh\" — this is a <b>sample</b>.</p>",
+  "text": "Hello \"Linh\" — this is a sample.",
+  "headers": {
+    "List-Unsubscribe": "<https://news.acme.io/p/acme/unsubscribe/abc>",
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    "X-ReputeCast-Message": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40"
+  },
+  "metadata": { "reputecast_id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40", "stream": "broadcast" },
+  "tracking": { "opens": false, "clicks": false }
+}
+```
+
+Example ESP signe chaque webhook avec `X-Example-Timestamp: <Unix seconds>` et `X-Example-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<body>">`, avec pour clé le secret saisi comme **Secret de signature du webhook** de la connexion. Cette requête :
+
+```json title="Webhook body from Example ESP"
+{
+  "events": [
+    { "event": "delivered", "recipient": "Linh@Example.com", "message_id": "msg_7fa3", "metadata": { "reputecast_id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e40" }, "smtp": { "code": "250 2.0.0", "message": "OK" }, "ts": 1791882062 },
+    { "event": "bounce_permanent", "recipient": "john@example.com", "message_id": "msg_7fa4", "metadata": { "reputecast_id": "0199d5a8-2b6e-7c41-9a0e-5b8f1c2d3e41" }, "smtp": { "code": "550 5.1.1", "message": "The email account that you tried to reach does not exist." }, "ts": 1791882065123 },
+    { "event": "bounce_permanent", "recipient": "ana@example.com", "message_id": "msg_7fa5", "smtp": { "code": "550 5.7.1", "message": "Message rejected as spam" }, "ts": "2026-10-13T09:01:05Z" },
+    { "event": "sent", "recipient": "x@example.com", "message_id": "msg_7fa6" },
+    { "event": "opened", "recipient": "x@example.com", "message_id": "msg_7fa6" }
+  ]
+}
+```
+
+produit quatre événements :
+
+<TableScroll label="Événements produits par le webhook d’exemple">
+
+| Événement du fournisseur      | Événement     | Destinataire       | Code        | Classe de rebond |
+| ----------------------------- | ------------- | ------------------ | ----------- | ---------------- |
+| `delivered`                   | `delivered`   | `linh@example.com` | `250 2.0.0` | —                |
+| `bounce_permanent`, 5.1.1     | `hard_bounce` | `john@example.com` | `550 5.1.1` | `mailbox_unknown` |
+| `bounce_permanent`, spam      | `soft_bounce` | `ana@example.com`  | `550 5.7.1` | `spam_block`     |
+| `opened` (absent de `types`)  | `open`        | `x@example.com`    | —           | —                |
+
+</TableScroll>
+
+L’événement `sent` est ignoré. Les deux premiers événements sont associés à leurs messages par l’ID ReputeCast renvoyé, les autres par l’ID du message du fournisseur.
+
+## Remarques
+
+- L’adaptateur HTTP générique envoie un message par requête, configure les domaines par des enregistrements DNS manuels et applique la [liste de suppression](/fr/reference/glossary/#suppression-list) en local (Locale uniquement) ; il ne détecte pas le quota. Quand un fournisseur a besoin de lots, d’une API de domaine, d’une synchronisation de la liste de suppression ou de plusieurs appels par message, écrivez un [adaptateur communautaire](/fr/adapters/community/).
+- L’enregistrement refuse une correspondance qui pose problème et nomme le champ (`body`, `url`, `webhook.type_path`…). Le journal d’audit enregistre la méthode, l’URL, les noms des en-têtes, la correspondance du webhook et le mode d’authentification, jamais les valeurs des en-têtes.
+- Chaque adaptateur installé apparaît dans <UiPath path="nav.providers > providers.overview.addProvider" /> dans chaque espace de travail, avec ses conditions, ses tarifs et ses champs de connexion. Chaque processus relit les adaptateurs installés toutes les 15 secondes.
+
+<Aside type="danger">
+  Les modèles d’en-têtes contiennent souvent des identifiants. Lisez-les depuis `secrets.<key>` (saisis à la connexion d’un fournisseur, scellés au repos) au lieu de taper une clé dans la correspondance, que chaque admin de l’instance peut lire.
+</Aside>

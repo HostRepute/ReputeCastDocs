@@ -1,0 +1,141 @@
+---
+title: Enviar a través de cualquier servidor SMTP
+description: 'Envía tu newsletter por un servidor SMTP o un relay con ReputeCast: conecta el host, TLS y el inicio de sesión, y un buzón de rebotes IMAP o POP3.'
+type: how-to
+audience: [admin, operator]
+permissions: ['providers:manage', 'domains:manage']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: newsletter por un servidor SMTP
+sources:
+  - internal/providers/smtp
+  - internal/providers/bounce
+  - internal/providers/mimemsg
+  - internal/ingest/jobs.go
+  - internal/connect/connection.go
+  - web/src/features/connect/ConnectionSMTP.tsx
+  - web/src/features/connect/connection.messages.ts
+sidebar:
+  order: 13
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Con ReputeCast puedes enviar tu newsletter por un servidor SMTP: tu propio servidor de correo, un relay o el endpoint
+SMTP de un proveedor. SMTP no tiene webhooks de eventos, así que también conectas un
+[buzón de rebotes](/es/reference/glossary/#bounce-mailbox): ReputeCast lee los fallos de entrega y los informes de spam
+que llegan allí y los convierte en los mismos eventos de rebote y de queja que otros proveedores envían por webhook.
+
+<ProviderMatrix family="email" id="smtp" />
+
+## Antes de empezar
+
+- **Los datos del servidor:** nombre de host, puerto, cifrado y, si lo exige, un inicio de sesión. ReputeCast inicia
+  sesión con `AUTH PLAIN` o `AUTH LOGIN`; los servidores que solo ofrecen otros métodos (como CRAM-MD5 o XOAUTH2) no se
+  pueden usar. TLS necesita la versión 1.2 o posterior y un certificado válido para el nombre de host.
+- **Firma DKIM en el servidor o en el relay.** ReputeCast entrega cada mensaje sin firmar, así que el servidor tiene que
+  firmarlo con la clave DKIM de tu dominio.
+- **Un buzón de rebotes exclusivo** accesible por IMAP o POP3, cuya dirección será el return-path (remitente del sobre)
+  de cada mensaje. No lo leas en un cliente de correo: ReputeCast solo recoge los mensajes no leídos.
+- **Para un servidor en tu propia red** (direcciones de loopback o privadas), quien administra la instancia activa
+  `providers.allow_private_networks` (`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Las direcciones de metadatos
+  de la nube se rechazan siempre.
+- **Permisos.** Para conectar necesitas `providers:manage`; para añadir un dominio de envío nuevo, `domains:manage`.
+
+## Conectar un servidor SMTP
+
+<Steps>
+
+1. Abre <UiPath path="nav.providers" />, elige <UiPath path="providers.overview.addProvider" /> y selecciona la tarjeta
+   SMTP en el catálogo. [Conectar un proveedor de envío](/es/providers/connect/) explica los pasos que comparten todos
+   los proveedores.
+
+2. En <UiPath path="connect.connection.smtp.serverTitle" />, rellena:
+   - <UiPath path="connect.connection.smtp.host" />, por ejemplo `smtp.example.com`;
+   - <UiPath path="connect.connection.smtp.port" /> y <UiPath path="connect.connection.smtp.encryption" />: STARTTLS en
+     el 587 (el predeterminado), TLS implícito en el 465 o sin TLS (solo en una red privada);
+   - <UiPath path="connect.connection.smtp.username" /> y <UiPath path="connect.connection.smtp.password" />, si el
+     servidor exige iniciar sesión;
+   - <UiPath path="connect.connection.smtp.maxRate" /> y <UiPath path="connect.connection.smtp.dailyCap" />. Los
+     servidores SMTP no publican sus límites, así que ReputeCast limita la velocidad a la que escribas (10 mensajes por
+     segundo si lo dejas vacío) y reduce el ritmo cuando el servidor responde con un código 4xx.
+
+3. Elige <UiPath path="connect.connection.smtp.testConnection" />. ReputeCast se conecta, envía EHLO con el nombre de
+   host de tu URL pública, inicia TLS e inicia sesión, y después se desconecta; no se envía nada. El resultado muestra lo
+   que funcionó, por ejemplo "STARTTLS, TLS 1.3 · AUTH PLAIN aceptado", con las respuestas del servidor.
+
+4. En <UiPath path="connect.connection.smtp.mailboxTitle" />, rellena la
+   <UiPath path="connect.connection.smtp.returnPath" />, el <UiPath path="connect.connection.smtp.protocol" /> (se
+   recomienda IMAP), el <UiPath path="connect.connection.smtp.mailServer" />, el puerto, el inicio de sesión y, para IMAP,
+   la <UiPath path="connect.connection.smtp.folder" /> (`INBOX` por defecto). Elige
+   <UiPath path="connect.connection.smtp.testMailbox" />. ReputeCast lee el buzón sin cambiarlo e indica cuántos mensajes
+   encontró y cuántos parecen informes de entrega.
+
+5. Elige <UiPath path="connect.connection.continueDomain" />; se desbloquea cuando pasan las dos pruebas. Escribe tu
+   dominio de envío. ReputeCast no puede añadir registros en el servidor, así que muestra lo que debes publicar: un
+   registro SPF con `a:<your SMTP host>`, combinado con tu registro SPF actual, y DMARC si el dominio no tiene ninguno.
+   Publica el registro DKIM que te dé tu servidor o tu relay.
+
+6. En <UiPath path="connect.stepTest" />, envía una prueba. La entrega se confirma con la respuesta `250` del servidor;
+   el rebote de una dirección que no existe llega más tarde a través del buzón de rebotes.
+
+7. Termina <UiPath path="connect.stepStreams" /> y <UiPath path="connect.stepContacts" />. No hay nada que recibir de un
+   servidor SMTP: la lista de supresión se queda en ReputeCast.
+
+</Steps>
+
+## Comprobar que funciona
+
+- La tarjeta SMTP en <UiPath path="nav.providers > providers.tabProviders" /> muestra
+  <UiPath path="providers.statusHealthy" />. ReputeCast repite la comprobación de conexión e inicio de sesión cada 5
+  minutos aproximadamente.
+- Un rebote a una dirección que no existe aparece en <UiPath path="nav.providers > providers.tabEvents" /> en pocos
+  minutos, con el código de estado original.
+
+ReputeCast envía hasta 25 mensajes por una misma conexión SMTP, con las cabeceras `Message-ID`, `List-Unsubscribe`,
+`List-Unsubscribe-Post` y `Feedback-ID`, y la dirección del buzón de rebotes como remitente del sobre. Los servidores
+SMTP no informan de entregas: ReputeCast cuenta un mensaje como entregado (deducido) en cuanto el servidor lo acepta con
+su respuesta `250`, y se entera de los fallos por el buzón de rebotes. Cuando el servidor anuncia que admite DSN,
+ReputeCast también pide notificaciones de estado de entrega en caso de éxito, fallo y retraso, solo con las cabeceras;
+un aviso de éxito confirma la entrega y nunca se lee como rebote. En el buzón de rebotes, lee las notificaciones de
+estado de entrega estándar (RFC 3464), los informes de spam en formato ARF (RFC 5965) y los formatos de rebote no
+estándar habituales; las respuestas de fuera de la oficina y el resto del correo se ignoran. Un informe solo cuenta
+cuando trata de un mensaje que envió ReputeCast (encontrado por su cabecera `X-ReputeCast-Message` o su `Message-ID`) y
+nombra al destinatario de ese mensaje; los demás informes se guardan como eventos y no cambian nada. Un fallo permanente
+es un rebote permanente y suprime la dirección en todo el espacio de trabajo; los temporales son rebotes temporales. Los
+códigos poco claros cuentan como temporales, así que nada se suprime por suposición.
+
+<Aside type="note">
+  ReputeCast comprueba el buzón de rebotes cada minuto y lee hasta 200 mensajes no leídos cada vez. Marca como leídos
+  los mensajes IMAP y elimina los mensajes POP3 después de leerlos. Las opciones
+  <UiPath path="connect.connection.smtp.pollEvery" /> y <UiPath path="connect.connection.smtp.afterProcessing" /> del
+  formulario se guardan, pero todavía no cambian este comportamiento.
+</Aside>
+
+## Solución de problemas
+
+- **"ECONNREFUSED · nada escucha en ese puerto"**, **"ENOTFOUND · el nombre de host no se resuelve"** o
+  **"ETIMEDOUT · sin respuesta en 15 s"**. Comprueba el host y el puerto, y si un cortafuegos bloquea el SMTP saliente
+  desde el host de ReputeCast.
+- **"… no ofrece STARTTLS en el puerto …".** Usa TLS implícito en el 465, o desactiva el cifrado solo en una red
+  privada.
+- **"… no ofrece ningún método de inicio de sesión compatible con ReputeCast".** El servidor no ofrece ni `PLAIN` ni
+  `LOGIN`. Activa uno de los dos para la cuenta o usa otro relay.
+- **La prueba de conexión falla con `535`.** El servidor rechazó el nombre de usuario o la contraseña.
+- **"ReputeCast no se conectará a esa dirección".** El host está en una dirección privada o de loopback. Activa
+  `providers.allow_private_networks` o usa el nombre público del servidor.
+- **"El buzón rechazó el nombre de usuario o la contraseña."** Comprueba el inicio de sesión del buzón de rebotes;
+  algunos proveedores necesitan una contraseña de aplicación para IMAP o POP3.
+- **Los rebotes nunca aparecen.** Comprueba que la dirección de return-path sea el buzón de rebotes, que nadie lea el
+  buzón en un cliente de correo (los mensajes leídos se omiten) y que la carpeta sea la correcta.
+- **Gmail o Yahoo indican que falta DKIM.** ReputeCast no firma el correo SMTP. Activa la firma DKIM en el servidor o en
+  el relay y publica su clave.
+
+## Relacionado
+
+- [Conectar un proveedor de envío](/es/providers/connect/)
+- [Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/)
+- [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)
+- [Enviar con tu propio servidor Postal](/es/providers/postal/)
+- [Rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/)

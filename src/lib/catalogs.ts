@@ -4,7 +4,17 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getCollection, type CollectionEntry } from 'astro:content'
 import { parse as parseYaml } from 'yaml'
+import de from '../content/i18n/de.json'
+import en from '../content/i18n/en.json'
+import es from '../content/i18n/es.json'
+import fr from '../content/i18n/fr.json'
+import vi from '../content/i18n/vi.json'
 import { groupBy, pick, slugify } from './l10n.ts'
+import { isLang, type Lang } from './locales.ts'
+import type { Loc } from '../data/schemas.ts'
+
+// Built-in strings by locale (src/content/i18n/<lang>.json), for headings rendered outside a Starlight `t`.
+const UI_STRINGS: Record<Lang, Record<string, string>> = { en, de, es, fr, vi }
 
 /** Collection name → data file (src/data/<file>.yaml), as wired in src/content.config.ts. */
 const FILES = {
@@ -69,7 +79,7 @@ export async function cliSections(lang: string, level: HeadingLevel = 2) {
   return {
     sections,
     global,
-    globalHeading: { depth: level, slug: 'global-flags', text: label(lang, 'Global flags', 'Cờ dùng chung') },
+    globalHeading: { depth: level, slug: 'global-flags', text: label(lang, 'rc.cli.global') },
   }
 }
 
@@ -90,12 +100,12 @@ export async function configSections(lang: string, level: HeadingLevel = 2) {
     envHeading: {
       depth: level,
       slug: 'environment-only-variables',
-      text: label(lang, 'Environment-only variables', 'Biến chỉ đặt qua môi trường'),
+      text: label(lang, 'rc.config.envOnly'),
     },
   }
 }
 
-function localizedGroups<T extends { group?: { en: string; vi?: string }; area?: { en: string; vi?: string } }>(
+function localizedGroups<T extends { group?: Loc; area?: Loc }>(
   list: T[],
   field: 'group' | 'area',
   lang: string,
@@ -132,14 +142,14 @@ export async function limitSections(lang: string, level: HeadingLevel = 2) {
 export async function mcpSections(lang: string, level: HeadingLevel = 2) {
   const all = await rows('mcp')
   const kinds = [
-    { type: 'tool', slug: 'tools', en: 'Tools', vi: 'Công cụ' },
-    { type: 'resource', slug: 'resources', en: 'Resources', vi: 'Tài nguyên' },
-    { type: 'prompt', slug: 'prompts', en: 'Prompts', vi: 'Prompt' },
+    { type: 'tool', slug: 'tools', key: 'rc.mcp.tools' },
+    { type: 'resource', slug: 'resources', key: 'rc.mcp.resources' },
+    { type: 'prompt', slug: 'prompts', key: 'rc.mcp.prompts' },
   ] as const
   return kinds.map((k) => {
     const list = all.filter((r) => r.type === k.type)
     return {
-      heading: { depth: level, slug: k.slug, text: label(lang, k.en, k.vi) },
+      heading: { depth: level, slug: k.slug, text: label(lang, k.key) },
       rows: k.type === 'tool' ? [] : list,
       children:
         k.type === 'tool'
@@ -157,8 +167,8 @@ export function areaKey(limitId: string): string {
   return limitId.split('.')[0]
 }
 
-function label(lang: string, en: string, vi: string): string {
-  return lang === 'vi' ? vi : en
+function label(lang: string, key: string): string {
+  return (isLang(lang) ? UI_STRINGS[lang][key] : undefined) ?? UI_STRINGS.en[key] ?? key
 }
 
 export function flatten<T>(sections: Section<T>[]): Heading[] {

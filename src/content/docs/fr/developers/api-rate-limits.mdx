@@ -1,0 +1,122 @@
+---
+title: Limites de débit
+description: "Les limites de débit de l’API ReputeCast : requêtes par minute par clé et par session, connexion, MCP, envois transactionnels, en-têtes X-RateLimit et 429."
+type: reference
+audience: [developer, operator]
+primaryKeyword: limites de débit de l’API
+sources:
+  - internal/server/ratelimit.go
+  - internal/server/sessionlimit.go
+  - internal/api/auth.go
+  - internal/app/app.go
+  - internal/config/config.go
+  - internal/transactional/ratelimit.go
+  - internal/transactional/send.go
+  - internal/revenue/conversions.go
+  - internal/mcpserver/server.go
+sidebar:
+  order: 6
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Voici les limites de débit de l’API d’une instance ReputeCast : le nombre de requêtes que chaque appelant peut faire,
+la façon dont le serveur les compte, et ce qu’il répond quand un appelant les dépasse.
+
+## Limites
+
+<LimitsTable area="rate-limits" />
+
+- Les appels avec une clé API ou un jeton d’agent sont comptés par clé, quelle que soit l’adresse d’origine. Un
+  navigateur connecté est compté par session une fois sa connexion vérifiée, et tous les navigateurs connectés depuis
+  une même adresse IP partagent un plafond plus élevé : une équipe derrière le même réseau de bureau ne partage donc pas
+  un seul budget. Les appels sans l’un ni l’autre sont comptés par adresse IP du client.
+- Les appels d’envoi transactionnel, unitaires ou par lots, ne comptent pas dans la limite de requêtes par clé ; chaque
+  clé a plutôt son propre débit de messages (voir
+  [envoyer des e-mails transactionnels avec l’API](/fr/developers/transactional-api/)).
+- Les pages publiques, les liens de suivi et les webhooks des fournisseurs (`/p/`, `/t/`, `/hooks/`) échappent à ces
+  limites. Les formulaires d’inscription ont leurs propres limites (voir
+  [formulaires d’inscription](/fr/forms/signup-forms/)).
+- Chaque processus serveur compte de son côté, sauf pour les débits d’envoi transactionnel, que tous les nœuds web
+  prennent sur le même budget. Avec plusieurs nœuds web derrière un répartiteur de charge, un appelant peut atteindre
+  les autres limites sur chaque nœud.
+
+## En-têtes
+
+<TableScroll label="En-têtes de limite de débit">
+
+| En-tête                 | Envoyé sur                                                                         | Valeur                                                                                                                                                                                                     |
+| ----------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-RateLimit-Limit`     | Chaque réponse `/api/`, sauf l’envoi transactionnel unitaire et par lots           | Requêtes autorisées par minute pour cet appelant (pour un navigateur connecté, le plafond partagé de son adresse).                                                                                        |
+| `X-RateLimit-Remaining` | Les mêmes                                                                          | Requêtes restantes dans la fenêtre en cours.                                                                                                                                                               |
+| `X-RateLimit-Reset`     | Les mêmes                                                                          | La fin de la fenêtre en cours, en secondes Unix.                                                                                                                                                           |
+| `Retry-After`           | Les réponses `429`                                                                 | Les secondes à attendre. `60` pour les limites par clé, par adresse, de connexion et MCP ; pour une session de navigateur, les envois transactionnels et les conversions, le temps restant avant qu’il y ait de nouveau de la place (au moins 1). |
+
+</TableScroll>
+
+```http title="En-têtes de réponse"
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Ratelimit-Limit: 600
+X-Ratelimit-Remaining: 590
+X-Ratelimit-Reset: 1792671646
+```
+
+Les noms d’en-têtes HTTP ne sont pas sensibles à la casse ; lisez-les sans dépendre de la casse.
+
+## Réponses quand une limite est atteinte
+
+Au-delà de la limite de requêtes par clé :
+
+```json title="429 Too Many Requests"
+{
+  "code": "rate_limited",
+  "detail": "Rate limit reached. Requests resume within a minute; batch endpoints accept up to 1,000 items per call.",
+  "status": 429,
+  "title": "Too Many Requests"
+}
+```
+
+Les « 1,000 items » de ce message valent pour l’ajout d’adresses à la liste de suppression ; l’opération d’envoi
+transactionnel par lots accepte jusqu’à 100 messages.
+
+Au-delà du débit de messages d’une clé d’envoi uniquement (ici 50 par seconde), avec `Retry-After: 1` :
+
+```json title="429 Too Many Requests"
+{
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This key sends at most 50 messages per second. Wait 1 second (Retry-After) and send again with the same idempotency key.",
+  "code": "rate_limited"
+}
+```
+
+Au-delà de la limite de connexion, le détail est « Too many sign-in attempts from your network. Wait a minute and try
+again. » Au-delà de la limite d’une session de navigateur, il vaut « Too many requests from this session: at most 600 a
+minute. Requests resume in 12 s. », avec le même nombre de secondes dans `Retry-After` ; le plafond par adresse répond
+comme la limite par clé. Le serveur MCP répond à sa limite en texte brut, avec `Retry-After: 60` : « Rate limit
+reached: 120 calls per minute per agent. Calls resume within a minute. » (avec la limite propre à l’agent à la place
+de 120). Voir [erreurs de l’API](/fr/developers/api-errors/) pour le format des problèmes.
+
+## Rester sous les limites
+
+- Lisez `X-RateLimit-Remaining` et ralentissez avant qu’il atteigne 0.
+- Sur `429`, attendez le nombre de secondes indiqué dans `Retry-After`, puis réessayez. Réessayer plus tôt ne vous
+  vaut qu’un autre `429`.
+- Utilisez les opérations par lots et la plus grande taille de page dont vous avez besoin (voir
+  [pagination](/fr/developers/api-pagination/)).
+- [Recevez des webhooks](/fr/developers/webhooks/) au lieu d’interroger l’API pour détecter les changements.
+- Réessayez les envois transactionnels avec le même `Idempotency-Key`, pour qu’un message ne soit envoyé qu’une fois.
+- Donnez à chaque tâche sa propre clé, pour qu’une tâche chargée n’épuise pas la limite d’une autre.
+
+## Modifier les limites
+
+Les exploitants du serveur définissent les limites de requêtes dans la configuration : `http.rate_limit_api` pour
+chaque clé API et chaque session de navigateur, `http.rate_limit_ip` pour l’ensemble des navigateurs connectés depuis
+une même adresse, et `http.rate_limit_auth` pour la connexion (voir la
+[référence de configuration](/fr/reference/configuration/)). Régler `http.rate_limit_api` sur 0 désactive les trois.
+Quand ReputeCast tourne derrière un reverse proxy, définissez `http.trusted_proxies` pour que les appelants soient
+comptés selon leur propre adresse, et non selon celle du proxy (voir
+[reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)). Le débit de messages d’une clé d’envoi uniquement se définit
+à la création de la clé, et la limite d’appels d’un agent MCP dans les paramètres MCP de l’espace de travail.

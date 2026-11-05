@@ -1,0 +1,213 @@
+---
+title: Rebonds, plaintes et limites des fournisseurs
+description: Ce que ReputeCast fait de chaque rebond et plainte, ce qu’il exclut aussitôt, et le seuil de taux de rebond des fournisseurs d’envoi et de ReputeCast.
+type: explanation
+audience: [publisher, admin]
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: seuil de taux de rebond
+sources:
+  - internal/providers/provider.go
+  - internal/providers/bounce/bounce.go
+  - internal/providers/ses/sns.go
+  - internal/ingest/normalize.go
+  - internal/suppressions/sync.go
+  - internal/reports/bounces.go
+  - internal/providers/state/state.go
+  - internal/providers/manage/usage.go
+  - internal/connect/connection.go
+  - internal/deliverability/providers.go
+  - internal/sending/engine/loop.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/watch.go
+  - internal/mailbox/mailbox.go
+  - internal/counters/counters.go
+  - web/src/features/reports/messages.ts
+  - web/src/features/traffic/traffic.messages.ts
+sidebar:
+  order: 8
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Un [rebond](/fr/reference/glossary/#bounce) est un message que le serveur de réception a refusé ; une
+[plainte](/fr/reference/glossary/#complaint) est un lecteur qui signale votre e-mail comme spam. Les deux comptent dans
+le seuil de taux de rebond et les limites de plaintes que les fournisseurs d’envoi appliquent à votre compte, ainsi que
+dans les seuils que ReputeCast applique pendant l’envoi d’une campagne. Cette page explique comment chaque type est
+enregistré, quelles adresses sont exclues aussitôt, et où se situent ces limites.
+
+## Rebonds définitifs, rebonds temporaires et plaintes
+
+- Un [rebond définitif](/fr/reference/glossary/#hard-bounce) est un échec permanent : l’adresse n’existe pas, le
+  domaine n’a pas de serveur de messagerie, ou le serveur de réception a refusé le message pour de bon. Les réponses
+  SMTP correspondantes commencent par 5 (par exemple `550 5.1.1`).
+- Un [rebond temporaire](/fr/reference/glossary/#soft-bounce) est un échec passager, comme une boîte pleine ou un
+  serveur de réception qui demande de réessayer plus tard. Les réponses commencent par 4 (par exemple `452 4.2.2`). Le
+  fournisseur d’envoi réessaie ; un message qu’il ne parvient finalement pas à délivrer est signalé comme rebond
+  temporaire.
+- Un [report](/fr/reference/glossary/#deferral) est une tentative retardée que le fournisseur d’envoi réessaiera. De
+  nombreux reports chez un même fournisseur de messagerie signifient généralement qu’il limite le débit de vos e-mails.
+  Un message ne compte qu’une fois comme différé, quel que soit le nombre de tentatives différées.
+- Une plainte vous parvient par une [boucle de rétroaction](/fr/reference/glossary/#feedback-loop) : le
+  [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider) signale un clic sur « Signaler comme spam » à
+  votre [fournisseur d’envoi](/fr/reference/glossary/#sending-provider), qui le transmet.
+- Un message rejeté est un message que le fournisseur d’envoi a refusé avant de l’envoyer, par exemple parce que
+  l’adresse figure sur la liste de suppression propre au fournisseur ou que le contenu a été signalé.
+
+C’est le fournisseur d’envoi qui décide si un rebond est définitif ou temporaire. ReputeCast conserve cette décision,
+avec le type d’événement et le code d’origine du fournisseur.
+
+## Ce que fait ReputeCast de chaque événement
+
+1. Le fournisseur d’envoi signale l’événement au webhook de ReputeCast ou, pour un serveur SMTP, ReputeCast le lit
+   dans la [boîte de réception des rebonds](/fr/reference/glossary/#bounce-mailbox). Le contenu brut est stocké avant
+   toute autre chose.
+2. ReputeCast le fait correspondre à un seul type d’[événement normalisé](/fr/reference/glossary/#normalized-event) :
+   `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected`, `open`, `click` ou `unsubscribe`. Le
+   type d’origine (« Bounce · Permanent · General ») et le code (« 550 5.1.1 ») l’accompagnent.
+3. Un rebond reçoit aussi une [classe de rebond](/fr/reference/glossary/#bounce-class), déduite du code d’état étendu
+   et du texte de diagnostic, pour qu’une même réponse ait le même sens chez tous les fournisseurs d’envoi.
+4. Un rebond définitif, une plainte et un désabonnement signalés par le fournisseur placent aussitôt l’adresse sur la
+   [liste de suppression partagée](/fr/reference/glossary/#suppression-list), et l’état du contact passe à rebond ou à
+   plainte. La [synchronisation de la liste de suppression](/fr/reference/glossary/#suppression-sync) envoie ensuite
+   l’adresse à chaque fournisseur d’envoi connecté qui accepte les suppressions : un seul rebond arrête les envois
+   partout.
+5. Un blocage lié à la réputation ou à la politique de l’expéditeur (`policy_block`, `spam_block`, `reputation`)
+   n’exclut jamais l’adresse, même quand le fournisseur d’envoi le qualifie de permanent : l’adresse est valide, et
+   elle reçoit de nouveau des e-mails une fois le blocage corrigé.
+6. Un rebond temporaire ou un report n’exclut pas une adresse à lui seul. Ils comptent dans les rapports et dans le
+   [suivi en direct](/fr/campaigns/live-monitor/). Les e-mails transactionnels ajoutent une règle : quand un message
+   Transactionnel rebondit temporairement et que l’adresse a eu 3 rebonds temporaires en 7 jours, l’adresse est exclue.
+7. Les rebonds par type, les reports et les plaintes alimentent l’[envoi protégé](/fr/reference/glossary/#guarded-sending) :
+   quand les taux d’une campagne franchissent les [seuils de pause automatique](#seuils-de-pause-automatique),
+   ReputeCast ralentit ou retient la part concernée.
+
+Les copies envoyées par un [test de placement](/fr/deliverability/placement-tests/) à vos propres boîtes témoins sont la
+seule exception : leurs rebonds et leurs plaintes n’excluent jamais la boîte témoin.
+
+Chaque événement brut et sa forme normalisée apparaissent côte à côte dans
+<UiPath path="nav.providers > providers.tabEvents" />.
+
+<Screenshot
+  id="providers-events"
+  alt="Le journal des événements dans Événements et synchronisation : chaque événement brut d’un fournisseur, comme un Bounce · Permanent · General d’Amazon SES, à côté de son type normalisé, du code et du diagnostic d’origine, du destinataire et de sa source, comme une campagne, une étape d’automatisation ou l’API transactionnelle."
+/>
+
+### Classes de rebond
+
+Les rapports de campagne regroupent les rebonds par classe dans leur tableau des rebonds, avec les codes d’origine de
+chaque fournisseur d’envoi, et indiquent ce qu’il est advenu des adresses.
+
+<TableScroll label="Classes de rebond">
+
+| Classe            | Ce qu’a dit le serveur de réception                              | Ligne du rapport                   | Ce qui se passe                                         |
+| ----------------- | ---------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------- |
+| `mailbox_unknown` | L’adresse n’existe pas (`5.1.1`, « user unknown »)               | Définitif · destinataire inexistant | Exclue automatiquement                                 |
+| `domain_invalid`  | Le domaine n’existe pas ou n’a pas de serveur de messagerie      | Définitif · domaine introuvable    | Exclue automatiquement                                  |
+| `mailbox_full`    | La boîte a dépassé son quota (`4.2.2`, `5.2.2`)                  | Temporaire · boîte pleine          | Nouvelle tentative au prochain envoi                    |
+| `temporary`       | Un échec temporaire qui ne s’est jamais résolu                   | Temporaire · report expiré         | Nouvelle tentative au prochain envoi                    |
+| `policy_block`    | Refus pour raison de politique, souvent l’authentification (`5.7.1`, `5.7.26`) | Bloqué · politique ou réputation | Jamais exclue ; examinez et corrigez la cause |
+| `spam_block`      | Refus pour spam, ou à cause d’une inscription sur une liste de blocage | Bloqué · politique ou réputation | Jamais exclue ; examinez et corrigez la cause     |
+| `reputation`      | Refus ou limitation de débit à cause de la réputation de l’expéditeur | Bloqué · politique ou réputation | Jamais exclue ; examinez et corrigez la cause      |
+| `other`           | Aucun code que ReputeCast sait classer                           | Autre                              | À vous de l’examiner                                    |
+
+</TableScroll>
+
+Les rebonds de blocage mettent en cause votre configuration d’envoi, pas l’adresse : ReputeCast ne les exclut donc
+jamais, même quand le fournisseur d’envoi les a signalés comme permanents. Dans le tableau des rebonds du rapport, la
+ligne des blocages propose <UiPath path="reports.investigate" />, qui montre ce qu’a dit chaque fournisseur d’envoi, et
+<UiPath path="reports.retryTitle" /> crée de nouveau un brouillon du numéro pour les adresses bloquées encore présentes
+dans votre liste, chacune une fois, à envoyer depuis <UiPath path="composer.reviewSend" /> après avoir corrigé la cause.
+Vérifiez [SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/) et les
+[inscriptions en liste de blocage](/fr/deliverability/blocklists/), et recherchez le code dans les
+[codes d’erreur SMTP](/fr/smtp-errors/).
+
+### Plaintes : où elles sont signalées
+
+La plupart des fournisseurs de messagerie envoient un signalement par plainte à votre fournisseur d’envoi, que
+ReputeCast reçoit sous la forme d’un événement `complaint` : Outlook, Yahoo et beaucoup des fournisseurs regroupés dans
+Autres. Gmail et iCloud ne signalent jamais les plaintes une par une. ReputeCast ne calcule donc les taux de plainte que
+sur les e-mails délivrés aux fournisseurs de messagerie qui les signalent, et affiche les taux de plainte propres à
+Gmail et à iCloud en <UiPath path="live.model.notAvailable" /> avec la raison, jamais à 0 %. Inconnu ne veut pas dire
+zéro : une campagne envoyée uniquement à Gmail n’a pas de taux de plainte, pas un taux parfait. Le fournisseur de
+messagerie d’un destinataire est déduit des enregistrements MX du domaine : les adresses Google Workspace comptent donc
+comme Gmail, et les adresses Microsoft 365 comme Outlook.
+
+Gmail fonctionne autrement : sa boucle de rétroaction indique des taux de spam agrégés par identifiant dans Google
+Postmaster Tools, d’après un en-tête `Feedback-ID` présent dans le message
+([Aide Gmail, « Feedback Loop »](https://support.google.com/mail/answer/6254652), vérifié en octobre 2026). ReputeCast
+ajoute cet en-tête aux e-mails des flux Diffusions, Automatisations et Transactionnel :
+
+```text title="En-tête Feedback-ID"
+Feedback-ID: <campaign, automation or template>:<workspace>:<stream>:reputecast
+```
+
+Les identifiants regroupent les données de Gmail par campagne, par espace de travail et par flux. Avec
+[HostRepute](/fr/deliverability/hostrepute/) connecté, les chiffres de Postmaster Tools, campagnes signalées comprises,
+apparaissent dans la Délivrabilité, et la surveillance des plaintes après un envoi peut lire le taux de spam quotidien de
+Gmail (voir [définir les règles de trafic](/fr/providers/traffic-rules/)).
+
+Les plaintes continuent d’arriver pendant des jours après la livraison. Chacune exclut quand même l’adresse et compte
+dans le rapport de la campagne, et pendant 72 heures après un envoi (par défaut), ReputeCast alerte les personnes qui
+peuvent reprendre les envois quand un fournisseur de messagerie dépasse sa limite de plaintes.
+
+## Limites de compte des fournisseurs d’envoi
+
+Les fournisseurs d’envoi surveillent les taux de rebond et de plainte de votre compte et peuvent vous empêcher
+d’envoyer quand ils deviennent trop élevés. Amazon SES, par exemple, publie deux niveaux pour chaque taux
+([Amazon SES sending review process FAQs](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), vérifié en
+octobre 2026) :
+
+| Taux             | Compte en cours d’examen | Envoi susceptible d’être suspendu |
+| ---------------- | ------------------------ | --------------------------------- |
+| Taux de rebond   | 5 % ou plus              | 10 % ou plus                      |
+| Taux de plainte  | 0,1 % ou plus            | 0,5 % ou plus                     |
+
+Amazon SES ne compte que les rebonds définitifs vers des domaines que vous n’avez pas vérifiés, et les plaintes des
+seuls fournisseurs de messagerie qui envoient des retours, mesurés sur un « volume représentatif » de vos e-mails plutôt
+que sur une période fixe. Il conseille de rester sous 2 % de rebonds et sous 0,1 % de plaintes.
+
+ReputeCast enregistre les deux niveaux d’Amazon SES avec chaque connexion SES et affiche le taux de rebond et le taux de
+plainte des 7 derniers jours de chaque fournisseur d’envoi dans
+[Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/), à côté de la limite qu’il applique à
+ce fournisseur. Le taux de plainte ne compte que les e-mails délivrés là où les plaintes sont signalées. La barre
+avertit à partir de la moitié de la première limite, dès que ReputeCast a compté 500 messages sur les 7 jours. Les
+serveurs auto-hébergés comme Postal ou un serveur SMTP n’ont pas de limites de compte ; la ligne affichée est alors le
+seuil de protection que fixe ReputeCast, ou le seuil de protection de chauffe tant que le serveur est
+[en chauffe](/fr/providers/warm-up/).
+
+## Seuils de pause automatique
+
+Les seuils propres à ReputeCast s’appliquent pendant chaque campagne, par fournisseur de messagerie et par fournisseur
+d’envoi. Ils se situent au niveau ou en dessous des niveaux qui déclenchent l’examen d’un compte Amazon SES : un mauvais
+envoi s’arrête donc avant de nuire au compte. Chaque type de rebond a son propre seuil : les rebonds de
+blocage/politique par fournisseur de messagerie, les utilisateurs inconnus sur l’ensemble de l’envoi à deux niveaux
+(avertir, puis mettre en pause), et les rebonds temporaires et les reports par fournisseur de messagerie sur
+10 minutes à deux niveaux (ralentir, puis mettre en pause). Les plaintes et les rebonds de blocage/politique nettement
+au-dessus de la limite déclenchent la pause quelle que soit la taille de l’envoi. Réglez-les dans les
+[règles de trafic](/fr/providers/traffic-rules/).
+
+<LimitsTable area="auto-pause" />
+
+## Quand les modifier
+
+- Gardez les valeurs par défaut pendant la chauffe d’un nouveau domaine ou d’une nouvelle IP, ou après une migration :
+  elles repèrent une mauvaise liste avant qu’un fournisseur d’envoi ne le fasse.
+- Relevez un seuil pour une campagne dans [Vérifier et envoyer](/fr/reference/glossary/#review-and-send) uniquement
+  quand vous savez pourquoi le taux sera élevé, par exemple une campagne de redemande de consentement vers une ancienne
+  liste, et envoyez-la d’abord à un petit segment.
+- Abaissez le seuil de rebond si la limite propre à un fournisseur d’envoi est plus stricte que la valeur par défaut de
+  ReputeCast.
+
+Voir [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/) pour savoir ce qui se passe quand un seuil
+est franchi, et [Paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/) pour savoir où
+se trouvent les valeurs par défaut de l’espace de travail.
+
+## Voir aussi
+
+- [Événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/)
+- [La liste de suppression](/fr/audience/suppressions/)
+- [Lire les rapports de campagne](/fr/campaigns/reports/)
+- [Codes d’erreur SMTP](/fr/smtp-errors/)

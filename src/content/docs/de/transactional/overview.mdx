@@ -1,0 +1,111 @@
+---
+title: Transaktions-E-Mails in ReputeCast
+description: "Wie selbst gehostete Transaktions-E-Mails in ReputeCast funktionieren: eigener Stream, Route und Failover, Kategorien, Sperrliste, Status und Warnungen."
+type: explanation
+audience: [admin, developer]
+permissions: ['transactional:view']
+uiPath: 'nav.transactional'
+primaryKeyword: selbst gehostete Transaktions-E-Mails
+sources:
+  - internal/transactional
+  - internal/smtprelay
+  - web/src/features/transactional
+  - docs/spec/reputecast-design-addon-transactional.md
+  - internal/sending/engine/{transactional.go,warmup_send.go}
+sidebar:
+  order: 1
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast versendet selbst gehostete Transaktions-E-Mails (Passwort-Resets, Anmeldelinks, Belege und andere E-Mails
+Ihres Produkts) von derselben Instanz wie Ihre Newsletter, ohne deren Reputation oder Warteschlange zu teilen. Ihre App
+ruft die HTTP-API oder das SMTP-Relay mit einer Vorlagen-ID und Daten auf; ReputeCast rendert eine veröffentlichte
+[Transaktionsvorlage](/de/reference/glossary/#transactional-template), prüft die Sperrliste und übergibt die
+Nachricht an die Versandanbieter der Route Transaktional. Alles finden Sie unter <UiPath path="nav.transactional" />.
+
+<Screenshot
+  id="transactional"
+  alt="Die Übersicht von Transaktional: Route und Zustellzahlen der letzten 7 Tage, darunter die Vorlagen mit Kategorie, Live-Version und Versandzahl der letzten 7 Tage."
+/>
+
+## Wie eine Transaktionsnachricht gesendet wird
+
+1. **Ihre App ruft ReputeCast auf.** Sie sendet eine Nachricht oder einen Batch von bis zu 100 mit einem
+   [Nur-Senden-Schlüssel](/de/reference/glossary/#send-only-key) über die API oder verbindet sich mit dem
+   [SMTP-Relay](/de/transactional/smtp-relay/). Die API antwortet mit `202` und der Nachrichten-ID. Das
+   Anfrageformat, den Header `Idempotency-Key` und Codebeispiele finden Sie unter
+   [Transaktions-E-Mails mit der API senden](/de/developers/transactional-api/).
+2. **ReputeCast rendert die Live-Version.** Nur veröffentlichte Versionen werden gesendet. Fehlen erforderliche
+   Variablen, schlägt der Aufruf mit `missing_variables` fehl, und nichts wird gesendet. Per SMTP eingehende E-Mails
+   sind bereits gerendert und werden als **Rohformat (SMTP)** protokolliert.
+3. **Sperrliste und Kategorien werden geprüft.** Transaktions-E-Mails gehen nie an eine Adresse mit Hard Bounce,
+   Beschwerde oder Spamfallen-Treffer, an eine ungültige Adresse oder an eine Adresse, die von Hand oder per Import
+   auf die [Sperrliste](/de/audience/suppressions/) gesetzt wurde. Einträge, die nur für Marketing gelten, ignorieren
+   sie: Abmeldungen und Rollenadressen wie `billing@`. Wer eine optionale Kategorie abgeschaltet hat, erhält diese
+   Kategorie nicht.
+4. **Die Route Transaktional stellt sie zu.** Transaktional ist der vierte [Stream](/de/reference/glossary/#stream)
+   neben Massenversand, Automationen und System, mit einer eigenen [Route](/de/providers/routing/): einem
+   Hauptanbieter und einem optionalen Ersatzanbieter. Das Failover läuft automatisch. Versendet derselbe
+   Versandanbieter gleichzeitig eine Kampagne, haben Transaktionsnachrichten innerhalb seiner Senderate Vorrang.
+   Routing-Bedingungen zum Postfachanbieter lesen diesen aus den MX-Einträgen des Empfängers, sodass eine Adresse bei
+   Google Workspace als Gmail zählt. Transaktions-E-Mails warten nie auf ein [Warm-up](/de/providers/warm-up/): Ein
+   Anbieter im Warm-up sendet sie innerhalb des heutigen Limits und rechnet sie wie andere E-Mails darauf an. Ist das
+   Limit erreicht oder der Warm-up-Plan pausiert, geht eine Nachricht über einen aufgewärmten Anbieter ihrer Route,
+   der sie annehmen kann, andernfalls trotzdem über den Anbieter im Warm-up, und die Warm-up-Seite zählt sie als über
+   dem Limit.
+5. **Ereignisse kommen zurück.** Zustellungs-, Bounce-, Beschwerde- und Interaktionsereignisse aktualisieren den
+   Status der Nachricht im [Nachrichtenprotokoll](/de/transactional/message-log/) und gehen als `message.*`-Ereignisse
+   an Ihre [Webhook-Endpunkte](/de/developers/webhooks/).
+
+## Kategorien
+
+Jede Vorlage gehört zu einer Kategorie, und die Kategorie entscheidet, ob ein Empfänger sie abschalten kann.
+
+| Art       | Verhalten                                                                                                     |
+| --------- | ------------------------------------------------------------------------------------------------------------- |
+| Notwendig | Wird immer gesendet: Anmelde-, Passwort-, Abrechnungs- und Konto-E-Mails. Die Fußzeile hat keinen Abmeldelink. |
+| Optional  | Empfänger können sie im Präferenzcenter oder über den Abmeldelink in der Fußzeile abschalten.                  |
+
+Kategorien verwalten Sie in den [Einstellungen für Transaktional](/de/transactional/settings/).
+
+## Status von Nachrichten
+
+Eine Nachricht ist **Geplant**, **In Warteschlange**, **Gesendet**, **Zugestellt**, **Zurückgestellt**, **Bounce**,
+**Beschwerde**, **Abgelehnt**, **Abgebrochen**, **Fehlgeschlagen** oder **Test**. Geplant heißt, sie wartet auf den
+Zeitpunkt `send_at`, den Ihre App angegeben hat; bis dahin können Sie sie
+[abbrechen oder verschieben](/de/transactional/message-log/#geplante-nachricht-abbrechen-oder-verschieben), und eine
+abgebrochene Nachricht zeigt Abgebrochen. Abgelehnt heißt, ReputeCast hat sie vor dem Senden gestoppt, etwa weil die
+Adresse gesperrt ist oder der Empfänger die Kategorie abgeschaltet hat. Test heißt, ein Schlüssel im Testmodus hat sie
+gesendet; Schlüssel im Testmodus stellen nur an Mitglieder des Arbeitsbereichs und an die Testadressen zu, die Sie für
+den Schlüssel erlauben.
+
+## Warnungen statt Auto-Pause
+
+Kampagnen werden [automatisch pausiert](/de/campaigns/live-monitor/), wenn Bounces oder Beschwerden steigen.
+Transaktions-E-Mails pausieren nie, denn ein Passwort-Reset muss weiter ankommen. Stattdessen prüft ReputeCast jede
+Minute die letzte Stunde und warnt Sie, wenn die Bounce-Rate einer Vorlage, die Zahl fehlgeschlagener Nachrichten oder
+die Zustellzeit (Median) ihr Limit überschreitet.
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="transactional" />
+
+## Wann Sie sie ändern sollten
+
+- Bewahren Sie gerenderte Inhalte länger auf (bis zu 90 Tage), wenn der Support nachsehen muss, was ein Kunde
+  erhalten hat; kürzer oder gar nicht, wenn Inhalte personenbezogene Daten enthalten. Ändern Sie das in den
+  [Einstellungen für Transaktional](/de/transactional/settings/).
+- Senken Sie die Warnlimits für Vorlagen, bei denen jeder Fehler zählt, etwa Anmeldelinks.
+- Geben Sie der Route Transaktional einen Ersatzanbieter bei einem anderen Versandanbieter, damit ein Ausfall bei
+  einem Anbieter nie die Passwort-Resets stoppt.
+
+## Verwandte Themen
+
+- [Erste Transaktions-E-Mail senden](/de/transactional/first-send/)
+- [Transaktionsvorlagen erstellen und veröffentlichen](/de/transactional/templates/)
+- [Transaktionsvorlagen importieren](/de/migrate/transactional-templates/)
+- [E-Mails über mehrere Anbieter routen](/de/providers/routing/)
+- [Berechtigungen und Rollen](/de/reference/permissions/)

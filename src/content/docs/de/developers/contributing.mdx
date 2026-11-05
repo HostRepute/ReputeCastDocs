@@ -1,0 +1,197 @@
+---
+title: ReputeCast aus dem Quellcode ausführen
+description: "Die ReputeCast-Entwicklungsumgebung aus dem Quellcode mit Go, Node.js und Docker: Demodaten, simulierte Live-Versände, Tests, Linter, Builds und Konventionen."
+type: how-to
+audience: [developer]
+primaryKeyword: ReputeCast-Entwicklungsumgebung
+sources:
+  - Makefile
+  - README.md
+  - docs/dev/CONVENTIONS.md
+  - docker-compose.yml
+  - .env.example
+  - .air.toml
+  - go.mod
+  - web/package.json
+  - web/playwright.config.ts
+  - web/scripts/patterns-check.ts
+  - web/scripts/bundle-budget.ts
+  - .github/workflows/ci.yml
+  - internal/cli/demo.go
+sidebar:
+  order: 12
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import TableScroll from '~/components/TableScroll.astro'
+
+Diese Anleitung beschreibt die ReputeCast-Entwicklungsumgebung: Sie führt die App aus ihrem Quellcode mit Live-Reload
+aus, lädt den Demo-Arbeitsbereich und zeigt die Befehle, mit denen Sie sie testen und bauen. Nutzen Sie sie, um einen
+Fehler zu beheben, eine Funktion zu entwickeln oder einen [Adapter](/de/adapters/overview/) gegen einen echten Server
+zu testen. Um ReputeCast für Ihre eigenen E-Mails zu betreiben, installieren Sie stattdessen ein Release
+([Mit Docker Compose installieren](/de/self-hosting/docker/)).
+
+## Bevor Sie beginnen
+
+- **Go 1.27.** `go.mod` verlangt Go 1.27.2; ein aktuelles Go lädt diese Toolchain selbst herunter.
+- **Node.js 24** (LTS) mit **pnpm 12** für die Web-App. Die `package.json` der Web-App legt pnpm 12.11.0 fest.
+- **Docker** mit Compose, für PostgreSQL 18 und [Mailpit](https://mailpit.axllent.org/) (ein lokaler Mail-Catcher).
+- **golangci-lint v2**, nur um die Go-Linter auszuführen (`make lint`).
+- Freie Ports 5432 (PostgreSQL), 1025 und 8025 (Mailpit), 8080 (API) und 5173 (Web-App).
+
+## Lokal ausführen
+
+<Steps>
+
+1. Holen Sie den Quellcode und installieren Sie die Go-Module und die Web-Abhängigkeiten:
+
+   ```sh title="Terminal"
+   git clone https://github.com/hostrepute/reputecast.git
+   cd reputecast
+   make deps
+   ```
+
+2. Starten Sie alles:
+
+   ```sh title="Terminal"
+   make dev
+   ```
+
+   Das startet PostgreSQL und Mailpit mit Docker Compose, dann die API mit Live-Reload unter http://localhost:8080 und
+   die Web-App (Vite) unter http://localhost:5173. Die API wendet beim Start die Datenbankmigrationen an. Beenden Sie
+   beides mit <kbd>Ctrl</kbd> <kbd>C</kbd>.
+
+3. Laden Sie in einem zweiten Terminal die Demodaten, die Arbeitsbereiche von Acme:
+
+   ```sh title="Terminal"
+   make seed
+   ```
+
+4. Öffnen Sie http://localhost:5173 und melden Sie sich mit einem Demokonto an. Jede E-Mail, die die App sendet,
+   landet in Mailpit unter http://localhost:8025.
+
+</Steps>
+
+| Konto           | Passwort          | Rolle                     | Hinweise                                                                         |
+| --------------- | ----------------- | ------------------------- | -------------------------------------------------------------------------------- |
+| `linh@acme.io`  | `reputecast-demo` | Inhaber, Instanz-Admin    | Authenticator-Geheimnis `JBSWY3DPEHPK3PXP`, Wiederherstellungscode `b4xk-9q2m-7hdn` |
+| `aisha@acme.io` | `reputecast-demo` | Betrachter                | Nur Passwort (Schonfrist für die Zwei-Faktor-Authentifizierung)                  |
+
+<Aside type="tip" title="Andere Ports">
+Ist ein Port belegt, kopieren Sie `.env.example` nach `.env` und ändern Sie `PG_PORT`, `MAILPIT_SMTP_PORT` oder
+`MAILPIT_UI_PORT`. Docker Compose und das Makefile lesen beide diese Datei.
+</Aside>
+
+## Live-Versand beobachten
+
+Die Versandanbieter der Demo sind simuliert: Nichts, was sie senden, verlässt Ihren Rechner. `reputecast demo send`
+startet den Versand einer Kampagne über sie, und der laufende Server sendet in Echtzeit weiter, mit Zustellungen,
+Bounces, Beschwerden, Öffnungen und Klicks, damit der [Live-Monitor](/de/campaigns/live-monitor/) etwas anzuzeigen hat:
+
+```sh title="Terminal"
+export REPUTECAST_ENV=development   # the command refuses to run otherwise
+go run ./cmd/reputecast demo send "Weekly Digest #142" --elapsed 20m
+go run ./cmd/reputecast demo send "Weekly Digest #142" --scenario outlook-complaints --elapsed 20m --reset
+go run ./cmd/reputecast demo send "Weekly Digest #142" --scenario postal-outage --elapsed 17m --reset
+```
+
+- `--elapsed` startet den Versand vor dieser Zeitspanne und spult ihn vor, sodass der Monitor mitten im Versand öffnet.
+- `--scenario outlook-complaints` lässt nicht mehr aktive Outlook-Leser sich beschweren, bis der Outlook-Anteil
+  automatisch pausiert wird; `--scenario postal-outage` lässt Postal nach 14 Minuten Verbindungen ablehnen, sodass sein
+  Anteil zurückgehalten wird; `--scenario steady` ist der normale Versand, ohne dass der Anbieter ab und zu einen
+  Aufruf drosselt.
+- `--canary` ist `auto`, `on` oder `off`: ob der Versand mit einer Canary-Phase beginnt. Standardmäßig ist sie im
+  normalen Szenario an und in den anderen aus.
+- `--reset` löscht zuerst einen früheren Versand der Kampagne, einschließlich dessen, was er anderswo geändert hat
+  (Anbieterstatistiken, Sperrlisteneinträge aus seinen Bounces). Es läuft nur in einem Arbeitsbereich, dessen Anbieter
+  alle Demo-Anbieter sind.
+
+Die Flags stehen in der [CLI-Referenz](/de/reference/cli/).
+
+## Testen, linten und bauen
+
+<TableScroll label="Entwicklungsaufgaben">
+
+| Aufgabe                                                                   | Befehl                                           |
+| ------------------------------------------------------------------------- | ------------------------------------------------ |
+| Alle Tests: Go-Unit- und Integrationstests auf echtem PostgreSQL, Web-Unit-Tests | `make test`                               |
+| Linter: golangci-lint, ESLint, die Musterprüfung der Web-App und TypeScript | `make lint`                                    |
+| sqlc-Code, das OpenAPI-Dokument und die Web-API-Typen neu erzeugen         | `make generate`                                  |
+| Produktions-Build: ein Binary mit eingebetteter Web-App, in `bin/reputecast` | `make build`                                   |
+| Docker-Image                                                              | `make docker`                                    |
+| Browser-Smoke-Test (Playwright): Der Demo-Inhaber meldet sich an, die Hauptbildschirme laden und ⌘K findet eine Kampagne; erfordert `make dev` und `make seed` | `make e2e` |
+| Die Landingpage reputecast.com: bauen oder mit Live-Reload auf :5288       | `make site`, `make site-dev`                     |
+| Adapter-SDK und -Vorlage: bauen und testen, dann über die Go-Laufzeit ausführen | `make sdk`                                  |
+| Barrierefreiheitsprüfung der App-Bildschirme (axe-core, WCAG 2.0–2.2 A und AA) | `cd web && pnpm a11y`                        |
+| Das Budget für die Bundle-Größe der Web-App, nach einem Build              | `cd web && pnpm budget`                          |
+| Lasttest: eine Million Kontakte in die Datenbank von `REPUTECAST_LOAD_DATABASE_URL` geladen und die häufigsten Abfragen gemessen | `make loadtest` |
+| Jede Aufgabe mit einer einzeiligen Beschreibung                           | `make help`                                      |
+
+</TableScroll>
+
+Integrationstests starten PostgreSQL 18 mit Testcontainers oder verwenden die Compose-Datenbank wieder, wenn sie
+läuft; `make test` wählt automatisch. Die CI führt die Go-Tests mit Go 1.27 gegen PostgreSQL 16, 17 und 18 aus, prüft
+das Bundle-Budget der Web-App und führt den Smoke-Test und die Barrierefreiheitsprüfung gegen einen Server mit
+Demodaten aus. Teilen sich mehrere Testläufe einen Datenbankserver, hält `go test -p 4 ./...` die Zahl der
+Verbindungen innerhalb der Grenzen von PostgreSQL.
+
+Die Musterprüfung schlägt fehl, wenn eine Änderung zurückbringt, was die gemeinsamen Komponenten ersetzt haben: einen
+selbst gebauten Schalter, eine Schrittleiste oder ein Kästchen zum Auswählen aller Einträge, ein lokales Debounce,
+einen Button „Show more“, der nicht der gemeinsame Pager ist, oder neue Hex-Farben statt der Design-Tokens.
+
+Nachdem Sie eine API-Operation geändert haben, erzeugen Sie das OpenAPI-Dokument und die Web-Typen neu und committen
+Sie beides:
+
+```sh title="Terminal"
+go run ./cmd/reputecast openapi > web/openapi.json
+cd web && pnpm api:types
+```
+
+## Konventionen
+
+Lesen Sie vor Ihrer ersten Änderung
+[`docs/dev/CONVENTIONS.md`](https://github.com/hostrepute/reputecast/blob/main/docs/dev/CONVENTIONS.md). Dort steht,
+wie ein Bildschirm von Anfang bis Ende aufgebaut ist. Kurz gesagt:
+
+- Jede Domäne ist ein Go-Paket unter `internal/` mit einem `Service` und einer Funktion `Register` für ihre
+  API-Operationen. Jede Operation deklariert, wer sie aufrufen darf und welche Berechtigung sie braucht, und jede
+  Änderung schreibt in derselben Transaktion einen Eintrag ins [Audit-Protokoll](/de/team/audit-log/).
+- Fehler sind Problem-Dokumente nach RFC 9457 mit einem Satz, der sagt, was zu tun ist
+  ([API-Fehler](/de/developers/api-errors/)). Geheime Werte sind nicht auslesbar.
+- SQL liegt in `internal/store/queries/` und läuft über sqlc; Migrationen sind goose-Dateien in `migrations/`, jede mit
+  einem `Down`, und müssen auf PostgreSQL 16 bis 18 laufen.
+- Die Web-App ruft die API nur über den Client auf, der aus `web/openapi.json` erzeugt wird.
+- Bildschirme folgen den Design-Boards in `design/boards/` bei 1440, 834 und 390 px.
+- Oberflächentexte gehören in Nachrichtendateien, damit sie übersetzt werden können
+  ([ReputeCast übersetzen](/de/developers/translating/)).
+
+## Pull Request öffnen
+
+- Halten Sie `make test`, `make lint` und `make build` grün und fügen Sie Ihrer Änderung Tests hinzu.
+- Schreiben Sie Commit-Nachrichten als [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
+  `type(scope): description`, zum Beispiel `fix(campaigns): count only blocking issues for a blocked draft`. Die erste
+  Zeile hat höchstens 100 Zeichen, steht im Imperativ und nach dem Doppelpunkt in Kleinbuchstaben, ohne Punkt am Ende.
+- Fügen Sie nie Paywalls oder Lizenzprüfungen hinzu: Jede Funktion im Repository ist kostenlos.
+
+## Prüfen, ob es funktioniert hat
+
+- `make dev` gibt `API  http://localhost:8080   Web  http://localhost:5173   Mail http://localhost:8025` aus.
+- `curl http://localhost:8080/readyz` antwortet mit `200`.
+- Sie können sich als `linh@acme.io` anmelden und sehen den Arbeitsbereich Acme Newsletter.
+
+## Fehlerbehebung
+
+- **`make dev` scheitert an einem Port**: Ein anderes PostgreSQL oder Mailpit läuft. Beenden Sie es, oder legen Sie
+  in `.env` andere Ports fest.
+- **„too many clients“ in Tests**: Führen Sie `go test -p 4 ./...` aus.
+- **`make lint` meldet, dass golangci-lint fehlt**: Installieren Sie golangci-lint v2.
+- **`demo send` verweigert die Ausführung**: Setzen Sie in diesem Terminal `REPUTECAST_ENV=development`.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="ReputeCast übersetzen" href="/de/developers/translating/" description="Wo die Oberflächentexte liegen und wie Sie sie prüfen." />
+  <LinkCard title="Community-Adapter schreiben" href="/de/adapters/community/" description="Einen Versandanbieter hinzufügen, ohne ReputeCast zu ändern." />
+  <LinkCard title="ReputeCast konfigurieren" href="/de/self-hosting/configuration/" description="Jede Einstellung, die der Server liest." />
+  <LinkCard title="Auf ReputeCast aufbauen" href="/de/developers/overview/" description="Die API, Webhooks und MCP." />
+</CardGrid>

@@ -1,0 +1,414 @@
+---
+title: Suivre un envoi et la pause automatique
+description: 'Comment ReputeCast protège un envoi en cours : pause automatique selon le taux de rebond et de plainte, phase canari, pannes et vos choix après une pause.'
+type: explanation
+audience: [publisher]
+permissions: ['campaigns:pause', 'campaigns:send', 'campaigns:approve']
+uiPath: 'nav.campaigns > campaigns.liveMonitor'
+primaryKeyword: pause automatique selon le taux de rebond
+sources:
+  - internal/sending/engine/engine.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/thresholds_live.go
+  - internal/sending/engine/rearm.go
+  - internal/sending/engine/actions.go
+  - internal/sending/engine/analysis.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/routeerrors.go
+  - internal/sending/engine/doubt.go
+  - internal/sending/engine/canary.go
+  - internal/sending/engine/canary_live.go
+  - internal/sending/engine/replies.go
+  - internal/sending/engine/rates.go
+  - internal/sending/engine/estimate.go
+  - internal/sending/engine/watch.go
+  - internal/sending/engine/warmup_send.go
+  - internal/sending/engine/live.go
+  - internal/sending/engine/api.go
+  - internal/sending/engine/messages/en.json
+  - internal/sending/rules
+  - internal/providers/state/vet.go
+  - internal/providers/{brevo,sparkpost}/idempotency.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/live
+sidebar:
+  order: 14
+---
+
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Une fois une campagne lancée, le <UiPath path="live.title" /> la montre en temps réel, et
+l’[envoi protégé](/fr/reference/glossary/#guarded-sending) la protège par une pause automatique selon le taux de
+rebond, le taux de plainte ou un autre seuil. Quand l’un d’eux dépasse sa limite, ReputeCast met en pause ou ralentit
+uniquement la partie de l’envoi qui en est la cause, par exemple les destinataires Outlook, et le reste continue. Un
+envoi peut commencer par un petit [canari](/fr/reference/glossary/#canary), une panne ne retient que la part du
+fournisseur d’envoi défaillant, et aucun message n’est jamais envoyé deux fois. Dès que quelque chose est retenu, une
+personne décide de la suite.
+
+<Screenshot
+  id="live-monitor"
+  alt="Le suivi en direct pendant l’envoi de Weekly Digest #142 : la carte de progression avec la part envoyée, l’heure de fin de chaque route et la ligne de synthèse Envoi à tous les destinataires ; chaque seuil reste dans sa limite, puis les tuiles délivrés, rebonds, plaintes, ouvertures et clics. En dessous, chaque seuil de pause automatique, des rebonds aux erreurs d’API du fournisseur d’envoi, est Surveillé et dans sa limite."
+/>
+
+## Ce qu’affiche le suivi
+
+- **L’en-tête** indique qui a lancé, programmé et approuvé l’envoi, la fraîcheur des chiffres (« En direct · mis à
+  jour il y a 1 s ») et qui peut agir dessus. Au lieu d’une clé d’autorisation, le suivi nomme les personnes qui
+  peuvent reprendre l’envoi ou décider.
+- **La carte de progression** affiche la part envoyée, une barre par fournisseur d’envoi (avec ce qui est retenu, en
+  file d’attente ou incertain) et, aux débits actuels, l’heure de fin de chaque route. Sa ligne de synthèse dit ce qui
+  compte maintenant, comme « Envoi à tous les destinataires ; chaque seuil reste dans sa limite. » Les lecteurs d’écran
+  annoncent cette ligne quand elle change, pas chaque compteur.
+- **Cinq tuiles :** délivrés, rebonds (répartis entre utilisateurs inconnus, rebonds de blocage/politique et rebonds
+  temporaires), plaintes, ouvertures et clics. La tuile des ouvertures met en avant les
+  [ouvertures humaines](/fr/reference/glossary/#human-opens) ; toute ouverture qui n’est pas le fait d’une personne,
+  [ouvertures protégées par la confidentialité](/fr/reference/glossary/#privacy-protected-open) comme celles des
+  scanners, compte ici comme « automatique ». Le [rapport de campagne](/fr/campaigns/reports/) les distingue.
+- <UiPath path="live.perMailbox" /> : envoyés, restants, délivrés, reports des 10 dernières minutes, taux de rebond et
+  de plainte, débit actuel et heure de fin de chaque [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider).
+  Les fournisseurs de messagerie sont déterminés à partir des enregistrements MX de chaque domaine : Gmail inclut donc
+  les destinataires Google Workspace, et Outlook ceux de Microsoft 365.
+- <UiPath path="live.perProvider" /> : la part, le débit, le taux de délivrance, les erreurs d’API sur 3 minutes et
+  l’heure de fin de chaque fournisseur d’envoi. Un fournisseur [en chauffe](/fr/providers/warm-up/) affiche son jour et
+  le plafond du jour.
+- <UiPath path="live.thresholds" /> : une barre par seuil avec les données sur lesquelles elle repose, décrites
+  ci-dessous.
+- <UiPath path="live.liveEvents" /> et <UiPath path="live.sendDetails" /> : l’expéditeur, l’audience, la route, le coût
+  jusqu’ici, qui a programmé l’envoi, le canari et la surveillance des plaintes après l’envoi.
+
+Les chiffres proviennent des webhooks de livraison de vos fournisseurs d’envoi (voir
+[événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/)) et arrivent par une
+connexion en direct environ une fois par seconde. Un simple serveur SMTP ne signale aucune livraison : un message qui
+lui est envoyé compte donc comme délivré dès que le serveur l’accepte, marqué « déduit ».
+
+### Les plaintes seulement là où elles sont signalées
+
+Gmail et iCloud ne signalent jamais les plaintes individuelles aux expéditeurs. Leurs taux de plainte affichent
+<UiPath path="live.model.notAvailable" /> avec la raison, et leurs e-mails délivrés sont exclus de tous les taux de
+plainte, pour ne pas les diluer. Les taux de plainte ne comptent que les e-mails délivrés aux fournisseurs de
+messagerie qui signalent les plaintes : Outlook, Yahoo et beaucoup de ceux d’Autres. Le taux de spam propre à Gmail
+arrive une fois par jour depuis Google Postmaster Tools ; la
+[surveillance des plaintes](#après-lenvoi-la-surveillance-des-plaintes) peut le lire.
+
+## Comment l’envoi protégé décide
+
+1. **Les règles de réponse agissent d’abord.** Les [règles de réponse](/fr/reference/glossary/#reply-rule) comptent les
+   réponses SMTP d’un fournisseur de messagerie, comme `TSS04` chez Yahoo, et agissent dès que leur nombre est atteint,
+   avant tout seuil de taux. Chaque espace de travail démarre avec des valeurs par défaut ; voir
+   [Définir les règles de trafic](/fr/providers/traffic-rules/).
+2. **Puis les seuils, toutes les 2 secondes.** D’abord les seuils par type de rebond : rebonds de blocage/politique et
+   reports par fournisseur de messagerie, puis utilisateurs inconnus sur l’ensemble de l’envoi. Ensuite les plaintes et
+   les rebonds par fournisseur de messagerie, les rebonds par fournisseur d’envoi, et les rebonds et plaintes de
+   l’ensemble de l’envoi. Le premier seuil déclenché agit.
+3. **Chaque type de rebond a son propre seuil.** Les rebonds de blocage/politique (refus pour cause de réputation, de
+   politique ou de contenu) sont jugés par fournisseur de messagerie. Les utilisateurs inconnus (adresses qui
+   n’existent pas) sont jugés sur l’ensemble de l’envoi à deux niveaux : le premier avertit, le second met l’envoi en
+   pause. Les rebonds temporaires et les reports sont jugés par fournisseur de messagerie sur les 10 dernières minutes,
+   chaque message une seule fois, à deux niveaux : le premier ralentit ce fournisseur de messagerie à la moitié du
+   débit, le second le met en pause.
+4. **Un taux ne se déclenche que sur des données suffisantes.** Il lui faut au moins 5 événements, au moins 500
+   messages vers ce fournisseur de messagerie ou ce fournisseur d’envoi (1 000 pour l’ensemble de l’envoi), et environ
+   90 % de confiance que le taux réel dépasse la limite, pour que quelques plaintes en début d’envoi ne l’arrêtent pas.
+   Les taux de plainte comptent les e-mails délivrés là où les plaintes sont signalées ; les autres taux comptent les
+   e-mails envoyés.
+5. **Certains taux n’attendent pas autant de données.** Les plaintes et les rebonds de blocage/politique sont le
+   verdict d’un fournisseur de messagerie sur l’expéditeur : ils déclenchent donc aussi un envoi de n’importe quelle
+   taille dès qu’ils dépassent nettement la limite, à partir de 3, avec la borne inférieure de l’intervalle de
+   confiance à 95 % du taux (Wilson) au-dessus de la limite. Les rebonds de blocage/politique se déclenchent aussi sur
+   un pic : 3 ou plus chez Gmail, Outlook, Yahoo ou iCloud en 10 minutes, nettement au-dessus de la limite par rapport
+   à ce qui y a été envoyé pendant ce temps. Cela détecte un fournisseur de messagerie qui commence à bloquer tard dans
+   un gros envoi.
+6. **L’action décide de la suite.** Par défaut, un seuil déclenché ne met en pause que ce fournisseur de messagerie (ou
+   la part de ce fournisseur d’envoi), et tout le reste continue. Les règles de trafic peuvent faire qu’un seuil
+   ralentisse le périmètre concerné à la moitié du débit, mette en pause tout l’envoi ou se contente d’avertir. Avec la
+   <UiPath path="senders.providers.pauseScope" /> réglée sur la campagne entière, chaque pause retient tout.
+
+Chaque barre de la carte des seuils affiche l’un de quatre états :
+
+- <UiPath path="traffic.legendCollecting" /> : moins de 5 événements ou pas assez d’e-mails, sans dépassement net de
+  la limite. La barre est grise ; elle ne peut pas encore se déclencher.
+- <UiPath path="traffic.legendWatching" /> : assez de données, dans la limite.
+- <UiPath path="traffic.legendNear" /> : à 90 % de la limite ou plus.
+- <UiPath path="traffic.legendTripped" /> : assez de données montrant que le taux dépasse la limite ; son action s’est
+  exécutée.
+
+La carte liste les rebonds (ensemble de l’envoi), <UiPath path="live.model.thresholdBlock" /> et les reports (le
+fournisseur de messagerie le plus proche de sa limite), les plaintes (ensemble de l’envoi, là où elles sont signalées)
+et les plaintes du fournisseur de messagerie le plus élevé, <UiPath path="live.model.thresholdReplies" /> et
+<UiPath path="live.model.thresholdErrors" />.
+
+Les seuils proviennent des valeurs par défaut de l’espace de travail et des
+[règles de trafic](/fr/reference/glossary/#traffic-rules), modifiés pour cette campagne dans
+<UiPath path="composer.reviewSend" /> si vous l’avez fait. Pendant que l’envoi s’exécute ou attend,
+<UiPath path="live.editThresholdsLive" /> ouvre <UiPath path="live.thresholdsEditTitle" /> : les nouvelles limites
+s’appliquent au reste de cet envoi en quelques secondes, les valeurs par défaut de l’espace de travail ne changent pas,
+et la modification est consignée dans le [journal d’audit](/fr/team/audit-log/) avec votre nom.
+
+## Ce qui se passe lors d’une pause
+
+- Les destinataires retenus attendent dans la file. Rien n’est abandonné.
+- Toutes les personnes de l’espace de travail qui peuvent envoyer des campagnes reçoivent une notification urgente
+  dans l’application et par e-mail, par exemple « Outlook : le taux de plainte a atteint 0,18 % (limite 0,10 %). 2 522
+  retenus, tout le reste continue. »
+- Le [webhook](/fr/reference/webhook-events/) `campaign.paused` se déclenche avec `paused_by: auto_pause`, la
+  métrique, sa valeur et sa limite, le périmètre et le nombre de destinataires retenus.
+- Le suivi en direct ouvre un panneau de décision : <UiPath path="live.whatTripped" /> avec les données, les causes
+  probables, une recommandation et <UiPath path="live.chooseTitle" />.
+
+<Screenshot
+  id="live-monitor-paused"
+  alt="Weekly Digest #142 avec seulement sa part Outlook mise en pause automatiquement : 3 plaintes sur 725 délivrés portent le taux de plainte d’Outlook à 0,41 % pour une limite de 0,10 %, nettement au-dessus, tandis que Gmail, Yahoo, iCloud et Autres continuent. Le panneau affiche la cause de la pause, les causes probables, la recommandation et les choix Reprendre tel quel, Reprendre avec des modifications (recommandé) et Annuler la part Outlook."
+/>
+
+### Décisions après une pause sur seuil
+
+- <UiPath path="sending.opt.resumeAction" /> envoie à tous ceux qui sont encore retenus. Une boîte de dialogue
+  <UiPath path="live.resumeSending" /> demande comment : reprendre et remettre en pause si le taux dépasse de nouveau la
+  limite (au débit inférieur recommandé, s’il y en a un), ou reprendre avec le seuil relevé pour cette campagne
+  uniquement, ce que le journal d’audit consigne avec votre nom. Dans les deux cas, le seuil se réarme à partir des
+  compteurs actuels : seuls les nouveaux événements comptent, si bien que ceux qui l’ont déclenché ne le remettent
+  jamais en pause. <UiPath path="live.keepPaused" /> le garde retenu.
+- <UiPath path="sending.opt.changesAction" /> est proposé quand ReputeCast trouve une cause. Cette option peut laisser
+  de côté le groupe à l’origine de la plupart des plaintes (imports jamais engagés, ou contacts désengagés), envoyer le
+  reste de la part d’un fournisseur de messagerie ou d’un fournisseur d’envoi à un débit inférieur et, quand une
+  automatisation de redemande de consentement ou de réengagement correspondante est active, y ajouter les contacts
+  laissés de côté. L’option détaille exactement ce qu’elle fera avant que vous la choisissiez.
+- **Annuler la part** ignore les destinataires retenus ; le reste de la campagne se termine normalement. Après une
+  pause de toute la campagne, <UiPath path="sending.opt.cancelCampaign" /> ignore tous ceux qui restent.
+- <UiPath path="live.cancelWhole" /> arrête tout ce qui n’a pas été envoyé.
+
+### Ralentissements, avertissements et règles de réponse
+
+Un seuil réglé pour ralentir ou avertir ne retient personne. Il laisse un avis sur le suivi avec
+<UiPath path="live.acknowledge" /> : un fournisseur de messagerie ralenti garde la moitié de son débit pour le reste de
+l’envoi (modifiez-le dans <UiPath path="live.adjustRates" />), et un avertissement prévient aussi les personnes qui
+peuvent envoyer des campagnes.
+
+Une règle de réponse qui met en pause un fournisseur de messagerie pendant une durée définie propose trois choix :
+lui envoyer de nouveau tout de suite (la règle ne compte alors que les nouvelles réponses),
+<UiPath path="sending.opt.replyWaitAction" /> jusqu’à la fin de la durée de la règle (l’envoi reprend de lui-même), ou
+annuler sa part.
+
+## Pannes des fournisseurs d’envoi
+
+Que la panne soit détectée par l’envoi lui-même ou par la vérification de l’état du fournisseur, la part suit le même
+chemin. La part d’un fournisseur d’envoi est retenue quand :
+
+- tous ses appels pour cet envoi ont échoué pendant 3 minutes, avec au moins 5 appels en échec ;
+- il a continué à limiter le débit du compte pendant 3 minutes, même à un débit inférieur ;
+- ses erreurs d’API dépassent la limite <UiPath path="live.model.thresholdErrors" /> sur 3 minutes (5,0 % par défaut,
+  jugée après 20 appels et 3 échecs) ;
+- la vérification de l’état le déclare en panne, ou il refuse les identifiants ;
+- il refuse l’expéditeur parce que celui-ci n’y est pas vérifié, ou indique que le quota du compte est épuisé. Rien
+  n’est marqué en échec : les messages attendent la route.
+
+La suite dépend de la [politique de basculement](/fr/providers/routing/) des Diffusions. Avec une politique
+automatique, ReputeCast transfère la part vers un autre fournisseur, mais seulement s’il passe tous les contrôles :
+disponible, ses conditions autorisent l’envoi en masse, hors sandbox, le domaine de l’expéditeur y est vérifié, assez
+de quota restant, et pas en chauffe. Il essaie d’abord le fournisseur de secours du flux, puis la plus grande part de
+la répartition. Avec « mettre en pause et demander », avec des identifiants refusés, ou quand aucun fournisseur ne
+convient, la part est retenue et les personnes qui peuvent envoyer des campagnes sont invitées à décider.
+
+En attendant une décision, la part retenue teste elle-même son fournisseur : 1 message de test toutes les 60 secondes,
+vers une boîte témoin quand l’espace de travail en a une, sinon l’un des messages de la part. Après 3 tests réussis
+d’affilée, la part reprend d’elle-même.
+
+<Screenshot
+  id="live-monitor-outage"
+  alt="Postal a renvoyé des erreurs de connexion pendant 3 minutes : sa part de Weekly Digest #142 est donc retenue tandis qu’Amazon SES continue, et ReputeCast teste Postal avec 1 message vers une boîte témoin toutes les 60 secondes. Le panneau affiche ce que Postal a renvoyé, les causes probables, ce que coûterait le transfert des destinataires retenus vers SES (coût supplémentaire, durée supplémentaire, quota restant, risque pour la réputation Faible car la chauffe de SES est terminée) et les contrôles que ReputeCast a effectués sur SES, avec le transfert recommandé."
+/>
+
+### Décisions après une retenue pour panne
+
+- **Réessayer** garde les destinataires sur le même fournisseur et poursuit les messages de test. Si le fournisseur
+  échoue encore 15 minutes plus tard, on vous redemande.
+- **Transférer** envoie les destinataires retenus vers le fournisseur que ReputeCast recommande. Le panneau affiche le
+  coût supplémentaire, la durée supplémentaire au débit de ce fournisseur, son quota après le transfert, le risque pour
+  la réputation (« Faible · SES : chauffe terminée ») et les contrôles réussis : le domaine de l’expéditeur y est
+  vérifié, quota disponible après le transfert, chauffe terminée. Les destinataires retenus pour un
+  [test A/B](/fr/campaigns/ab-testing/) ou un canari restent retenus jusqu’à la décision du gagnant ou du canari. Les
+  messages déjà envoyés conservent leur suivi.
+- **Annuler la part** ignore les destinataires retenus. Ils sont marqués « non envoyés » dans le rapport et peuvent
+  être envoyés plus tard.
+
+Une décision sur une part n’annule jamais une <UiPath path="live.pause" /> faite par une personne : si quelqu’un a mis
+tout l’envoi en pause, il reste en pause.
+
+## Aucun message n’est envoyé deux fois
+
+Un message en échec temporaire est réessayé jusqu’à 10 fois, après 5, 10, 20 et 40 secondes, puis toutes les 60
+secondes. Chaque tentative porte une clé d’idempotence, et un appel au fournisseur dispose de 30 secondes au plus pour
+se terminer même quand le serveur s’arrête, afin que sa réponse soit enregistrée.
+
+Quand un appel se termine malgré tout sans réponse enregistrée (un plantage, une réponse arrivée trop tard), personne
+ne sait si le fournisseur a pris ses messages. Au bout de 5 minutes, ReputeCast les règle :
+
+- un fournisseur qui reconnaît un message déjà pris les reçoit de nouveau avec la même clé, dans sa fenêtre moins 5
+  minutes. SparkPost conserve une clé 24 heures et Brevo 30 minutes ;
+- tout autre message devient l’un des [messages incertains](/fr/reference/glossary/#messages-in-doubt). Il n’est
+  jamais renvoyé au hasard.
+
+Le suivi les affiche dans leur propre panneau, avec <UiPath path="live.model.inDoubtWho" /> : chaque fournisseur,
+combien de messages, quand ils lui ont été remis, et si ce fournisseur reconnaît un renvoi et jusqu’à quand. Le badge
+indique <UiPath path="live.model.inDoubtSafeBadge" /> ou <UiPath path="live.model.inDoubtTwiceBadge" />. Choisissez
+<UiPath path="sending.opt.resendTitle" /> ou <UiPath path="sending.opt.leaveOutTitle" /> ; la recommandation suit le
+badge. Les messages laissés de côté apparaissent comme « non envoyés, statut incertain » dans le rapport. Si le
+fournisseur signale un événement pour l’un d’eux (délivré, rebond ou plainte), il compte comme envoyé et quitte la
+liste de lui-même. Le reste de l’envoi continue entre-temps ; une fois qu’il ne reste rien d’autre, l’envoi attend
+cette décision.
+
+## La phase canari
+
+Un envoi peut commencer par un canari : les destinataires les plus engagés, 5 % par défaut, plus les
+[boîtes témoins](/fr/reference/glossary/#seed-mailbox) de l’espace de travail, reçoivent l’e-mail d’abord pendant que
+tous les autres attendent. Un canari se lance de lui-même, sur une audience de 1 000 destinataires ou plus, quand :
+
+- le domaine d’envoi est nouveau (ses 30 premiers jours), ou une IP d’envoi dédiée n’a jamais envoyé pour cet espace de
+  travail ;
+- certains destinataires n’ont jamais reçu d’e-mail du domaine d’envoi ;
+- l’audience dépasse le double de la taille habituelle (la médiane des 8 derniers envois).
+
+Vous pouvez aussi choisir <UiPath path="review.canaryOn" /> ou <UiPath path="review.canaryOff" /> dans
+<UiPath path="composer.reviewSend" />. Les raisons et les tailles se règlent dans les
+[règles de trafic](/fr/providers/traffic-rules/).
+
+<Screenshot
+  id="live-monitor-canary"
+  alt="Weekly Digest #142 en phase canari : les 5 % de destinataires les plus engagés plus 10 boîtes témoins ont reçu l’e-mail en premier et sont surveillés pendant que tous les autres sont en file d’attente ; 2 critères sur 5 sont respectés et aucun n’a échoué, tandis que les rebonds, les plaintes et le placement des boîtes témoins sont encore en collecte de données. À droite : Poursuivre l’envoi à tous maintenant, Surveiller 10 minutes de plus et Arrêter l’envoi."
+/>
+
+La vue du canari affiche <UiPath path="live.canary.why" />, la progression avec les destinataires en file d’attente,
+<UiPath path="live.canary.gates" /> et <UiPath path="live.canary.seedsTitle" />. Après le dernier message du canari,
+celui-ci est surveillé pendant 20 minutes par défaut. Ensuite, chaque critère disposant d’assez de données doit être
+respecté : rebonds, rebonds de blocage/politique, reports, plaintes par fournisseur de messagerie (chacun demande 500
+délivrés chez ce fournisseur avant de pouvoir échouer) et boîtes témoins en spam. S’ils sont respectés, l’envoi
+continue de lui-même vers tout le monde. Si un critère échoue, l’envoi est retenu et les personnes qui peuvent envoyer
+des campagnes sont invitées à poursuivre ou à arrêter. Les critères encore en collecte de données ne retiennent pas
+l’envoi ; ils deviennent ses seuils.
+
+Pendant le canari :
+
+- <UiPath path="live.canary.continueNow" /> lance l’envoi principal avant la fin de la surveillance, et
+  <UiPath path="sending.opt.canaryContinueTitle" /> libère un envoi retenu par un critère en échec. Les deux demandent
+  une personne qui peut approuver les envois, et seule une personne peut le faire, jamais une clé d’API ni un agent.
+- <UiPath path="live.canary.watchMore" /> retient plus longtemps les destinataires en file d’attente.
+- <UiPath path="live.canary.stop" /> retire de l’envoi les destinataires en file d’attente. Les résultats du canari
+  restent dans le rapport.
+
+Le canari part vers vos lecteurs les plus engagés : il vérifie donc les blocages, les reports et l’arrivée en boîte de
+réception, pas la réaction des nouveaux imports. Leurs plaintes sont surveillées pendant l’envoi principal et pendant
+72 heures après.
+
+## Retenues dues à la chauffe
+
+Quand un fournisseur [en chauffe](/fr/providers/warm-up/) atteint le plafond du jour, sa part attend le plafond du
+lendemain (<UiPath path="live.model.providerWarmupHeld" />) et le reste de l’envoi continue. Le bandeau propose
+<UiPath path="providers.warmup.holdWait" />, un transfert vers un fournisseur dont la chauffe est terminée et qui passe
+ses contrôles, ou <UiPath path="providers.warmup.holdCancel" />. Attendre et transférer demandent l’autorisation
+d’envoyer des campagnes ; annuler le reste demande l’autorisation de mettre en pause les envois. Une retenue due à la
+chauffe n’est jamais traitée comme une panne.
+
+## Modifier les débits pendant l’envoi
+
+<UiPath path="live.adjustRates" /> ouvre <UiPath path="live.ratesTitle" />. Baissez un débit pour ménager un
+fournisseur de messagerie pendant le reste de l’envoi, sur toutes les routes, pendant que les autres gardent leur
+rythme ; le panneau affiche la nouvelle heure de fin avant que vous l’appliquiez. Un débit part de la
+[limitation de débit](/fr/reference/glossary/#throttle) de l’espace de travail, et les limitations sont partagées par
+tous les envois de l’espace de travail qui partent en même temps : deux campagnes ne dépassent donc jamais ensemble le
+débit d’un fournisseur de messagerie. Le nouveau débit d’un fournisseur de messagerie retenu s’applique à sa reprise.
+Pendant un canari, les débits sont ceux de l’envoi principal.
+
+## Après l’envoi, la surveillance des plaintes
+
+Les plaintes continuent d’arriver pendant des jours après la livraison : à la fin de l’envoi, ReputeCast les surveille
+donc, pendant 72 heures par défaut. La vue terminée indique pour chaque fournisseur de messagerie jusqu’à quand il est
+surveillé, ou « Non signalé » pour Gmail et iCloud. Quand un fournisseur de messagerie, ou l’ensemble de l’envoi,
+dépasse sa limite de plaintes avec assez de données, les personnes qui peuvent reprendre les envois reçoivent une
+alerte dans l’application et par e-mail, et <UiPath path="live.acknowledge" /> la marque comme lue. Rien n’est mis en
+pause : l’envoi est terminé, et l’alerte indique ce qu’il faut vérifier avant le suivant.
+
+Avec les données de Postmaster Tools issues de [HostRepute](/fr/deliverability/hostrepute/), la surveillance lit
+aussi le taux de spam quotidien de Gmail pour le domaine d’envoi et alerte quand il dépasse la limite de plaintes par
+fournisseur de messagerie. Gmail n’indique pas qui a marqué l’e-mail comme spam : personne n’est donc exclu pour
+cela. Les plaintes tardives signalées une par une ajoutent le contact à la liste de suppression et comptent dans le
+rapport de la campagne.
+
+## Mettre en pause et reprendre à la main
+
+<TableScroll label="Actions du suivi en direct et qui peut les effectuer">
+
+| Action                                                       | Qui peut                                          | Remarques                                                                                       |
+| ------------------------------------------------------------ | ------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| <UiPath path="live.pause" />                                 | Les personnes qui peuvent mettre en pause les envois | Tout s’arrête jusqu’à ce que quelqu’un reprenne l’envoi. Affiché pendant l’envoi de la campagne. |
+| <UiPath path="live.resumeSending" />, décisions sur une retenue | Les personnes qui peuvent envoyer des campagnes | Aussi les transferts, les nouvelles tentatives, les messages incertains, les débits et les seuils de cet envoi. |
+| <UiPath path="live.cancelSend" />                            | Les personnes qui peuvent envoyer des campagnes   | La boîte de dialogue propose <UiPath path="live.pauseInstead" /> si vous pouvez mettre en pause les envois. |
+| Poursuivre un canari plus tôt                                | Les personnes qui peuvent approuver les envois    | Uniquement des personnes, jamais une clé d’API ni un agent.                                     |
+| Consulter le suivi                                           | Toutes les personnes qui peuvent voir les campagnes |                                                                                                 |
+
+</TableScroll>
+
+Mettre en pause est volontairement l’autorisation la moins exigeante (`campaigns:pause`) : une personne qui remarque
+un problème peut arrêter un envoi, et une personne qui peut envoyer (`campaigns:send`) décide de la suite. Quand vous
+ne pouvez pas effectuer une action, le suivi nomme les personnes qui le peuvent. Propriétaire, Admin et Éditeur peuvent
+mettre en pause et envoyer ; Observateur ne peut ni l’un ni l’autre. Voir
+[rôles et autorisations](/fr/team/roles-and-permissions/).
+
+## Sur un téléphone
+
+<Screenshot
+  id="live-monitor-mobile"
+  alt="Le suivi en direct sur un téléphone : un en-tête court avec la fraîcheur des données, la part envoyée avec l’heure de fin de chaque route, les tuiles sur deux colonnes avec les ouvertures humaines distinguées des ouvertures automatiques, les seuils, et Mettre en pause avec un menu d’autres actions en bas."
+/>
+
+Sous 768 px, la vue en direct a sa propre mise en page : un en-tête court avec la fraîcheur, les tuiles sur deux
+colonnes, des lignes compactes pour les seuils, les fournisseurs de messagerie et les fournisseurs d’envoi, et Mettre
+en pause (ou Reprendre) en bas avec un menu pour <UiPath path="live.adjustRates" /> et
+<UiPath path="live.cancelSend" />. Le canari et les panneaux de décision ont leur propre mise en page pour téléphone.
+
+### Quand les chiffres ne sont plus à jour
+
+Le serveur se manifeste au moins toutes les 15 secondes. Si le suivi ne reçoit rien pendant 90 secondes, un proxy met
+peut-être en mémoire tampon la connexion en direct : le suivi affiche « Aucune mise à jour depuis 90 s » et vérifie
+plutôt toutes les 10 secondes. Si la connexion est coupée, il se reconnecte de lui-même (jusqu’à 10 tentatives) et
+propose <UiPath path="live.reconnectNow" />. L’envoi continue sur le serveur dans tous les cas. Un suivi qui ne se met
+jamais à jour derrière un reverse proxy signifie généralement que le proxy met le flux en mémoire tampon ; voir
+[reverse proxy et TLS](/fr/self-hosting/reverse-proxy/).
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="auto-pause" />
+
+### Canari
+
+<LimitsTable area="canary" />
+
+## Quand les modifier
+
+- **Les valeurs par défaut de l’espace de travail**, dans les
+  [paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/), fixent les seuils de
+  rebond et de plainte, la limite d’erreurs d’API et la <UiPath path="senders.providers.pauseScope" />.
+  Les [règles de trafic](/fr/providers/traffic-rules/) fixent les seuils par type de rebond, leurs actions, les règles
+  de réponse, le canari et la surveillance des plaintes.
+- **Une campagne** peut utiliser d’autres seuils ou la portée campagne dans <UiPath path="composer.reviewSend" />, et
+  <UiPath path="live.editThresholdsLive" /> pendant l’envoi. Abaissez-les pour une liste que vous n’avez pas contactée
+  depuis longtemps ou pour un nouveau fournisseur ; choisissez la portée campagne quand un envoi partiel dérouterait
+  les lecteurs, par exemple pour une offre limitée dans le temps.
+- Relever un seuil au-delà de ce que tolère votre fournisseur d’envoi revient à échanger un envoi en pause contre un
+  compte suspendu. Comparez avec les limites du fournisseur dans
+  [rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/).
+
+## Voir aussi
+
+- [Programmer et envoyer une campagne](/fr/campaigns/schedule-and-send/) : c’est là que se règlent les seuils propres
+  à une campagne et le choix du canari.
+- [Définir les règles de trafic](/fr/providers/traffic-rules/) pour les seuils par type de rebond, les règles de
+  réponse et le canari.
+- [État et pannes des fournisseurs](/fr/providers/health-and-outages/) traite des parts Diffusions retenues depuis
+  l’écran Fournisseurs d’envoi.
+- [Lire les rapports de campagne](/fr/campaigns/reports/) affiche les chiffres définitifs par fournisseur de messagerie
+  et par fournisseur d’envoi.
+- [Limites et valeurs par défaut](/fr/reference/limits-and-defaults/) liste toutes les valeurs fixes.

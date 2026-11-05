@@ -1,0 +1,64 @@
+---
+title: Configuration requise
+description: 'Configuration requise de ReputeCast auto-hébergé : systèmes d’exploitation, image Docker, PostgreSQL 16 à 18, accès réseau, ports et stockage à conserver.'
+type: reference
+audience: [operator]
+primaryKeyword: configuration requise de ReputeCast
+sources:
+  - .goreleaser.yaml
+  - Dockerfile
+  - deploy/Dockerfile.release
+  - deploy/docker-compose.yml
+  - .github/workflows/ci.yml
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/app/wire_mailbox.go
+  - internal/mailbox/mx.go
+  - internal/cli/healthcheck.go
+  - migrations/03372_m43_contacts_search.sql
+sidebar:
+  order: 1
+---
+
+import UiPath from '~/components/UiPath.astro'
+
+Voici la configuration requise de ReputeCast : ce dont un serveur a besoin pour exécuter une
+[instance](/fr/reference/glossary/#instance) avec le binaire ou l’image Docker.
+
+## Logiciels
+
+| Composant                    | Exigence                                                                                                                                                                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Binaire                      | Linux, macOS ou Windows sur `amd64` ou `arm64`. Un seul fichier statique (compilé sans cgo) qui contient l’application web et les migrations de la base de données. Les versions le publient en `.tar.gz` (`.zip` pour Windows) avec `checksums.txt`.        |
+| Image de conteneur           | `ghcr.io/hostrepute/reputecast` pour `linux/amd64` et `linux/arm64`. Construite sur `gcr.io/distroless/static-debian13:nonroot` : pas de shell, s’exécute sous l’utilisateur `nonroot` (uid 65532), écoute sur le port 8080, conserve ses données dans le volume `/var/lib/reputecast` et déclare une vérification de l’état (health check) qui exécute `reputecast healthcheck`. |
+| Base de données              | PostgreSQL 16, 17 ou 18. Les tests de ReputeCast s’exécutent sur les trois ; le fichier Compose fourni utilise PostgreSQL 18. Les migrations créent une extension, `pg_trgm`, fournie avec PostgreSQL ([PostgreSQL](/fr/self-hosting/postgres/#postgresql-managé)). Les tâches d’arrière-plan sont mises en file dans PostgreSQL, aucun autre service n’est donc nécessaire. |
+| Environnement d’exécution    | Rien d’autre. Node.js et Go ne sont nécessaires que pour [compiler ReputeCast depuis les sources](/fr/developers/contributing/).                                                                                                                             |
+
+## Réseau
+
+| Sens     | Quoi                                                                                                                                                                                                                                               |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Entrant  | Une adresse HTTPS publique (`http.public_url`) que les fournisseurs d’envoi peuvent joindre : ils livrent les événements à `<public URL>/hooks/…`, et Zapier et Make appellent la même adresse. Terminez TLS dans un [reverse proxy](/fr/self-hosting/reverse-proxy/). |
+| Entrant  | Le port 8080 (`http.addr`) depuis le reverse proxy uniquement. Le port 9464 (`metrics.addr`) depuis Prometheus uniquement, jamais en public. Les ports 587 et 465 quand le [SMTP relay](/fr/transactional/smtp-relay/) est activé ; ils sont désactivés par défaut. |
+| Sortant  | HTTPS vers les API de vos fournisseurs d’envoi et vers tous les autres services que vous connectez (paiements, boutiques, modèles d’IA, HostRepute).                                                                                              |
+| Sortant  | Des requêtes DNS pour les contrôles d’authentification, les listes de blocage et les enregistrements MX qui indiquent quel [fournisseur de messagerie](/fr/reference/glossary/#mailbox-provider) héberge le domaine d’un contact (Google Workspace compte comme Gmail, Microsoft 365 comme Outlook). Sans DNS, les domaines d’entreprise restent dans Autre pour le routage, la limitation de débit et les rapports. Spamhaus refuse les requêtes qui arrivent par des résolveurs publics : faites donc pointer `dns.servers` vers votre propre résolveur si vous comptez sur les contrôles de listes de blocage (consultez [les listes de blocage](/fr/deliverability/blocklists/)). |
+| Sortant  | `https://api.github.com` une fois par jour pour la vérification des versions. Désactivez-la avec `updates.check: false` ou dans <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />.                                                     |
+
+## Stockage
+
+| Quoi                                          | Où                                                                                                                                                                                                                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Données PostgreSQL                            | Les contacts, les campagnes, les événements, la file des tâches et le journal d’audit. Dimensionnez-les selon votre nombre de contacts et votre volume d’événements ; [limites et valeurs par défaut](/fr/reference/limits-and-defaults/) indique combien de temps chaque type de données est conservé. |
+| Clé secrète (`secrets.key_file`)              | `/var/lib/reputecast/secret.key` dans l’image, `data/secret.key` sous le répertoire de travail pour le binaire. Créée au premier démarrage, sauf si vous définissez `secrets.key`. Sans elle, les identifiants enregistrés des fournisseurs ne peuvent pas être déchiffrés : [sauvegardez-la](/fr/self-hosting/backups/). |
+| Fichiers importés (`files.dir`)               | Un dossier `files` à côté de la clé secrète (`/var/lib/reputecast/files` dans l’image) : produits numériques et cadeaux d’inscription. Chaque processus web et worker a besoin du même dossier.                                                              |
+
+## Remarques
+
+- Les images PostgreSQL 18 conservent leurs données dans `/var/lib/postgresql`, et non dans
+  `/var/lib/postgresql/data` ; montez le volume à cet endroit.
+- L’image n’a pas de shell ; sa vérification de l’état exécute le binaire ReputeCast. Les répartiteurs de charge
+  sondent `/healthz` et `/readyz` en HTTP ([vérifications de l’état, métriques et journaux](/fr/self-hosting/monitoring/)).
+- Par défaut, un seul processus exécute tous les rôles. [Passez à l’échelle avec les rôles web, ingest et
+  worker](/fr/self-hosting/scaling/) quand vous avez besoin de plus de débit.
+- [PostgreSQL](/fr/self-hosting/postgres/) traite des bases de données managées, des pools de connexions et du rôle
+  dont les segments SQL ont besoin.

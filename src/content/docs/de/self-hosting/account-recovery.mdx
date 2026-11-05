@@ -1,0 +1,192 @@
+---
+title: Zugriff über die Kommandozeile wiederherstellen
+description: 'Admin-Passwort zurücksetzen, 2FA und Anmeldesperren vom Server aus aufheben: mit den Befehlen reputecast user, in Docker oder mit der Binärdatei.'
+type: how-to
+audience: [operator]
+primaryKeyword: Admin-Passwort zurücksetzen
+sources:
+  - internal/cli/user.go
+  - internal/cli/root.go
+  - internal/accounts/reset.go
+  - internal/accounts/signin.go
+  - internal/store/queries/users.sql
+  - internal/store/queries/throttle.sql
+  - internal/instance/users.go
+  - web/src/features/admin/users/UsersPage.tsx
+  - web/src/features/admin/users/UserDialogs.tsx
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Wenn niemand ein Konto in der App reparieren kann, können Sie mit den Befehlen `reputecast user` vom Server aus das
+Admin-Passwort zurücksetzen und die Zwei-Faktor-Authentifizierung und Anmeldesperren aufheben. Die Befehle sprechen
+direkt mit der Datenbank, daher funktionieren sie, bevor ein Versandanbieter verbunden ist, und auch dann, wenn alle
+Admins ausgesperrt sind.
+
+## Bevor Sie beginnen
+
+- Shell-Zugriff auf den Server, auf dem ReputeCast läuft.
+- Die Befehle brauchen dieselbe Konfiguration wie der Server, mindestens die Datenbank-URL:
+  - **Docker Compose:** Führen Sie sie im laufenden App-Container aus, der seine Umgebung bereits hat:
+    `docker compose exec app /usr/local/bin/reputecast user …`
+  - **Binärdatei:** Laden Sie zuerst die Umgebung, die der Dienst verwendet, zum Beispiel mit
+    `set -a; . /etc/reputecast/env; set +a`, und führen Sie dann `reputecast user …` aus.
+- Die E-Mail-Adresse des Kontos der Person. Jeder Befehl nimmt `--email` an.
+
+Jeder Befehl schreibt einen Eintrag ins [Audit-Protokoll](/de/reference/glossary/#audit-log) mit dem Akteur
+**CLI (server)**. Die Befehle enden mit `0` bei Erfolg, mit `2` bei einem Bedienfehler (ein fehlendes `--reason`, ein
+zu kurzes Passwort) und mit `1` bei anderen Fehlern, etwa `Error: no account for <email>`.
+
+| Situation                                           | Befehl                                                          |
+| --------------------------------------------------- | --------------------------------------------------------------- |
+| Passwort vergessen                                  | `reputecast user reset-password --email <address>`              |
+| Passwort vergessen, und kein Weg, einen Link zu übergeben | `reputecast user reset-password --email <address> --password …` |
+| Authenticator-App verloren                          | `reputecast user reset-2fa --email <address> --reason "…"`      |
+| Nach fehlgeschlagenen Anmeldungen ausgesperrt       | Siehe [Anmeldesperre aufheben](#anmeldesperre-aufheben)         |
+| Kein Instanz-Admin mehr übrig                       | `reputecast user make-admin --email <address>`                  |
+
+## Vergessenes Passwort zurücksetzen
+
+<Steps>
+
+1. Geben Sie einen einmaligen Link zum Zurücksetzen aus:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io
+   ```
+
+   ```txt title="Ausgabe"
+   One-time password reset link for aisha@acme.io (works once, until 12:39 UTC):
+
+     https://reputecast.acme.io/reset-password/<token>
+
+   Send it to them privately. Their current password keeps working until they use it.
+   ```
+
+   Der Link verwendet die unter <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> gespeicherte
+   öffentliche URL oder, solange keine gespeichert ist, `http.public_url`. Ein deaktiviertes Konto wird abgelehnt:
+   `<email> is deactivated; reactivate the account first`.
+
+2. Senden Sie den Link über einen privaten Kanal an die Person. Er funktioniert einmal, 15 Minuten lang.
+
+3. Die Person öffnet ihn und wählt ein neues Passwort. Die Passwortrichtlinie der Instanz gilt (Länge, Wiederverwendung,
+   Prüfung auf Datenlecks). Das Setzen meldet jede Sitzung ab und hebt eine Anmeldesperre auf; die nächste Anmeldung
+   fragt weiterhin nach dem zweiten Faktor.
+
+</Steps>
+
+Solange noch kein Versandanbieter über den Stream System senden kann, zeigt der Link
+<UiPath path="auth.forgotPassword" /> auf der Anmeldeseite genau diesen Befehl, statt eine E-Mail zu senden.
+
+### Passwort direkt setzen
+
+Mit `--password` setzt der Befehl das Passwort sofort, statt einen Link auszugeben:
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user reset-password --email aisha@acme.io --password 'a long passphrase here'
+```
+
+Er antwortet `Password set for aisha@acme.io. Every session was signed out.` und macht offene Links zum Zurücksetzen
+ungültig. Das Passwort muss `auth.password_min_length` aus der [Konfiguration](/de/reference/configuration/) erfüllen
+(standardmäßig 12 Zeichen), nicht die Richtlinie in der Instanzverwaltung; ein kürzeres bricht mit
+`Error: Use at least 12 characters. Passphrases are fine.` ab.
+
+<Aside type="caution">
+  Ein Passwort auf der Kommandozeile landet in Ihrem Shell-Verlauf. Verwenden Sie lieber den Link zum Zurücksetzen,
+  oder lassen Sie die Person das Passwort gleich nach der Anmeldung ändern.
+</Aside>
+
+## Verlorene Authenticator-App entfernen
+
+<Steps>
+
+1. Vergewissern Sie sich, dass die Anfrage von der Person selbst kommt, zum Beispiel in einem Anruf, und nicht aus
+   einer E-Mail, die darum bittet.
+
+2. Entfernen Sie ihre Authenticator-App mit einem Grund, der ins Audit-Protokoll geschrieben wird:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast user reset-2fa --email aisha@acme.io --reason "lost phone, verified by video call"
+   ```
+
+   Der Befehl antwortet `Two-factor reset for aisha@acme.io. They have 72 hours to set it up again.` Ohne `--reason`
+   bricht er mit `Error: --reason is required; it's written to the audit log` ab.
+
+3. Die Person meldet sich mit ihrem Passwort an. Der Befehl hat ihre Authenticator-App und ihre
+   Wiederherstellungscodes entfernt und ihre Sitzungen abgemeldet; ihre Passkeys bleiben. Sie wird aufgefordert, erneut
+   einen Passkey oder eine Authenticator-App hinzuzufügen, und muss das innerhalb von 72 Stunden tun.
+
+</Steps>
+
+Wer noch einen [Wiederherstellungscode](/de/reference/glossary/#recovery-code) hat, braucht das nicht: Diese Person
+wählt beim zweiten Anmeldeschritt die Option für den Wiederherstellungscode. In der App kann ein Instanz-Admin dasselbe
+Zurücksetzen über <UiPath path="shell.userMenuInstanceAdmin > admin.users" /> und dann **⋯** ›
+<UiPath path="admin.resetTwoFactor" /> vornehmen. Diese Variante fragt nach dem Passwort des Admins, benachrichtigt
+die Person und verwendet statt 72 Stunden die Schonfrist der Richtlinie.
+
+## Anmeldesperre aufheben
+
+Nach zu vielen falschen Passwörtern (standardmäßig 10) antwortet die Anmeldung für diese E-Mail-Adresse mit
+`Die Anmeldung ist nach zu vielen Versuchen gesperrt. Versuchen Sie es ab <time> erneut, setzen Sie Ihr Passwort zurück oder verwenden Sie einen Passkey.`
+
+- **In der App:** <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, dann **⋯** ›
+  <UiPath path="admin.unlockSignIn" /> hebt die Sperre sofort auf.
+- **Mit einem Link zum Zurücksetzen:** Ein neues Passwort, gesetzt über einen Link aus
+  `reputecast user reset-password`, hebt die Sperre auf.
+- **Durch Warten:** Die Sperre endet von selbst nach Ablauf der Sperrdauer (standardmäßig 15 Minuten).
+
+`reputecast user unlock --email <address>` antwortet `<email> can sign in again.` und setzt den Zähler der
+fehlgeschlagenen Versuche des Kontos zurück. In dieser Version hebt der Befehl nicht die Sperre auf, die die Anmeldung
+mit Passwort zuerst prüft, daher bleibt die Anmeldung mit Passwort gesperrt, bis die Sperrdauer endet. Verwenden Sie
+einen der drei Wege oben.
+
+## Jemanden zum Instanz-Admin machen
+
+```sh
+docker compose exec app /usr/local/bin/reputecast user make-admin --email linh@acme.io
+```
+
+Der Befehl antwortet `linh@acme.io is now an instance admin.` Er vergibt die Kennzeichnung nur. Um sie zu entziehen,
+verwenden Sie <UiPath path="shell.userMenuInstanceAdmin > admin.users" />, dann **⋯** ›
+<UiPath path="admin.removeInstanceAdmin" />.
+
+<Aside type="tip" title="Wenn Single Sign-on ausgefallen ist">
+  Bei einer Domain, für die [SSO erzwungen wird](/de/self-hosting/sso/), ist die Anmeldung mit Passwort ausgeschaltet,
+  daher hilft das Zurücksetzen eines Passworts nicht. Inhaber unter dieser Domain, die als Inhaber mit Notfallzugang
+  gekennzeichnet sind, darunter der erste Inhaber, den `reputecast install` angelegt hat, behalten die Anmeldung mit
+  Passwort und Zwei-Faktor-Authentifizierung. Kann sich keiner davon anmelden, machen Sie ein Konto unter einer anderen
+  Domain zum Instanz-Admin und schalten Sie die Erzwingung unter
+  <UiPath path="shell.userMenuInstanceAdmin > admin.sso" /> ab.
+</Aside>
+
+## Prüfen, ob es funktioniert hat
+
+- Die Person meldet sich an oder öffnet ihren Link zum Zurücksetzen, bevor er abläuft.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.audit" /> listet den Befehl mit dem Akteur **CLI (server)**.
+
+## Fehlerbehebung
+
+- **`Error: no account for <email>`**: Die E-Mail-Adresse passt zu keinem Konto. Die Befehle vergleichen die Adresse
+  ohne Rücksicht auf Groß- und Kleinschreibung; prüfen Sie auf Tippfehler oder eine alte Adresse.
+- **Der Link zum Zurücksetzen zeigt auf `http://localhost:8080`**: Es ist noch keine öffentliche URL gespeichert, und
+  `http.public_url` hat den Standardwert. Legen Sie die öffentliche URL fest oder ersetzen Sie den Host im Link durch
+  die Adresse, die Personen verwenden.
+- **Der Befehl kann sich mit der Binärdatei nicht mit der Datenbank verbinden**: Er hat die Datenbank-URL des Servers
+  nicht und greift auf den Standard `localhost:5432` zurück. Laden Sie zuerst die Umgebung des Dienstes.
+- **Nach `reputecast user unlock` weiterhin gesperrt**: In dieser Version zu erwarten. Verwenden Sie
+  <UiPath path="admin.unlockSignIn" /> in der App, einen Link zum Zurücksetzen, oder warten Sie, bis die Sperre endet.
+
+## Standardwerte und Grenzen
+
+<LimitsTable area="authentication" />
+
+## Verwandte Themen
+
+- [Instanzverwaltung](/de/self-hosting/instance-admin/): dieselben Aktionen in der App.
+- [Ihr Konto absichern](/de/team/account-security/): Passwörter, Passkeys, Authenticator-Apps und
+  Wiederherstellungscodes.
+- [CLI-Referenz](/de/reference/cli/): jeder Befehl und jedes Flag von `reputecast`.

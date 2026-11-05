@@ -1,0 +1,207 @@
+---
+title: Configurar ReputeCast
+description: 'Cómo funciona la configuración de ReputeCast: valores predeterminados, archivo YAML, variables REPUTECAST_ y opciones, su orden, nombres, validación y ejemplo.'
+type: explanation
+audience: [operator]
+primaryKeyword: configuración de ReputeCast
+sources:
+  - internal/config/config.go
+  - internal/cli/root.go
+  - internal/cli/serve.go
+  - internal/app/app.go
+  - internal/app/wire_publicurl.go
+  - deploy/docker-compose.yml
+  - README.md
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import UiPath from '~/components/UiPath.astro'
+
+La configuración de ReputeCast se lee una vez, cuando arranca un proceso: primero los valores predeterminados
+integrados, luego un archivo YAML opcional, luego las variables de entorno y, por último, las opciones de la línea de
+comandos. Cubre lo que el servidor necesita antes de que nadie inicie sesión: direcciones, la base de datos, la clave
+secreta, los logs y los roles que ejecuta un proceso. Todo lo que las personas cambian mientras ReputeCast funciona,
+desde las políticas de inicio de sesión hasta los proveedores de envío, se gestiona en la aplicación.
+
+## Cómo lee ReputeCast su configuración
+
+Cada capa sustituye a la anterior:
+
+1. **Valores predeterminados** integrados en el binario. La [referencia de configuración](/es/reference/configuration/)
+   los recoge.
+2. **Un archivo YAML**, cuando pasas `--config /etc/reputecast/config.yaml` o defines `REPUTECAST_CONFIG` con su
+   ruta.
+3. **Variables de entorno** que empiezan por `REPUTECAST_`.
+4. **`DATABASE_URL`**, la variable que definen muchas plataformas de alojamiento, pero solo cuando
+   `REPUTECAST_DATABASE__URL` no está definida.
+5. **Opciones** que pasas de forma explícita: `--role` (define `roles`), `--addr` (`http.addr`), `--database-url`
+   (`database.url`) y `--log-level` (`log.level`). Una opción que no pasas no cambia nada.
+
+Con `log.level: info` en el archivo, `REPUTECAST_LOG__LEVEL=debug` en el entorno y `--log-level=error` en la línea de
+comandos, el proceso registra en el nivel `error`.
+
+## Nombres de las variables de entorno
+
+Toma la clave, escríbela en mayúsculas, pon `REPUTECAST_` delante y un doble guion bajo entre niveles. Los guiones
+bajos simples siguen formando parte del nombre de la clave:
+
+| Clave                              | Variable de entorno                           |
+| ---------------------------------- | --------------------------------------------- |
+| `env`                              | `REPUTECAST_ENV`                              |
+| `http.public_url`                  | `REPUTECAST_PUBLIC_URL`                       |
+| `database.max_conns`               | `REPUTECAST_DATABASE__MAX_CONNS`              |
+| `providers.allow_private_networks` | `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS` |
+
+- **La URL pública** tiene un solo nombre en todas partes: `REPUTECAST_PUBLIC_URL`, para el binario, el contenedor, el
+  archivo Compose y las pantallas de configuración. Sustituye a `http.public_url` del archivo YAML. El nombre que da la
+  regla anterior, `REPUTECAST_HTTP__PUBLIC_URL`, sigue funcionando cuando `REPUTECAST_PUBLIC_URL` no está definida.
+- **Listas**: `roles`, `http.trusted_proxies`, `secrets.previous_keys` y `dns.servers` aceptan valores separados por
+  comas en una variable de entorno, como `REPUTECAST_HTTP__TRUSTED_PROXIES=10.0.0.0/8,192.168.1.10`.
+- **Duraciones**: usan el formato de Go con una unidad: `30s`, `5m`, `12h`. Un `30` sin unidad se rechaza.
+- **Booleanos**: `true` o `false`.
+- Algunas variables no son claves de configuración: `REPUTECAST_CONFIG`, `REPUTECAST_AUTO_MIGRATE`,
+  `REPUTECAST_AUTO_INSTALL` y `REPUTECAST_ADMIN_EMAIL`, `_NAME` y `_PASSWORD` (que leen `serve` e `install`), y las
+  variables propias del archivo Compose, como `REPUTECAST_PORT`, `REPUTECAST_IMAGE` y `REPUTECAST_VERSION`. La
+  referencia las recoge en
+  [variables solo de entorno](/es/reference/configuration/#environment-only-variables).
+
+## Un archivo YAML completo
+
+Todas las claves son opcionales. Este archivo define los valores que suele cambiar un servidor de producción y muestra
+los valores predeterminados del resto:
+
+```yaml title="/etc/reputecast/config.yaml"
+env: production
+
+# Roles this process runs: web, worker, ingest (default: all three).
+roles: [web, worker, ingest]
+
+http:
+  addr: 127.0.0.1:8080
+  # The address people and sending providers reach. Use https in production.
+  public_url: https://news.example.com
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  trusted_proxies: [127.0.0.1]
+  rate_limit_auth: 30 # sign-in requests per minute per client IP
+  rate_limit_api: 600 # API requests per minute per key or signed-in browser session
+  rate_limit_ip: 6000 # API requests per minute of all signed-in browsers at one address
+  read_timeout: 30s
+  write_timeout: 60s
+  shutdown_timeout: 20s
+
+database:
+  # Or set REPUTECAST_DATABASE__URL / DATABASE_URL to keep the password out of the file.
+  url: postgres://reputecast:change-me@localhost:5432/reputecast?sslmode=disable
+  max_conns: 20 # pool size of this process
+
+secrets:
+  # A base64 32-byte key from `reputecast secrets generate-key`; better set by environment.
+  # key: ""
+  # Old keys while you rotate; `reputecast secrets reseal` moves stored values off them.
+  # previous_keys: []
+  # Used when key is empty; created with a new key on first start. Back it up.
+  key_file: /var/lib/reputecast/secret.key
+
+files:
+  # Product files and lead magnets; shared by every web and worker process.
+  dir: /var/lib/reputecast/files
+
+log:
+  level: info # debug, info, warn or error
+  format: json # text or json; logs go to standard error
+
+auth:
+  cookie_name: rc_session
+  cookie_secure: true
+  password_min_length: 12 # for `install` and `user reset-password --password`
+
+worker:
+  concurrency: 50
+
+updates:
+  check: true # daily release check against GitHub (version number only)
+  repo: hostrepute/reputecast
+
+metrics:
+  enabled: true
+  addr: ":9464" # /metrics, /healthz and /readyz on their own listener; never public
+  # token: "" # at least 16 characters; also serves /metrics on the main listener to this bearer token
+
+webhooks:
+  allow_private_networks: false # outgoing webhooks and the audit stream
+
+providers:
+  allow_private_networks: false # provider URLs and community adapters on your network
+
+dns:
+  servers: [] # empty: the system resolvers
+  timeout: 4s
+```
+
+Guarda los datos secretos (la contraseña de la base de datos, `secrets.key`) en variables de entorno o en un archivo
+de entorno que solo pueda leer el servicio, y el resto en el archivo YAML.
+
+## Qué comprueba ReputeCast al arrancar
+
+Un proceso se niega a arrancar, y muestra `Error: …`, cuando:
+
+- un valor no se puede interpretar, como una duración sin unidad (`'http.read_timeout' time: missing unit in duration`);
+- un rol no es `web`, `worker` ni `ingest` (`unknown role "mailer" (want web, worker or ingest)`);
+- `http.public_url` no es una URL absoluta (`http.public_url must be an absolute URL, got "news.example.com"`);
+- `secrets.key` está definida pero no es la codificación en base64 de exactamente 32 bytes;
+- `auth.password_min_length` es inferior a 8;
+- `metrics.token` está definido pero tiene menos de 16 caracteres.
+
+<Aside type="caution">
+  ReputeCast ignora sin ningún aviso las claves que no conoce. Una variable mal escrita, como
+  `REPUTECAST_HTTP__PUBLIK_URL`, deja el valor predeterminado, así que revisa la línea de log `http listening`, que
+  muestra la dirección, la URL pública y los roles que usa el proceso.
+</Aside>
+
+## Valores predeterminados y límites
+
+Los límites fijos del servidor HTTP y los tiempos de espera que puedes cambiar:
+
+<LimitsTable area="server" />
+
+## Cuándo cambiarlos
+
+- **Detrás de un proxy inverso**: define `http.public_url` con la dirección https y `http.trusted_proxies` con el
+  proxy ([proxy inverso y TLS](/es/self-hosting/reverse-proxy/)).
+- **Varios procesos**: reparte `roles` y dimensiona `database.max_conns` para que el total quede por debajo de
+  `max_connections` de PostgreSQL ([escalado](/es/self-hosting/scaling/) y [PostgreSQL](/es/self-hosting/postgres/)).
+- **Herramientas de envío de logs**: `log.format: json` (la imagen de Docker ya lo usa).
+- **Prometheus solo llega a la dirección pública** (una plataforma de alojamiento con un solo puerto): `metrics.token`,
+  enviado como bearer token ([comprobaciones de estado, métricas y logs](/es/self-hosting/monitoring/)).
+- **Comprobaciones de listas de bloqueo**: `dns.servers` apuntando a tu propio resolutor, porque Spamhaus rechaza los
+  resolutores públicos.
+- **Proveedores o receptores de webhooks en tu propia red** (un servidor Postal, n8n):
+  `providers.allow_private_networks` o `webhooks.allow_private_networks`. Las direcciones link-local y de metadatos de
+  la nube siguen bloqueadas.
+- **Sin archivo de clave en disco**: `secrets.key` generada con `reputecast secrets generate-key`, definida antes del
+  primer arranque ([seguridad y protección](/es/self-hosting/security/)).
+- **Servidores sin conexión**: `updates.check: false`.
+
+## Configuración que se gestiona en la aplicación
+
+- Los métodos de inicio de sesión, la política de contraseñas, la obligatoriedad de la verificación en dos pasos, la
+  duración de la sesión y el tiempo de inactividad, el bloqueo de acceso y el SSO están en
+  <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />
+  ([administración de la instancia](/es/self-hosting/instance-admin/)).
+- El nombre de la instancia, el logo, la zona horaria y el idioma predeterminados, y la URL pública están en
+  <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. Una URL pública guardada ahí sustituye a
+  `http.public_url` para los enlaces, las páginas públicas y los webhooks de los proveedores en menos de 30 segundos en
+  todos los procesos. Las cookies solo HTTPS y HSTS siguen dependiendo de `http.public_url`, así que mantén las dos
+  iguales.
+- Los proveedores de envío, los remitentes, los equipos y todo lo demás pertenecen a cada espacio de trabajo.
+
+## Relacionado
+
+- [Referencia de configuración](/es/reference/configuration/): cada clave, su variable de entorno y su valor
+  predeterminado.
+- [Instalar con Docker Compose](/es/self-hosting/docker/): dónde define estas variables el archivo Compose.
+- [Instalar el binario](/es/self-hosting/binary/): un archivo de entorno para systemd.
+- [Referencia de la CLI](/es/reference/cli/): las opciones de cada comando.

@@ -1,0 +1,175 @@
+---
+title: Déployer ReputeCast sur Railway
+description: "Déployer ReputeCast sur Railway avec le modèle PostgreSQL, l’image Docker, un volume, un domaine public, une vérification de l’état et le premier Propriétaire."
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast sur Railway
+sources:
+  - deploy/docker-compose.yml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/cli/install.go
+  - internal/db/db.go
+sidebar:
+  order: 6
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Ce guide fait tourner ReputeCast sur Railway sous la forme de deux services dans un même projet, la base de données
+PostgreSQL de Railway et l’image Docker de ReputeCast, avec un volume pour les fichiers importés et HTTPS sur un domaine
+Railway ou sur le vôtre.
+
+## Avant de commencer
+
+- Un compte Railway avec une offre payante (Hobby ou Pro). L’offre Free n’autorise qu’un volume par projet, que le
+  modèle PostgreSQL utilise. Un Trial convient pour un test, mais un Limited Trial (compte non vérifié) restreint l’accès
+  réseau sortant dont ReputeCast a besoin pour joindre les fournisseurs d’envoi.
+- Docker ou OpenSSL sur votre ordinateur, pour générer la clé secrète. Voir aussi la
+  [configuration requise](/fr/self-hosting/requirements/).
+
+## Déployer ReputeCast
+
+<Steps>
+
+1. Dans le tableau de bord de Railway, cliquez sur **New Project** et choisissez **Empty Project**.
+
+2. Cliquez sur **+ New**, puis sur **Database**, puis sur **PostgreSQL**. Railway déploie PostgreSQL 18 comme un
+   service nommé `Postgres`, avec son propre volume et une variable `DATABASE_URL` qui passe par le réseau privé.
+
+3. Cliquez sur **+ New**, puis sur **Docker Image**, saisissez `ghcr.io/hostrepute/reputecast:v1.3.1`, appuyez sur
+   Entrée et cliquez sur **Deploy**. Ce premier déploiement échoue, car le service n’a encore aucun paramètre.
+
+4. Générez la clé secrète sur votre ordinateur et enregistrez-la dans votre gestionnaire de mots de passe. Les deux
+   commandes affichent une clé au même format (44 caractères se terminant par `=`) :
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.3.1 secrets generate-key` ou `openssl rand -base64 32`.
+
+5. Ouvrez le service ReputeCast. Dans **Settings** → **Networking** → **Public Networking**, cliquez sur
+   **Generate Domain** (si Railway demande un port, saisissez `8080`, pas 9464 : c’est le port des métriques, qui
+   reste privé). Railway sert le domaine `*.up.railway.app` en HTTPS.
+
+6. Dans l’onglet **Variables**, cliquez sur **Raw Editor**, collez ces lignes avec votre adresse e-mail et votre clé,
+   puis enregistrez :
+
+   ```sh title="Raw Editor"
+   REPUTECAST_DATABASE__URL=${{Postgres.DATABASE_URL}}
+   REPUTECAST_PUBLIC_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-4
+   PORT=8080
+   RAILWAY_RUN_UID=0
+   ```
+
+   - `${{Postgres.DATABASE_URL}}` fait référence à la chaîne de connexion de la base de données (`Postgres` est le nom
+     du service). Gardez-la telle quelle : sans paramètre `sslmode`, ReputeCast utilise le TLS que l’image PostgreSQL
+     de Railway active.
+   - `${{RAILWAY_PUBLIC_DOMAIN}}` est le domaine de l’étape 5. Avec
+     [votre propre domaine](#utiliser-votre-propre-domaine), écrivez plutôt l’URL.
+   - `REPUTECAST_ADMIN_EMAIL` est l’adresse e-mail du premier Propriétaire, utilisée seulement tant que la base de
+     données n’a aucun utilisateur.
+   - `PORT=8080` indique à la vérification de l’état de Railway quel port appeler. ReputeCast écoute sur 8080 et ne lit
+     pas `PORT`.
+   - `RAILWAY_RUN_UID=0` exécute l’application en root : Railway monte les volumes avec root comme propriétaire, et
+     l’utilisateur de l’image (uid 65532) ne peut pas y écrire.
+   - Railway ne documente pas la plage d’adresses de son proxy de périphérie : laissez donc
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` vide ([proxys de confiance](/fr/self-hosting/docker/#proxys-de-confiance)).
+     Autres paramètres : [configuration](/fr/self-hosting/configuration/).
+
+7. Faites un clic droit sur le canevas du projet (ou appuyez sur <kbd>⌘</kbd> <kbd>K</kbd> ou
+   <kbd>Ctrl</kbd> <kbd>K</kbd>), créez un volume, connectez-le au service ReputeCast et réglez son point de montage sur
+   `/var/lib/reputecast`.
+
+8. Dans **Settings** → **Deploy**, réglez **Healthcheck Path** sur `/readyz`. Railway attend alors jusqu’à 300 secondes
+   une réponse `2xx` avant d’envoyer du trafic vers un nouveau déploiement ; ReputeCast en renvoie une dès qu’il
+   joint la base de données, que son schéma a toutes les migrations et que ses workers tournent.
+
+9. Cliquez sur **Deploy** dans le bandeau du canevas qui liste les changements en attente. À son premier démarrage,
+   ReputeCast applique les migrations de la base de données et crée le premier Propriétaire.
+
+10. Dans l’onglet **Deployments**, cliquez sur le déploiement pour ouvrir ses journaux et filtrez-les sur `Password`.
+    Avec la CLI de Railway, dans un dossier lié au projet : `railway logs --lines 500 --filter "Password"`.
+
+    ```txt title="Journaux de déploiement"
+      ReputeCast is installed.
+
+      Sign in at  https://reputecast-production-1a2b.up.railway.app
+      Email       you@company.com
+      Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+    ```
+
+11. Ouvrez l’URL publique et connectez-vous. La [première connexion](/fr/self-hosting/first-run/) vous demande de
+    remplacer le mot de passe, d’ajouter une clé d’accès ou une application d’authentification, d’enregistrer les codes
+    de récupération, de confirmer les informations de base de l’instance et de créer un espace de travail.
+
+</Steps>
+
+<Aside type="caution">
+  Gardez une copie de `REPUTECAST_SECRETS__KEY` hors de Railway : sans elle, les identifiants des fournisseurs stockés
+  dans la base de données ne peuvent pas être déchiffrés. Pour la masquer dans le tableau de bord, choisissez **Seal**
+  dans le menu à trois points de la variable (une variable scellée ne peut plus être relue ni descellée).
+</Aside>
+
+### Utiliser votre propre domaine
+
+1. Dans **Settings** → **Networking** → **Public Networking**, cliquez sur **+ Custom Domain**, saisissez le domaine
+   (par exemple `news.example.com`) et choisissez le port `8080`.
+2. Créez chez votre hébergeur DNS les deux enregistrements que Railway affiche, un `CNAME` et un `TXT`. Railway vérifie
+   le domaine (coche verte) et émet un certificat Let's Encrypt, en général en moins d’une heure.
+3. Dans l’onglet **Variables**, définissez `REPUTECAST_PUBLIC_URL=https://news.example.com` et déployez le changement.
+   Faites-le avant la première connexion : ReputeCast lie les clés d’accès au domaine de l’URL publique et le met dans
+   chaque lien qu’il envoie.
+
+Derrière le proxy de Cloudflare, réglez le mode SSL/TLS de Cloudflare sur **Full** ; selon Railway,
+**Full (Strict)** ne fonctionne pas comme prévu. L’offre Trial autorise 1 domaine personnalisé, l’offre Hobby 2 par
+service.
+
+## Vérifier le résultat
+
+- L’onglet **Deployments** affiche le déploiement en `Active` : la vérification de l’état sur `/readyz` a réussi.
+- `curl https://news.example.com/readyz` répond `ready`, ou `database unavailable` (statut 503) quand ReputeCast ne
+  peut pas joindre PostgreSQL. Railway n’appelle `/readyz` qu’au démarrage d’un déploiement : pointez donc un outil de
+  surveillance de disponibilité dessus pour une vérification continue ([surveillance](/fr/self-hosting/monitoring/)).
+
+## Mettre à niveau
+
+1. Lisez les notes de version et faites une [sauvegarde](/fr/self-hosting/backups/). L’onglet **Backups** du service
+   PostgreSQL sauvegarde son volume à la main ou selon un calendrier quotidien, hebdomadaire ou mensuel.
+2. Dans **Settings** → **Source** → **Source Image** du service ReputeCast, cliquez sur l’icône de modification et
+   changez le tag, par exemple en `ghcr.io/hostrepute/reputecast:v1.3.1`. Quand Railway signale une mise à jour de
+   l’image, son bouton de mise à jour prépare le nouveau tag pour vous.
+3. Cliquez sur **Deploy**. ReputeCast applique les nouvelles migrations à son démarrage. Un service avec un volume
+   n’exécute jamais deux déploiements à la fois : prévoyez donc une courte interruption. La mise à niveau vers 1.3.0
+   convertit `delivery_events` en partitions mensuelles et garde le verrou des migrations pendant toute l’opération
+   ([mise à niveau vers 1.3.0](/fr/self-hosting/upgrades/#mettre-à-niveau-vers-130)) ; sur une très grande table,
+   laissez plus de 300 secondes à la vérification de l’état avec une variable `RAILWAY_HEALTHCHECK_TIMEOUT_SEC`
+   ([healthchecks](https://docs.railway.com/deployments/healthchecks), vérifié en novembre 2026).
+
+Pour que Railway applique les nouvelles versions pendant une fenêtre de maintenance, utilisez
+**Configure Auto Updates** dans la même section ([mettre à niveau ReputeCast](/fr/self-hosting/upgrades/)).
+
+## Dépannage
+
+- **`Error: secret key file /var/lib/reputecast/secret.key: open /var/lib/reputecast/secret.key: permission denied`** :
+  le volume appartient à root et `REPUTECAST_SECRETS__KEY` n’est pas définie. Définissez la clé et
+  `RAILWAY_RUN_UID=0`, puis déployez.
+- **Le domaine affiche « Application failed to respond » ou `404 page not found`** : le port cible du domaine n’est pas
+  8080 (9464 est le port des métriques). Dans **Settings** → **Networking**, cliquez sur l’icône de modification à côté
+  du domaine et indiquez `8080`.
+- **Le déploiement échoue à la vérification de l’état** : `/readyz` n’a pas répondu `ready` à temps. Il répond
+  `database unavailable` tant que ReputeCast ne peut pas joindre PostgreSQL : vérifiez que `REPUTECAST_DATABASE__URL`
+  nomme le service de base de données tel que le canevas l’affiche, dans le même environnement. Si les journaux de
+  déploiement montrent que des migrations sont encore en cours, augmentez `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` et
+  déployez de nouveau.
+- **Un fournisseur d’envoi SMTP ne parvient pas à se connecter** : Railway coupe le SMTP sortant sur les offres Free,
+  Trial et Hobby. Utilisez un fournisseur doté d’une API HTTPS, comme Amazon SES, Postmark ou Resend, ou passez à
+  l’offre Pro et redéployez.
+
+Documentation de la plateforme (vérifiée en octobre 2026) : [Quick start](https://docs.railway.com/quick-start),
+[PostgreSQL](https://docs.railway.com/databases/postgresql), [Variables](https://docs.railway.com/variables),
+[référence des variables](https://docs.railway.com/variables/reference), [Volumes](https://docs.railway.com/volumes),
+[référence des volumes](https://docs.railway.com/volumes/reference), [Services](https://docs.railway.com/services),
+[Healthchecks](https://docs.railway.com/deployments/healthchecks), [Logs](https://docs.railway.com/observability/logs),
+[Domains](https://docs.railway.com/networking/domains/working-with-domains), [Plans](https://docs.railway.com/pricing/plans),
+[Image auto updates](https://docs.railway.com/deployments/image-auto-updates), [Free trial](https://docs.railway.com/pricing/free-trial),
+[Outbound networking](https://docs.railway.com/networking/outbound-networking).

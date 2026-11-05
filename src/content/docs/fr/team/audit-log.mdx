@@ -1,0 +1,156 @@
+---
+title: Journal d’audit
+description: Ce que le journal d’audit de ReputeCast enregistre, qui peut le lire, ses filtres, l’export CSV et JSON, le flux d’audit signé et la conservation.
+type: reference
+audience: [admin, operator]
+permissions: ['audit:view']
+uiPath: 'nav.settings > settings.audit'
+primaryKeyword: journal d’audit
+sources:
+  - internal/audit/audit.go
+  - internal/auditlog
+  - internal/maintenance/maintenance.go
+  - migrations/00002_workspaces.sql
+  - web/src/features/audit
+  - web/src/features/admin/audit
+  - internal/readiness/{service.go,undo.go,rules.go}
+  - internal/sending/engine/{canary.go,traffic_api.go}
+  - internal/brandkit
+  - internal/renders/renders.go
+  - internal/tracking/{networks.go,agents.go}
+  - internal/campaigns/manage.go
+  - internal/instance/system.go
+  - internal/cli/secrets.go
+sidebar:
+  order: 7
+---
+
+import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Le [journal d’audit](/fr/reference/glossary/#audit-log) enregistre qui a fait quoi, sur quoi, depuis où, et si l’action
+était autorisée, pour chaque espace de travail dans <UiPath path="nav.settings > settings.audit" /> et pour l’instance dans
+<UiPath path="shell.userMenuInstanceAdmin > admin.audit" />.
+
+<Screenshot
+  id="settings-audit"
+  alt="Le journal d’audit de l’espace de travail : l’état du flux, Exporter en CSV, Exporter en JSON et Flux webhook au-dessus de la recherche et des filtres par type d’acteur, action, résultat et période, une liste d’entrées avec heure, acteur, événement, cible, source et résultat, et une entrée post.published sélectionnée avec son diff avant/après."
+/>
+
+## Accès
+
+| Journal             | Qui peut le lire                                   | Qui peut modifier la conservation et la diffusion en continu |
+| ------------------- | -------------------------------------------------- | ------------------------------------------------------------ |
+| Espace de travail   | Les membres, les clés API et les agents MCP disposant de `audit:view` (Propriétaire, Admin, Éditeur, Observateur ; pas les rôles clients) | Les membres connectés disposant de `workspace:manage` |
+| Instance            | Les admins de l’instance, connectés                | Les admins de l’instance                                     |
+
+Le journal de l’instance affiche les entrées de chaque espace de travail, plus celles du niveau de l’instance :
+connexions, authentification unique, politiques, utilisateurs et mode agence. Les admins de l’instance peuvent passer de
+l’un à l’autre avec <UiPath path="audit.instanceView" />.
+
+## Contenu d’une entrée
+
+<TableScroll label="Champs d’une entrée d’audit">
+
+| Champ              | Contenu                                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Heure              | Le moment de l’action (en UTC dans les exports).                                                            |
+| Acteur             | Type (membre, clé API, agent MCP, ou automatique pour le système), ID et nom.                               |
+| Action             | Un nom à points comme `role.updated`, `member.removed` ou `audit.exported`.                                 |
+| Cible              | Type, ID et nom de ce qui a changé.                                                                         |
+| Résultat           | `allowed`, `denied` ou `error`, avec le motif (par exemple l’autorisation manquante).                       |
+| Avant et après     | Les valeurs modifiées ; le panneau de détail les affiche sous forme de diff.                                |
+| Source             | Adresse IP du client (telle que résolue par vos proxys de confiance), agent utilisateur et ID de requête.   |
+| Métadonnées        | Contexte supplémentaire, comme le nombre d’entrées d’un export.                                             |
+
+</TableScroll>
+
+## Remarques sur l’enregistrement
+
+- Une action et son entrée sont enregistrées dans la même transaction de base de données.
+- Les entrées ne sont pas modifiables : un déclencheur de la base de données refuse les modifications et les
+  suppressions, sauf le nettoyage lié à la conservation. L’application n’offre aucun moyen de les modifier ou de les
+  supprimer.
+- Les entrées survivent à l’espace de travail, à l’utilisateur ou à la clé qu’elles nomment.
+- Les modifications refusées sont toujours enregistrées. Les lectures refusées ne sont enregistrées que lorsqu’elles
+  nécessitent une autorisation sensible, comme un export. La plupart des simples lectures ne sont pas enregistrées.
+- Les secrets (clés API, secrets de webhook et de fournisseur) n’apparaissent jamais dans les entrées.
+- Les exports sont eux-mêmes enregistrés comme `audit.exported`.
+- Une exécution du [contrôle avant envoi](/fr/reference/glossary/#send-readiness) demandée par quelqu’un (`readiness.run`,
+  ou `readiness.send_time_check` quand un envoi programmé est revérifié) nomme qui l’a demandée : le membre, ou la clé
+  API ou l’agent MCP lui-même. Les corrections en un clic sont enregistrées comme les modifications qu’elles apportent,
+  et leur annulation comme `readiness.fixes_undone`.
+- Une phase canari enregistre sa conclusion : `campaign.canary_passed`, `campaign.canary_continued`,
+  `campaign.canary_held` ou `campaign.canary_extended`.
+- Les [règles d’envoi](/fr/campaigns/sending-rules/) de l’espace de travail (`sending_rule.created`, `.updated`,
+  `.deleted`), les [règles de trafic](/fr/providers/traffic-rules/) (`traffic_rules.updated`), le
+  [kit de marque](/fr/campaigns/brand-kit/) et ses blocs synchronisés (`brand_kit.save`, `synced_block.*`) et les
+  services de rendu (`rendering.connect`, `.test`, `.disconnect`) sont enregistrés dans le journal de l’espace de
+  travail. Les modifications des réseaux et des agents utilisateurs du filtre anti-robots (`tracking_network.*`,
+  `tracking_user_agent.*`) sont des entrées de l’instance.
+- La gestion des campagnes est enregistrée comme `campaign.delete`, `.restore`, `.archive`, `.unarchive`,
+  `campaign.rescheduled`, `campaign.tags` et `campaign.follow_up`. Le travail sur les contacts ajoute
+  `contact.remove_from_list`, les actions groupées `contacts.remove_from_list` et `contacts.remove_tag`,
+  `contacts.export_downloaded`, `contact_view.update`, `field.restore`, `field.values_removed` et
+  `suppression.upload_remove`. Les automatisations ajoutent `automation.contact_remove` (avec le motif) et
+  `automation.test_send`, et `automation.resume` conserve le choix fait pour les contacts en retard.
+- Autres entrées de l’espace de travail : `marketing_cap.updated`, `transactional.message_cancelled` et
+  `.message_rescheduled`, `payments.webhook_events_added`, et les exports `gift.exported`, `conversion.exported`,
+  `payment_events.exported`, `sponsor.bookings_exported` et `sponsor.report_exported`. Une modification dans
+  <UiPath path="nav.settings > settings.general > workspace.retentionTitle" /> est enregistrée comme `workspace.updated`.
+- Réessayer, annuler ou supprimer une tâche en échec dans <UiPath path="shell.userMenuInstanceAdmin > admin.system" />
+  (`instance.job_retried`, `.job_cancelled`, `.job_deleted`) et `reputecast secrets reseal`
+  (`instance.secrets_resealed`) sont des entrées de l’instance.
+
+## Filtres
+
+| Filtre       | Valeurs                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------- |
+| Recherche    | Nom de la cible ou de l’acteur (contient), ID de la cible ou ID de requête (exact). Le journal de l’instance trouve aussi l’ID de référence de connexion affiché sur les pages d’erreur. |
+| Type d’acteur | Membres, Clés API, Agents MCP, Système                                                                 |
+| Action       | 22 catégories, d’Envois et Équipe et accès jusqu’à Agence                                               |
+| Résultat     | Autorisé, Refusé, Erreur (journal de l’instance : Autorisé, Refusé)                                     |
+| Période      | 24 dernières heures, 7 derniers jours (par défaut), 30 derniers jours, 90 derniers jours, toute la période conservée, ou des dates personnalisées dans le fuseau horaire de l’espace de travail |
+| Espace de travail | Journal de l’instance uniquement : tous les espaces de travail, un seul, ou les entrées de l’instance seules |
+
+## Export
+
+<UiPath path="audit.exportCsv" /> et <UiPath path="audit.exportJson" /> téléchargent les entrées qui correspondent aux
+filtres en cours, sans limite de lignes, sous la forme `audit-<workspace>-<date>.csv` ou `.json` (instance :
+`audit-instance-<date>`). Les colonnes du CSV sont `occurred_at, actor_type, actor_name, actor_id, action, target_type,
+target_id, target_name, result, reason, summary, ip, user_agent, request_id, before, after` ; l’export de l’instance
+ajoute `workspace`. L’équivalent dans l’API est `GET /api/v1/workspaces/<workspace>/audit/export?format=csv|json` avec
+les mêmes filtres (voir la [référence de l’API](/api/)).
+
+## Flux d’audit
+
+La boîte de dialogue <UiPath path="audit.streamDialog" /> de l’espace de travail, avec
+<UiPath path="audit.streamToggle" />, envoie les nouvelles entrées à un endpoint HTTPS, comme un SIEM ou un entrepôt de
+données. Les admins de l’instance configurent un flux distinct pour les entrées du niveau de l’instance avec
+<UiPath path="audit.streamInstance" />.
+
+- Toutes les 30 secondes, ReputeCast publie jusqu’à 500 nouvelles entrées par espace de travail, des plus anciennes aux
+  plus récentes, sous la forme `{"workspace": "<id>", "sent_at": "…", "events": [ … ]}`.
+- Chaque requête est signée comme les [webhooks de l’espace de travail](/fr/developers/webhooks/) : en-têtes
+  `X-ReputeCast-Timestamp`, `X-ReputeCast-Event: audit.batch` et `X-ReputeCast-Signature`, le HMAC-SHA256 de
+  `<timestamp>.<raw body>` avec le secret `whsec_…` affiché une seule fois après l’enregistrement.
+- Un lot compte comme livré sur toute réponse 2xx. D’ici là, le même lot est réessayé toutes les 30 secondes, dans
+  l’ordre, et rien n’est abandonné.
+- Activer le flux ou changer son URL prend effet à partir de ce moment ; les entrées plus anciennes ne sont pas envoyées.
+- Les adresses privées et loopback sont refusées, sauf si l’exploitant définit `webhooks.allow_private_networks`.
+
+## Conservation
+
+Définissez <UiPath path="audit.keepEntriesFor" /> dans la boîte de dialogue de l’espace de travail, ou
+<UiPath path="audit.changeRetention" /> pour le journal de l’instance. Le nettoyage s’exécute toutes les heures.
+
+<LimitsTable area="audit-log" />
+
+## Voir aussi
+
+- [Rôles et autorisations](/fr/team/roles-and-permissions/)
+- [Sécurité et durcissement](/fr/self-hosting/security/)
+- [Recevoir des webhooks](/fr/developers/webhooks/)
+- [Administration de l’instance](/fr/self-hosting/instance-admin/)

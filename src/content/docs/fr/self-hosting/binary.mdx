@@ -1,0 +1,171 @@
+---
+title: Installer le binaire
+description: 'Installer ReputeCast sous Linux sans Docker : vérifier le téléchargement, préparer PostgreSQL, écrire un fichier d’environnement et le lancer avec systemd.'
+type: how-to
+audience: [operator]
+primaryKeyword: installer ReputeCast sous Linux
+sources:
+  - .goreleaser.yaml
+  - internal/cli/install.go
+  - internal/cli/serve.go
+  - internal/cli/doctor.go
+  - internal/app/schema.go
+  - internal/config/config.go
+  - README.md
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Ce guide explique comment installer ReputeCast sous Linux sous la forme d’un binaire unique exécuté par systemd, à
+côté d’un serveur PostgreSQL. Le binaire contient l’application web et toutes les migrations de la base de données :
+rien d’autre n’est à installer.
+
+## Avant de commencer
+
+- Un serveur Linux sur `amd64` ou `arm64` avec systemd, et PostgreSQL 16, 17 ou 18 (consultez la
+  [configuration requise](/fr/self-hosting/requirements/)).
+- Un accès `sudo` et un reverse proxy pour TLS sur le même serveur
+  ([reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)).
+- Le binaire fonctionne aussi sous macOS et Windows, mais ce guide utilise systemd.
+
+## Installer ReputeCast
+
+<Steps>
+
+1. Téléchargez l’archive de votre plateforme (`linux_amd64` ou `linux_arm64`) et `checksums.txt` depuis la
+   [page des versions](https://github.com/hostrepute/reputecast/releases), vérifiez-la et installez le binaire :
+
+   ```sh
+   sha256sum --ignore-missing -c checksums.txt
+   tar -xzf reputecast_*_linux_amd64.tar.gz reputecast
+   sudo install -m 0755 reputecast /usr/local/bin/reputecast
+   reputecast version
+   ```
+
+2. Créez la base de données, son utilisateur et le rôle des segments SQL
+   ([PostgreSQL](/fr/self-hosting/postgres/#créer-la-base-de-données)) :
+
+   ```sh
+   sudo -u postgres psql -c "CREATE ROLE reputecast LOGIN PASSWORD 'change-me'" \
+     -c "CREATE DATABASE reputecast OWNER reputecast" \
+     -c "CREATE ROLE reputecast_segments NOLOGIN" \
+     -c "GRANT reputecast_segments TO reputecast"
+   ```
+
+3. Créez un utilisateur système. systemd crée son dossier de données, `/var/lib/reputecast`, à l’étape 6 :
+
+   ```sh
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin reputecast
+   ```
+
+4. Créez le dossier `/etc/reputecast` (`sudo mkdir -p /etc/reputecast`) et écrivez-y la configuration sous la forme
+   d’un fichier d’environnement, lisible uniquement par root et le service :
+
+   ```sh title="/etc/reputecast/env"
+   REPUTECAST_DATABASE__URL=postgres://reputecast:change-me@localhost:5432/reputecast?sslmode=disable
+   REPUTECAST_PUBLIC_URL=https://news.example.com
+   REPUTECAST_HTTP__ADDR=127.0.0.1:8080
+   REPUTECAST_METRICS__ADDR=127.0.0.1:9464
+   REPUTECAST_HTTP__TRUSTED_PROXIES=127.0.0.1
+   REPUTECAST_SECRETS__KEY_FILE=/var/lib/reputecast/secret.key
+   REPUTECAST_LOG__FORMAT=json
+   ```
+
+   ```sh
+   sudo chown root:reputecast /etc/reputecast/env && sudo chmod 0640 /etc/reputecast/env
+   ```
+
+   Sans `REPUTECAST_SECRETS__KEY_FILE`, le fichier de clé serait `data/secret.key` sous le répertoire de travail, et
+   sans `REPUTECAST_METRICS__ADDR`, les métriques Prometheus écouteraient sur le port 9464 de toutes les interfaces.
+   Chaque clé est décrite dans [configurer ReputeCast](/fr/self-hosting/configuration/).
+
+5. Appliquez les migrations et créez le premier Propriétaire :
+
+   ```sh
+   sudo sh -c 'set -a && . /etc/reputecast/env && reputecast install --email you@company.com --name "Your Name"'
+   ```
+
+   ```txt title="Sortie"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    HAwc-PKEn-jSXh-EE9w   (temporary: you'll replace it at first sign-in)
+   ```
+
+   `install` écrit uniquement dans la base de données. Il s’arrête avec
+   ``ReputeCast is already installed: users exist`` quand la base de données contient des utilisateurs.
+
+6. Créez le service :
+
+   ```ini title="/etc/systemd/system/reputecast.service"
+   [Unit]
+   Description=ReputeCast
+   After=network-online.target postgresql.service
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=reputecast
+   Group=reputecast
+   EnvironmentFile=/etc/reputecast/env
+   ExecStart=/usr/local/bin/reputecast serve
+   Restart=on-failure
+   StateDirectory=reputecast
+   WorkingDirectory=/var/lib/reputecast
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   Avec `StateDirectory=reputecast`, systemd crée `/var/lib/reputecast` avec l’utilisateur du service comme
+   propriétaire. À son premier démarrage, ReputeCast y écrit sa clé secrète et conserve les fichiers importés dans
+   `/var/lib/reputecast/files`.
+
+7. Démarrez-le :
+
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now reputecast
+   ```
+
+8. Faites pointer votre [reverse proxy](/fr/self-hosting/reverse-proxy/) vers `127.0.0.1:8080`, ouvrez l’URL publique
+   et effectuez la [première connexion](/fr/self-hosting/first-run/).
+
+</Steps>
+
+<Aside type="caution">
+  Sauvegardez `/var/lib/reputecast/secret.key` avec la base de données. Sans elle, les identifiants des fournisseurs
+  et les autres secrets stockés dans la base de données ne peuvent pas être déchiffrés
+  ([sauvegarder et restaurer](/fr/self-hosting/backups/)).
+</Aside>
+
+## Vérifier le résultat
+
+- `systemctl status reputecast` affiche `active (running)`.
+- `journalctl -u reputecast` affiche une ligne `http listening` avec l’adresse, l’URL publique et les rôles.
+- `curl http://127.0.0.1:8080/readyz` répond `ready`.
+- `sudo -u reputecast sh -c 'set -a && . /etc/reputecast/env && reputecast doctor'` affiche `ok` pour la base de
+  données, le schéma et la clé secrète, et `reputecast migrate status`, exécuté de la même façon, ne liste aucune
+  migration `pending`.
+
+## Dépannage
+
+- **`Error: http.public_url must be an absolute URL, got "…"`** : écrivez l’adresse avec son schéma,
+  `https://news.example.com`.
+- **L’application est en lecture seule avec un bandeau de maintenance** : `serve` n’applique pas les migrations sans
+  `--auto-migrate`, donc un binaire plus récent attend ses migrations. Exécutez `reputecast migrate up` avec le même
+  environnement, ou ajoutez `--auto-migrate` à `ExecStart`.
+- **`connect to postgres: …`** : vérifiez l’URL, le mot de passe et `pg_hba.conf` avec `psql` et la même URL.
+- **Permission refusée sur la clé secrète** : `/var/lib/reputecast` doit appartenir à l’utilisateur du service ;
+  conservez `StateDirectory=reputecast` dans l’unité.
+- **Le mot de passe temporaire est perdu** : `reputecast user reset-password --email you@company.com` affiche un lien
+  à usage unique ([récupérer l’accès](/fr/self-hosting/account-recovery/)).
+
+## Voir aussi
+
+- [Installer avec Docker Compose](/fr/self-hosting/docker/)
+- [Mettre à niveau ReputeCast](/fr/self-hosting/upgrades/)
+- [Référence de la CLI](/fr/reference/cli/)

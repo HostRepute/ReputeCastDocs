@@ -6,12 +6,15 @@ import sans600 from '@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-nor
 import { apiPageMeta } from './lib/api-pages.ts'
 import { ogKey } from './lib/og.ts'
 import { hasHeadingComponents, mergeHeadings, nestToc } from './lib/toc.ts'
+import { PREFIXED_LOCALES, type Localized } from './lib/locales.ts'
 import { firstSegment, groupFor, localize, localizedPath, topicFor } from './lib/topics.ts'
 
 const SITE = 'https://docs.reputecast.com'
 const WEBSITE_ID = `${SITE}/#website`
 const ORG_ID = 'https://hostrepute.com/#org'
 const ORG = { '@type': 'Organization', '@id': ORG_ID, name: 'HostRepute', url: 'https://hostrepute.com' }
+// The breadcrumb's first item, as TRANSLATING.md names "Documentation" in each language.
+const DOCS: Localized = { en: 'Docs', de: 'Dokumentation', es: 'Documentación', fr: 'Documentation', vi: 'Tài liệu' }
 
 export const onRequest = defineRouteMiddleware(async (context, next) => {
   await next()
@@ -68,7 +71,7 @@ export const onRequest = defineRouteMiddleware(async (context, next) => {
     )
   }
 
-  const isHome = route.id === '' || route.id === 'vi'
+  const isHome = route.id === '' || (PREFIXED_LOCALES as readonly string[]).includes(route.id)
   const homeUrl = `${site}${localizedPath('/', lang)}`
   let graph: Record<string, unknown>[]
   if (isHome) {
@@ -101,7 +104,7 @@ export const onRequest = defineRouteMiddleware(async (context, next) => {
   } else {
     const topic = topicFor(route.id)
     const group = groupFor(route.id)
-    const crumbs: { name: string; item: string }[] = [{ name: lang === 'vi' ? 'Tài liệu' : 'Docs', item: homeUrl }]
+    const crumbs: { name: string; item: string }[] = [{ name: localize(DOCS, lang), item: homeUrl }]
     if (topic) crumbs.push({ name: localize(topic.label, lang), item: `${site}${localizedPath(topic.link, lang)}` })
     crumbs.push({ name: title, item: canonical })
     graph = [

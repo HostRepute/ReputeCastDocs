@@ -1,0 +1,199 @@
+---
+title: Cómo funciona ReputeCast
+description: La arquitectura de envío de newsletters de ReputeCast, de los espacios de trabajo y los flujos a las rutas, la conmutación por error y la supresión.
+type: explanation
+audience: [publisher, admin, operator]
+primaryKeyword: arquitectura de envío de newsletters
+sources:
+  - docs/spec/reputecast-design-spec.md
+  - README.md
+  - internal/providers/provider.go
+  - internal/routing/routing.go
+  - internal/ingest
+  - internal/suppressions
+  - internal/readiness
+  - internal/sending/engine
+  - internal/authz
+  - internal/mailbox
+  - internal/sending/rules
+  - internal/cadence
+  - internal/erasure
+  - internal/workspaces/retention.go
+sidebar:
+  order: 4
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+import LimitsTable from '~/components/LimitsTable.astro'
+import SendFlowDiagram from '~/components/diagrams/SendFlowDiagram.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Esta página explica la arquitectura de envío de newsletters de ReputeCast: quién trabaja dónde, qué tipos de correo
+existen, cómo encuentra cada correo su proveedor de envío y cómo vuelven los resultados de entrega para proteger tu
+próximo envío. Los términos que se usan aquí aparecen en toda la aplicación y en el resto de esta documentación.
+
+## Instancias, espacios de trabajo y miembros
+
+- Una [instancia](/es/reference/glossary/#instance) es una instalación de ReputeCast: el servidor, su base de datos
+  PostgreSQL y todos los espacios de trabajo que contiene. Quienes
+  [administran la instancia](/es/reference/glossary/#instance-admin) gestionan los usuarios, los métodos de inicio de
+  sesión, el inicio de sesión único y las actualizaciones de toda la instancia, y vigilan sus
+  [tareas, colas y almacenamiento](/es/self-hosting/instance-admin/).
+- Un [espacio de trabajo](/es/reference/glossary/#workspace) es un espacio separado con sus propias listas, campañas,
+  automatizaciones, proveedores de envío y equipo. Una instancia puede tener cualquier número de espacios de trabajo, por
+  ejemplo uno por publicación, marca o cliente.
+- Un [miembro](/es/reference/glossary/#member) es una persona de un espacio de trabajo, con exactamente un
+  [rol](/es/reference/glossary/#role) en él. Los roles integrados son Propietario, Administrador, Editor y Lector;
+  puedes añadir roles personalizados con tu propio conjunto de permisos. Las claves de API y los agentes de IA reciben
+  permisos de la misma forma y nunca pueden tener más que la persona que los creó. Lee
+  [Roles y permisos](/es/team/roles-and-permissions/).
+
+## Proveedores de envío y proveedores de buzón
+
+ReputeCast siempre dice a cuál de los dos se refiere:
+
+- Un [proveedor de envío](/es/reference/glossary/#sending-provider) entrega tu correo: Amazon SES, Postmark, Mailgun, un
+  servidor Postal, cualquier servidor SMTP y los demás de [Elegir un proveedor de envío](/es/providers/choose/).
+- Un [proveedor de buzón](/es/reference/glossary/#mailbox-provider) es donde tu lector abre el correo: Gmail, Outlook,
+  Yahoo, iCloud y otros.
+
+ReputeCast deduce el proveedor de buzón de cada contacto a partir de los registros MX del dominio de la dirección, así
+que una empresa en Google Workspace cuenta como Gmail y una en Microsoft 365 como Outlook. El enrutamiento, la revisión
+previa, los informes y el calentamiento usan esa respuesta. Gmail e iCloud nunca comunican las quejas por mensaje, así
+que sus tasas de quejas muestran n/d y quedan fuera de los totales de la tasa de quejas.
+
+Los informes y el monitor en tiempo real muestran los resultados por proveedor de buzón y por proveedor de envío uno
+junto a otro, porque un problema puede estar en cualquiera de los dos lados.
+
+## Cuatro flujos
+
+Un [flujo](/es/reference/glossary/#stream) es un tipo de correo. Cada flujo tiene su propia ruta y su propia política de
+conmutación por error, así que una campaña problemática nunca bloquea un restablecimiento de contraseña.
+
+| Flujo            | Qué lleva                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Envíos masivos   | Campañas.                                                                                                           |
+| Automatizaciones | Correos enviados por los recorridos de automatización.                                                              |
+| Sistema          | Correos de doble confirmación, enlaces al centro de preferencias, invitaciones al equipo y restablecimientos de contraseña. |
+| Transaccional    | Correo de producto que tu propia aplicación envía a través de la API transaccional o del SMTP relay.               |
+
+Las invitaciones, los restablecimientos de contraseña y las notificaciones por correo solo funcionan cuando un proveedor
+de envío lleva el flujo Sistema. El correo transaccional sale primero cuando comparte proveedor de envío con Envíos
+masivos. Consulta [Correo transaccional en ReputeCast](/es/transactional/overview/).
+
+## Rutas, repartos ponderados y conmutación por error
+
+Una [ruta](/es/reference/glossary/#route) decide qué proveedor de envío entrega un correo. Cada flujo tiene una regla
+predeterminada, y puedes añadir reglas para listas concretas, dominios del remitente o el proveedor de buzón del
+destinatario. Una regla puede enviar todo su correo a través de un proveedor o repartirlo en un
+[reparto ponderado](/es/reference/glossary/#weighted-split), por ejemplo 90/10 mientras te pasas a un proveedor nuevo o
+calientas una IP nueva.
+
+Cuando un proveedor falla, la política de [conmutación por error](/es/reference/glossary/#failover) del flujo decide qué
+ocurre:
+
+- **Automática**: el correo pasa a un proveedor de respaldo que supera sus comprobaciones, como estar disponible,
+  admitir ese tipo de correo y tener un dominio del remitente verificado. Es la opción predeterminada de
+  Automatizaciones, Sistema y Transaccional.
+- **Pausar y preguntar**: los destinatarios que quedan esperan hasta que una persona decide. Es la opción predeterminada
+  de Envíos masivos, porque pasar un envío grande a un proveedor sin calentar a mitad de camino puede dañar tu
+  reputación.
+- **Automática, solo con calentamiento completado**: el correo solo pasa a un proveedor de respaldo que no esté en
+  calentamiento; si no hay ninguno, ReputeCast pausa y pregunta.
+
+Consulta [Enrutar el correo entre proveedores](/es/providers/routing/).
+
+## Un modelo de eventos y una lista de supresión
+
+Cada proveedor de envío comunica las entregas, los rebotes y las quejas en su propio formato. ReputeCast recibe estos
+avisos en su URL pública (`/hooks/<adapter>/<token>`), comprueba la firma, guarda el payload sin procesar y responde de
+inmediato; después, una tarea en segundo plano traduce cada aviso a un
+[evento normalizado](/es/reference/glossary/#normalized-event): entregado, aplazado, rebote permanente, rebote temporal,
+queja, rechazado, apertura, clic o baja. El código original del proveedor se queda con el evento. Los servidores SMTP no
+tienen webhooks, así que ReputeCast lee sus rebotes desde un buzón de rebotes.
+
+Los rebotes permanentes, las quejas y las bajas van a una sola [lista de supresión](/es/reference/glossary/#suppression-list)
+compartida por todos los proveedores de envío: un rebote en un proveedor detiene el correo a esa dirección en todos.
+Cada entrada se aplica a todo el correo o solo al correo de marketing, y solo los rebotes permanentes y las quejas que
+se aplican a todo el correo se envían a los proveedores. Lee
+[Eventos de entrega y sincronización de supresiones](/es/providers/events-and-sync/) y
+[La lista de supresión](/es/audience/suppressions/).
+
+## Consentimiento
+
+ReputeCast registra el [consentimiento](/es/reference/glossary/#consent) por lista, con su evidencia: cómo y cuándo se
+suscribió el contacto y el texto exacto que aceptó. Los formularios de suscripción pueden usar la
+[doble confirmación](/es/reference/glossary/#double-opt-in), que se confirma con un botón en la página que abre el
+enlace, de modo que un escáner de enlaces no puede confirmar por el lector. Las importaciones conservan el estado de
+consentimiento de la plataforma que dejas: los contactos dados de baja, con rebote o con queja se convierten en
+supresiones y nunca se vuelven a suscribir. Lee [Listas, consentimiento y doble confirmación](/es/audience/lists-and-consent/).
+
+Al borrar definitivamente un contacto se eliminan sus datos de todas las partes de ReputeCast que los guardan, y la
+[conservación de datos](/es/team/workspaces/) del espacio de trabajo borra las suscripciones nunca confirmadas y limpia
+las direcciones IP y los agentes de usuario de las aperturas y los clics según un calendario, sin cambiar ningún
+informe. Lee [Nociones básicas de consentimiento y leyes antispam](/es/deliverability/compliance/).
+
+## El envío protegido de principio a fin
+
+<SendFlowDiagram />
+
+La revisión previa comprueba una campaña antes de que empiece, el enrutamiento entrega cada destinatario a un proveedor
+de envío, los eventos de entrega vuelven a través de webhooks y los umbrales deciden si el envío sigue o se pausa.
+
+1. **Revisión previa.** La [revisión previa](/es/reference/glossary/#send-readiness) comprueba la reputación, la
+   autenticación, el contenido, los idiomas, la accesibilidad, el contenido condicional, los enlaces, el cumplimiento,
+   la calidad de la audiencia y el enrutamiento, y da un veredicto: “Preparada”, “Preparada, con avisos” o “Bloqueada”.
+   Vuelve a ejecutarse 15 minutos antes de un envío programado y cuando el envío empieza. Un bloqueo detiene el envío;
+   los avisos nuevos, una audiencia que ha cambiado más de un 10 % o los cambios hechos después de programar lo retienen
+   hasta que una persona lo vuelve a revisar.
+2. **Enrutamiento.** El envío construye su lista de destinatarios por páginas, dejando fuera los contactos que la
+   revisión previa excluyó (como los contactos suprimidos, los que no interactúan y los que superan el
+   [límite de marketing](/es/campaigns/sending-rules/) del espacio de trabajo), y enruta cada destinatario. Los lotes van
+   a cada proveedor dentro de su límite de velocidad y de la limitación de velocidad de cada proveedor de buzón, y los
+   límites del [calentamiento](/es/providers/warm-up/) retienen lo que un proveedor joven aún no puede asumir. Cada
+   mensaje se reserva antes de salir, así que nada se envía dos veces. Un envío puede empezar con una fase de
+   [envío canario](/es/reference/glossary/#canary): el pequeño porcentaje de contactos con más interacción y tus buzones
+   de prueba lo reciben primero.
+3. **Eventos de entrega.** Los proveedores comunican las entregas, los rebotes y las quejas, y ReputeCast los normaliza.
+4. **Umbrales.** Durante el envío, ReputeCast comprueba las tasas de rebote, de quejas y de aplazamientos cada 2
+   segundos. Una tasa que supera su umbral, con suficiente evidencia, pone en
+   [pausa automática](/es/reference/glossary/#auto-pause) solo el proveedor de buzón o el proveedor de envío al que
+   afecta, o la campaña entera si elegiste ese alcance. Los aplazamientos ralentizan un envío antes de pausarlo, las
+   quejas solo cuentan donde los proveedores de buzón las comunican y las reglas de respuesta de los proveedores de buzón
+   pueden ralentizar un solo proveedor de buzón. Una vigilancia de quejas sigue el envío durante 72 horas.
+5. **Decisión.** El monitor en tiempo real explica qué lo activó. Una persona con permiso reanuda el envío, lo reanuda
+   con cambios o lo cancela.
+
+## Valores predeterminados y límites
+
+Estos son los valores predeterminados de la pausa automática del
+[envío protegido](/es/reference/glossary/#guarded-sending):
+
+<LimitsTable area="auto-pause" />
+
+Todos los demás valores predeterminados están en [Límites y valores predeterminados](/es/reference/limits-and-defaults/).
+
+## Cuándo cambiarlos
+
+- **Baja los umbrales** para una lista a la que hace tiempo que no escribes, o para un dominio de envío nuevo, de modo
+  que un segmento problemático se pause antes.
+- **Súbelos un poco** solo cuando una causa conocida infla una tasa, como una lista que sabes que contiene direcciones
+  antiguas y que estás limpiando a propósito.
+- **Pausa la campaña entera** en lugar de una ruta cuando cualquier problema deba detenerlo todo, por ejemplo un anuncio
+  que debe llegar a todo el mundo o a nadie.
+
+Cambia los valores predeterminados del espacio de trabajo en <UiPath path="nav.settings > settings.providers" />, los
+umbrales por tipo de rebote y las reglas de respuesta en <UiPath path="nav.providers > providers.tabTraffic" />, y los
+valores de una sola campaña en <UiPath path="composer.reviewSend" />; lee
+[Valores de envío predeterminados del espacio de trabajo](/es/providers/workspace-defaults/),
+[Reglas de tráfico](/es/providers/traffic-rules/) y
+[Supervisar un envío y pausarlo automáticamente](/es/campaigns/live-monitor/).
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Qué es ReputeCast" href="/es/getting-started/introduction/" />
+  <LinkCard title="Revisión previa: comprobar antes de enviar" href="/es/campaigns/send-readiness/" />
+  <LinkCard title="Enrutar el correo entre proveedores" href="/es/providers/routing/" />
+  <LinkCard title="Glosario" href="/es/reference/glossary/" />
+</CardGrid>

@@ -1,0 +1,150 @@
+---
+title: 'Gmail 421 4.7.28: volumen inusual de correo'
+description: Gmail 421 4.7.28 indica que Gmail ha detectado un volumen inusual de correo tuyo y lo limita por ahora. Mira por qué ocurre y cómo recuperarte en ReputeCast.
+type: how-to
+audience: [publisher, admin]
+permissions: ['providers:view', 'providers:manage', 'campaigns:send']
+uiPath: 'nav.providers > providers.tabEvents'
+primaryKeyword: Gmail 421 4.7.28
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/bytype.go
+  - internal/sending/engine/replies.go
+  - internal/sending/rules/reply.go
+  - migrations/03312_m40_default_reply_rules.sql
+  - internal/sending/engine/analysis.go
+  - internal/readiness/assemble.go
+  - internal/reports/bounces.go
+  - web/src/features/senders/providers.messages.ts
+  - web/src/features/providers/events.messages.ts
+sidebar:
+  label: Gmail 421 4.7.28
+  order: 1
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Gmail 421 4.7.28 es un rechazo temporal: Gmail ha detectado un volumen inusual de correo, a menudo no solicitado, desde
+tu dirección IP, tu dominio o un dominio de los enlaces de tus mensajes, y ralentiza ese correo hasta que el volumen
+vuelve a parecer normal. Esta página explica la respuesta y cómo devolver tus envíos a un ritmo que Gmail acepte.
+
+## Qué quiere decir Gmail
+
+Gmail envía el código con uno de varios textos. El más habitual menciona la dirección IP de envío:
+
+> Gmail has detected an unusual rate of email originating from your IP address _ip-address_. To protect our users from
+> spam, email sent from your IP address has been temporarily rate limited.
+
+Las demás variantes indican qué está limitando Gmail:
+
+- tu bloque de IP ("unusual rate of unsolicited email originating from your IP Netblock")
+- tu dominio DKIM o tu dominio SPF ("unusual rate of unsolicited email originating from your DKIM domain")
+- un dominio de enlace ("unusual rate of unsolicited email containing one of your URL domains")
+- tu dirección IP, bloqueada por ahora en lugar de limitada ("an unusual amount of unsolicited email originating from
+  your IP address")
+- Message-ID repetidos ("this sender exceeded the quota for sending messages that have the same Message-ID")
+
+Cada variante remite a las [directrices para remitentes de correo](https://support.google.com/mail/answer/81126) de
+Google. Fuente:
+[Gmail SMTP errors and codes](https://knowledge.workspace.google.com/admin/support/troubleshooting/gmail-smtp-errors-and-codes),
+Ayuda de Google Workspace. Comprobado en octubre de 2026.
+
+## Por qué ocurre
+
+Gmail limita la velocidad cuando tu volumen, o la proporción de tu correo que sus usuarios no quieren, crece más deprisa
+de lo que permite tu [reputación del remitente](/es/reference/glossary/#sender-reputation). Causas habituales:
+
+- Un salto de volumen desde una dirección IP, un dominio o un proveedor de envío que no se ha
+  [calentado](/es/providers/warm-up/).
+- Correo a personas que no lo pidieron o que dejaron de leerlo, lo que sube la tasa de spam. Google pide a los
+  remitentes que mantengan la tasa de spam que muestra Postmaster Tools por debajo del 0,3 %
+  ([directrices para remitentes de correo](https://support.google.com/mail/answer/81126), comprobado en octubre de
+  2026).
+- Un dominio de enlace de tu contenido que Gmail ve en mucho correo no deseado (la variante del dominio de URL).
+
+## Cómo lo clasifica ReputeCast
+
+- Mientras el proveedor de envío reintenta, cada intento rechazado llega como un
+  [aplazamiento](/es/reference/glossary/#deferral): un evento <UiPath path="providers.events.optionDeferred" /> en el
+  registro de eventos. Los aplazamientos no aparecen en la tabla de rebotes del informe de la campaña.
+- Todos los espacios de trabajo empiezan con una [regla de respuesta](/es/reference/glossary/#reply-rule) para este
+  código: cuando 5 respuestas de Gmail contienen `421-4.7.28` en 10 minutos, ReputeCast reduce Gmail a la mitad de
+  velocidad durante 30 minutos, antes que cualquier umbral de tasas. Los demás proveedores de buzón mantienen su ritmo.
+  La regla busca ese texto en cualquier parte de la respuesta; si tu registro de eventos muestra el código escrito de
+  otra forma, como `421 4.7.28`, añade una regla para `4.7.28` en las [reglas de tráfico](/es/providers/traffic-rules/).
+- Los aplazamientos y los rebotes temporales también cuentan para los umbrales de aplazamientos de Gmail, cada mensaje
+  una vez, durante los últimos 10 minutos. Al 15 % del correo enviado a Gmail, ReputeCast reduce Gmail a la mitad de
+  velocidad; al 40 %, [pausa automáticamente](/es/reference/glossary/#auto-pause) la parte de Gmail de la campaña, o la
+  campaña entera cuando el ámbito de la pausa es la campaña. Cada nivel espera a que haya 500 mensajes a Gmail en ese
+  tiempo y al menos 5 aplazamientos.
+- Si el proveedor de envío deja de reintentar, notifica un rebote. El texto de Gmail contiene la palabra "spam", así que
+  la [clase de rebote](/es/reference/glossary/#bounce-class) es `spam_block` y la fila del informe es
+  <UiPath path="reports.bounceType.blocked" />. Un bloqueo por la reputación del remitente nunca suprime la dirección,
+  aunque el proveedor de envío lo considere permanente (consulta
+  [cuándo suprime ReputeCast una dirección](/es/smtp-errors/#cuándo-suprime-reputecast-una-dirección)). Uno permanente
+  cuenta para el umbral de rebotes por bloqueo o política de Gmail.
+- La variante del Message-ID, o el código solo sin el texto de Gmail, es `temporary`
+  (<UiPath path="reports.bounceType.deferralExpired" />).
+
+[Códigos de error SMTP](/es/smtp-errors/#cómo-elige-reputecast-la-clase-de-rebote) explica el clasificador.
+
+## Antes de empezar
+
+- `providers:view` para leer el registro de eventos.
+- `providers:manage` para cambiar los límites de velocidad en <UiPath path="nav.settings > settings.providers" /> y las
+  reglas de respuesta en <UiPath path="nav.providers > providers.tabTraffic" />.
+- `campaigns:send` para reanudar un envío en pausa automática o cambiar sus velocidades.
+
+## Recuperarse del límite de velocidad
+
+<Steps>
+
+1. Identifica la variante. Abre <UiPath path="nav.providers > providers.tabEvents" />, pon
+   <UiPath path="providers.events.typeFilter" /> en <UiPath path="providers.events.optionDeferred" /> y busca un
+   destinatario de Gmail. <UiPath path="providers.events.colCode" /> muestra el texto de Gmail, que indica si Gmail
+   limita una dirección IP, un dominio o un enlace.
+2. Reduce el ritmo hacia Gmail. Gmail no tiene límite de velocidad por defecto. En
+   <UiPath path="nav.settings > settings.providers > senders.providers.throttlesTitle" />, define una velocidad para
+   Gmail en mensajes por segundo. Durante un envío, baja la velocidad de Gmail con <UiPath path="live.adjustRates" /> en
+   el [monitor en tiempo real](/es/campaigns/live-monitor/). Si un envío ya está en pausa automática, el monitor en
+   tiempo real recomienda una velocidad menor para la parte de Gmail; reanuda con ese cambio.
+3. Envía primero a los lectores con más interacción. Los contactos que dejaron de abrir suben la proporción de correo no
+   deseado. Usa los [grupos de interacción](/es/audience/list-health/) y deja que la revisión previa excluya a los
+   contactos sin interacción cuando avise de ellos.
+4. Si la dirección IP, el dominio o el proveedor de envío son nuevos, sigue un
+   [plan de calentamiento](/es/providers/warm-up/) en lugar de enviar a toda la lista de una vez.
+5. En la variante del dominio de URL, revisa los enlaces de la campaña. Las
+   [comprobaciones de contenido](/es/campaigns/content-checks/) señalan los enlaces acortados y los incluidos en listas
+   de bloqueo; enlaza a tu propio dominio en lugar de a un acortador de URL público.
+6. En las variantes del dominio DKIM y del dominio SPF, vigila la tasa de spam de tu dominio en Google Postmaster
+   Tools. ReputeCast muestra los datos de Postmaster en <UiPath path="nav.deliverability > placement.health" /> en
+   cuanto los recibe; consulta [supervisar el estado de los dominios y los proveedores](/es/deliverability/health/).
+
+</Steps>
+
+## Comprobar que funciona
+
+- En el siguiente envío, la tasa de aplazamientos de Gmail en el monitor en tiempo real se mantiene baja, el envío no
+  se ralentiza ni se pausa automáticamente, y su fila <UiPath path="live.model.thresholdReplies" /> muestra la regla de
+  `421-4.7.28` muy por debajo de su recuento.
+- El registro de eventos muestra eventos de entrega para los destinatarios de Gmail en lugar de nuevos aplazamientos
+  421 4.7.28.
+
+## Solución de problemas
+
+- **Los aplazamientos continúan durante días.** Baja todavía más el límite de velocidad de Gmail y envía solo a tus
+  contactos con más interacción hasta que paren los aplazamientos; después, sube el volumen paso a paso.
+- **El registro de eventos muestra el código sin el texto de Gmail.** Algunos proveedores de envío solo notifican el
+  código. En ese caso la clase es `temporary`; la solución es la misma.
+- **Las quejas también son altas.** Lee [rebotes, quejas y límites de los proveedores](/es/deliverability/bounces-and-complaints/)
+  y comprueba que todos los mensajes tienen [baja con un clic](/es/deliverability/one-click-unsubscribe/).
+
+## Relacionado
+
+- [Códigos de error SMTP](/es/smtp-errors/)
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Supervisar un envío y la pausa automática](/es/campaigns/live-monitor/)
+- [Yahoo 421 4.7.0 \[TSS04\]](/es/smtp-errors/yahoo-421-4-7-0-tss04/), el aplazamiento temporal de Yahoo

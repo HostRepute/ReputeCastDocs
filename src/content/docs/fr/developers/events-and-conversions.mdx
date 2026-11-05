@@ -1,0 +1,225 @@
+---
+title: Enregistrer des événements et des conversions
+description: L’API de suivi des conversions attribue commandes et passages à un forfait supérieur à l’e-mail d’origine ; les événements API lancent des automatisations.
+type: how-to
+audience: [developer]
+permissions: ['conversions:create', 'subscribers:edit']
+uiPath: 'nav.earn > earn.tabSettings > earn.settings.tabAttribution'
+primaryKeyword: API de suivi des conversions
+sources:
+  - internal/automations/events.go
+  - internal/automations/graph.go
+  - internal/automations/api.go
+  - internal/revenue/conversions.go
+  - internal/revenue/attribution.go
+  - internal/revenue/api.go
+  - internal/clicktoken/clicktoken.go
+  - internal/earn/hooks.go
+  - web/src/features/earn/revenue/attribution.messages.ts
+  - web/src/features/keys/CreateKeyDialog.tsx
+  - src/data/api-samples/send-automation-event.yaml
+  - src/data/api-samples/create-conversion.yaml
+sidebar:
+  order: 11
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Votre produit sait des choses que ReputeCast ignore : un essai a démarré, un forfait a été changé pour un forfait
+supérieur, une commande a été payée. Deux endpoints font entrer ces faits. Les **événements API** démarrent et
+pilotent des [automatisations](/fr/reference/glossary/#automation). L’**API de suivi des conversions** enregistre ce
+qu’une action a rapporté et l’attribue à l’e-mail de campagne ou d’automatisation sur lequel le lecteur a cliqué, pour
+que le revenu s’affiche à côté de vos e-mails.
+
+## Avant de commencer
+
+- Une clé API. Les événements API nécessitent `subscribers:edit`. Les conversions nécessitent `conversions:create` ;
+  le préréglage <UiPath path="keys.presetConversions" /> de <UiPath path="nav.settings > settings.keys" /> détient
+  cette autorisation et rien d’autre, et expire par défaut au bout d’un an.
+  <UiPath path="earn.attribution.createKey" /> sous
+  <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" /> ouvre la même boîte de dialogue.
+- Le contact doit déjà exister dans l’espace de travail. Aucun des deux endpoints ne crée de contacts ; utilisez
+  d’abord [Créer ou mettre à jour un contact](/fr/developers/integration-api/#actions).
+
+## Envoyer un événement API
+
+`POST /api/v1/workspaces/<workspace>/automations/events` enregistre un événement pour un contact :
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:edit.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/automations/events \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "event": "trial.started",
+    "email": "sam.rivera@outlook.com",
+    "properties": { "plan": "team", "trial_days": 14 }
+  }'
+```
+
+- `event` le nomme : lettres, chiffres et `. _ : -`, en commençant par une lettre ou un chiffre, 100 caractères au
+  plus (`trial.started`, `workspace.created`).
+- Indiquez de qui il s’agit avec `email` ou `contactId`. Une adresse inconnue répond `404` : ajoutez d’abord le
+  contact.
+- `properties` est un objet JSON quelconque de 16 Ko au plus.
+
+La réponse est `202`, avec le contact et le nombre d’automatisations actives que l’événement démarre :
+
+```json title="202 Accepted"
+{ "accepted": true, "contactId": "0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f", "flows": 1 }
+```
+
+### Utiliser l’événement dans une automatisation
+
+<Steps>
+
+1. Dans <UiPath path="nav.automations" />, ouvrez un scénario et définissez son déclencheur, ou l’un de ses
+   déclencheurs, sur <UiPath path="automations.graph.kindApiEvent" />.
+
+2. Saisissez le même <UiPath path="automations.panels.eventName" /> que celui qu’envoie votre produit, par exemple
+   `trial.started`. La correspondance doit être exacte.
+
+3. Publiez le scénario. Les contacts y entrent quelques secondes après chaque événement.
+
+</Steps>
+
+Les objectifs et les branches peuvent aussi attendre un événement, avec la condition
+<UiPath path="automations.panels.condEvent" />. La liste complète des déclencheurs et des étapes se trouve dans
+[Déclencheurs et étapes](/fr/automations/triggers-and-steps/).
+
+Les événements sont de l’activité de contact, comme les ouvertures et les clics : ils n’apparaissent donc pas dans le
+journal d’audit. Chaque appel enregistre un nouvel événement : ne relancez pas un appel qui a reçu la réponse `202`.
+
+## Enregistrer une conversion
+
+`POST /api/v1/workspaces/<workspace>/conversions` enregistre une action de valeur qu’un lecteur a faite dans votre
+produit :
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with conversions:create.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# Add "click_token" with the rc_click value of the link the reader followed, when you have it.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/conversions \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: order-1042' \
+  --data '{
+    "name": "Upgraded to Team plan",
+    "value": "29.00",
+    "currency": "USD",
+    "email": "sam.rivera@outlook.com",
+    "metadata": { "order_id": "1042" }
+  }'
+```
+
+<TableScroll label="Champs d’une conversion">
+
+| Champ         | Obligatoire       | Contenu                                                                                        |
+| ------------- | ----------------- | ---------------------------------------------------------------------------------------------- |
+| `name`        | Oui               | Ce qui s’est passé, 120 caractères au plus : « Upgraded to Team plan ».                        |
+| `value`       | Oui               | Une **chaîne** décimale, `"29.00"`, pas `29`. Pas plus de décimales que la devise n’en a.      |
+| `currency`    | Oui               | Un code ISO 4217 à trois lettres : `USD`, `EUR`, `JPY`.                                        |
+| `email`       | L’un des deux     | L’adresse du lecteur.                                                                          |
+| `click_token` | L’un des deux     | La valeur `rc_click` du lien que le lecteur a suivi. Voir [Transmettre le jeton de clic](#transmettre-le-jeton-de-clic). |
+| `occurred_at` | Non               | Le moment où c’est arrivé, au format RFC 3339. Jusqu’à 30 jours en arrière ; maintenant si vous l’omettez. |
+| `metadata`    | Non               | Vos propres champs, conservés avec la conversion (8 Ko au plus).                               |
+
+</TableScroll>
+
+Envoyez un en-tête `Idempotency-Key` (200 caractères au plus), comme votre ID de commande. Renvoyer la même clé avec
+le même corps répond avec la première conversion au lieu d’en enregistrer une deuxième ; la même clé avec un corps
+différent répond `409 idempotency_key_reused`. Les clés sont mémorisées par clé API.
+
+La réponse est `202` et indique comment la conversion a été rapprochée :
+
+```json title="202 Accepted"
+{
+  "id": "0192f1c4-9e21-7a40-8c3b-2d4f6a8b0c1e",
+  "matched": "click_token",
+  "credited": { "kind": "campaign", "id": "0192f0aa-1b2c-7d3e-9f40-5a6b7c8d9e0f", "name": "Weekly Digest #142" }
+}
+```
+
+## Comment une conversion est attribuée
+
+ReputeCast attribue une conversion au dernier e-mail de campagne ou d’automatisation sur lequel le lecteur a cliqué
+pendant la **fenêtre d’attribution** : 7 jours par défaut, de 1 à 30 jours sous
+<UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution > earn.attribution.windowTitle" />.
+
+1. Avec un `click_token` valide, l’e-mail qui portait le lien cliqué, quand le clic tombe dans la fenêtre qui précède
+   `occurred_at`. `matched` vaut `click_token`.
+2. Sinon, avec un `email` qui correspond à un contact : `matched` vaut `email`, et la conversion est attribuée au
+   dernier e-mail sur lequel ce contact a cliqué pendant la fenêtre, s’il y en a un.
+3. Sinon, `matched` vaut `none`. La conversion est conservée, sans être attribuée.
+
+Quand rien n’est attribué, la réponse n’a pas de champ `credited`.
+
+Une conversion attribuée déclenche l’événement webhook `conversion.recorded`
+([événements webhook](/fr/reference/webhook-events/)). Les conversions apparaissent dans
+<UiPath path="earn.attribution.logTitle" /> et comme conversions produit sur la vue d’ensemble des revenus ; elles ne
+comptent pas dans le MRR ([les indicateurs de revenus expliqués](/fr/earn/revenue/)).
+
+### Transmettre le jeton de clic
+
+La correspondance par e-mail ne fonctionne que si le lecteur est un contact connu qui a cliqué. Le jeton de clic
+fonctionne aussi quand le lecteur s’inscrit avec une autre adresse :
+
+<Steps>
+
+1. Activez <UiPath path="earn.attribution.tokenTitle" /> et ajoutez les domaines de votre produit, comme
+   `app.example.com`.
+
+2. Les liens de vos e-mails vers ces domaines portent alors `rc_click=…`. Le jeton est opaque et signé, et il n’est
+   jamais ajouté aux liens vers d’autres domaines, liens de sponsors compris.
+
+3. Dans votre produit, lisez `rc_click` dans l’URL d’arrivée et conservez-le avec le visiteur (par exemple, dans sa
+   session ou dans l’enregistrement de son inscription).
+
+4. Envoyez-le comme `click_token` quand la conversion a lieu. Un jeton plus ancien que la fenêtre d’attribution
+   n’attribue plus rien.
+
+</Steps>
+
+## Erreurs et limites
+
+- `422 missing_identity` : envoyez `email`, `click_token` ou les deux.
+- `422 invalid_value` : envoyez la valeur sous forme de chaîne décimale, sans plus de décimales que la devise n’en
+  autorise.
+- `422 invalid_currency` : utilisez un code ISO 4217 à trois lettres.
+- `422 occurred_at_out_of_range` : `occurred_at` remonte à plus de 30 jours ou se situe dans le futur.
+- `409 idempotency_key_reused` : la clé est arrivée avec un corps différent.
+- `429 rate_limited` : chaque clé enregistre jusqu’à 600 conversions par minute ; attendez `Retry-After`.
+
+Tous les codes sont listés dans [erreurs de l’API](/fr/developers/api-errors/).
+
+## Vérifier le résultat
+
+- Sous <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" />,
+  <UiPath path="earn.attribution.sendTest" /> enregistre une conversion de test pour votre propre adresse. Les
+  conversions de votre produit apparaissent dans <UiPath path="earn.attribution.logTitle" />, les plus récentes en
+  premier.
+- La réponse à un événement API indique combien de scénarios actifs il a démarrés (`flows`). Les statistiques d’étape
+  de l’automatisation montrent l’entrée du contact.
+
+## Dépannage
+
+- **`matched: "none"` ou pas de `credited`** : le lecteur n’a cliqué sur aucun e-mail pendant la fenêtre, ou
+  l’adresse n’est pas un contact. Transmettez le jeton de clic, ou élargissez la fenêtre.
+- **`flows: 0`** : aucune automatisation active n’a de déclencheur d’événement API avec exactement ce nom d’événement.
+  Vérifiez l’orthographe et que le scénario est publié.
+- **`404` sur un événement API** : le contact n’existe pas ; créez-le d’abord.
+- **Conversions en double** : envoyez un `Idempotency-Key` et réutilisez-le lors des nouvelles tentatives.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Gagner de l’argent avec votre newsletter" href="/fr/earn/overview/" description="Abonnements payants, revenus et attribution." />
+  <LinkCard title="Créer des automatisations" href="/fr/automations/overview/" description="Des scénarios qui réagissent aux événements de votre produit." />
+  <LinkCard title="Créer une intégration" href="/fr/developers/integration-api/" description="Contacts, listes, tags et événements depuis d’autres outils." />
+  <LinkCard title="Référence de l’API" href="/api/operations/create-conversion/" description="L’opération create-conversion en détail." />
+</CardGrid>

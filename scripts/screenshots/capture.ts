@@ -1,13 +1,13 @@
 /**
  * Captures the docs screenshots from the upstream ReputeCast demo (scripts/screenshots/manifest.ts).
  *
- *   pnpm shots                                   # every shot, English and Vietnamese
+ *   pnpm shots                                   # every shot, in every docs locale
  *   pnpm shots --only review-send,live-monitor   # some shots
- *   pnpm shots --locale vi --no-reseed           # Vietnamese only, on the current Acme database
+ *   pnpm shots --locale de,es,fr --no-reseed     # German, Spanish and French only, on the current Acme database
  *
  * Options
  *   --only <id,id>          shot ids (default: all)
- *   --locale en|vi          one locale (default: both; English-only shots skip vi)
+ *   --locale <code,code>    locales: en, de, es, fr, vi (default: all; English-only shots skip the others)
  *   --app <url>             web app origin (default $SHOT_APP, else http://localhost:5173)
  *   --no-reseed             keep the current Acme database for the Acme shots
  *   --channel chrome|bundled  installed Google Chrome (default) or Playwright's Chromium
@@ -48,8 +48,9 @@ import {
   type Upstream,
 } from './lib/upstream.ts'
 import { shots, type Shot } from './manifest.ts'
+import { LOCALES, isLang, type Lang } from '../../src/lib/locales.ts'
 
-type Locale = 'en' | 'vi'
+type Locale = Lang
 type User = NonNullable<Shot['user']>
 type Result = { id: string; locale: Locale; result: 'captured' | 'failed' | 'skipped'; kb?: number; note?: string }
 type Prefs = { language: string; regionFormat: string; hourCycle: string; weekStart: string }
@@ -89,14 +90,15 @@ const { values: opts } = parseArgs({
   },
 })
 const app = (opts.app ?? process.env.SHOT_APP ?? 'http://localhost:5173').replace(/\/+$/, '')
-const runLocales: Locale[] = opts.locale ? [opts.locale as Locale] : ['en', 'vi']
+const requestedLocales = opts.locale ? opts.locale.split(',').filter(Boolean) : [...LOCALES]
 const only = new Set((opts.only ?? '').split(',').filter(Boolean))
 
 function usage(message: string): never {
   console.error(message)
   process.exit(2)
 }
-if (!runLocales.every((l) => l === 'en' || l === 'vi')) usage(`--locale must be en or vi, not ${opts.locale}`)
+if (!requestedLocales.every(isLang)) usage(`--locale takes ${LOCALES.join(', ')}, not ${opts.locale}`)
+const runLocales: Locale[] = requestedLocales.filter(isLang)
 if (opts.channel !== 'chrome' && opts.channel !== 'bundled') usage(`--channel must be chrome or bundled`)
 const unknown = [...only].filter((id) => !shots.some((s) => s.id === id))
 if (unknown.length) usage(`unknown shot ids: ${unknown.join(', ')}`)
@@ -273,7 +275,7 @@ class RateLimited extends Error {
 async function captureAll(list: Shot[]): Promise<void> {
   for (const locale of runLocales) {
     for (const s of list) {
-      if (!(s.locales ?? ['en', 'vi']).includes(locale)) {
+      if (!(s.locales ?? LOCALES).includes(locale)) {
         results.push({ id: s.id, locale, result: 'skipped', note: 'English only (see the manifest)' })
         continue
       }

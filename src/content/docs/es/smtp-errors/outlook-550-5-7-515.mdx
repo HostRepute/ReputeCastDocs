@@ -1,0 +1,132 @@
+---
+title: 'Outlook 550 5.7.515: nivel de autenticación insuficiente'
+description: Outlook 550 5.7.515 indica que tu dominio From no cumple las reglas de autenticación de Microsoft para remitentes de gran volumen. Corrige SPF, DKIM y DMARC.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: Outlook 550 5.7.515
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/routing/routing.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/senders
+  - web/src/features/connect/domain.messages.ts
+sidebar:
+  label: Outlook 550 5.7.515
+  order: 6
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Outlook 550 5.7.515 es un rechazo permanente de los servicios de correo de consumo de Microsoft (Outlook.com, Hotmail,
+Live.com, MSN): tu dominio From envía suficiente correo para contar como remitente de gran volumen, pero no supera la
+autenticación que Microsoft exige a esos remitentes. La solución está en tus registros DNS. Esta página enumera los
+requisitos de Microsoft y dónde comprueba ReputeCast cada uno.
+
+## Qué quiere decir Microsoft
+
+El error completo es:
+
+> 550 5.7.515 Access denied, sending domain `<domain>` does not meet the required authentication level.
+
+> The sender's domain in the 5322.From address doesn't meet the authentication requirements defined for the sender.
+
+Microsoft considera que un dominio es un remitente de gran volumen cuando envía 5000 mensajes o más a los servicios de
+correo de consumo de Microsoft, todos con el mismo dominio en la dirección From. A partir de ese momento, el correo de
+ese dominio debe cumplir todos estos requisitos:
+
+1. El dominio tiene publicados registros SPF y DKIM, y tanto la comprobación SPF como la DKIM son correctas.
+2. El dominio tiene publicado un registro DMARC, como mínimo `v=DMARC1; p=none`.
+3. El mensaje supera DMARC: SPF o DKIM, al menos uno de los dos, se alinea con el dominio de la dirección From.
+
+Fuente: [Fix NDR error "550 5.7.515" in Outlook.com](https://support.microsoft.com/en-us/outlook/fix-ndr-error-550-5-7-515-in-outlook-com),
+Soporte técnico de Microsoft. Comprobado en octubre de 2026.
+
+## Por qué ocurre
+
+- Un proveedor de envío de tu ruta firma DKIM con su propio dominio en lugar del tuyo, así que DKIM no se alinea.
+- SPF falla para el dominio de return-path, por ejemplo después de añadir un proveedor de envío sin publicar sus
+  registros.
+- El dominio no tiene registro DMARC.
+
+## Cómo lo clasifica ReputeCast
+
+- [Clase de rebote](/es/reference/glossary/#bounce-class): `policy_block`, por las palabras "Access denied". Cuando un
+  proveedor de envío solo transmite el código sin el texto de Microsoft, la clase es `other`.
+- Fila del informe: <UiPath path="reports.bounceType.blocked" />, o <UiPath path="reports.bounceType.other" /> para el
+  código solo.
+- Supresión: el rechazo se refiere a tu dominio, no a la dirección, así que la dirección no se suprime, tanto si el
+  proveedor de envío registra un rebote temporal como uno permanente (consulta
+  [cuándo suprime ReputeCast una dirección](/es/smtp-errors/#cuándo-suprime-reputecast-una-dirección)). En el informe
+  de la campaña, <UiPath path="reports.investigate" /> en esa fila muestra lo que dijo cada proveedor de envío, y
+  <UiPath path="reports.retryTitle" /> vuelve a preparar la edición en borrador para esas direcciones cuando hayas
+  corregido la causa.
+- Durante un envío: uno permanente cuenta para el umbral de rebotes por bloqueo o política de Outlook, que pausa
+  Outlook por defecto; consulta los
+  [valores predeterminados de la pausa automática](/es/campaigns/live-monitor/#valores-predeterminados-y-límites) y las
+  [reglas de tráfico](/es/providers/traffic-rules/).
+- ReputeCast cuenta outlook.com, hotmail.com, live.com y msn.com, y sus dominios de cada país, como el proveedor de
+  buzón Outlook, igual que los dominios cuyos registros MX apuntan a Microsoft 365. El monitor en tiempo real y el
+  informe muestran estos rebotes en Outlook.
+
+## Dónde comprueba ReputeCast los requisitos de Microsoft
+
+| Microsoft exige                              | Revisión previa, grupo <UiPath path="review.groupAuthentication" />                                   |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Que SPF sea correcto                         | Bloquea el envío cuando el dominio no tiene registro SPF o SPF no autoriza a un proveedor de envío     |
+| Que DKIM sea correcto                        | Bloquea el envío cuando DKIM no está verificado para un proveedor de envío                             |
+| Un registro DMARC, como mínimo `p=none`      | Bloquea el envío cuando el registro DMARC falta o no es válido                                         |
+| Que DMARC sea correcto, con SPF o DKIM alineados | Avisa cuando menos del 90 % del correo está alineado con DMARC en los últimos 7 días               |
+
+## Antes de empezar
+
+- `domains:manage` para ver y comprobar los registros DNS de un dominio de envío.
+- Acceso al proveedor de DNS de tu dominio.
+- `providers:view` para leer el registro de eventos.
+
+## Cumplir los requisitos de Microsoft
+
+<Steps>
+
+1. Confirma el error. Abre <UiPath path="nav.providers > providers.tabEvents" />, busca un destinatario de Outlook.com o
+   Hotmail y lee <UiPath path="providers.events.colCode" />.
+2. Abre <UiPath path="nav.settings > settings.senders" /> y el dominio de tu dirección From. Su página de registros
+   enumera los registros DNS que necesita cada proveedor de envío, cada uno con un estado.
+3. Publica todos los registros que muestren <UiPath path="connect.domain.statusMissing" /> o
+   <UiPath path="connect.domain.statusPending" />: los registros DKIM de todos los proveedores de envío de tus rutas, el
+   registro SPF y un registro DMARC. [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/) tiene los pasos
+   para los proveedores de DNS habituales.
+4. Si el proveedor de envío admite un dominio MAIL FROM (return path) personalizado, configúralo para que SPF también se
+   alinee.
+5. Abre <UiPath path="composer.reviewSend" /> de la siguiente campaña y comprueba que el grupo
+   <UiPath path="review.groupAuthentication" /> de la [revisión previa](/es/campaigns/send-readiness/) es correcto.
+
+</Steps>
+
+## Comprobar que funciona
+
+- Todos los registros de la página del dominio muestran <UiPath path="connect.domain.statusVerified" />.
+- El informe de la siguiente campaña no tiene ningún 550 5.7.515 en <UiPath path="reports.colCodes" />.
+
+## Solución de problemas
+
+- **Solo se rechaza el correo que pasa por un proveedor de envío.** Faltan los registros DKIM o la entrada SPF de ese
+  proveedor. Revisa la página de registros del dominio para ese proveedor.
+- **DMARC es correcto en unos informes y falla en otros.** Lee tus
+  [informes agregados de DMARC](/es/deliverability/dmarc-reports/) para encontrar los orígenes que no se alinean.
+- **ReputeCast envía menos de 5000 mensajes a Microsoft.** Microsoft cuenta los mensajes por dominio From, así que
+  también cuenta el correo que otros sistemas envían con el mismo dominio From.
+
+## Relacionado
+
+- [Códigos de error SMTP](/es/smtp-errors/)
+- [Gmail 550 5.7.26](/es/smtp-errors/gmail-550-5-7-26/), el bloqueo por autenticación de Gmail
+- [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)
+- [Añadir dominios de envío y remitentes](/es/providers/senders-and-domains/)

@@ -20,11 +20,11 @@ export function changedSources(sources: string[], changed: string[]): string[] {
 }
 
 /**
- * True when every `messages.ts` in a feature folder has a sibling `messages.vi.ts`
+ * True when every `messages.ts` in a feature folder has a sibling `messages.<lang>.ts`
  * (paths relative to the feature folder, e.g. ['messages.ts', 'messages.vi.ts', 'sub/messages.ts']).
  */
-export function hasCompleteVietnamese(files: string[]): boolean {
+export function hasCompleteTranslation(files: string[], lang: string): boolean {
   const en = files.filter((f) => /(^|\/)messages\.ts$/.test(f))
   const set = new Set(files)
-  return en.length > 0 && en.every((f) => set.has(f.replace(/messages\.ts$/, 'messages.vi.ts')))
+  return en.length > 0 && en.every((f) => set.has(f.replace(/messages\.ts$/, `messages.${lang}.ts`)))
 }

@@ -1,0 +1,225 @@
+---
+title: État et pannes des fournisseurs
+description: Ce que fait ReputeCast pendant une panne de fournisseur d’e-mails, des vérifications et états Dégradé ou En panne au basculement contrôlé et au retour.
+type: explanation
+audience: [admin]
+permissions: ['providers:view']
+uiPath: 'nav.providers > providers.tabProviders'
+primaryKeyword: panne de fournisseur d’e-mails
+sources:
+  - internal/providers/manage/health.go
+  - internal/providers/manage/record.go
+  - internal/opsmetrics/opsmetrics.go
+  - internal/providers/manage/review_health.go
+  - internal/providers/manage/actions.go
+  - internal/providers/manage/usage.go
+  - internal/providers/state/state.go
+  - internal/providers/state/vet.go
+  - internal/providers/state/messages/en.json
+  - internal/routing/routing.go
+  - internal/sending/engine/outages.go
+  - internal/sending/engine/guard.go
+  - internal/sending/engine/routeerrors.go
+  - web/src/features/providers/messages.ts
+  - web/src/features/providers/overview.messages.ts
+  - web/src/features/providers/incidents.messages.ts
+sidebar:
+  order: 18
+---
+
+import { Aside, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+ReputeCast vérifie en arrière-plan chaque fournisseur d’envoi connecté et lui attribue un état. Quand une
+panne de fournisseur d’e-mails commence, les e-mails qui doivent continuer à partir passent sur un secours qui réussit ses
+contrôles, la part d’une campagne sur le fournisseur défaillant attend votre décision, et le trafic revient dès que le
+fournisseur est opérationnel depuis 10 minutes.
+
+## Ce que signifient les états
+
+<UiPath path="nav.providers > providers.tabProviders" /> affiche une carte par fournisseur avec son état, les flux qu’il
+transporte, ses IP d’envoi, la fraîcheur de ses webhooks, son taux d’erreurs d’API, son quota et sa cadence d’envoi, son
+coût ce mois-ci et ses capacités.
+
+<Screenshot
+  id="providers-list"
+  alt="La page des fournisseurs : 3 fournisseurs connectés, 2 Opérationnel et 1 En chauffe. Les cartes Amazon SES et Postmark sont Opérationnel, chacune avec les flux qu’elle transporte, ses IP d’envoi, ses webhooks, son taux d’erreurs d’API sur 7 jours, ses taux de rebond et de plainte face à leurs limites, son quota, sa cadence d’envoi, son coût et ses puces de capacités."
+/>
+
+<TableScroll label="États des fournisseurs">
+
+| État                                                                                         | Signification                                                                                                                                                             | Accepte de nouveaux e-mails                                  |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| <UiPath path="providers.statusHealthy" />                                                    | Les derniers contrôles ont réussi.                                                                                                                                        | Oui                                                          |
+| <UiPath path="providers.statusWarmingUp" /> · jour N sur M                                   | Un [plan de chauffe](/fr/providers/warm-up/) est en cours ; son plafond quotidien s’applique aux Diffusions.                                                                 | Oui, jusqu’au plafond du jour                                |
+| <UiPath path="providers.statusSandbox" />                                                    | Le compte ne peut envoyer qu’à des adresses vérifiées, comme dans le sandbox Amazon SES.                                                                                  | Seulement à ces adresses                                     |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.webhooksSilent" /> | Le fournisseur accepte les e-mails mais ne signale aucun événement de livraison, de rebond ou de plainte. Voir [webhooks silencieux](#webhooks-silencieux).               | Non : les Diffusions attendent, les autres flux utilisent leur secours |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.rejecting" />    | Le fournisseur refuse une part inhabituelle des messages qui lui sont confiés, par exemple pour un expéditeur non vérifié ou un compte suspendu. Voir [rejet de messages](#rejet-de-messages). | Oui ; les messages refusés n’ont pas été envoyés |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.mailboxFailing" /> | La [boîte de réception des rebonds](/fr/reference/glossary/#bounce-mailbox) d’un serveur SMTP ne peut pas être lue : ses rebonds n’atteignent pas la liste de suppression. | Oui                                                          |
+| <UiPath path="providers.statusDegraded" /> · <UiPath path="providers.health.queueFailing" /> | La file d’événements d’Amazon SES ne peut pas être lue ; ses événements y attendent.                                                                                      | Oui                                                          |
+| <UiPath path="providers.statusDown" />                                                       | Les appels échouent, ou le fournisseur a refusé les identifiants (<UiPath path="providers.health.downAuth" />).                                                            | Non                                                          |
+| <UiPath path="providers.statusPaused" />                                                     | Le fournisseur est en pause.                                                                                                                                              | Non                                                          |
+
+</TableScroll>
+
+Les taux de rebond et de plainte d’une carte couvrent les 7 derniers jours (ou sont les chiffres du fournisseur lui-même,
+quand il les communique). Ils sont affichés face aux limites du compte chez le fournisseur, comme les niveaux d’examen et
+de suspension d’Amazon SES, pour que vous voyiez à quelle distance votre compte en est. Vous pouvez modifier les limites
+affichées dans les <UiPath path="providers.overview.settings" /> du fournisseur. Elles servent uniquement de repère : les
+seuils qui mettent un envoi en pause sont les [paramètres d’envoi par défaut de l’espace de travail](/fr/providers/workspace-defaults/)
+et les [règles de trafic](/fr/providers/traffic-rules/).
+
+Un taux sans données n’est jamais affiché comme 0 % :
+
+- Le taux de plainte ne compte que les e-mails délivrés aux [fournisseurs de messagerie](/fr/reference/glossary/#mailbox-provider)
+  qui signalent les plaintes. Gmail et iCloud ne le font jamais : un fournisseur dont les e-mails ne sont allés que là
+  affiche « n.d. » avec la raison, « Gmail et iCloud ne signalent pas les plaintes ».
+- Si rien n’a été délivré au cours des 7 derniers jours, les taux affichent aussi « n.d. ».
+- Le taux d’erreurs d’API d’un fournisseur qui n’a reçu aucun appel affiche
+  <UiPath path="providers.overview.errorRateNoCalls" />.
+
+## Comment l’état est vérifié
+
+1. Toutes les 5 minutes, ReputeCast fait un appel en lecture seule à chaque fournisseur (par exemple `GetAccount` pour
+   Amazon SES ou `GET /server` pour Postmark) et enregistre le résultat, le quota et la cadence d’envoi indiqués. Tant
+   qu’un fournisseur est En panne ou Dégradé, il le vérifie toutes les minutes.
+2. Les vrais envois comptent aussi : chaque appel d’API pendant un envoi est enregistré.
+3. Un fournisseur est marqué **En panne** après 2 vérifications en échec d’affilée, ou quand au moins la moitié d’au
+   moins 5 appels ont échoué au cours des 3 dernières minutes. Une réponse `401` ou une réponse similaire « identifiants
+   refusés » le marque En panne immédiatement.
+4. Un fournisseur est marqué **Dégradé** quand ses webhooks deviennent silencieux, quand il commence à rejeter des
+   messages, ou quand ReputeCast ne peut pas lire sa boîte de réception des rebonds ou sa file d’événements. Chacun de
+   ces cas ouvre un incident et prévient les personnes qui gèrent les fournisseurs d’envoi.
+5. Un fournisseur En panne est considéré comme rétabli dès que les appels réussissent de nouveau (moins de 1 sur 10 en
+   échec) pendant 10 minutes. Après le remplacement d’identifiants refusés, il se rétablit à la vérification réussie
+   suivante.
+
+La bannière de panne a un bouton pour revérifier le fournisseur tout de suite au lieu d’attendre la prochaine
+vérification.
+
+## Ce qui se passe pendant une panne
+
+Quand un fournisseur tombe en panne, ReputeCast traite chaque flux qui fait passer des e-mails par lui, selon la
+[politique de basculement](/fr/providers/routing/) du flux. Les e-mails ne passent que sur un secours qui réussit d’abord
+chaque contrôle : disponible, conditions autorisant les envois en masse (pour les Diffusions), hors sandbox, domaine de
+l’expéditeur vérifié chez lui, quota suffisant pour les e-mails à transférer, et chauffe terminée. Un fournisseur en
+chauffe ne prend des e-mails de basculement qu’avec la politique automatique et dans la limite du plafond du jour.
+
+- **Automatisations, Système et Transactionnel** basculent automatiquement vers le secours du flux quand celui-ci
+  réussit ses contrôles. La bannière indique combien d’e-mails ont été reroutés. Quand le secours échoue à un contrôle,
+  ReputeCast continue de réessayer le fournisseur au lieu de basculer, et les nouveaux e-mails du flux attendent que le
+  fournisseur se rétablisse.
+- **Diffusions** suit la politique des Diffusions. Avec la politique par défaut, mettre en pause et demander, chaque
+  campagne qui passe par le fournisseur voit sa part sur ce fournisseur retenue pendant que les autres parts continuent
+  de partir, et les personnes qui peuvent envoyer des campagnes sont invitées à décider. Avec le basculement
+  automatique, ou réservé aux fournisseurs à chauffe terminée, la part passe sur le secours quand la politique le permet
+  et que le secours réussit ses contrôles.
+
+Une part retenue passe par le circuit de panne unique du moteur d’envoi, que la panne ait été détectée par la
+vérification de l’état ou d’abord par l’envoi : ses appels ont échoué pendant 3 minutes, le compte subissait sans cesse
+une limitation de débit, ses erreurs d’API ont dépassé la limite de l’envoi, ou il a refusé l’expéditeur ou épuisé son
+quota. Tant que personne n’a décidé, la part teste le fournisseur avec un message par minute et reprend d’elle-même
+après 3 réussites d’affilée. Le [suivi en direct](/fr/campaigns/live-monitor/) montre la même retenue, avec l’analyse du
+moteur et ses options.
+
+Pour une part de Diffusion retenue, la bannière de panne de la page des fournisseurs propose trois choix. Au-dessus
+d’eux, <UiPath path="providers.incidents.checksFirst" />, et chaque cible liste les contrôles qu’elle a réussis.
+
+- **Attendre** le fournisseur : la part reprend d’elle-même une fois que le fournisseur est opérationnel depuis
+  10 minutes. Ce choix est recommandé quand aucune cible n’a réussi tous les contrôles.
+- **Transférer** les destinataires retenus vers un autre fournisseur. Une cible qui a échoué à un contrôle ne peut pas
+  être choisie. Si elle est encore en chauffe et que le transfert dépasserait le plafond du jour, le bouton indique
+  qu’il n’est pas recommandé.
+- <UiPath path="providers.incidents.cancelSend" /> : les destinataires retenus ne reçoivent pas la campagne, le reste de
+  l’envoi s’arrête, et ce qui a déjà été envoyé reste envoyé. Cette action est irréversible.
+
+Attendre et transférer relancent l’envoi et demandent `campaigns:send` ; annuler demande `campaigns:pause`.
+
+Les membres qui ont `providers:manage` sont prévenus quand un fournisseur tombe en panne. Chaque étape (panne,
+basculement, attente, retour, rétablissement) est inscrite dans la <UiPath path="providers.incidents.timelineTitle" />,
+et la panne est consignée dans le [journal d’audit](/fr/team/audit-log/). Les [endpoints de webhook](/fr/developers/webhooks/)
+de l’espace de travail reçoivent `provider.down` quand le fournisseur tombe en panne (avec la raison, l’erreur, et les
+flux qui ont basculé et ceux qui attendent) et `provider.recovered` quand il revient (avec le nombre de minutes de
+panne).
+
+Les exploitants du serveur peuvent suivre les mêmes appels dans les [métriques Prometheus](/fr/self-hosting/monitoring/) :
+`reputecast_provider_calls_total` compte les appels d’envoi par adaptateur (ok ou error), et
+`reputecast_provider_messages_total` les messages transmis (acceptés, refusés, différés ou en échec).
+
+### Le retour au fournisseur principal
+
+Après 10 minutes de fonctionnement normal, les flux qui avaient basculé reviennent à leur principal, et les parts de
+Diffusion en attente reprennent là où elles s’étaient arrêtées.
+
+### Webhooks silencieux
+
+Les webhooks d’un fournisseur sont silencieux quand il continue d’accepter des e-mails mais qu’aucun événement de
+livraison, de rebond ou de plainte ne revient : les messages qu’il a pris sont en retard au-delà d’un délai de grâce,
+comme le précise la ligne « Webhooks silencieux » dans [valeurs par défaut et limites](#valeurs-par-défaut-et-limites).
+Un fournisseur qui n’a jamais signalé d’événement est signalé dès que des e-mails qui lui sont destinés sont en retard :
+un webhook qui n’a jamais fonctionné n’affiche donc pas indéfiniment « aucun événement pour l’instant ». Les serveurs
+SMTP sont exemptés, car leurs rebonds viennent d’une boîte aux lettres.
+
+Tant que les webhooks sont silencieux, l’envoi fonctionne mais l’état des nouveaux messages est inconnu : la protection
+contre les rebonds de cette route est aveugle. Le fournisseur est marqué Dégradé. ReputeCast ne bascule pas sur la seule
+base du silence : les Diffusions sur le fournisseur attendent que des événements arrivent ou que vous décidiez, et les
+autres flux utilisent leur secours quand ils en ont un. La bannière montre ce que ReputeCast a vérifié (l’API, si le
+webhook est toujours enregistré chez le fournisseur, si son adresse de webhook est publique et quand le fournisseur l’a
+jointe pour la dernière fois), les causes probables et l’impact : les messages en retard et encore dans le délai de
+grâce de 30 minutes, les campagnes concernées et les rebonds pas encore exclus. De là, vous pouvez choisir
+<UiPath path="providers.incidents.sendTestEvent" /> (le fournisseur en envoie un au webhook, et son arrivée prouve que
+l’adresse fonctionne), <UiPath path="providers.incidents.reregister" /> ou, quand l’API du fournisseur conserve les
+messages passés, <UiPath path="providers.incidents.checkNow" /> pour lire l’état des messages en retard. La bannière
+disparaît dès que des événements arrivent. La façon dont les événements parviennent à ReputeCast est décrite dans
+[événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/).
+
+### Rejet de messages
+
+Un fournisseur qui refuse des messages qui lui ont été confiés, par exemple parce que l’expéditeur n’y est pas vérifié
+ou que le compte est suspendu, est marqué <UiPath path="providers.health.rejecting" /> dès que les refus dépassent la
+ligne « Rejette des messages » dans [valeurs par défaut et limites](#valeurs-par-défaut-et-limites). Les messages refusés
+n’ont pas été envoyés. L’incident indique combien de messages ont été refusés et la dernière réponse ; vérifiez le
+domaine de l’expéditeur et le compte chez le fournisseur. L’état disparaît dès qu’il accepte de nouveau des messages.
+Pendant une campagne, un fournisseur qui refuse l’expéditeur retient sa part au lieu de faire échouer chaque message :
+rien n’est marqué en échec, et les messages attendent que vous corrigiez l’expéditeur, les transfériez ou les annuliez.
+
+### Identifiants refusés
+
+Quand un fournisseur répond que les identifiants ne sont plus valides, par exemple parce que quelqu’un a renouvelé la clé
+API chez le fournisseur, il est marqué En panne immédiatement et ses flux basculent comme décrit plus haut. Remplacez les
+identifiants dans les <UiPath path="providers.overview.settings" /> du fournisseur : ReputeCast vérifie les nouveaux
+auprès du fournisseur avant de les stocker.
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="providers" />
+
+## Quand les modifier
+
+- **Donnez à chaque flux un secours qui peut prendre ses e-mails.** Un deuxième fournisseur avec le domaine de
+  l’expéditeur vérifié et assez de quota transforme une panne en bref basculement pour les e-mails Automatisations,
+  Système et Transactionnel. Lisez [Router les e-mails entre fournisseurs](/fr/providers/routing/).
+- **Choisissez la politique des Diffusions en connaissance de cause.** Mettre en pause et demander est la valeur par
+  défaut sûre. Basculez automatiquement, uniquement vers un fournisseur à chauffe terminée, si vous préférez que les
+  campagnes continuent et que votre secours a un historique d’envoi.
+- **Assurez-vous que les webhooks peuvent vous joindre.** Des webhooks silencieux viennent en général d’un reverse
+  proxy, d’un pare-feu ou d’un problème d’URL publique. Lisez [Reverse proxy et TLS](/fr/self-hosting/reverse-proxy/) et
+  [Dépannage](/fr/self-hosting/troubleshooting/).
+
+<Aside type="tip">
+La santé du compte chez le fournisseur au-delà des propres contrôles de ReputeCast, comme les listes de blocage et la
+réputation auprès des fournisseurs de messagerie, se trouve dans les pages Délivrabilité. Lisez
+[Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/).
+</Aside>
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Router les e-mails entre fournisseurs" href="/fr/providers/routing/" />
+  <LinkCard title="Suivre un envoi et la pause automatique" href="/fr/campaigns/live-monitor/" />
+  <LinkCard title="Événements de livraison et synchronisation des suppressions" href="/fr/providers/events-and-sync/" />
+  <LinkCard title="Notifications" href="/fr/team/notifications/" />
+</CardGrid>

@@ -6,11 +6,14 @@ import starlightLlmsTxt from 'starlight-llms-txt'
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi'
 import starlightSidebarTopics from 'starlight-sidebar-topics'
 import previewNoindex from './src/integrations/preview-noindex.ts'
+import { LANGUAGE_NAMES, PREFIXED_LOCALES } from './src/lib/locales.ts'
 import { sidebarTopics } from './src/lib/sidebar.ts'
 
 const isPreview = process.env.DOCS_PREVIEW === '1'
+// A locale prefix of a docs path ('de', 'es', 'fr', 'vi').
+const LOCALE = `(?:${PREFIXED_LOCALES.join('|')})`
 // Pages whose #anchors come from reference components (glossary terms, CLI commands, keys, tables).
-const COMPONENT_ANCHORS = /^\/(vi\/)?(reference\/[^/#]+|developers\/api-errors)\/#/
+const COMPONENT_ANCHORS = new RegExp(`^/(${LOCALE}/)?(reference/[^/#]+|developers/api-errors)/#`)
 // Placeholder that starlight-openapi fills with the generated API reference pages (Developers topic).
 const apiSidebarGroup = createOpenAPISidebarGroup()
 const topicsConfig = sidebarTopics(apiSidebarGroup)
@@ -25,8 +28,8 @@ export default defineConfig({
       titleDelimiter: '·',
       defaultLocale: 'root',
       locales: {
-        root: { label: 'English', lang: 'en' },
-        vi: { label: 'Tiếng Việt', lang: 'vi' },
+        root: { label: LANGUAGE_NAMES.en, lang: 'en' },
+        ...Object.fromEntries(PREFIXED_LOCALES.map((l) => [l, { label: LANGUAGE_NAMES[l], lang: l }])),
       },
       logo: { src: './src/assets/brand/reputecast-mark.svg', alt: 'ReputeCast' },
       favicon: '/favicon.svg',
@@ -76,7 +79,7 @@ export default defineConfig({
           },
         ]),
         starlightSidebarTopics(topicsConfig, {
-          exclude: ['/', '/vi/'],
+          exclude: ['/', ...PREFIXED_LOCALES.map((l) => `/${l}/`)],
           topics: { developers: ['/api/**'] },
         }),
         starlightLinksValidator({
@@ -84,7 +87,8 @@ export default defineConfig({
           errorOnLocalLinks: false,
           // Anchors rendered by data components and the generated API pages are invisible to the validator;
           // scripts/content/check-links.ts checks them in dist/ after the build.
-          exclude: ({ link }) => /^\/(vi\/)?api\//.test(link) || (link.includes('#') && COMPONENT_ANCHORS.test(link)),
+          exclude: ({ link }) =>
+            new RegExp(`^/(${LOCALE}/)?api/`).test(link) || (link.includes('#') && COMPONENT_ANCHORS.test(link)),
         }),
         starlightImageZoom(),
         starlightLlmsTxt({

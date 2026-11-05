@@ -1,0 +1,135 @@
+---
+title: 'Outlook 550 5.7.515: Authentifizierungsstufe nicht erreicht'
+description: Outlook 550 5.7.515 bedeutet, dass Ihre From-Domain die Authentifizierungsregeln von Microsoft für Absender mit hohem Volumen nicht erfüllt. So beheben Sie es.
+type: how-to
+audience: [publisher, admin]
+permissions: ['domains:manage', 'providers:view']
+uiPath: 'nav.settings > settings.senders'
+primaryKeyword: Outlook 550 5.7.515
+sources:
+  - internal/providers/bounce/bounce.go
+  - internal/readiness/assemble.go
+  - internal/routing/routing.go
+  - internal/reports/bounces.go
+  - internal/reports/suppress.go
+  - internal/ingest/normalize.go
+  - internal/sending/engine/bytype.go
+  - internal/mailbox/mailbox.go
+  - web/src/features/senders
+  - web/src/features/connect/domain.messages.ts
+sidebar:
+  label: Outlook 550 5.7.515
+  order: 6
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Outlook 550 5.7.515 ist eine dauerhafte Ablehnung der E-Mail-Dienste von Microsoft für Privatkunden (Outlook.com,
+Hotmail, Live.com, MSN): Ihre From-Domain sendet genug E-Mails, um als Absender mit hohem Volumen zu gelten, besteht aber
+nicht die Authentifizierung, die Microsoft von diesen Absendern verlangt. Die Lösung liegt in Ihren DNS-Einträgen. Diese
+Seite listet die Anforderungen von Microsoft auf und zeigt, wo ReputeCast jede davon prüft.
+
+## Was Microsoft damit meint
+
+Der vollständige Fehler lautet:
+
+> 550 5.7.515 Access denied, sending domain `<domain>` does not meet the required authentication level.
+
+> The sender's domain in the 5322.From address doesn't meet the authentication requirements defined for the sender.
+
+Das heißt: Der Zugriff wird verweigert, weil die sendende Domain die erforderliche Authentifizierungsstufe nicht
+erreicht; die Domain in der 5322.From-Adresse erfüllt die für den Absender festgelegten Anforderungen nicht.
+
+Microsoft behandelt eine Domain als Absender mit hohem Volumen, wenn sie 5.000 oder mehr Nachrichten an die
+E-Mail-Dienste von Microsoft für Privatkunden sendet, alle mit derselben Domain in der From-Adresse. Ab dann müssen
+E-Mails dieser Domain alle diese Anforderungen erfüllen:
+
+1. Für die Domain sind SPF- und DKIM-Einträge veröffentlicht, und sowohl die SPF- als auch die DKIM-Prüfung besteht.
+2. Für die Domain ist ein DMARC-Eintrag veröffentlicht, mindestens `v=DMARC1; p=none`.
+3. Die Nachricht besteht DMARC: SPF oder DKIM, mindestens eines davon, ist mit der Domain der From-Adresse ausgerichtet.
+
+Quelle: [Fix NDR error „550 5.7.515“ in Outlook.com](https://support.microsoft.com/en-us/outlook/fix-ndr-error-550-5-7-515-in-outlook-com),
+Microsoft Support. Geprüft im Oktober 2026.
+
+## Warum es passiert
+
+- Ein Versandanbieter auf Ihrer Route signiert DKIM mit seiner eigenen Domain statt mit Ihrer, daher ist DKIM nicht
+  ausgerichtet.
+- SPF schlägt für die Return-Path-Domain fehl, zum Beispiel nachdem Sie einen Versandanbieter hinzugefügt haben, ohne
+  seine Einträge zu veröffentlichen.
+- Die Domain hat keinen DMARC-Eintrag.
+
+## Wie ReputeCast den Code einordnet
+
+- [Bounce-Klasse](/de/reference/glossary/#bounce-class): `policy_block`, wegen der Wörter „Access denied“. Gibt ein
+  Versandanbieter nur den Code ohne den Text von Microsoft weiter, ist die Klasse `other`.
+- Zeile im Bericht: <UiPath path="reports.bounceType.blocked" />, oder <UiPath path="reports.bounceType.other" /> für den
+  bloßen Code.
+- Sperre: Die Ablehnung betrifft Ihre Domain, nicht die Adresse, daher wird die Adresse nicht gesperrt, egal ob der
+  Versandanbieter einen Soft oder einen Hard Bounce erfasst (siehe
+  [Wann ReputeCast eine Adresse sperrt](/de/smtp-errors/#wann-reputecast-eine-adresse-sperrt)). Im Kampagnenbericht
+  zeigt <UiPath path="reports.investigate" /> in dieser Zeile, was jeder Versandanbieter gemeldet hat, und
+  <UiPath path="reports.retryTitle" /> legt die Ausgabe für diese Adressen erneut als Entwurf an, sobald Sie die
+  Ursache behoben haben.
+- Während eines Versands: Ein harter zählt zum Schwellenwert für Block- und Richtlinien-Bounces von Outlook, der Outlook
+  standardmäßig pausiert; siehe die [Standardwerte für Auto-Pause](/de/campaigns/live-monitor/#standardwerte-und-grenzen)
+  und die [Traffic-Regeln](/de/providers/traffic-rules/).
+- ReputeCast zählt outlook.com, hotmail.com, live.com und msn.com samt ihren Länderdomains zum Postfachanbieter Outlook,
+  ebenso Domains, deren MX-Einträge auf Microsoft 365 zeigen. Der Live-Monitor und der Bericht zeigen diese Bounces
+  unter Outlook.
+
+## Wo ReputeCast die Anforderungen von Microsoft prüft
+
+| Microsoft verlangt                               | Versandbereitschaft, Gruppe <UiPath path="review.groupAuthentication" />                                     |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| SPF besteht                                      | Blockiert den Versand, wenn die Domain keinen SPF-Eintrag hat oder SPF einen Versandanbieter nicht autorisiert |
+| DKIM besteht                                     | Blockiert den Versand, wenn DKIM für einen Versandanbieter nicht verifiziert ist                             |
+| Ein DMARC-Eintrag, mindestens `p=none`           | Blockiert den Versand, wenn der DMARC-Eintrag fehlt oder ungültig ist                                        |
+| DMARC besteht, mit ausgerichtetem SPF oder DKIM  | Warnt, wenn in den letzten 7 Tagen weniger als 90 % der E-Mails mit DMARC ausgerichtet waren                 |
+
+## Bevor Sie beginnen
+
+- `domains:manage`, um die DNS-Einträge einer Versand-Domain zu sehen und zu prüfen.
+- Zugriff auf den DNS-Hoster Ihrer Domain.
+- `providers:view`, um das Ereignisprotokoll zu lesen.
+
+## Die Anforderungen von Microsoft erfüllen
+
+<Steps>
+
+1. Bestätigen Sie den Fehler. Öffnen Sie <UiPath path="nav.providers > providers.tabEvents" />, suchen Sie nach einem
+   Empfänger bei Outlook.com oder Hotmail und lesen Sie <UiPath path="providers.events.colCode" />.
+2. Öffnen Sie <UiPath path="nav.settings > settings.senders" /> und die Domain Ihrer From-Adresse. Ihre Seite mit den
+   Einträgen listet die DNS-Einträge auf, die jeder Versandanbieter braucht, jeweils mit einem Status.
+3. Veröffentlichen Sie jeden Eintrag, der <UiPath path="connect.domain.statusMissing" /> oder
+   <UiPath path="connect.domain.statusPending" /> zeigt: die DKIM-Einträge jedes Versandanbieters auf Ihren Routen, den
+   SPF-Eintrag und einen DMARC-Eintrag. [SPF, DKIM und DMARC einrichten](/de/deliverability/spf-dkim-dmarc/) enthält
+   die Schritte für gängige DNS-Hoster.
+4. Wo der Versandanbieter eine eigene MAIL-FROM-Domain (Return-Path) unterstützt, richten Sie sie ein, damit auch SPF
+   ausgerichtet ist.
+5. Öffnen Sie <UiPath path="composer.reviewSend" /> der nächsten Kampagne und prüfen Sie, ob die Gruppe
+   <UiPath path="review.groupAuthentication" /> der [Versandbereitschaft](/de/campaigns/send-readiness/) besteht.
+
+</Steps>
+
+## Prüfen, ob es funktioniert hat
+
+- Jeder Eintrag auf der Seite der Domain zeigt <UiPath path="connect.domain.statusVerified" />.
+- Der Bericht der nächsten Kampagne enthält in <UiPath path="reports.colCodes" /> kein 550 5.7.515.
+
+## Fehlerbehebung
+
+- **Nur E-Mails über einen Versandanbieter werden abgelehnt.** Die DKIM-Einträge oder der SPF-Eintrag dieses Anbieters
+  fehlen. Prüfen Sie die Seite mit den Einträgen der Domain für diesen Anbieter.
+- **DMARC besteht in manchen Berichten und schlägt in anderen fehl.** Lesen Sie Ihre
+  [DMARC-Sammelberichte](/de/deliverability/dmarc-reports/), um die Quellen zu finden, die nicht ausgerichtet sind.
+- **ReputeCast sendet weniger als 5.000 Nachrichten an Microsoft.** Microsoft zählt Nachrichten je From-Domain, daher
+  zählen auch E-Mails, die andere Systeme mit derselben From-Domain senden.
+
+## Verwandte Themen
+
+- [SMTP-Fehlercodes](/de/smtp-errors/)
+- [Gmail 550 5.7.26](/de/smtp-errors/gmail-550-5-7-26/), die Authentifizierungssperre von Gmail
+- [Regeln für Massenabsender von Gmail, Yahoo und Microsoft](/de/deliverability/bulk-sender-requirements/)
+- [Versand-Domains und Absender hinzufügen](/de/providers/senders-and-domains/)

@@ -2,29 +2,40 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-export type UiLabelRow = { id: string; en: string; vi?: string; source: string }
+import { PREFIXED_LOCALES, type PrefixedLang } from '../../../src/lib/locales.ts'
+
+export type UiLabelRow = { id: string; en: string; source: string } & Partial<Record<PrefixedLang, string>>
 export type UiLabelReport = {
   /** Labels whose text or source no longer matches upstream (the drift check fails on these). */
   problems: string[]
-  /** Ids without `vi` whose source now has a Vietnamese sibling file upstream (warning: fill `vi`). */
-  viAvailable: string[]
+  /** Labels without a locale's text whose source now has that locale's sibling file upstream (warning: fill it). */
+  available: { id: string; lang: PrefixedLang }[]
 }
 /** Returns the file's text, or undefined when the repo-relative path does not exist. */
 export type ReadFile = (path: string) => string | undefined
 
+/** Each translated locale's name in English, for messages. */
+export const LANGUAGE_IN_ENGLISH: Record<PrefixedLang, string> = {
+  de: 'German',
+  es: 'Spanish',
+  fr: 'French',
+  vi: 'Vietnamese',
+}
+
 /**
- * Upstream files that may hold the Vietnamese text of `source`, in order: `messages.ts` → `messages.vi.ts`,
- * `x.messages.ts` → `x.messages.vi.ts`, `xMessages.ts` → `x.messages.vi.ts`, `common.ts` → `common.vi.ts` or
- * `common.messages.vi.ts`, `messages/en.json` → `messages/vi.json`. Empty for sources that are not message files.
+ * Upstream files that may hold the `lang` text of `source`, in order (here for vi): `messages.ts` →
+ * `messages.vi.ts`, `x.messages.ts` → `x.messages.vi.ts`, `xMessages.ts` → `x.messages.vi.ts`, `common.ts` →
+ * `common.vi.ts` or `common.messages.vi.ts`, `messages/en.json` → `messages/vi.json`. Empty for sources that are not
+ * message files.
  */
-export function viSiblings(source: string): string[] {
-  if (source.endsWith('/en.json') || source === 'en.json') return [source.replace(/en\.json$/, 'vi.json')]
-  if (!source.endsWith('.ts') || source.endsWith('.vi.ts')) return []
-  if (/[a-z]Messages\.ts$/.test(source)) return [source.replace(/Messages\.ts$/, '.messages.vi.ts')]
-  const plain = source.replace(/\.ts$/, '.vi.ts')
+export function translationSiblings(source: string, lang: PrefixedLang): string[] {
+  if (source.endsWith('/en.json') || source === 'en.json') return [source.replace(/en\.json$/, `${lang}.json`)]
+  if (!source.endsWith('.ts') || PREFIXED_LOCALES.some((l) => source.endsWith(`.${l}.ts`))) return []
+  if (/[a-z]Messages\.ts$/.test(source)) return [source.replace(/Messages\.ts$/, `.messages.${lang}.ts`)]
+  const plain = source.replace(/\.ts$/, `.${lang}.ts`)
   return source.endsWith('.messages.ts') || source.endsWith('/messages.ts') || source === 'messages.ts'
     ? [plain]
-    : [plain, source.replace(/\.ts$/, '.messages.vi.ts')]
+    : [plain, source.replace(/\.ts$/, `.messages.${lang}.ts`)]
 }
 
 const escapes: Record<string, string> = { n: '\n', r: '\r', t: '\t', '\n': '' }
@@ -153,12 +164,11 @@ const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined)
 /** Checks each label row against the upstream files read through `readFile` (paths are repo-relative). */
 export function checkUiLabels(rows: readonly Record<string, unknown>[], readFile: ReadFile): UiLabelReport {
   const problems: string[] = []
-  const viAvailable: string[] = []
+  const available: UiLabelReport['available'] = []
   const seen = new Set<string>()
   for (const row of rows) {
     const id = str(row.id) ?? '(no id)'
     const en = str(row.en)
-    const vi = str(row.vi)
     const source = str(row.source)
     if (seen.has(id)) problems.push(`${id}: duplicate id`)
     seen.add(id)
@@ -172,18 +182,22 @@ export function checkUiLabels(rows: readonly Record<string, unknown>[], readFile
       continue
     }
     if (!hasLiteral(src, en)) problems.push(`${id}: English "${en}" not found in ${source}`)
-    const candidates = viSiblings(source)
-    const sibling = candidates.find((path) => readFile(path) !== undefined) ?? candidates[0]
-    const viSrc = sibling === undefined ? undefined : readFile(sibling)
-    if (vi !== undefined) {
-      if (viSrc === undefined)
-        problems.push(
-          `${id}: has vi but ${sibling === undefined ? `${source} has no translation file` : `${sibling} not found`}`,
-        )
-      else if (!hasLiteral(viSrc, vi)) problems.push(`${id}: Vietnamese "${vi}" not found in ${sibling}`)
-    } else if (viSrc !== undefined) viAvailable.push(id)
+    for (const lang of PREFIXED_LOCALES) {
+      const text = str(row[lang])
+      const candidates = translationSiblings(source, lang)
+      const sibling = candidates.find((path) => readFile(path) !== undefined) ?? candidates[0]
+      const langSrc = sibling === undefined ? undefined : readFile(sibling)
+      if (text !== undefined) {
+        if (langSrc === undefined)
+          problems.push(
+            `${id}: has ${lang} but ${sibling === undefined ? `${source} has no translation file` : `${sibling} not found`}`,
+          )
+        else if (!hasLiteral(langSrc, text))
+          problems.push(`${id}: ${LANGUAGE_IN_ENGLISH[lang]} "${text}" not found in ${sibling}`)
+      } else if (langSrc !== undefined) available.push({ id, lang })
+    }
   }
-  return { problems, viAvailable }
+  return { problems, available }
 }
 
 /** `checkUiLabels` against an upstream checkout at `root`. */

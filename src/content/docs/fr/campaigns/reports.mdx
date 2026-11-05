@@ -1,0 +1,398 @@
+---
+title: Lire les rapports de campagne
+description: 'Rapport de campagne ReputeCast : un taux d’ouverture des e-mails non gonflé par Apple Mail Privacy Protection, des clics humains consolidés, des liens partagés.'
+type: how-to
+audience: [publisher]
+permissions: ['reports:view', 'reports:share']
+uiPath: 'nav.campaigns > campaigns.report'
+primaryKeyword: taux d’ouverture des e-mails
+sources:
+  - internal/reports
+  - internal/counters
+  - internal/abstats
+  - internal/tracking/classify.go
+  - internal/tracking/settle.go
+  - internal/tracking/record.go
+  - internal/retryaudience
+  - internal/campaigns/{retry,followup}.go
+  - web/src/features/campaigns/followup.tsx
+  - internal/ai/reportask.go
+  - internal/ai/summary.go
+  - internal/publicurl/publicurl.go
+  - migrations/03208_r05_share_expiry.sql
+  - web/src/features/reports
+  - web/src/features/ai/report.tsx
+sidebar:
+  order: 15
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Un rapport de campagne ReputeCast vous dit ce qu’ont fait les lecteurs, et non leurs applications de messagerie. Le
+taux d’ouverture des e-mails compte les [ouvertures humaines](/fr/reference/glossary/#human-opens) des lecteurs dont
+les ouvertures sont visibles : les préchargements d’Apple Mail Privacy Protection sont rangés à part au lieu de le
+gonfler, et les clics ne comptent qu’une fois [consolidés](/fr/reference/glossary/#settled-click) comme ceux d’une
+personne. Chaque tuile est comparée à vos derniers numéros, et chaque résultat est ventilé par fournisseur de
+messagerie et par fournisseur d’envoi, pour que vous voyiez où un problème a commencé.
+
+## Avant de commencer
+
+- Lire un rapport demande `reports:view`.
+- L’exporter et créer des liens en lecture seule demande `reports:share` (Propriétaire, Admin et Éditeur en disposent ;
+  Observateur non).
+- Ajouter des adresses en rebond à la liste de suppression depuis le rapport demande `subscribers:edit`.
+- Préparer une nouvelle tentative pour les adresses bloquées en raison de votre réputation, ou une relance, demande
+  `campaigns:edit`.
+- Les résumés et les réponses aux questions par l’IA demandent `ai:use` et un modèle connecté pour
+  l’[assistant IA](/fr/integrations/ai-assistant/).
+
+## Ouvrir un rapport
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.campaigns" /> et sélectionnez <UiPath path="campaigns.report" /> sur une campagne
+   envoyée. Vérifier et envoyer renvoie aussi au rapport une fois la campagne terminée.
+
+2. Vérifiez la ligne d’état sous le titre. « résultats en direct » signifie que la campagne est encore en cours
+   d’envoi. « résultats encore en cours d’arrivée · définitifs le » suivi d’une date signifie que l’envoi s’est terminé
+   il y a moins de 72 heures : les ouvertures, les clics, les plaintes et les rebonds tardifs arrivent encore, et rien
+   n’est encore comparé à vos derniers numéros. « résultats définitifs depuis le » suivi d’une date signifie que les
+   chiffres sont stabilisés.
+
+3. Tant que les résultats arrivent encore, sélectionnez <UiPath path="reports.emailWhenFinal" /> pour être prévenu
+   quand ils sont définitifs, dans l’application et par e-mail selon vos préférences de notification. Seule une
+   personne connectée peut le demander, pas une clé d’API ni un agent.
+
+4. Lisez les huit tuiles du haut : Envoyés, Délivrés, <UiPath path="reports.humanOpens" />,
+   <UiPath path="reports.privacyOpens" />, <UiPath path="reports.humanClicks" />, Désabonnements, Plaintes et Rebonds.
+   Une fois les résultats définitifs, chaque tuile affiche son évolution par rapport à vos derniers numéros et une
+   courbe de tendance.
+
+</Steps>
+
+<Screenshot
+  id="report"
+  alt="Le rapport d’October Product Update : l’en-tête avec Exporter en CSV, Exporter en PDF, Partager un lien en lecture seule, Relancer et Dupliquer la campagne, un résumé par l’IA conservé et vérifié par rapport au rapport, et le champ de question, puis 47 980 envoyés, 19 590 ouvertures humaines (52,8 % des mesurables), 10 436 à confidentialité protégée et 2 996 clics humains avec 1 108 clics de robots filtrés, chaque tuile avec une courbe de tendance ; les analyses, la croissance, le graphique d’engagement, la carte des clics, les résultats par fournisseur de messagerie et par fournisseur d’envoi, les rebonds, le test A/B, les commandes de la boutique et les liens de partage."
+>
+
+1. Les tuiles principales, chacune avec son évolution par rapport à la médiane de vos derniers numéros et une courbe
+   de tendance.
+2. <UiPath path="reports.insightsTitle" /> : ce qui ressort des chiffres, chaque élément avec une action comme
+   <UiPath path="reports.checkDelisting" />.
+3. <UiPath path="reports.clickMap" /> : les clics humains sur chaque lien, dessinés sur l’e-mail, avec un sélecteur
+   pour <UiPath path="reports.colBotClicks" />.
+4. <UiPath path="reports.mailboxTitle" /> : les ouvertures humaines des destinataires mesurables, les ouvertures à
+   confidentialité protégée, et n/d pour les plaintes qu’un fournisseur de messagerie ne signale pas.
+5. <UiPath path="reports.shareTitle" /> : ce qu’inclut un nouveau lien et quand il expire, et les liens actifs.
+
+</Screenshot>
+
+## Comment les ouvertures sont comptées
+
+ReputeCast range chaque ouverture dans l’une de trois catégories :
+
+- **Ouvertures humaines** : une personne a ouvert l’e-mail. Le clic consolidé d’une personne compte aussi comme
+  ouverture humaine.
+- **Ouvertures à confidentialité protégée** : Apple Mail Privacy Protection (le réseau d’Apple ou son user agent nu),
+  ou un autre proxy de confidentialité figurant dans le [filtre anti-robots](/fr/reference/glossary/#bot-filter) de
+  l’instance, a récupéré l’e-mail à son arrivée. On ne peut pas savoir si quelqu’un l’a lu : ce ne sont donc ni des
+  ouvertures de personnes ni des ouvertures de machines.
+- **Ouvertures automatiques** : les scanners de sécurité (d’après leur user agent, ou depuis un réseau de scanners à
+  l’arrivée de l’e-mail), les proxys d’images de Gmail et de Yahoo dans les premières secondes suivant l’arrivée, les
+  requêtes sans user agent ou les requêtes `HEAD`, et toute ouverture dans les premières secondes suivant l’arrivée.
+  La note sous les tuiles les compte comme ouvertures de scanners ; elles ne comptent nulle part ailleurs.
+
+La tuile <UiPath path="reports.humanOpens" /> affiche deux taux. « des délivrés » divise les ouvertures humaines par
+tous les messages délivrés, y compris ceux des lecteurs dont les ouvertures sont invisibles : c’est donc un plancher.
+« des mesurables » est le [taux d’ouverture mesurable](/fr/reference/glossary/#measurable-open-rate) : les ouvertures
+humaines divisées par les délivrés moins les ouvertures à confidentialité protégée. Dépliez
+<UiPath path="reports.measurableTitle" /> sous les tuiles pour voir le calcul avec les chiffres de cette campagne. Les
+flèches des ouvertures comparent le taux mesurable : une évolution du nombre de vos lecteurs qui utilisent Apple Mail
+ne les fait donc pas bouger.
+
+Les fenêtres se mesurent à partir de la livraison quand le fournisseur d’envoi la signale, sinon à partir du moment où
+le fournisseur a pris en charge le message. Quand un espace de travail conserve le suivi propre à un fournisseur
+d’envoi, ses ouvertures et ses clics sont rangés de la même façon d’après le user agent et l’adresse que transmet le
+fournisseur.
+
+## Comment les clics sont comptés
+
+Un clic redirige toujours le lecteur immédiatement, mais il ne compte qu’une fois consolidé :
+
+1. Un clic qui ressemble à celui d’une personne attend une minute.
+2. ReputeCast examine ensuite les clics qui l’entourent. Si le même e-mail a cliqué sur plusieurs de ses liens en
+   quelques secondes, ou a suivi le lien caché de l’e-mail qu’aucune personne ne peut voir, le clic venait d’un scanner
+   et il est classé comme clic de robot.
+3. Sinon, il est consolidé comme celui d’une personne et compte une fois : comme clic humain, comme ouverture humaine,
+   comme clic unique sur son lien, et dans les automatisations, les segments, les scores et les niveaux d’engagement.
+
+Les clics d’un user agent de scanner, depuis un réseau de scanners à l’arrivée de l’e-mail, ou dans les premières
+secondes suivant l’arrivée sont immédiatement des clics de robots. La tuile <UiPath path="reports.humanClicks" /> compte
+des personnes, chacune une fois, et indique combien de clics de robots ont été filtrés ; sélectionnez cette ligne pour
+voir où ils ont atterri sur la carte des clics. Une commande est tout de même attribuée à un clic en cours de
+consolidation, car acheter est un acte de personne.
+
+Les mêmes règles s’appliquent dans tous les espaces de travail de l’instance. Les admins de l’instance ajoutent des
+réseaux et des user agents dans
+[Administration de l’instance › Filtre anti-robots](/fr/self-hosting/instance-admin/#modifier-le-filtre-anti-robots).
+
+<LimitsTable area="tracking" />
+
+## Plaintes, compteurs et comparaisons
+
+- **Les plaintes seulement là où elles sont signalées.** Gmail et iCloud ne signalent pas les plaintes aux
+  expéditeurs : leurs taux de plainte affichent donc « n/d » avec la raison, et le taux « là où elles sont signalées »
+  de la tuile Plaintes exclut leurs e-mails. Le taux de spam de Gmail se trouve dans Google Postmaster Tools, dans
+  Délivrabilité. Les fournisseurs de messagerie sont distingués d’après l’enregistrement MX de chaque domaine : Gmail
+  inclut Google Workspace et Outlook inclut Microsoft 365.
+- **Des compteurs fondés sur l’état des messages.** Les chiffres additionnent l’état de chaque message (délivré,
+  rebond, ouvert, cliqué) : un événement tardif ou répété ne compte donc jamais deux fois. Une fois les résultats
+  définitifs, et chaque fois que les règles de comptage changent, les compteurs de chaque campagne sont reconstruits à
+  partir de ses messages et événements enregistrés. Les campagnes importées depuis une autre plateforme gardent leurs
+  totaux importés.
+- **Des comparaisons avec vos derniers numéros.** Chaque tuile se compare à la médiane des six derniers numéros envoyés
+  aux mêmes listes et segments, pour qu’un numéro inhabituel ne déplace pas la référence : en pourcentage pour
+  Envoyés, en points pour les taux. La courbe de tendance trace la tuile sur ces numéros et sur celui-ci. Un rapport
+  affiche « Aucun numéro précédent auquel comparer pour l’instant. » quand il n’y en a pas.
+
+## Ce qu’affiche chaque section
+
+- **Résumé par l’IA et Poser une question sur ce rapport.** Voir
+  [résumer et poser des questions avec l’IA](#résumer-et-poser-des-questions-avec-lia).
+- **Analyses.** Ce qui ressort, calculé à partir des chiffres du rapport lui-même : des messages qu’un fournisseur de
+  messagerie a bloqués en raison de la réputation de l’IP d’envoi (<UiPath path="reports.checkDelisting" />), un
+  fournisseur de messagerie qui a renvoyé bien plus de rebonds que les autres
+  (<UiPath path="reports.insight.openSnds" /> pour Outlook, <UiPath path="reports.insight.openPostmaster" /> pour
+  Gmail), ou un lien qui a attiré une grande partie des clics humains (<UiPath path="reports.insight.showLink" />). Les
+  analyses décrivent des chiffres ; elles ne devinent jamais une cause.
+- **Croissance et revenus générés par ce numéro.** Les nouveaux abonnés issus des transferts, des parrainages et de
+  l’article web, et les <UiPath path="reports.webViews" /> de la page d’archives du numéro et de l’article du site,
+  comptées sur le serveur sans cookies. Avec Monétisation, les passages au payant et les conversions de produits
+  attribués à cet e-mail.
+- **Engagement sur les 72 premières heures.** Ouvertures humaines, ouvertures à confidentialité protégée et clics
+  humains en part des délivrés, sous forme de graphique ou de tableau. Avec un test A/B, un repère indique quand le
+  gagnant est parti vers le reste de l’audience.
+- **Carte des clics.** La part des clics humains de chaque lien, sur l’e-mail envoyé. Passez à
+  <UiPath path="reports.colBotClicks" /> pour voir où les scanners ont cliqué. Avec un test A/B, choisissez
+  <UiPath path="reports.variantToShow" /> : <UiPath path="reports.allRecipients" /> ou une variante. Un test du contenu
+  n’a pas de carte pour tout le monde : la carte de chaque variante montre son propre e-mail. Avec des versions
+  linguistiques, vous pouvez changer la langue de la carte.
+- **Résultats par fournisseur de messagerie et par fournisseur d’envoi.** Délivrance, ouvertures humaines des
+  destinataires mesurables, ouvertures à confidentialité protégée, clics humains, rebonds et plaintes pour chacun, plus
+  les désabonnements par fournisseur de messagerie et le délai de livraison médian, le coût et le jour de chauffe par
+  fournisseur d’envoi. Un problème chez un fournisseur de messagerie (des plaintes chez Outlook) ne ressemble pas à un
+  problème chez un fournisseur d’envoi (une panne de Postal).
+- **Résultats par langue.** Affichés quand deux versions linguistiques ou plus ont été envoyées. Voir
+  [envoyer à chaque lecteur sa langue](/fr/campaigns/languages/).
+- **Rebonds par type.** Définitifs, temporaires, bloqués pour politique ou réputation, et autres, chacun avec les codes
+  d’origine des fournisseurs d’envoi comme `550 5.1.1`. Les rebonds définitifs sont exclus automatiquement et les
+  rebonds temporaires sont réessayés au prochain envoi. Les adresses bloquées en raison de votre IP ou de votre domaine
+  d’envoi sont valides : elles ne sont donc jamais exclues pour cette raison ; voir
+  [réessayer les adresses bloquées après correction](#réessayer-les-adresses-bloquées-après-correction). Les autres
+  rebonds ouvrent un examen de ce qu’ont dit les fournisseurs, depuis lequel vous pouvez les ajouter à la
+  [liste de suppression](/fr/audience/suppressions/). Recherchez un code dans les
+  [codes d’erreur SMTP](/fr/smtp-errors/).
+- **Motifs de désabonnement.** Ce que les personnes ont choisi sur la page de désabonnement, et combien ont plutôt
+  choisi de recevoir moins d’e-mails.
+- **Test A/B.** L’échantillon de chaque variante, son résultat sur la métrique qui a décidé, et la façon dont le
+  gagnant a été choisi. Voir [tester en A/B l’objet, le contenu et l’heure d’envoi](/fr/campaigns/ab-testing/#lire-le-résultat).
+- Sections qui apparaissent selon le cas : sondages, revenus (demande `earn:view`), sponsor, commandes de la boutique,
+  article web et ventes de produits.
+
+<Screenshot
+  id="report-ab"
+  alt="La carte du test A/B d’October Product Update : Gagnant : B avec une confiance de 98 %, décidé sur les clics, avec 6,7 % de clics humains contre 5,6 % pour A, et la façon dont le gagnant a été choisi : un test z de deux proportions 2 heures après l’envoi de l’échantillon, au moins 500 destinataires par variante, les 38 384 destinataires restants ont reçu B à 12:00."
+/>
+
+## Réessayer les adresses bloquées après correction
+
+Quand un fournisseur de messagerie bloque des e-mails en raison de la réputation de votre IP ou de votre domaine
+d’envoi, les adresses sont valides. Corrigez d’abord la cause, puis renvoyez-leur le numéro :
+
+<Steps>
+
+1. Dans **Rebonds par type**, sélectionnez <UiPath path="reports.investigate" /> sur la ligne Bloqué · politique ou
+   réputation. La boîte de dialogue affiche ce qu’a dit chaque fournisseur d’envoi.
+
+2. Sélectionnez <UiPath path="reports.checkDelisting" /> pour ouvrir Délivrabilité, et faites retirer l’IP ou le
+   domaine de la liste, ou lever le blocage.
+
+3. De retour dans la boîte de dialogue, sous <UiPath path="reports.retryTitle" />, sélectionnez le bouton de nouvelle
+   tentative, qui indique à combien d’adresses elle s’adresse. ReputeCast prépare une nouvelle campagne au nom du numéro
+   suivi de « · nouvelle tentative », adressée uniquement aux adresses bloquées encore sur votre liste, et l’ouvre dans
+   Vérifier et envoyer.
+
+4. Envoyez-la depuis Vérifier et envoyer une fois que le contrôle avant envoi est d’accord. Chaque adresse reçoit le
+   numéro une seule fois.
+
+</Steps>
+
+Les adresses désabonnées ou exclues depuis sont laissées de côté. Un numéro n’a qu’une nouvelle tentative à la fois,
+une nouvelle tentative n’est jamais elle-même retentée, et le bouton n’apparaît qu’une fois l’envoi terminé. Quand une
+nouvelle tentative existe, la boîte de dialogue y renvoie : <UiPath path="reports.retryOpen" /> tant que c’est un
+brouillon, ou son rapport une fois partie.
+
+## Relancer les non-ouvreurs ou les cliqueurs
+
+Le rapport d’une campagne e-mail envoyée affiche <UiPath path="campaigns.followUp.menu" /> à côté de ses autres
+boutons ; le menu ⋯ de la campagne dans la [liste des campagnes](/fr/campaigns/overview/) propose aussi
+<UiPath path="campaigns.manage.followUp" />.
+
+<Steps>
+
+1. Sélectionnez <UiPath path="campaigns.followUp.menu" /> › <UiPath path="campaigns.followUp.nonOpeners" /> ou
+   <UiPath path="campaigns.followUp.clickers" />.
+
+2. Lisez qui la relance atteint. Les non-ouvreurs sont les contacts qui ont reçu l’e-mail et ne l’ont pas ouvert du
+   tout. Les contacts dont les seules ouvertures sont passées par un proxy de confidentialité comme Apple Mail Privacy
+   Protection comptent comme inconnus, comme dans le rapport, et sont laissés de côté pour que personne ne le reçoive
+   deux fois ; la boîte de dialogue indique combien. Les cliqueurs sont les personnes dont les clics ont été consolidés
+   comme ceux d’une personne : les clics des scanners de liens ne comptent pas. Passez de l’un à l’autre sous
+   <UiPath path="campaigns.followUp.who" />.
+
+3. Modifiez le <UiPath path="campaigns.followUp.subject" />. Il commence par « Au cas où vous l’auriez manqué : » ou
+   « Pour aller plus loin : » suivi de l’objet d’origine.
+
+4. Sous <UiPath path="campaigns.followUp.send" />, choisissez 1 ou 2 jours après l’original (seules les heures encore à
+   venir sont proposées), ou <UiPath path="campaigns.followUp.later" />.
+
+5. Sélectionnez <UiPath path="campaigns.followUp.create" />. Un brouillon nommé « Relance : » suivi du nom de
+   l’original s’ouvre dans l’éditeur.
+
+</Steps>
+
+<Screenshot
+  id="campaign-followup"
+  alt="La boîte de dialogue Renvoyer aux personnes qui n’ont pas ouvert pour October Product Update : combien de contacts l’ont reçue et ne l’ont pas ouverte, un choix entre Personnes qui ne l’ont pas ouverte et Personnes qui ont cliqué, le nouvel objet commençant par Au cas où vous l’auriez manqué, l’heure d’envoi, et une note indiquant qu’un brouillon au contenu identique est créé."
+/>
+
+Le brouillon reprend le contenu et l’expéditeur de l’original. Son audience est un nouveau
+[segment](/fr/audience/segments/) dynamique, comme « N’ont pas ouvert : October Product Update », qui reste à jour
+jusqu’au départ de la relance ; quand le groupe est vide, la boîte de dialogue le signale. L’heure choisie attend dans
+Vérifier et envoyer, d’où vous l’envoyez comme n’importe quelle campagne. Les exclusions, les désabonnements et le
+plafond marketing s’appliquent comme d’habitude. Chaque relance est consignée dans le
+[journal d’audit](/fr/team/audit-log/) sous `campaign.follow_up`, et l’[opération d’API pour créer une relance de
+campagne](/api/operations/create-campaign-follow-up/) fait la même chose depuis un script.
+
+## Exporter un rapport
+
+- Sélectionnez <UiPath path="reports.exportCsv" /> pour télécharger l’ensemble du rapport dans un seul fichier CSV :
+  les chiffres principaux avec les ouvertures humaines des destinataires mesurables, les ouvertures à confidentialité
+  protégée, les ouvertures de scanners et les clics de robots écartés, les plaintes là où elles sont signalées, les
+  tableaux par fournisseur de messagerie, par fournisseur d’envoi et par langue, l’engagement heure par heure, les
+  liens (par variante pour un test du contenu), les rebonds, les motifs de désabonnement et le résultat A/B.
+- Sélectionnez <UiPath path="reports.exportPdf" /> pour ouvrir la boîte de dialogue d’impression de votre navigateur
+  avec une mise en page adaptée ; enregistrez-la en PDF depuis celle-ci.
+
+Les deux demandent `reports:share` et sont consignés dans le journal d’audit.
+
+## Partager un lien en lecture seule
+
+<Steps>
+
+1. Faites défiler jusqu’à <UiPath path="reports.shareTitle" /> en bas du rapport. <UiPath path="reports.shareLink" />
+   en haut vous y amène et copie le lien actif le plus récent.
+
+2. Sous <UiPath path="reports.newLink" />, choisissez ce que le lien affiche en plus. Les chiffres, les graphiques et
+   les tableaux sont toujours inclus ; cochez <UiPath path="reports.includeCost" />,
+   <UiPath path="reports.includeWarmup" /> ou <UiPath path="reports.includeEmail" /> (le message tel qu’envoyé, dans la
+   carte des clics).
+
+3. Sous <UiPath path="reports.expires" />, choisissez 7, 30 ou 90 jours.
+
+4. Sélectionnez <UiPath path="reports.createLink" />. Le lien (`https://<your public URL>/r/<token>`) est copié et
+   apparaît dans les liens actifs avec la personne qui l’a créé, sa date d’expiration et ce qu’il inclut. Toute personne
+   qui le possède voit le rapport sans se connecter.
+
+5. Pour qu’un lien cesse de fonctionner, sélectionnez <UiPath path="reports.revoke" /> à côté. Il s’arrête
+   immédiatement.
+
+</Steps>
+
+Chaque lien expire. Les liens créés avant ReputeCast 1.2.0 n’expiraient jamais ; la mise à jour a donné à chacun 30
+jours à partir de son exécution. Par l’API et MCP (`share_campaign_report`), un lien peut durer n’importe quel nombre
+de jours de 1 à 90.
+
+La page partagée n’affiche que des chiffres agrégés : elle ne montre jamais qui a reçu, ouvert ou cliqué, ni le résumé
+par l’IA, ni le champ de question. Elle exclut les sondages, les revenus, les commandes de la boutique et la section
+web, et elle est marquée `noindex` et jamais mise en cache.
+
+<Aside type="caution">
+Un rapport partagé affiche tout de même le nom de la campagne, les objets des variantes A/B et le nom de vos
+fournisseurs d’envoi, ainsi que l’e-mail et ses liens si vous l’incluez. Ne le partagez qu’avec des personnes
+autorisées à voir ces informations.
+</Aside>
+
+## Résumer et poser des questions avec l’IA
+
+Si l’espace de travail a connecté un modèle pour l’[assistant IA](/fr/integrations/ai-assistant/), les membres qui
+disposent de `ai:use` voient <UiPath path="ai.summarize" />. Il rédige un court résumé du rapport à partir de ses
+chiffres agrégés, jamais d’une adresse.
+
+- Chaque chiffre du résumé est vérifié par rapport au rapport. « Chaque chiffre correspond au rapport » signifie que
+  vous pouvez le conserver ; sinon, les chiffres absents du rapport sont listés, et un résumé modifié contenant de tels
+  chiffres ne peut pas être conservé.
+- Un résumé conservé est visible par toutes les personnes qui peuvent lire le rapport, marqué
+  <UiPath path="ai.suggest.numbersMatchReport" /> ou avec les chiffres qui ont changé à l’arrivée de résultats
+  tardifs. Il n’apparaît jamais sur les liens en lecture seule.
+- Saisissez une question dans <UiPath path="ai.suggest.askTitle" />, comme « Pourquoi Outlook a-t-il eu plus de
+  rebonds ? ». La réponse provient uniquement des chiffres du rapport, chaque chiffre qu’elle contient est vérifié par
+  rapport au rapport, et elle le signale quand les chiffres ne permettent pas de répondre.
+
+Les [agents MCP](/fr/developers/mcp/) lisent le même rapport par `get_campaign_report`, avec les mêmes autorisations
+et les mêmes trois catégories d’ouvertures.
+
+<Screenshot
+  id="report-mobile"
+  alt="Le rapport sur un téléphone : l’état Envoyée avec la période d’envoi et les résultats définitifs, des boutons pour exporter, partager, relancer et dupliquer, et le résumé par l’IA conservé par Linh Nguyen avec la vérification que chaque chiffre correspond à ce rapport, au-dessus de la barre de navigation du bas de l’application."
+/>
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="reports" />
+
+## Vérifier le résultat
+
+- La ligne d’état affiche « résultats définitifs depuis le » suivi d’une date une fois les chiffres stabilisés, et les
+  tuiles affichent leur évolution par rapport à vos derniers numéros.
+- Un lien en lecture seule s’ouvre dans une fenêtre de navigation privée sans connexion, affiche « Rapport en lecture
+  seule » et cesse de fonctionner à sa date d’expiration.
+
+## Dépannage
+
+- **Exporter en CSV et Partager un lien en lecture seule sont désactivés.** Ils demandent `reports:share` ; le bouton
+  indique qui peut vous aider.
+- **« Rien à partager pour l’instant. »** Les liens en lecture seule n’existent que pour les campagnes dont l’envoi a
+  commencé.
+- **« Ce rapport a déjà 10 liens actifs. »** Révoquez-en un dont vous n’avez plus besoin, puis créez-en un nouveau.
+- **« Ce lien n’ouvre aucun rapport. »** Le lien a été révoqué ou a expiré. Créez-en un nouveau.
+- **« L’ingestion des événements a N minutes de retard. »** Les événements de livraison d’un fournisseur d’envoi
+  arrivent en retard : les chiffres récents sont donc bas. Voir
+  [événements de livraison et synchronisation des suppressions](/fr/providers/events-and-sync/).
+- **Les plaintes affichent « n/d » pour Gmail et iCloud.** Ils ne signalent pas les plaintes aux expéditeurs.
+  Consultez le taux de spam de Gmail dans Google Postmaster Tools, dans Délivrabilité.
+- **Les tuiles n’affichent aucune flèche.** Les résultats arrivent encore, ou aucun numéro précédent n’a été envoyé
+  aux mêmes listes et segments.
+- **Le bouton de nouvelle tentative est absent ou désactivé.** L’envoi n’est pas terminé, le numéro est lui-même une
+  nouvelle tentative, une nouvelle tentative existe déjà, chaque adresse bloquée a été délivrée ou retentée, ou vous
+  n’avez pas `campaigns:edit`. La boîte de dialogue indique la raison.
+- **Relancer est absent ou désactivé.** Le rapport ne concerne pas une campagne e-mail envoyée (un envoi annulé ou en
+  échec n’a pas de relance), ou vous n’avez pas `campaigns:edit` ; le bouton désactivé indique qui peut vous aider.
+- **La boîte de dialogue de relance ne propose que Choisir dans Vérifier et envoyer.** Les délais d’un et de deux
+  jours après l’original sont tous deux dépassés. Choisissez l’heure dans Vérifier et envoyer.
+- **Le taux d’ouverture paraît bas par rapport à celui d’un autre outil.** Cet outil compte probablement les
+  préchargements d’Apple Mail comme des ouvertures. Comparez plutôt le taux d’ouverture mesurable.
+- **Les clics humains sont inférieurs à ceux que compte votre raccourcisseur de liens.** Les clics de robots sont
+  exclus. Consultez la ligne des clics de robots sous la tuile.
+
+## Voir aussi
+
+- [Suivre un envoi et la pause automatique](/fr/campaigns/live-monitor/) affiche les mêmes chiffres pendant l’envoi.
+- [Rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/) explique les types de
+  rebond.
+- [Garder une liste saine](/fr/audience/list-health/) utilise les ouvertures et les clics humains pour classer les
+  contacts par niveau d’engagement.
+- [URL publiques et endpoints](/fr/reference/public-urls/) liste les chemins `/r/` et de suivi.

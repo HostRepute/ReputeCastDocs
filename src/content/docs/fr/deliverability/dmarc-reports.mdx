@@ -1,0 +1,246 @@
+---
+title: Lire les rapports agrégés DMARC
+description: Recevoir chaque rapport agrégé DMARC via HostRepute ou votre boîte, l’importer dans ReputeCast et voir quelles sources réussissent, échouent ou sont alignées.
+type: how-to
+audience: [admin]
+permissions: ['deliverability:view', 'domains:manage']
+uiPath: 'nav.deliverability > placement.health'
+primaryKeyword: rapport agrégé DMARC
+sources:
+  - internal/deliverability/dmarc.go
+  - internal/deliverability/api.go
+  - internal/deliverability/deliverability.go
+  - internal/domains/records.go
+  - internal/hostrepute/client.go
+  - internal/hostrepute/sync.go
+  - internal/readiness/assemble.go
+  - web/src/features/deliverability/DmarcCard.tsx
+  - web/src/features/deliverability/dmarc.messages.ts
+sidebar:
+  order: 4
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Un [rapport agrégé DMARC](/fr/reference/glossary/#dmarc-aggregate-report) vous indique quels serveurs ont envoyé des
+e-mails au nom de votre domaine et si ces e-mails ont réussi DMARC. Ce guide explique comment collecter les rapports,
+les faire entrer dans ReputeCast et les lire dans <UiPath path="nav.deliverability > placement.health" />, pour faire
+passer votre politique [DMARC](/fr/reference/glossary/#dmarc) de `p=none` à `quarantine` ou `reject` sans perdre de vrais
+e-mails.
+
+Les fournisseurs de messagerie qui prennent en charge DMARC envoient ces rapports sous forme de fichiers XML, par défaut
+une fois par jour, aux adresses de la balise `rua` de votre enregistrement DMARC
+([RFC 7489, section 6.3](https://www.rfc-editor.org/rfc/rfc7489#section-6.3), vérifié en octobre 2026). ReputeCast n’a
+pas de boîte de réception à lui pour les recevoir : soit [HostRepute](/fr/reference/glossary/#hostrepute) les collecte
+et les analyse pour vous, soit vous les recevez dans votre propre boîte de réception et vous les importez.
+
+## Avant de commencer
+
+- Votre domaine d’envoi publie un enregistrement DMARC. Sinon, commencez par
+  [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/).
+- La lecture des rapports exige `deliverability:view`, que tous les rôles intégrés possèdent. L’import d’un rapport
+  exige `domains:manage` (Propriétaire et Admin).
+- Décidez où vont les rapports : HostRepute, une boîte de réception qui vous appartient, ou les deux. `rua` accepte
+  plusieurs adresses séparées par des virgules.
+
+## Collecter les rapports
+
+### Via HostRepute
+
+<Steps>
+
+1. Connectez HostRepute ([Connecter HostRepute](/fr/deliverability/hostrepute/)). Sur une carte DMARC vide,
+   <UiPath path="deliverability.dmarc.useHostRepute" /> vous y emmène.
+
+2. Copiez l’adresse de rapport que HostRepute attribue à votre compte. La carte DMARC l’affiche (« rapports agrégés
+   envoyés à … »), et l’enregistrement DMARC suggéré par ReputeCast l’inclut sous la forme `rua=mailto:…` dès que
+   HostRepute est connecté.
+
+3. Ajoutez l’adresse à la balise `rua` de votre enregistrement DMARC, chez votre hébergeur DNS.
+
+</Steps>
+
+HostRepute analyse les rapports, et ReputeCast lit les résultats des 7 derniers jours lors de sa synchronisation
+horaire.
+
+### Dans votre propre boîte de réception
+
+<Steps>
+
+1. Ajoutez à la balise `rua` une boîte de réception qui vous appartient :
+
+   ```txt title="_dmarc.acme.io TXT"
+   v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
+   ```
+
+2. Si la boîte de réception se trouve sur un autre domaine organisationnel que l’enregistrement DMARC, cet autre domaine
+   doit accepter les rapports en publiant un enregistrement TXT `v=DMARC1` sur
+   `<your domain>._report._dmarc.<its domain>`, par exemple `acme.io._report._dmarc.example.net`. Sans lui, les
+   fournisseurs de messagerie n’y envoient pas les rapports
+   ([RFC 7489, section 7.1](https://www.rfc-editor.org/rfc/rfc7489#section-7.1), vérifié en octobre 2026).
+
+3. Enregistrez les pièces jointes des rapports à leur arrivée. Ce sont généralement des fichiers `.xml.gz` ou `.zip`.
+
+</Steps>
+
+## Importer un rapport
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.deliverability > placement.health" />. Tant qu’aucun rapport ne couvre les 7 derniers jours,
+   la carte s’intitule **Synthèse des rapports DMARC**, avec le badge **Pas encore de rapports**.
+
+2. Sélectionnez <UiPath path="deliverability.dmarc.uploadButton" /> et choisissez un fichier : le rapport `.xml`, ou le
+   `.xml.gz` ou le `.zip` qui le contenait. Un `.zip` doit contenir le rapport `.xml` ; ReputeCast lit le premier qu’il
+   y trouve. Le fichier peut faire jusqu’à 20 Mio, compressé comme décompressé.
+
+3. Sélectionnez <UiPath path="deliverability.dmarc.upload" />. Le message de confirmation indique l’organisation qui a
+   envoyé le rapport, le nombre de messages et le domaine.
+
+</Steps>
+
+ReputeCast ne stocke que les chiffres du rapport : la politique publiée et, pour chaque IP d’envoi, le nombre de
+messages, ce que le serveur de réception en a fait et les résultats SPF et DKIM. Importer de nouveau le même rapport
+(même organisation et même ID de rapport) remplace la copie précédente : rien n’est compté deux fois.
+
+Le bouton d’import n’existe que sur la carte vide. Dès que des rapports des 7 derniers jours s’affichent, importez les
+rapports suivants avec l’opération d’API [Importer un rapport agrégé DMARC](/api/operations/upload-dmarc-report/), qui
+prend le fichier brut et exige une clé d’API disposant de `domains:manage` :
+
+```sh title="Importer un rapport agrégé DMARC avec l’API"
+curl -X POST "https://reputecast.example.com/api/v1/workspaces/acme-newsletter/deliverability/dmarc/reports" \
+  -H "Authorization: Bearer $REPUTECAST_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.xml.gz
+```
+
+Un import réussi renvoie `201` avec l’organisation, l’ID du rapport, le domaine, la période et le nombre de messages.
+Voir [Authentification et clés d’API](/fr/developers/api-authentication/) pour créer une clé.
+
+## Lire la carte DMARC
+
+<Screenshot
+  id="deliverability"
+  alt="La santé de la délivrabilité d’Acme Newsletter. En bas à gauche, la carte des rapports DMARC indique 99,6 % de réussite sur 7 jours : Amazon SES, Postal et Postmark alignés, et une source inconnue en 198.51.100.77 qui a échoué et a été mise en quarantaine."
+  caption="La carte des rapports DMARC se trouve en bas à gauche, à côté de la chronologie des incidents."
+>
+  1. La santé de chaque domaine d’envoi et de chaque IP dédiée, dont l’alignement DMARC sur 7 jours.
+  2. La santé du compte de chaque fournisseur d’envoi.
+  3. Les résultats des listes de blocage pour ces mêmes domaines et IP.
+</Screenshot>
+
+La carte s’intitule **Rapports DMARC · 7 derniers jours** et résume chaque rapport dont la période s’est terminée au
+cours des 7 derniers jours. Son badge indique le taux de réussite : la part des messages qui ont réussi DMARC grâce à
+SPF ou DKIM. Il est vert à partir de 98 %, orange à partir de 90 % et rouge en dessous.
+
+<TableScroll label="Colonnes de la carte DMARC">
+
+| Colonne  | Ce qu’elle affiche                                                                                                                                       |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source   | Le fournisseur d’envoi pour son pool partagé (`Amazon SES`), le fournisseur et l’IP pour une IP dédiée (`Postal · 203.0.113.25`), ou `Inconnu · <IP>`. |
+| Messages | Les messages de cette source dans les rapports.                                                                                                          |
+| SPF      | `aligned` quand au moins la moitié des messages ont réussi SPF en accord avec le domaine From ; sinon le résultat le plus fréquent, par exemple `fail`. |
+| DKIM     | La même chose, pour DKIM.                                                                                                                                |
+| Résultat | `pass` quand SPF ou DKIM est aligné. Sinon `quarantined` ou `rejected` quand au moins la moitié des messages ont été traités ainsi, et `fail` autrement. |
+
+</TableScroll>
+
+Seuls les e-mails dont le domaine From appartient à cet espace de travail comptent. Les fournisseurs d’envoi connus
+viennent en premier, par volume, puis les sources inconnues, teintées en rouge et marquées « aucun de vos
+fournisseurs ».
+
+<Aside type="caution" title="Pools partagés dans les rapports importés">
+ReputeCast reconnaît un pool partagé, comme celui d’Amazon SES ou de Postmark, au nom DNS inverse de l’IP d’envoi. Les
+rapports importés ne contiennent pas ce nom : les e-mails envoyés depuis des pools partagés y apparaissent donc en
+`Inconnu · <IP>`. Seules les IP déclarées chez un fournisseur d’envoi, comme vos IP dédiées, sont reconnues. Vérifiez
+une IP inconnue avant de la considérer comme étrangère.
+</Aside>
+
+### Examiner une source
+
+Quand une source inconnue a envoyé des e-mails au nom de votre domaine, la carte ajoute une ligne sous le tableau, par
+exemple « Quelqu’un envoie en tant que news.acme.io depuis un hôte inconnu ; p=quarantine a tenu ces e-mails hors des
+boîtes de réception. » Avec `p=none`, elle indique que les serveurs de réception peuvent quand même délivrer ces
+e-mails.
+
+<Steps>
+
+1. Sélectionnez <UiPath path="deliverability.dmarc.investigate" />.
+
+2. Lisez la boîte de dialogue : les messages et les rapports des 7 derniers jours, les dates d’observation, les
+   organisations qui ont signalé la source, le nom DNS inverse, les domaines From utilisés, les résultats SPF et DKIM
+   avec leurs domaines, et ce que les serveurs de réception ont fait des e-mails (délivrés, mis en quarantaine ou
+   rejetés).
+
+3. Déterminez ce qu’est la source :
+   - **Un service que vous utilisez**, comme un CRM, un service d’assistance ou un outil de facturation : ajoutez-le à
+     l’enregistrement SPF du domaine et activez la signature DKIM dans ce service.
+   - **Pas un de vos services :** rien à corriger de votre côté. Si les serveurs de réception ont quand même délivré
+     les e-mails, durcissez votre politique DMARC.
+
+</Steps>
+
+## Passer à quarantine ou à reject
+
+Durcissez la politique quand chaque source que vous reconnaissez affiche `aligned` pour SPF ou DKIM, et que seules des
+sources inconnues échouent. Microsoft conseille de procéder par étapes, de `none` à `quarantine` puis à `reject`, pour
+éviter de perdre des e-mails
+([Microsoft, « Outlook’s new requirements for high-volume senders »](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730),
+FAQ, vérifié en octobre 2026).
+
+<Steps>
+
+1. Corrigez les sources restantes que vous reconnaissez, comme dans [Examiner une source](#examiner-une-source).
+
+2. Remplacez `p=none` par `p=quarantine` dans l’enregistrement DMARC, chez votre hébergeur DNS. Gardez la balise
+   `rua` :
+
+   ```txt title="_dmarc.acme.io TXT"
+   v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@acme.io
+   ```
+
+3. Surveillez la carte pendant quelques semaines. Les e-mails qui échouent affichent désormais `quarantined` dans la
+   colonne Résultat.
+
+4. Quand plus aucun e-mail légitime n’est mis en quarantaine, passez la politique à `p=reject`.
+
+</Steps>
+
+[BIMI](/fr/deliverability/bimi/) exige que `p=quarantine` ou `p=reject` s’applique à tous les e-mails : n’abaissez donc
+pas `pct` sous 100 si vous comptez afficher votre logo.
+
+## Vérifier le résultat
+
+- Dans le tableau des domaines de <UiPath path="nav.settings > settings.senders" />, la colonne DMARC affiche la
+  nouvelle politique. `p=none` s’affiche comme un avertissement, `p=quarantine` et `p=reject` comme réussis.
+- Dans le [contrôle avant envoi](/fr/campaigns/send-readiness/), la ligne DMARC indique par exemple « DMARC
+  p=quarantine, 99,6 % des e-mails alignés sur les 7 derniers jours ». Sous 90 % d’e-mails alignés, elle affiche un
+  avertissement.
+- La carte du domaine dans l’onglet Santé affiche **Alignement DMARC, 7 j** avec le même pourcentage.
+
+## Dépannage
+
+- **Aucun rapport n’arrive.** Vérifiez que l’adresse `rua` ne contient pas de faute de frappe et, pour une boîte de
+  réception sur un autre domaine, l’enregistrement `_report._dmarc` décrit dans
+  [Dans votre propre boîte de réception](#dans-votre-propre-boîte-de-réception). Les rapports sont généralement envoyés
+  une fois par jour : attendez au moins un jour après la publication.
+- **« Ce rapport concerne …, qui n’est pas un domaine d’envoi de cet espace de travail. »** Le domaine du rapport ne
+  partage de domaine organisationnel avec aucun domaine de cet espace de travail. Importez-le dans l’espace de travail
+  qui envoie au nom de ce domaine, ou [ajoutez d’abord le domaine](/fr/providers/senders-and-domains/).
+- **« Ce n’est pas un rapport agrégé DMARC. »** Seuls les rapports agrégés (`rua`) sont acceptés. Les rapports d’échec
+  de `ruf` et les autres fichiers XML sont refusés.
+- **« Le fichier zip ne contient aucun rapport .xml. »** Extrayez l’archive et importez le fichier `.xml`.
+- **Le bouton d’import est absent ou désactivé.** La carte affiche déjà des rapports des 7 derniers jours (utilisez
+  l’API), ou vous n’avez pas `domains:manage` ; le bouton désactivé indique qui peut vous aider.
+- **Amazon SES ou Postmark apparaît comme inconnu.** Le rapport a été importé ; voir
+  [Pools partagés dans les rapports importés](#lire-la-carte-dmarc).
+
+## Voir aussi
+
+- [Configurer SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/)
+- [Connecter HostRepute](/fr/deliverability/hostrepute/)
+- [Surveiller la santé des domaines et des fournisseurs](/fr/deliverability/health/)
+- [Exigences d’envoi en masse de Gmail, Yahoo et Microsoft](/fr/deliverability/bulk-sender-requirements/)

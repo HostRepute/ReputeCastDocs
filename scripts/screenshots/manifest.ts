@@ -3,10 +3,12 @@
  * them with <Screenshot id="…">. Paths marked "qa-map: <Board>" are copied verbatim from that board's entry
  * in hostrepute/reputecast web/scripts/qa-map.ts.
  *
- * Public pages show the newsletter's own content languages, not the app's, and the Acme sample has no Vietnamese
- * page copy: they are captured in English only. Every app screen is captured in English and Vietnamese.
+ * Public pages show the newsletter's own content languages, not the app's, and the Acme sample's page copy is
+ * English: they are captured in English only. Every app screen is captured in every docs locale (English, German,
+ * Spanish, French and Vietnamese), which are the app's languages too.
  */
 
+import type { Lang } from '../../src/lib/locales.ts'
 import type { BadgeSide } from './lib/markers.ts'
 
 export type Shot = {
@@ -32,7 +34,7 @@ export type Shot = {
   // numbered callouts; selectors must be structural (ids, hrefs, data-*, roles), never text. `badge` overrides the
   // side the number goes on (default: the first side with room, see badgeSide in lib/markers.ts).
   markers?: { n: number; selector: string; badge?: BadgeSide }[]
-  locales?: ('en' | 'vi')[] // default both
+  locales?: Lang[] // default every docs locale
   // `reputecast demo send`; `canary` defaults to the CLI's (on in the normal scenario, off in the others)
   demoSend?: {
     campaign: string

@@ -1,0 +1,222 @@
+---
+title: Ereignisse und Conversions erfassen
+description: Mit der Conversion-Tracking-API Upgrades und Bestellungen der E-Mail zuordnen, die sie gebracht hat, und API-Ereignisse senden, die Automationen starten.
+type: how-to
+audience: [developer]
+permissions: ['conversions:create', 'subscribers:edit']
+uiPath: 'nav.earn > earn.tabSettings > earn.settings.tabAttribution'
+primaryKeyword: Conversion-Tracking-API
+sources:
+  - internal/automations/events.go
+  - internal/automations/graph.go
+  - internal/automations/api.go
+  - internal/revenue/conversions.go
+  - internal/revenue/attribution.go
+  - internal/revenue/api.go
+  - internal/clicktoken/clicktoken.go
+  - internal/earn/hooks.go
+  - web/src/features/earn/revenue/attribution.messages.ts
+  - web/src/features/keys/CreateKeyDialog.tsx
+  - src/data/api-samples/send-automation-event.yaml
+  - src/data/api-samples/create-conversion.yaml
+sidebar:
+  order: 11
+---
+
+import { Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+
+Ihr Produkt weiß Dinge, die ReputeCast nicht weiß: Eine Testphase hat begonnen, ein Tarif wurde hochgestuft, eine
+Bestellung wurde bezahlt. Zwei Endpunkte bringen diese Fakten herein. **API-Ereignisse** starten und steuern
+[Automationen](/de/reference/glossary/#automation). Die **Conversion-Tracking-API** erfasst, was eine Aktion wert war,
+und ordnet sie der Kampagnen- oder Automations-E-Mail zu, auf die der Leser geklickt hat, sodass der Umsatz neben Ihren
+E-Mails erscheint.
+
+## Bevor Sie beginnen
+
+- Ein API-Schlüssel. API-Ereignisse erfordern `subscribers:edit`. Conversions erfordern `conversions:create`; die
+  Voreinstellung <UiPath path="keys.presetConversions" /> unter <UiPath path="nav.settings > settings.keys" /> hat
+  diese Berechtigung und sonst nichts und läuft standardmäßig nach 1 Jahr ab.
+  <UiPath path="earn.attribution.createKey" /> unter
+  <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" /> öffnet denselben Dialog.
+- Der Kontakt muss im Arbeitsbereich bereits existieren. Keiner der beiden Endpunkte legt Kontakte an; verwenden Sie
+  zuerst [Kontakt erstellen oder aktualisieren](/de/developers/integration-api/#aktionen).
+
+## API-Ereignis senden
+
+`POST /api/v1/workspaces/<workspace>/automations/events` erfasst ein Ereignis für einen Kontakt:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with subscribers:edit.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/automations/events \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "event": "trial.started",
+    "email": "sam.rivera@outlook.com",
+    "properties": { "plan": "team", "trial_days": 14 }
+  }'
+```
+
+- `event` benennt es: Buchstaben, Ziffern und `. _ : -`, beginnend mit einem Buchstaben oder einer Ziffer, bis zu 100
+  Zeichen (`trial.started`, `workspace.created`).
+- Geben Sie mit `email` oder `contactId` an, um wen es geht. Eine unbekannte Adresse antwortet mit `404`: Legen Sie
+  zuerst den Kontakt an.
+- `properties` ist ein beliebiges JSON-Objekt bis 16 KB.
+
+Die Antwort ist `202` mit dem Kontakt und der Zahl der veröffentlichten Automationen, die das Ereignis startet:
+
+```json title="202 Accepted"
+{ "accepted": true, "contactId": "0192f1c4-3a5b-7c2d-8e9f-1a2b3c4d5e6f", "flows": 1 }
+```
+
+### Ereignis in einer Automation verwenden
+
+<Steps>
+
+1. Öffnen Sie unter <UiPath path="nav.automations" /> einen Ablauf und setzen Sie seinen Auslöser oder einen seiner
+   Auslöser auf <UiPath path="automations.graph.kindApiEvent" />.
+
+2. Geben Sie unter <UiPath path="automations.panels.eventName" /> denselben Namen ein, den Ihr Produkt sendet, zum
+   Beispiel `trial.started`. Er muss genau übereinstimmen.
+
+3. Veröffentlichen Sie den Ablauf. Kontakte treten innerhalb von Sekunden nach jedem Ereignis ein.
+
+</Steps>
+
+Auch Ziele und Verzweigungen können mit der Bedingung <UiPath path="automations.panels.condEvent" /> auf ein Ereignis
+warten. Die vollständige Liste der Auslöser und Schritte steht unter
+[Auslöser und Schritte](/de/automations/triggers-and-steps/).
+
+Ereignisse sind Kontaktaktivität wie Öffnungen und Klicks, daher erscheinen sie nicht im Audit-Protokoll. Jeder Aufruf
+erfasst ein neues Ereignis: Wiederholen Sie keinen Aufruf, der mit `202` beantwortet wurde.
+
+## Conversion erfassen
+
+`POST /api/v1/workspaces/<workspace>/conversions` erfasst etwas Wertvolles, das ein Leser in Ihrem Produkt getan hat:
+
+```sh title="Terminal"
+# REPUTECAST_API_KEY: an API key (rc_live_…) with conversions:create.
+# Replace reputecast.example.com with your public URL and your-workspace with your workspace slug.
+# Add "click_token" with the rc_click value of the link the reader followed, when you have it.
+curl --request POST \
+  --url https://reputecast.example.com/api/v1/workspaces/your-workspace/conversions \
+  --header "Authorization: Bearer $REPUTECAST_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: order-1042' \
+  --data '{
+    "name": "Upgraded to Team plan",
+    "value": "29.00",
+    "currency": "USD",
+    "email": "sam.rivera@outlook.com",
+    "metadata": { "order_id": "1042" }
+  }'
+```
+
+<TableScroll label="Felder einer Conversion">
+
+| Feld          | Erforderlich      | Inhalt                                                                                         |
+| ------------- | ----------------- | ---------------------------------------------------------------------------------------------- |
+| `name`        | Ja                | Was passiert ist, bis zu 120 Zeichen: „Upgraded to Team plan“.                                 |
+| `value`       | Ja                | Ein Dezimal-**String**, `"29.00"`, nicht `29`. Nicht mehr Nachkommastellen, als die Währung hat. |
+| `currency`    | Ja                | Ein dreistelliger Code nach ISO 4217: `USD`, `EUR`, `JPY`.                                     |
+| `email`       | Eines von beiden  | Die Adresse des Lesers.                                                                        |
+| `click_token` | Eines von beiden  | Der Wert `rc_click` aus dem Link, dem der Leser gefolgt ist. Siehe [Klick-Token übergeben](#klick-token-übergeben). |
+| `occurred_at` | Nein              | Wann es passiert ist, nach RFC 3339. Bis zu 30 Tage zurück; ohne Angabe jetzt.                 |
+| `metadata`    | Nein              | Ihre eigenen Felder, mit der Conversion gespeichert (bis 8 KB).                                |
+
+</TableScroll>
+
+Senden Sie einen Header `Idempotency-Key` (bis zu 200 Zeichen), etwa Ihre Bestell-ID. Wird derselbe Schlüssel mit
+demselben Body erneut gesendet, antwortet die API mit der ersten Conversion, statt eine zweite zu erfassen; derselbe
+Schlüssel mit einem anderen Body antwortet mit `409 idempotency_key_reused`. Schlüssel werden je API-Schlüssel gemerkt.
+
+Die Antwort ist `202` und sagt, wie die Conversion zugeordnet wurde:
+
+```json title="202 Accepted"
+{
+  "id": "0192f1c4-9e21-7a40-8c3b-2d4f6a8b0c1e",
+  "matched": "click_token",
+  "credited": { "kind": "campaign", "id": "0192f0aa-1b2c-7d3e-9f40-5a6b7c8d9e0f", "name": "Weekly Digest #142" }
+}
+```
+
+## Wie eine Conversion zugeordnet wird
+
+ReputeCast ordnet eine Conversion der letzten Kampagnen- oder Automations-E-Mail zu, auf die der Leser innerhalb des
+**Zuordnungszeitraums** geklickt hat: standardmäßig 7 Tage, 1–30 Tage unter
+<UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution > earn.attribution.windowTitle" />.
+
+1. Mit einem gültigen `click_token` die E-Mail, die den angeklickten Link enthielt, wenn der Klick innerhalb des
+   Zeitraums vor `occurred_at` liegt. `matched` ist `click_token`.
+2. Andernfalls, mit einer `email`, die zu einem Kontakt passt: `matched` ist `email`, und die Conversion wird der
+   letzten E-Mail zugeordnet, auf die dieser Kontakt innerhalb des Zeitraums geklickt hat, falls es eine gibt.
+3. Andernfalls ist `matched` gleich `none`. Die Conversion wird gespeichert, aber nichts zugeordnet.
+
+Wird nichts zugeordnet, hat die Antwort kein Feld `credited`.
+
+Eine zugeordnete Conversion löst das Webhook-Ereignis `conversion.recorded` aus
+([Webhook-Ereignisse](/de/reference/webhook-events/)). Conversions erscheinen unter
+<UiPath path="earn.attribution.logTitle" /> und als Produkt-Conversions in der Umsatzübersicht; sie zählen nicht zum
+MRR ([Umsatzkennzahlen erklärt](/de/earn/revenue/)).
+
+### Klick-Token übergeben
+
+Die Zuordnung über die E-Mail-Adresse funktioniert nur, wenn der Leser ein bekannter Kontakt ist, der geklickt hat. Das
+Klick-Token funktioniert auch, wenn sich der Leser mit einer anderen Adresse registriert:
+
+<Steps>
+
+1. Aktivieren Sie <UiPath path="earn.attribution.tokenTitle" /> und fügen Sie die Domains Ihres Produkts hinzu, etwa
+   `app.example.com`.
+
+2. Links in Ihren E-Mails zu diesen Domains tragen dann `rc_click=…`. Das Token ist undurchsichtig und signiert, und
+   es wird nie an Links zu anderen Domains angehängt, auch nicht an Sponsorenlinks.
+
+3. Lesen Sie in Ihrem Produkt `rc_click` aus der Landing-URL und speichern Sie es beim Besucher (zum Beispiel in
+   seiner Sitzung oder im Registrierungsdatensatz).
+
+4. Senden Sie es als `click_token`, wenn die Conversion eintritt. Ein Token, das älter ist als der
+   Zuordnungszeitraum, ordnet nichts mehr zu.
+
+</Steps>
+
+## Fehler und Limits
+
+- `422 missing_identity`: Senden Sie `email`, `click_token` oder beides.
+- `422 invalid_value`: Senden Sie den Wert als Dezimal-String mit nicht mehr Nachkommastellen, als die Währung erlaubt.
+- `422 invalid_currency`: Verwenden Sie einen dreistelligen Code nach ISO 4217.
+- `422 occurred_at_out_of_range`: `occurred_at` liegt mehr als 30 Tage zurück oder in der Zukunft.
+- `409 idempotency_key_reused`: Der Schlüssel kam mit einem anderen Body.
+- `429 rate_limited`: Jeder Schlüssel erfasst bis zu 600 Conversions pro Minute; warten Sie `Retry-After` ab.
+
+Jeder Code steht unter [API-Fehler](/de/developers/api-errors/).
+
+## Prüfen, ob es funktioniert hat
+
+- Unter <UiPath path="nav.earn > earn.tabSettings > earn.settings.tabAttribution" /> erfasst
+  <UiPath path="earn.attribution.sendTest" /> eine Test-Conversion für Ihre eigene Adresse. Die Conversions Ihres
+  Produkts erscheinen unter <UiPath path="earn.attribution.logTitle" />, die neuesten zuerst.
+- Die Antwort auf ein API-Ereignis sagt, wie viele veröffentlichte Abläufe es gestartet hat (`flows`). Die
+  Schrittstatistik der Automation zeigt den Eintritt des Kontakts.
+
+## Fehlerbehebung
+
+- **`matched: "none"` oder kein `credited`**: Der Leser hat innerhalb des Zeitraums auf keine E-Mail geklickt, oder die
+  Adresse ist kein Kontakt. Übergeben Sie das Klick-Token, oder verlängern Sie den Zeitraum.
+- **`flows: 0`**: Keine veröffentlichte Automation hat einen Auslöser für API-Ereignisse mit genau diesem
+  Ereignisnamen. Prüfen Sie die Schreibweise und ob der Ablauf veröffentlicht ist.
+- **`404` bei einem API-Ereignis**: Der Kontakt existiert nicht; legen Sie ihn zuerst an.
+- **Doppelte Conversions**: Senden Sie einen `Idempotency-Key` und verwenden Sie ihn bei Wiederholungen erneut.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="Mit Ihrem Newsletter Geld verdienen" href="/de/earn/overview/" description="Bezahlabos, Umsatz und Zuordnung." />
+  <LinkCard title="Automationen erstellen" href="/de/automations/overview/" description="Abläufe, die auf die Ereignisse Ihres Produkts reagieren." />
+  <LinkCard title="Integration entwickeln" href="/de/developers/integration-api/" description="Kontakte, Listen, Tags und Ereignisse aus anderen Tools." />
+  <LinkCard title="API-Referenz" href="/api/operations/create-conversion/" description="Die Operation create-conversion im Detail." />
+</CardGrid>

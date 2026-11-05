@@ -1,0 +1,257 @@
+---
+title: Tester le placement avec des boîtes témoins
+description: Lancer un test de placement en boîte de réception avec des boîtes témoins chez Gmail, Outlook, Yahoo et d’autres, et voir où arrive chaque copie.
+type: how-to
+audience: [publisher, admin]
+permissions: ['placement:run', 'placement:manage']
+uiPath: 'nav.deliverability > placement.placementTests'
+primaryKeyword: test de placement en boîte de réception
+sources:
+  - internal/placement
+  - internal/placement/seedbox
+  - internal/ingest/normalize.go
+  - docs/integrations/seed-mailboxes.md
+  - internal/app/wire_canary.go
+  - internal/sending/engine/canary.go
+  - web/src/features/placement
+sidebar:
+  order: 10
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Un test de placement en boîte de réception envoie une copie d’un e-mail à chaque
+[boîte témoin](/fr/reference/glossary/#seed-mailbox) que vous possédez, puis se connecte à ces boîtes et indique où
+chaque copie est arrivée : la boîte de réception, un onglet comme Promotions, le dossier spam, ou nulle part, par
+fournisseur de messagerie. Utilisez-le pour comparer des e-mails et des fournisseurs d’envoi avant qu’une campagne
+parte vers votre liste. Les tests s’exécutent quand quelqu’un en lance un, ou quand l’[envoi
+canari](/fr/reference/glossary/#canary) d’un envoi inclut les boîtes témoins ; rien ne s’exécute selon un calendrier.
+
+## Avant de commencer
+
+- Ajouter, reconnecter et retirer des boîtes témoins exige `placement:manage`, une autorisation sensible, car le mot de
+  passe ou le jeton d’une boîte témoin peut lire toute la boîte. Lancer un test exige `placement:run`. Seules des
+  personnes peuvent lancer des tests et gérer les boîtes témoins : les clés d’API peuvent lire les résultats des tests,
+  et les agents IA ne peuvent détenir aucune de ces deux autorisations.
+- Utilisez des boîtes qui servent uniquement aux tests. ReputeCast ne cherche que les messages qui portent un jeton de
+  test et n’ouvre que la boîte de réception, le dossier spam et les onglets de Gmail, mais les identifiants donnent
+  accès à tout le contenu de la boîte.
+- Le contenu que vous testez a besoin d’un expéditeur vérifié sur le flux qu’il utilise
+  ([Ajouter des domaines d’envoi et des expéditeurs](/fr/providers/senders-and-domains/)).
+- Pour connecter des boîtes témoins Gmail, Google Workspace, Outlook.com ou Microsoft 365 avec OAuth, un
+  [admin de l’instance](/fr/reference/glossary/#instance-admin) ajoute d’abord une URI de redirection aux applications
+  de connexion de l’instance (voir
+  [Configurer les applications de connexion pour les boîtes témoins OAuth](#configurer-les-applications-de-connexion-pour-les-boîtes-témoins-oauth)).
+
+## Connexion de chaque boîte témoin
+
+| Fournisseur de messagerie  | Connexion avec                                         | Remarques                                                                                                  |
+| -------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Gmail                      | Mot de passe d’application IMAP (recommandé) ou OAuth  | Les onglets (Primary, Promotions, Updates, Social, Forums) sont lus à partir des libellés de Gmail.        |
+| Google Workspace           | OAuth ou mot de passe d’application IMAP               | OAuth via une application de la même organisation Workspace évite les limites de Google pour les applications non validées. |
+| Outlook.com, Microsoft 365 | OAuth                                                  | Lu via Microsoft Graph, qui distingue Focused et Other. Microsoft refuse les mots de passe en IMAP.        |
+| Yahoo, AOL                 | Mot de passe d’application IMAP                        | Créé dans les paramètres de sécurité du compte.                                                            |
+| iCloud                     | Mot de passe pour app                                  | L’identifiant Apple doit avoir l’authentification à deux facteurs.                                         |
+| GMX, Web.de                | Le mot de passe du compte, avec IMAP activé            | Activez d’abord IMAP dans les paramètres de la boîte.                                                      |
+
+ReputeCast renseigne le serveur et le port IMAP de chaque fournisseur. Les mots de passe et les jetons sont scellés avec
+la clé secrète de l’instance et sont en écriture seule : l’API ne les renvoie jamais.
+
+Microsoft a désactivé l’authentification de base, mots de passe d’application compris, pour IMAP dans Exchange Online
+([Microsoft Learn, « Deprecation of Basic authentication in Exchange Online »](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online),
+vérifié en octobre 2026), et la boîte de dialogue d’ajout de ReputeCast refuse un mot de passe d’application pour les
+boîtes témoins Outlook.com et Microsoft 365.
+
+## Configurer les applications de connexion pour les boîtes témoins OAuth
+
+Les boîtes témoins OAuth réutilisent les applications de connexion Google et Microsoft de l’instance, configurées dans
+<UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> ; il n’y a pas d’application distincte à
+enregistrer. Chaque application a besoin d’une deuxième URI de redirection à côté de celle de la connexion :
+
+```text title="URI de redirection pour les boîtes témoins"
+<public URL>/api/v1/placement/oauth/callback
+```
+
+<Steps>
+
+1. Dans l’application Google, ajoutez l’URI de redirection ci-dessus et le scope `https://mail.google.com/` à son
+   écran de consentement. L’accès IMAP avec OAuth exige ce scope.
+
+2. Dans l’application Microsoft, ajoutez l’URI de redirection et l’autorisation déléguée Microsoft Graph
+   `Mail.ReadWrite` (avec `offline_access`). Autorisez les comptes Microsoft personnels en plus des comptes
+   professionnels, sinon les boîtes témoins Outlook.com ne peuvent pas se connecter.
+
+3. Configurez les applications elles-mêmes comme décrit dans
+   [Connexion avec Google, Microsoft et GitHub](/fr/self-hosting/social-sign-in/).
+
+</Steps>
+
+<Aside type="note" title="Les limites de Google pour les applications non validées">
+`https://mail.google.com/` est un scope restreint. Tant que l’écran de consentement d’une application Google a le type
+d’utilisateur External et l’état de publication « Testing », Google délivre des jetons d’actualisation qui expirent au
+bout de 7 jours
+([Google, « Using OAuth 2.0 to access Google APIs »](https://developers.google.com/identity/protocols/oauth2), vérifié en
+octobre 2026) : une telle boîte témoin apparaît donc déconnectée chaque semaine. Connectez plutôt les boîtes témoins
+gmail.com avec un mot de passe d’application. Les applications utilisées uniquement au sein d’une organisation Google
+Workspace (type d’utilisateur Internal) n’ont besoin d’aucune validation
+([Aide Google Cloud, « Unverified apps »](https://support.google.com/cloud/answer/7454865), vérifié en octobre 2026) : une
+boîte témoin Google Workspace de cette organisation peut donc utiliser OAuth sans ces limites.
+</Aside>
+
+## Ajouter des boîtes témoins
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.deliverability > placement.placementTests" /> et sélectionnez
+   <UiPath path="placement.pillSeeds" />.
+
+2. Sélectionnez <UiPath path="placement.addSeed" /> et choisissez le fournisseur de messagerie.
+
+3. Sous <UiPath path="placement.connectWith" />, choisissez <UiPath path="placement.viaImap" /> ou
+   <UiPath path="placement.viaOAuth" /> quand le fournisseur propose les deux.
+
+   - **Mot de passe d’application :** saisissez l’adresse et le mot de passe, puis sélectionnez
+     <UiPath path="placement.checkAndAdd" />. ReputeCast se connecte et liste les dossiers trouvés, comme la boîte de
+     réception, les onglets et le dossier spam.
+   - **OAuth :** connectez-vous à la boîte témoin chez Google ou Microsoft et autorisez ReputeCast à lire et modifier
+     ses e-mails. Terminez en moins de 10 minutes ; le navigateur revient alors à ReputeCast et la boîte témoin est
+     ajoutée.
+
+4. Ajoutez une boîte témoin chez chaque fournisseur de messagerie qu’utilisent vos lecteurs. Un test peut envoyer des
+   copies à 100 boîtes témoins au plus.
+
+</Steps>
+
+<Screenshot
+  id="placement-seeds"
+  alt="Boîtes témoins · 10 : des boîtes témoins chez Gmail, Google Workspace, Outlook.com, Microsoft 365, Yahoo, AOL et iCloud, chacune avec les dossiers trouvés, le mot de passe d’application IMAP ou OAuth, son état et sa dernière utilisation. Une bannière indique l’échec de connexion de la boîte témoin iCloud et propose de la reconnecter."
+/>
+
+## Lancer un test de placement
+
+<Steps>
+
+1. Sélectionnez <UiPath path="placement.runTest" />. Vous pouvez aussi lancer un test depuis la page
+   [Vérifier et envoyer](#tester-depuis-vérifier-et-envoyer) de la campagne, depuis le menu
+   <UiPath path="placement.sendTest" /> de l’éditeur ou depuis le planificateur de chauffe.
+
+2. Choisissez ce que vous testez : une campagne, un modèle de campagne, le prochain numéro d’un digest ou un modèle
+   transactionnel. Choisissez la version quand l’e-mail a des variantes A/B, des versions linguistiques ou du contenu
+   conditionnel.
+
+3. Choisissez comment les copies partent :
+
+   - Avec <UiPath path="placement.throughRouteTitle" />, chaque boîte témoin reçoit sa copie via le fournisseur d’envoi
+     que la route choisirait pour elle.
+   - Avec <UiPath path="placement.throughOneTitle" />, vous testez un seul fournisseur d’envoi.
+   - Avec <UiPath path="placement.throughCompareTitle" />, chaque boîte témoin reçoit une copie par fournisseur, à
+     2 minutes d’intervalle, en alternant le fournisseur qui part en premier. Vous pouvez comparer jusqu’à
+     6 fournisseurs.
+
+4. Choisissez l’expéditeur et les boîtes témoins (toutes les boîtes témoins connectées, ou certaines). La boîte de
+   dialogue indique le nombre de copies, leur coût et, pour un fournisseur en chauffe, la part du plafond de chauffe du
+   jour qu’elles utilisent.
+
+5. Sélectionnez <UiPath path="placement.startTest" />.
+
+</Steps>
+
+Les copies sont de vrais envois, avec les mêmes en-têtes et le même suivi des liens que la campagne. Leurs ouvertures
+et leurs clics ne sont jamais comptés, elles n’apparaissent jamais dans les rapports ni dans l’historique des contacts,
+et les rebonds ou les plaintes d’une boîte témoin ne l’excluent jamais. Un test ne modifie jamais un envoi ni le verdict
+de son [contrôle avant envoi](/fr/reference/glossary/#send-readiness).
+
+## Tester depuis Vérifier et envoyer
+
+La page [Vérifier et envoyer](/fr/reference/glossary/#review-and-send) d’une campagne a une carte
+<UiPath path="placement.entryTitle" /> à côté des contrôles. Elle est facultative et ne change jamais le verdict du
+[contrôle avant envoi](/fr/campaigns/send-readiness/).
+
+- La carte indique combien de boîtes témoins un test atteint et chez quels fournisseurs de messagerie, combien sont à
+  vérifier (leur connexion a échoué ou a expiré, les tests les ignorent donc), et qu’un test prend environ 3 minutes.
+- <UiPath path="placement.runTest" /> ouvre la boîte de dialogue du test réglée sur cette campagne telle qu’elle est
+  programmée : via la route, ou en comparant les fournisseurs d’envoi quand la route en utilise plusieurs. Lancer un
+  test exige `placement:run` ; sans cette autorisation, le bouton indique qui peut le faire.
+- Le dernier résultat de la campagne affiche une ligne par fournisseur de messagerie, qui compte la boîte de réception,
+  l’onglet propre au fournisseur pour les envois en masse (Promotions chez Gmail, Other chez Outlook.com) et le spam,
+  par exemple « Gmail · Boîte de réception 2 · Promotions 2 · Spam 0 », avec une barre. Quand la route a comparé des
+  fournisseurs, une ligne par fournisseur d’envoi suit, comme « Via SES : Boîte de réception 8 · Onglet 2 ».
+  <UiPath path="placement.entryViewResults" /> ouvre le résultat complet.
+
+## Placement des boîtes témoins pendant un envoi canari
+
+Quand un envoi commence par un envoi canari qui inclut des boîtes témoins, ReputeCast lance un test de placement de la
+campagne via sa route vers chaque boîte témoin connectée, comme un test lancé depuis Vérifier et envoyer. Le critère de
+placement des boîtes témoins de l’envoi canari, dans le [suivi en direct](/fr/campaigns/live-monitor/), le lit par
+fournisseur de messagerie : des copies arrivées en spam peuvent donc retenir l’envoi avant que tout le monde le reçoive.
+Le test apparaît dans la liste des tests comme les autres.
+
+## Lire le résultat
+
+<Screenshot
+  id="placement-tests"
+  alt="Tests de placement : une bannière indique l’échec de connexion de la boîte témoin iCloud, puis six tests avec leur heure de lancement, ce qui a été testé, le fournisseur d’envoi utilisé, la personne qui l’a lancé et le résultat par fournisseur, comme Weekly Digest #142 lancé depuis Vérifier et envoyer, 8 en boîte de réception et 2 en onglet via SES, et 5 en boîte de réception, 2 en onglet, 2 en spam et 1 non arrivée via Postal."
+/>
+
+La liste des tests présente tous les tests de l’espace de travail, du plus récent au plus ancien, avec leur résultat
+par fournisseur d’envoi. Sélectionnez <UiPath path="placement.view" /> sur un test pour l’ouvrir.
+
+Les résultats se remplissent en direct. ReputeCast continue de chercher chaque copie pendant 15 minutes après la remise
+de la dernière copie à son fournisseur d’envoi ; une copie toujours absente apparaît alors comme
+<UiPath path="placement.legendNotArrived" />, et une copie qui arrive dans l’heure met le résultat à jour. Sélectionnez
+<UiPath path="placement.stopWaiting" /> pour arrêter d’attendre plus tôt.
+
+<Screenshot
+  id="placement-result"
+  alt="Weekly Digest #142 comparé via Amazon SES et Postal, lancé depuis Vérifier et envoyer : 8 boîtes témoins sur 10 en boîte de réception via SES et 5 sur 10 via Postal, en chauffe au jour 5 sur 21, avec le délai d’arrivée médian, les résultats SPF, DKIM et DMARC, les copies par fournisseur de messagerie et une copie arrivée dans le dossier Junk Email d’Outlook.com."
+/>
+
+- Le titre compte des boîtes témoins, par exemple « 8 sur 10 en boîte de réception », jamais un pourcentage : une
+  poignée de boîtes témoins est un échantillon, pas votre audience.
+- Chaque cellule indique où la copie est arrivée, avec les termes du fournisseur (boîte de réception, un onglet, le
+  dossier spam), le temps qu’elle a mis à arriver, et les résultats SPF, DKIM et DMARC que le serveur de réception a
+  écrits dans les en-têtes de la copie. Ouvrez une copie pour lire ses en-têtes et les événements du fournisseur
+  d’envoi.
+- Par défaut, les copies sont supprimées des boîtes témoins 24 heures après chaque test. Modifiez ce réglage dans
+  <UiPath path="placement.deletionSettings" /> (24 heures après chaque test, à la fin du test, ou jamais ; exige
+  `placement:manage`), ou supprimez les copies d’un test avec <UiPath path="placement.deleteCopiesNow" />.
+
+<LimitsTable area="placement" />
+
+## Vérifier le résultat
+
+- L’état du test est <UiPath path="placement.statusFinished" /> et chaque boîte témoin a un résultat.
+- Chaque boîte témoin de <UiPath path="placement.pillSeeds" /> affiche <UiPath path="placement.seedConnected" /> et la
+  date de sa dernière utilisation.
+
+## Dépannage
+
+- **Une boîte témoin affiche <UiPath path="placement.seedFailed" />.** Le fournisseur de messagerie a refusé le mot de
+  passe d’application, souvent parce qu’il a été révoqué ou que le mot de passe du compte a changé. Les tests ignorent
+  la boîte témoin jusqu’à ce que vous sélectionniez <UiPath path="placement.reconnect" /> et colliez un nouveau mot de
+  passe d’application.
+- **Une boîte témoin affiche <UiPath path="placement.seedExpired" />.** Le fournisseur de messagerie a mis fin à
+  l’accès OAuth de ReputeCast. Une boîte témoin gmail.com connectée via une application à l’état Testing expire tous
+  les 7 jours ; reconnectez-la avec un mot de passe d’application.
+- **OAuth indique que la connexion Google ou Microsoft n’est pas configurée.** L’application de connexion de l’instance
+  n’a pas encore d’ID client ni de secret. Un admin de l’instance les ajoute dans
+  <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> ; d’ici là, connectez les boîtes témoins Gmail et
+  Google Workspace avec un mot de passe d’application.
+- **Outlook.com refuse le mot de passe d’application.** C’est normal : connectez les boîtes témoins Outlook.com et
+  Microsoft 365 avec OAuth.
+- **Le test ne peut pas démarrer.** La boîte de dialogue indique pourquoi : aucune boîte témoin connectée, aucun
+  expéditeur vérifié pour le flux chez un fournisseur choisi, un fournisseur en panne, ou un plafond de chauffe que les
+  copies dépasseraient.
+- **Les copies arrivent en spam chez un fournisseur de messagerie.** Vérifiez les résultats d’authentification dans les
+  en-têtes de la copie, puis [SPF, DKIM et DMARC](/fr/deliverability/spf-dkim-dmarc/) et les
+  [inscriptions en liste de blocage](/fr/deliverability/blocklists/) du domaine d’envoi.
+
+## Voir aussi
+
+- [Contrôle avant envoi : vérifier avant d’envoyer](/fr/campaigns/send-readiness/)
+- [Chauffer un nouveau fournisseur ou une nouvelle IP](/fr/providers/warm-up/)
+- [Délivrabilité e-mail pour expéditeurs auto-hébergés](/fr/deliverability/overview/)
+- [Autorisations et rôles](/fr/reference/permissions/)
