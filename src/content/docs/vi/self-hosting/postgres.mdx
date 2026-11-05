@@ -17,6 +17,8 @@ sources:
   - internal/config/config.go
   - .github/workflows/ci.yml
   - docs/deploy/partitioning.md
+  - docs/deploy/postgres-tuning.md
+  - internal/segments/segments.go
 sidebar:
   order: 7
 ---
@@ -96,6 +98,36 @@ Hãy giảm `database.max_conns` cho mỗi tiến trình, hoặc tăng `max_conn
 Mỗi kết nối chạy `SET jit = off` ngay sau khi kết nối: các truy vấn của ReputeCast đều ngắn, và việc biên dịch chúng
 bằng JIT tốn nhiều thời gian hơn việc chạy chúng. Thiết lập này được đặt sau khi kết nối, không nằm trong gói khởi động,
 nên các trình gom kết nối như PgBouncer vẫn chấp nhận kết nối.
+
+## Tinh chỉnh bộ nhớ cho danh sách lớn
+
+Thiết lập bộ nhớ mặc định của PostgreSQL khá nhỏ (`shared_buffers` là 128 MB), và tệp Compose giữ nguyên chúng. Trong
+[các bài thử phần cứng](/vi/self-hosting/requirements/#phần-cứng), chúng đủ cho một triệu liên hệ trên máy chủ 4 GB:
+PostgreSQL dùng khoảng 500 MB, phần bộ nhớ trống còn lại đệm các tệp cơ sở dữ liệu. Với vài chục nghìn liên hệ, việc đếm
+phân khúc có điều kiện sự kiện (đã mở, đã nhấp) vẫn có thể chậm; một lần đếm trực tiếp mất hơn 10 giây sẽ hiện số đếm
+gần nhất. Phân khúc vẫn hoạt động khi gửi.
+
+Điểm khởi đầu cho một máy chủ chỉ chạy PostgreSQL. Trên máy chủ chạy cả ReputeCast, hãy tính phần trăm trên phần còn lại
+sau 300–400 MB của ReputeCast:
+
+| Thiết lập              | Điểm khởi đầu | Lý do                                                                                                        |
+| ---------------------- | ------------- | ------------------------------------------------------------------------------------------------------------ |
+| `shared_buffers`       | 25% RAM       | Giữ liên hệ và các sự kiện gần đây trong bộ nhớ.                                                             |
+| `effective_cache_size` | 50–75% RAM    | Cho bộ lập kế hoạch biết hệ điều hành đệm được bao nhiêu.                                                    |
+| `work_mem`             | `32MB`        | Sắp xếp và băm cho việc đếm phân khúc và báo cáo. Áp dụng cho từng thao tác, nên hãy để ý `max_connections`. |
+| `maintenance_work_mem` | `512MB`       | Vacuum và tạo index nhanh hơn sau các lần nhập lớn.                                                          |
+| `random_page_cost`     | `1.1`         | Quét index rẻ trên ổ SSD.                                                                                    |
+
+Với bộ Docker Compose, truyền chúng cho service `postgres` trong `docker-compose.override.yml` (cho máy chủ dành 4 GB
+cho PostgreSQL), rồi chạy `docker compose up -d`:
+
+```yaml title="docker-compose.override.yml"
+services:
+  postgres:
+    command: ['postgres', '-c', 'shared_buffers=1GB', '-c', 'effective_cache_size=3GB', '-c', 'work_mem=32MB']
+```
+
+Sau một lần nhập lớn, chạy `ANALYZE;` để bộ lập kế hoạch thấy dữ liệu mới ngay thay vì chờ autovacuum.
 
 ## Phân khúc SQL
 

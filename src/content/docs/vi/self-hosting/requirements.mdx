@@ -1,6 +1,6 @@
 ---
 title: Yêu cầu hệ thống
-description: 'Yêu cầu hệ thống ReputeCast khi tự triển khai: hệ điều hành, Docker image, PostgreSQL 16 đến 18, truy cập mạng, cổng và dữ liệu cần lưu giữ.'
+description: 'Yêu cầu hệ thống ReputeCast khi tự triển khai: CPU, bộ nhớ và ổ đĩa theo số liên hệ, Docker image, PostgreSQL 16 đến 18, truy cập mạng và dữ liệu cần lưu.'
 type: reference
 audience: [operator]
 primaryKeyword: yêu cầu hệ thống ReputeCast
@@ -9,6 +9,8 @@ sources:
   - Dockerfile
   - deploy/Dockerfile.release
   - deploy/docker-compose.yml
+  - docs/deploy/performance.md
+  - loadtest/k6
   - .github/workflows/ci.yml
   - internal/config/config.go
   - internal/app/app.go
@@ -24,6 +26,47 @@ import UiPath from '~/components/UiPath.astro'
 
 Đây là yêu cầu hệ thống ReputeCast: những gì một máy chủ cần để chạy một [hệ thống](/vi/reference/glossary/#instance)
 ReputeCast bằng tệp nhị phân hoặc Docker image.
+
+## Phần cứng
+
+Một máy chủ chạy cả ReputeCast và PostgreSQL, dùng ổ SSD:
+
+| Số liên hệ                      | vCPU | Bộ nhớ | Ổ đĩa |
+| ------------------------------- | ---- | ------ | ----- |
+| Tới 250.000 liên hệ (tối thiểu) | 2    | 2 GB   | 20 GB |
+| Tới 1.000.000 liên hệ           | 4    | 4 GB   | 40 GB |
+
+- **Bộ nhớ.** Lúc bận nhất, ReputeCast dùng 300–380 MB và PostgreSQL khoảng 500 MB (thiết lập mặc định của tệp Compose),
+  dù số liên hệ là bao nhiêu; phần bộ nhớ còn lại dùng để đệm cơ sở dữ liệu. 1 GB là quá ít: ReputeCast, PostgreSQL và
+  Docker cộng lại lên tới 0,86 GB, không còn gì cho hệ điều hành. Một triệu liên hệ trên 2 GB với ổ đĩa đám mây không
+  đạt: tìm kiếm và API gửi chậm lại (95% lượt gửi trong 3,9 giây thay vì 300 ms) và `/readyz` hết thời gian chờ, nên
+  health check có thể đã khởi động lại ứng dụng.
+- **CPU.** Một vCPU vẫn phục vụ được danh sách liên hệ và việc đếm phân khúc, nhưng một đợt email giao dịch dồn dập
+  (tăng dần tới 200 thư mỗi giây) trả lời chậm hơn mục tiêu 300 ms.
+- **Ổ đĩa.** Cơ sở dữ liệu thử nghiệm chiếm 0,7 GB ở 100.000 liên hệ, 1,4 GB ở 300.000 và 3,8 GB ở 1.050.000, với khoảng
+  hai thư và ba sự kiện gửi thư cho mỗi liên hệ. Write-ahead log của PostgreSQL thêm tới 1 GB, còn hai image chiếm 0,5
+  GB. Các dung lượng ở trên chừa chỗ cho một [bản sao lưu](/vi/self-hosting/backups/) và phần tăng thêm. Cơ sở dữ liệu
+  lớn dần theo mỗi thư bạn gửi, trong suốt thời gian [dữ liệu được giữ](/vi/reference/limits-and-defaults/).
+- **Sau một lần nhập lớn.** Các tác vụ nền ở lần khởi động đầu tiên (nhóm tương tác, ghi nhận nguồn tăng trưởng, nhà
+  cung cấp hộp thư) mất khoảng 7 phút cho một triệu liên hệ trên 4 vCPU và 4 GB với ổ đĩa đám mây.
+- **Trên một triệu liên hệ** chưa được đo. [Tách các vai trò](/vi/self-hosting/scaling/),
+  [tinh chỉnh bộ nhớ của PostgreSQL](/vi/self-hosting/postgres/#tinh-chỉnh-bộ-nhớ-cho-danh-sách-lớn) và tự đo tải của
+  bạn.
+
+### Cách đo các con số này
+
+Đo vào tháng 11 năm 2026 trên ReputeCast 1.4.0 với tệp Compose đi kèm và PostgreSQL 18. Mỗi máy chủ là một container có
+giới hạn CPU và bộ nhớ, không có swap và ổ đĩa bị giới hạn ở 3.000 IOPS và 125 MB/s, như một ổ đĩa đám mây tiêu chuẩn.
+Máy chủ chứa dữ liệu kiểm thử tải: không gian làm việc demo cùng 50.000, 250.000 hoặc 1.000.000 liên hệ với thư và sự
+kiện của họ. Các bài kiểm thử tải của upstream chạy từ bên ngoài: mười người lật trang và tìm liên hệ liên tục, bốn
+người đếm phân khúc, và API gửi tăng dần tới 200 thư mỗi giây.
+
+Một cấu hình đạt khi mọi mục tiêu đều giữ được, không khởi động lại và không bị dừng vì hết bộ nhớ: trang liên hệ dưới
+200 ms, tìm kiếm dưới 150 ms, đếm phân khúc dưới 2 giây và gửi dưới 300 ms ở phân vị 95, và lỗi dưới 1%. Nhân CPU của
+máy thử nhanh khoảng 1,5 lần một vCPU đám mây (lần chạy nhóm tương tác đầu tiên cho một triệu liên hệ mất 200 giây trên
+bốn nhân, 317 giây trên GitHub runner 4 vCPU của upstream), nên mỗi cấu hình được kiểm tra với thời gian CPU cắt bớt cho
+tương đương. Kết quả trên runner 4 vCPU nằm ở
+[mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/#hiệu-năng-đo-được).
 
 ## Phần mềm
 

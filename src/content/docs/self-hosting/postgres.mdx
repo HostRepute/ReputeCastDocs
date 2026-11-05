@@ -17,6 +17,8 @@ sources:
   - internal/config/config.go
   - .github/workflows/ci.yml
   - docs/deploy/partitioning.md
+  - docs/deploy/postgres-tuning.md
+  - internal/segments/segments.go
 sidebar:
   order: 7
 ---
@@ -91,6 +93,36 @@ Lower `database.max_conns` per process, or raise `max_connections`, when you [ad
 Each connection runs `SET jit = off` once it connects: ReputeCast's queries are short, and compiling them with JIT
 took longer than running them. It is set after connecting, not in the startup packet, so poolers such as PgBouncer
 accept the connection.
+
+## Tune memory for larger audiences
+
+PostgreSQL's default memory settings are small (`shared_buffers` is 128 MB), and the Compose file keeps them. In the
+[hardware tests](/self-hosting/requirements/#hardware) they were enough for a million contacts on a 4 GB server:
+PostgreSQL used about 500 MB, and the rest of the free memory cached the database files. With tens of thousands of contacts,
+segment counts with event conditions (opened, clicked) can still get slow; a live count that takes longer than
+10 seconds shows the last known count instead. The segment still works at send time.
+
+Starting points for a server that runs only PostgreSQL. On a server that also runs ReputeCast, take the percentages
+of what is left after ReputeCast's 300–400 MB:
+
+| Setting                | Starting point | Why                                                                                                   |
+| ---------------------- | -------------- | ----------------------------------------------------------------------------------------------------- |
+| `shared_buffers`       | 25% of RAM     | Keeps contacts and recent events in memory.                                                           |
+| `effective_cache_size` | 50–75% of RAM  | Tells the planner how much the operating system caches.                                               |
+| `work_mem`             | `32MB`         | Sorts and hashes for segment counts and reports. It applies per operation, so mind `max_connections`. |
+| `maintenance_work_mem` | `512MB`        | Faster vacuum and index builds after large imports.                                                   |
+| `random_page_cost`     | `1.1`          | Index scans are cheap on SSD storage.                                                                 |
+
+With the Docker Compose stack, pass them to the `postgres` service in `docker-compose.override.yml` (for a server with
+4 GB for PostgreSQL), then `docker compose up -d`:
+
+```yaml title="docker-compose.override.yml"
+services:
+  postgres:
+    command: ['postgres', '-c', 'shared_buffers=1GB', '-c', 'effective_cache_size=3GB', '-c', 'work_mem=32MB']
+```
+
+After a large import, run `ANALYZE;` so the planner sees the new data at once instead of waiting for autovacuum.
 
 ## SQL segments
 
