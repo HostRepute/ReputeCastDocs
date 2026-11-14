@@ -10,7 +10,12 @@ sources:
   - internal/cli/serve.go
   - internal/app/app.go
   - internal/app/wire_publicurl.go
+  - internal/instance/settings.go
+  - internal/instance/updates.go
+  - internal/publicurl/publicurl.go
+  - web/src/features/admin/instance/messages.ts
   - deploy/docker-compose.yml
+  - docs/deploy/configuration.md
   - README.md
 sidebar:
   order: 5
@@ -33,6 +38,9 @@ Each layer overrides the one before it:
 2. **A YAML file**, when you pass `--config /etc/reputecast/config.yaml` or set `REPUTECAST_CONFIG` to its path.
 3. **Environment variables** that start with `REPUTECAST_`.
 4. **`DATABASE_URL`**, the variable many hosting platforms set, but only when `REPUTECAST_DATABASE__URL` is not set.
+   Likewise **`PORT`**: when `REPUTECAST_HTTP__ADDR` is not set, ReputeCast listens on `:<PORT>`. The Docker image sets
+   `REPUTECAST_HTTP__ADDR=:8080`, so a container listens on 8080 whatever `PORT` says. A `PORT` that isn't a port
+   number (1–65535) stops the start. Available from the next release after 1.6.0.
 5. **Flags** you pass explicitly: `--role` (sets `roles`), `--addr` (`http.addr`), `--database-url` (`database.url`)
    and `--log-level` (`log.level`). A flag you leave out changes nothing.
 
@@ -78,7 +86,9 @@ http:
   addr: 127.0.0.1:8080
   # The address people and sending providers reach. Use https in production.
   public_url: https://news.example.com
-  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  # Pin public_url: Instance admin can't change it (for an instance you run for someone else).
+  # public_url_locked: false
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs, IPs or "private").
   trusted_proxies: [127.0.0.1]
   rate_limit_auth: 30 # sign-in requests per minute per client IP
   rate_limit_api: 600 # API requests per minute per key or signed-in browser session
@@ -101,8 +111,25 @@ secrets:
   key_file: /var/lib/reputecast/secret.key
 
 files:
-  # Product files and lead magnets; shared by every web and worker process.
+  # Product files, lead magnets, uploads in progress and exports, with storage.backend local.
   dir: /var/lib/reputecast/files
+
+storage:
+  backend: local # or s3: the bucket below, shared by every web and worker process
+  # s3:
+  #   bucket: reputecast-files
+  #   region: eu-central-1
+  #   endpoint: "" # empty is AWS; https://nyc3.digitaloceanspaces.com, http://minio:9000…
+  #   path_style: false
+  #   prefix: ""
+  #   access_key_id: "" # better set by environment; empty uses the default AWS credential chain
+  #   secret_access_key: ""
+  #   sse: "" # AES256 or aws:kms
+  #   kms_key_id: ""
+
+geoip:
+  # A MaxMind DB file you download (GeoLite or DB-IP Lite); empty is off.
+  # database: /var/lib/geoip/GeoLite2-City.mmdb
 
 log:
   level: info # debug, info, warn or error
@@ -119,6 +146,7 @@ worker:
 updates:
   check: true # daily release check against GitHub (version number only)
   repo: hostrepute/reputecast
+  # managed_by: Northwind Hosting # who upgrades this instance; Instance admin says so
 
 metrics:
   enabled: true
@@ -148,7 +176,16 @@ A process refuses to start, and prints `Error: …`, when:
 - `http.public_url` is not an absolute URL (`http.public_url must be an absolute URL, got "news.example.com"`);
 - `secrets.key` is set but is not a base64 encoding of exactly 32 bytes;
 - `auth.password_min_length` is below 8;
-- `metrics.token` is set but shorter than 16 characters.
+- `metrics.token` is set but shorter than 16 characters;
+- the storage settings don't fit together: `storage.backend` is neither `local` nor `s3`, `s3` without
+  `storage.s3.bucket`, an endpoint that isn't an `http://` or `https://` URL, only one of the two access keys, a prefix
+  that starts with `/`, `storage.s3.sse` other than `AES256` or `aws:kms`, or `storage.s3.kms_key_id` without
+  `aws:kms` ([object storage](/self-hosting/object-storage/#troubleshooting));
+- `PORT` is set, `REPUTECAST_HTTP__ADDR` isn't, and `PORT` isn't a port number
+  (`PORT must be a port number (1-65535), got "web"`).
+
+An entry of `http.trusted_proxies` that is no address, range or `private` doesn't stop the start: it is logged as
+`ignoring invalid trusted proxy` and ignored.
 
 <Aside type="caution">
   Keys ReputeCast doesn't know are ignored without a warning. A misspelled variable such as
@@ -165,7 +202,12 @@ The HTTP server's fixed limits and the timeouts you can change:
 ## When to change them
 
 - **Behind a reverse proxy**: set `http.public_url` to the https address and `http.trusted_proxies` to the proxy
-  ([reverse proxy and TLS](/self-hosting/reverse-proxy/)).
+  ([reverse proxy and TLS](/self-hosting/reverse-proxy/)). On a hosting platform or behind a Kubernetes Ingress
+  controller, whose address you can't know in advance, the keyword `private` trusts every private, shared and loopback
+  network ([trusted proxies](/deploy/overview/#trusted-proxies)). Available from the next release after 1.6.0.
+- **Countries in campaign reports**: `geoip.database`, a file you download ([add a GeoIP database](/self-hosting/geoip/)).
+- **Several machines without a shared volume**: `storage.backend: s3` and the `storage.s3` keys
+  ([object storage](/self-hosting/object-storage/)).
 - **Several processes**: split `roles` and size `database.max_conns` so the total stays below PostgreSQL's
   `max_connections` ([scaling](/self-hosting/scaling/) and [PostgreSQL](/self-hosting/postgres/)).
 - **Log shippers**: `log.format: json` (the Docker image already uses it).
@@ -176,7 +218,10 @@ The HTTP server's fixed limits and the timeouts you can change:
   `webhooks.allow_private_networks`. Link-local and cloud metadata addresses stay blocked.
 - **No key file on disk**: `secrets.key` from `reputecast secrets generate-key`, set before the first start
   ([security and hardening](/self-hosting/security/)).
-- **Offline servers**: `updates.check: false`.
+- **Offline servers**: `updates.check: false`. It also locks the update check off in Instance admin and at the first
+  sign-in.
+- **An instance you run for someone else**: `http.public_url_locked` and `updates.managed_by`
+  ([settings the server's operator manages](#settings-the-servers-operator-manages)).
 
 ## Settings managed in the app
 
@@ -184,9 +229,42 @@ The HTTP server's fixed limits and the timeouts you can change:
   <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" /> ([instance admin](/self-hosting/instance-admin/)).
 - The instance name, logo, default timezone and language, and the public URL live in
   <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. A public URL saved there replaces `http.public_url` for
-  links, public pages and provider webhooks within 30 seconds on every process. HTTPS-only cookies and HSTS still follow
-  `http.public_url`, so keep both the same.
+  links, public pages and provider webhooks within 30 seconds on every process, unless the server
+  [locks it](#settings-the-servers-operator-manages). HTTPS-only cookies and HSTS still follow `http.public_url`, so
+  keep both the same.
 - Sending providers, senders, teams and everything else belong to each workspace.
+
+## Settings the server's operator manages
+
+When a hosting company or an IT team runs an instance for its users, two settings keep what only the operator should
+change out of the instance admins' hands. Both arrived in 1.5.0.
+
+### Lock the public URL
+
+`http.public_url_locked: true` (`REPUTECAST_HTTP__PUBLIC_URL_LOCKED=true`) makes `http.public_url` the address every
+link, public page, provider webhook and passkey uses, whatever an instance admin saved:
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> and the <UiPath path="setup.instanceBasics" /> step of
+  the [first sign-in](/self-hosting/first-run/) show the public URL read only, with the sentence "Set by the server's
+  operator (http.public_url_locked). Links in sent emails, passkeys and provider webhooks depend on it, so only they can
+  change it." The URL check still runs, for the locked address.
+- A save that asks for another address is refused with `409` and the code `operator_locked`; the rest of the form
+  still saves.
+- At start, the locked address becomes the saved one. When an admin had saved another, provider webhooks move to the
+  locked address once, in the instance audit log as the server configuration's change, and the webhooks that providers
+  keep in their own settings are listed in the log (`provider webhooks to change by hand for the locked public URL`).
+  So turning the lock on, or changing the locked address and restarting, moves the instance.
+- The reset links `reputecast user reset-password` prints use the locked address too.
+- `reputecast doctor` warns when the locked address is one only the server itself reaches, such as
+  `http://localhost:8080`.
+
+### Name who upgrades
+
+`updates.managed_by` (`REPUTECAST_UPDATES__MANAGED_BY`), such as `Northwind Hosting`, names who upgrades the instance.
+The <UiPath path="admin.versionCard" /> card in <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> then says
+"Upgrades are managed by Northwind Hosting. They choose when this instance moves to a new release; ask them about
+timing or a specific version." instead of the `docker compose` upgrade command and the backup reminder. The release
+check and its switch stay as they are.
 
 ## Related
 
@@ -194,3 +272,4 @@ The HTTP server's fixed limits and the timeouts you can change:
 - [Install with Docker Compose](/self-hosting/docker/): where the Compose file sets these variables.
 - [Install the binary](/self-hosting/binary/): an environment file for systemd.
 - [CLI reference](/reference/cli/): the flags of each command.
+- [Add a GeoIP database](/self-hosting/geoip/) and [keep files in S3-compatible object storage](/self-hosting/object-storage/).

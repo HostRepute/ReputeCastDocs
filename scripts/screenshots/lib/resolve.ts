@@ -57,6 +57,12 @@ const lists: Record<string, ListLookup> = {
   store: (name) => ['stores', 'stores', (s) => s.name === name],
   // A sending domain by its name ({domain:news.acme.io}): list-senders (tag "Senders & domains") returns them.
   domain: (name) => ['senders', 'domains', (d) => d.domain === name || d.name === name],
+  // A discount code pool by its name ({pool:Welcome 15%}).
+  pool: (name) => ['coupons/pools', 'items', (p) => p.name === name],
+  // A Meta Lead Ads connection by its name ({leadConnection:Acme Marketing}).
+  leadConnection: (name) => ['lead-ads/connections', 'items', (c) => c.name === name],
+  // A post import by its status ({postImport:ready}): the demo's Substack export waiting for review.
+  postImport: (status) => ['website/imports', 'items', (i) => i.status === status],
 }
 
 /** The placeholder kinds resolvePath understands. */

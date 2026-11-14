@@ -1,10 +1,11 @@
 ---
 title: Desplegar ReputeCast en Render
-description: Despliega ReputeCast en Render con Render Postgres, la imagen Docker como web service, un disco opcional, tu dominio con HTTPS y la comprobación de /readyz.
+description: Despliega ReputeCast en Render desde el Blueprint o a mano, con Render Postgres, la imagen Docker como web service, un disco y tu dominio con HTTPS.
 type: how-to
 audience: [operator]
 primaryKeyword: ReputeCast en Render
 sources:
+  - render.yaml
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
@@ -16,9 +17,11 @@ sidebar:
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
 
-Esta guía ejecuta ReputeCast en Render como dos recursos creados en el Render Dashboard: una base de datos Render
-Postgres y un web service que descarga la imagen Docker de ReputeCast, servido por HTTPS en tu propio dominio.
+Esta guía ejecuta ReputeCast en Render como dos recursos: una base de datos Render Postgres y un web service que
+descarga la imagen Docker de ReputeCast, servido por HTTPS en tu propio dominio. Créalos a la vez desde el Blueprint del
+repositorio, o uno a uno en el Render Dashboard.
 
 ## Antes de empezar
 
@@ -28,13 +31,55 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
   [requisitos del sistema](/es/self-hosting/requirements/).
 - Un dominio para ReputeCast, como `news.example.com`, en un proveedor de DNS donde puedas añadir un registro `CNAME`.
 
-## Desplegar ReputeCast
+## Desplegar con render.yaml
+
+El archivo `render.yaml` del repositorio es un Blueprint de Render que crea los dos recursos. Disponible a partir de la
+próxima versión después de la 1.6.0.
+
+<Steps>
+
+1. Abre `https://render.com/deploy?repo=https://github.com/hostrepute/reputecast`, el enlace Deploy to Render del README
+   del repositorio, e inicia sesión en Render.
+
+2. Render muestra lo que crea el Blueprint:
+
+   - el web service `reputecast`, a partir de la imagen `ghcr.io/hostrepute/reputecast:latest` con el plan `0.5c-512mb`
+     (0,5 CPU, 512 MB), con `/readyz` como comprobación de estado y un disco de 10 GB, `reputecast-data`, en
+     `/var/lib/reputecast`;
+   - la base de datos `reputecast-db`, PostgreSQL 18 con el plan `0.1c-256mb`, con una base de datos y un usuario
+     llamados ambos `reputecast`, accesible solo a través de la red privada de Render.
+
+3. Introduce los dos valores que pide Render: `REPUTECAST_PUBLIC_URL`, la URL de tu dominio sin barra final (o la
+   dirección `onrender.com` del servicio, como `https://reputecast.onrender.com`, hasta que añadas un dominio), y
+   `REPUTECAST_ADMIN_EMAIL`, el correo del primer Propietario. Render solo los pide mientras crea el Blueprint
+   ([referencia de Blueprint](https://render.com/docs/blueprint-spec), comprobado en noviembre de 2026).
+
+4. Confirma, y Render crea los dos recursos. El servicio recibe el resto de su configuración del archivo:
+
+   - `DATABASE_URL`, la cadena de conexión de la base de datos. ReputeCast la lee cuando `REPUTECAST_DATABASE__URL` no
+     está definida.
+   - `REPUTECAST_HTTP__TRUSTED_PROXIES=private`, que confía en el proxy de Render en su red privada
+     ([proxies de confianza](/es/deploy/overview/#proxies-de-confianza)).
+   - `PORT=8080`, el puerto al que enruta Render y en el que escucha la imagen.
+
+5. Cuando el despliegue pase a Live, lee la contraseña temporal del primer Propietario en **Logs** del servicio, añade
+   tu dominio e inicia sesión, como describen los pasos 9 a 11 de [desplegar a mano](#desplegar-reputecast-a-mano).
+
+</Steps>
+
+ReputeCast crea su clave secreta en el disco en el primer arranque, como `/var/lib/reputecast/secret.key`. Render hace
+una instantánea del disco cada 24 horas y conserva cada una siete días
+([discos persistentes](https://render.com/docs/disks), comprobado en noviembre de 2026), pero la imagen no tiene shell,
+así que el archivo no se puede copiar mediante el shell de Render ni por SSH. Para conservar una copia de la clave fuera
+de Render, despliega a mano con `REPUTECAST_SECRETS__KEY`.
+
+## Desplegar ReputeCast a mano
 
 <Steps>
 
 1. Genera la clave secreta y guárdala en tu gestor de contraseñas. Los dos comandos generan una clave con el mismo
    formato (44 caracteres que terminan en `=`): `openssl rand -base64 32` o
-   `docker run --rm ghcr.io/hostrepute/reputecast:v1.4.0 secrets generate-key`.
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.6.0 secrets generate-key`.
 
 2. En el Render Dashboard, haz clic en **+ New** → **Postgres**. Introduce un **Name** como `reputecast-db`, elige una
    **Region**, deja **PostgreSQL Version** en 18, elige un plan de cómputo distinto de **Free** y haz clic en
@@ -46,7 +91,7 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
    conexiones sin cifrar.
 
 4. Haz clic en **+ New** → **Web Service**. En **Source Code**, haz clic en **Existing Image**, introduce la
-   **Image URL** `ghcr.io/hostrepute/reputecast:v1.4.0` y haz clic en **Connect**. La imagen es pública: no necesita
+   **Image URL** `ghcr.io/hostrepute/reputecast:v1.6.0` y haz clic en **Connect**. La imagen es pública: no necesita
    credenciales.
 
 5. Introduce un **Name** como `reputecast` (pasa a formar parte de la dirección `onrender.com` del servicio), elige la
@@ -62,8 +107,9 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
    REPUTECAST_SECRETS__KEY=paste-the-key-from-step-1
    ```
 
-   - `PORT=8080` indica a Render dónde escucha ReputeCast; el valor predeterminado de Render es 10000. ReputeCast no
-     lee `PORT`. También escucha en el 9464 para las métricas de Prometheus, que siguen siendo privadas: Render solo
+   - `PORT=8080` indica a Render dónde escucha ReputeCast; el valor predeterminado de Render es 10000. La imagen escucha
+     en el 8080 diga lo que diga `PORT`, porque define `REPUTECAST_HTTP__ADDR=:8080`, que prevalece sobre `PORT`.
+     ReputeCast también escucha en el 9464 para las métricas de Prometheus, que siguen siendo privadas: Render solo
      reenvía el puerto de `PORT` ([port binding](https://render.com/docs/web-services#port-binding), comprobado en
      noviembre de 2026).
    - `REPUTECAST_PUBLIC_URL` es la URL de tu dominio, sin barra final. Para usar en su lugar la dirección
@@ -71,12 +117,14 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
    - `REPUTECAST_ADMIN_EMAIL` es el correo del primer Propietario, que solo se usa mientras la base de datos no tiene
      usuarios. Con `REPUTECAST_SECRETS__KEY` definida, ReputeCast nunca lee ni escribe un archivo `secret.key`.
    - Render no documenta el rango de direcciones desde el que se conecta su balanceador de carga, así que deja
-     `REPUTECAST_HTTP__TRUSTED_PROXIES` sin definir ([proxies de confianza](/es/self-hosting/docker/#proxies-de-confianza)).
-     Otras opciones: [configuración](/es/self-hosting/configuration/).
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` sin definir con la 1.6.0
+     ([proxies de confianza](/es/deploy/overview/#proxies-de-confianza)). El Blueprint define en su lugar la palabra
+     clave `private`, que confía en la red privada de Render. Disponible a partir de la próxima versión después de la
+     1.6.0. Otras opciones: [configuración](/es/self-hosting/configuration/).
 
 7. Despliega **Advanced** al final del formulario y define **Health Check Path** como `/readyz`. Si quieres, haz clic en
    **Add disk**, define **Mount path** como `/var/lib/reputecast` y **Size** como 1 GB. El disco conserva los archivos
-   que subes para productos digitales y regalos de suscripción, que de lo contrario se pierden en cada despliegue y
+   que subes para productos digitales, regalos de suscripción y exportaciones de la audiencia, que de lo contrario se pierden en cada despliegue y
    reinicio. Con un disco, Render detiene la instancia en marcha antes de arrancar una nueva (sin despliegues sin
    interrupción) y el servicio no puede escalar horizontalmente.
 
@@ -106,6 +154,10 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
 
 </Steps>
 
+Si añades el dominio después del primer inicio de sesión, cambia también la URL pública en
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" />: la dirección guardada ahí prevalece sobre
+`REPUTECAST_PUBLIC_URL`, y al guardarla se trasladan los webhooks de los proveedores.
+
 <Aside type="caution">
   Guarda una copia de `REPUTECAST_SECRETS__KEY` fuera de Render: sin ella, las credenciales de los proveedores
   almacenadas en la base de datos no se pueden descifrar.
@@ -125,7 +177,8 @@ Postgres y un web service que descarga la imagen Docker de ReputeCast, servido p
 1. Lee las notas de la versión y haz una [copia de seguridad](/es/self-hosting/backups/). Las bases de datos Render
    Postgres de pago también tienen recuperación a un momento dado.
 2. En la página **Settings** del servicio, en la sección **Deploy**, cambia la etiqueta de la URL de la imagen, por
-   ejemplo a `ghcr.io/hostrepute/reputecast:v1.4.0`, y guarda.
+   ejemplo a `ghcr.io/hostrepute/reputecast:v1.6.0`, y guarda. Un servicio creado desde el Blueprint ejecuta `latest`:
+   haz clic en **Manual Deploy** → **Deploy latest reference** para descargarla de nuevo.
 3. Si no empieza ningún despliegue, haz clic en **Manual Deploy** → **Deploy latest reference**: Render descarga la
    imagen de la etiqueta que hay definida. ReputeCast aplica las migraciones nuevas al arrancar. Con un disco, cuenta con
    unos segundos de interrupción. La actualización a 1.3.0 convierte `delivery_events` en particiones mensuales y

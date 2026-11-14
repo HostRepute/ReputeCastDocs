@@ -1,0 +1,372 @@
+---
+title: Thiết lập nhận thư
+description: Nhận thư trả lời bản tin, email hủy đăng ký mailto, báo cáo DMARC và khiếu nại trong ReputeCast qua nhà cung cấp gửi thư đã kết nối hoặc hộp thư IMAP, POP3.
+type: how-to
+audience: [admin]
+permissions: ['domains:manage']
+uiPath: 'nav.settings > settings.senders > senders.receiving.title'
+primaryKeyword: nhận thư trả lời bản tin
+sources:
+  - internal/inbound
+  - internal/optout
+  - internal/providers/optional.go
+  - internal/providers/provider.go
+  - internal/providers/received
+  - internal/providers/{ses,postal,mailgun,postmark,sendgrid,resend,sparkpost,mailjet,brevo}/inbound.go
+  - internal/providers/{ses,postal,mailgun,sendgrid,resend,sparkpost,mailjet,brevo}/messages/en.json
+  - internal/sending/engine/inbound.go
+  - internal/domains/service.go
+  - internal/domains/records.go
+  - internal/deliverability/dmarc.go
+  - internal/ingest/normalize.go
+  - internal/readiness/assemble.go
+  - internal/app/wire_inbound.go
+  - web/src/features/senders/ReceivingCard.tsx
+  - web/src/features/senders/InboundSetupDialog.tsx
+  - web/src/features/senders/SendersPage.tsx
+  - web/src/features/senders/receiving.messages.ts
+sidebar:
+  order: 21
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Thiết lập <UiPath path="nav.settings > settings.senders > senders.receiving.title" /> để nhận thư trả lời bản tin, email
+hủy đăng ký qua `mailto:`, báo cáo tổng hợp DMARC và báo cáo khiếu nại ngay trong ReputeCast. Mỗi không gian làm việc có
+một tuyến nhận thư: tính năng nhận thư của một nhà cung cấp gửi thư bạn đã kết nối, hoặc một hộp thư IMAP hay POP3 mà
+ReputeCast đọc mỗi phút. ReputeCast không chạy máy chủ thư riêng. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `domains:manage` để thiết lập, thay đổi, kiểm tra hoặc gỡ tuyến nhận thư (Chủ sở hữu và Quản trị viên có
+  quyền này). Quyền này chỉ dành cho con người: khóa API và tác tử MCP không làm được việc này. Thành viên có
+  `providers:view` thấy thẻ; những người khác hoàn toàn không thấy thẻ.
+- Để nhận thư qua một nhà cung cấp gửi thư, không gian làm việc cần một tên miền gửi thư đã xác minh. Tuyến nhận thư tại
+  tên miền đó hoặc một tên miền phụ của nó; ReputeCast gợi ý `reply.` ghép với tên miền gửi thư đã xác minh đầu tiên của
+  bạn, ví dụ `reply.news.acme.io`. Hãy dùng một tên miền phụ chỉ dành cho ReputeCast: một tên miền có bản ghi MX đã trỏ
+  đến nơi khác sẽ bị từ chối, vì thư của nó sẽ ngừng đến. Hãy đọc
+  [thêm tên miền gửi thư và người gửi](/vi/providers/senders-and-domains/).
+- Tuyến qua nhà cung cấp gửi thư cần một địa chỉ HTTPS công khai mà nhà cung cấp gửi thư có thể gửi tới:
+  `<public URL>/hooks/inbound/<token>`. Tuyến hộp thư thì không cần: ReputeCast tự kết nối tới máy chủ thư.
+- Thư thử của bước thiết lập được gửi dưới dạng thư Hệ thống, nên phải có một nhà cung cấp gửi thư mang luồng Hệ thống.
+- Sau đó, bạn đọc thư trả lời trong <UiPath path="nav.audience > replies.tab" />; xem
+  [đọc và xử lý thư trả lời](/vi/audience/replies/).
+
+## Chọn cách ReputeCast nhận thư
+
+Bảy nhà cung cấp gửi thư tự thiết lập việc nhận thư: ReputeCast đăng ký qua API của họ khi bạn lưu tuyến, và bạn thêm
+bản ghi MX của [tên miền nhận thư](/vi/reference/glossary/#receiving-domain). Với Amazon SES và Postal, bạn làm theo các
+bước mà ReputeCast hiển thị trong trang quản trị (console) của chúng.
+
+<TableScroll label="Nhận thư theo nhà cung cấp gửi thư">
+
+| Nhà cung cấp gửi thư | Thiết lập | Bản ghi MX của tên miền nhận thư | Những gì bạn kiểm tra ở nhà cung cấp gửi thư |
+| --- | --- | --- | --- |
+| [Postmark](/vi/providers/postmark/) | ReputeCast đặt webhook nhận thư (inbound webhook) và inbound domain của server | `10 inbound.postmarkapp.com` | Không cần gì |
+| [Mailgun](/vi/providers/mailgun/) | ReputeCast thêm một route chuyển tiếp mọi thư của tên miền | `10 mxa.mailgun.org` và `10 mxb.mailgun.org` (khu vực EU: `mxa.eu.mailgun.org`, `mxb.eu.mailgun.org`) | Tên miền có trong Mailgun › Domains |
+| [SendGrid](/vi/providers/sendgrid/) | ReputeCast thêm một thiết lập Inbound Parse gửi thư gốc kèm kiểm tra spam, có chữ ký khi tài khoản cho phép | `10 mx.sendgrid.net` | Tên miền là một authenticated domain hoặc tên miền phụ của một authenticated domain; khóa Restricted Access có quyền Inbound Parse |
+| [Resend](/vi/providers/resend/) | ReputeCast thêm một webhook cho `email.received` | Bản ghi mà Resend hiển thị cho tên miền | Receiving đã được bật cho tên miền trong Resend › Domains |
+| [SparkPost](/vi/providers/sparkpost/) | ReputeCast thêm inbound domain và một relay webhook | `rx1`, `rx2` và `rx3.sparkpostmail.com` (EU: `rx1.eu.sparkpostmail.com`, v.v.); tài khoản Enterprise dùng host riêng | Không cần gì |
+| [Mailjet](/vi/providers/mailjet/) | ReputeCast thêm một parse route cho mọi địa chỉ của tên miền | `10 parse.mailjet.com` | Tên miền đã được xác thực (validated) trong Mailjet, và gói trả phí của tài khoản có Parse API |
+| [Brevo](/vi/providers/brevo/) | ReputeCast thêm một webhook nhận thư (inbound webhook) cho tên miền | `10 inbound1.sendinblue.com` và `20 inbound2.sendinblue.com` | Tên miền khác với tên miền bạn dùng để gửi thư, và thuộc một tên miền đã xác minh trong Brevo |
+| [Amazon SES](/vi/providers/amazon-ses/) | Bạn thêm một receipt rule phát (publish) tới một SNS topic, và một HTTPS subscription | `10 inbound-smtp.<region>.amazonaws.com` | Xem [nhận thư qua Amazon SES](#nhận-thư-qua-amazon-ses) |
+| [Postal](/vi/providers/postal/) | Bạn thêm một HTTP endpoint và một route | `10 <your Postal host>` | Xem [nhận thư qua Postal](#nhận-thư-qua-postal) |
+| Một hộp thư IMAP hoặc POP3 | ReputeCast đăng nhập mỗi phút và đọc những gì đã đến | Bản ghi của chính hộp thư | Hãy dùng một hộp thư chỉ dành cho ReputeCast |
+
+</TableScroll>
+
+[Azure Communication Services](/vi/providers/azure-communication-services/), [máy chủ SMTP](/vi/providers/smtp/),
+[adapter HTTP chung](/vi/providers/generic-http/) và các adapter cộng đồng không nhận thư. Bước thiết lập liệt kê chúng ở
+dạng mờ, kèm dòng "… không nhận thư. Hãy dùng một hộp thư."
+
+## Thiết lập nhận thư
+
+<Steps>
+
+1. Mở <UiPath path="nav.settings > settings.senders" />. Khi chưa có tuyến nào, thẻ
+   <UiPath path="senders.receiving.title" /> ghi <UiPath path="senders.receiving.statusNotSetUp" />, thư trả lời đến địa
+   chỉ trả lời (reply-to) và báo cáo DMARC đến các địa chỉ trong bản ghi DMARC của bạn. Chọn
+   <UiPath path="senders.receiving.setUp" />.
+
+   <Screenshot
+     id="receiving-not-set-up"
+     alt="Thẻ Nhận thư ghi Chưa thiết lập: ReputeCast có thể nhận thư trả lời, email hủy đăng ký và báo cáo DMARC qua một nhà cung cấp đã kết nối hoặc một hộp thư, cho đến lúc đó thư trả lời đến địa chỉ reply-to, kèm nút Thiết lập nhận thư."
+   />
+
+2. Trong <UiPath path="senders.receiving.step1" />, chọn một trong các nhà cung cấp gửi thư bạn đã kết nối hoặc
+   <UiPath path="senders.receiving.choiceMailbox" />. Mỗi nhà cung cấp cho biết ai thiết lập tuyến; nhà cung cấp không
+   nhận được thư hiện ở dạng mờ. Chọn <UiPath path="senders.receiving.continue" />.
+
+   <Screenshot
+     id="receiving-setup-how"
+     alt="Bước 1/3, ReputeCast nhận thư bằng cách nào: Postmark đang được chọn và tự thiết lập webhook nhận thư, Amazon SES và Postal cần thêm thủ công một receipt rule hoặc một route, và một hộp thư đọc qua IMAP hoặc POP3 là lựa chọn thay thế."
+   />
+
+3. Trong <UiPath path="senders.receiving.step2" />, nhập nơi thư đến:
+
+   - **Nhà cung cấp gửi thư:** <UiPath path="senders.receiving.domain" /> để nhận thư. Ghi chú bên dưới cho biết các địa
+     chỉ mà thư trả lời, email hủy đăng ký và báo cáo quay về.
+
+     <Screenshot
+       id="receiving-setup-domain"
+       alt="Bước 2, Chi tiết, cho Postmark: tên miền reply.news.acme.io, và ghi chú rằng thư trả lời quay về các địa chỉ r- trên tên miền đó, email hủy đăng ký đến các địa chỉ u- và báo cáo đến dmarc@ và fbl@, với webhook nhận thư của Postmark trỏ về ReputeCast chỉ cho tên miền này."
+     />
+
+   - **Hộp thư:** <UiPath path="senders.receiving.mbAddress" /> của hộp thư (không có phần sau dấu cộng, tối đa 22 ký tự
+     trước `@`), <UiPath path="senders.receiving.mbProtocol" /> (IMAP hoặc POP3),
+     <UiPath path="senders.receiving.mbServer" />, <UiPath path="senders.receiving.mbPort" /> (993 trừ khi bạn đổi),
+     <UiPath path="senders.receiving.mbSecurity" /> (TLS hoặc STARTTLS), <UiPath path="senders.receiving.mbUser" /> và
+     <UiPath path="senders.receiving.mbPassword" />. Thư trả lời quay về các địa chỉ `<mailbox>+r-…`, nên hộp thư nhận
+     chúng mà không cần quy tắc nào. Khi ReputeCast đã lấy một thư, IMAP đánh dấu thư là đã đọc còn POP3 xóa thư.
+
+     <Screenshot
+       id="receiving-setup-mailbox"
+       alt="Bước 2, Chi tiết, cho một hộp thư: địa chỉ, IMAP với cổng 993 và TLS, các trường máy chủ, tên người dùng và mật khẩu, cùng ghi chú hãy dùng một hộp thư chỉ dành cho ReputeCast vì thư được đánh dấu đã đọc hoặc bị xóa khi ReputeCast đã lấy."
+     />
+
+4. Chọn <UiPath path="senders.receiving.continue" />. ReputeCast lưu tuyến, và với bảy nhà cung cấp gửi thư tự thiết lập
+   việc nhận thư, ReputeCast đăng ký tuyến tại nhà cung cấp gửi thư ngay lập tức.
+
+5. Trong <UiPath path="senders.receiving.step3" />, thêm bản ghi MX được hiển thị tại nhà cung cấp DNS của bạn.
+   ReputeCast tra cứu bản ghi trong lúc hộp thoại đang mở và hiển thị <UiPath path="senders.receiving.mxFound" />,
+   <UiPath path="senders.receiving.mxMissing" />, <UiPath path="senders.receiving.mxWrong" /> hoặc
+   <UiPath path="senders.receiving.mxUnknown" />. Với Amazon SES, Postal và các nhà cung cấp gửi thư có điều cần kiểm
+   tra, các bước trong trang quản trị của nhà cung cấp gửi thư hiện tiếp theo, theo thứ tự, kèm
+   <UiPath path="senders.receiving.hookAddress" /> để dán vào nơi mà bước thiết lập yêu cầu.
+
+6. Chọn <UiPath path="senders.receiving.sendTest" />. Nút này dùng được khi bản ghi MX đã được tìm thấy. ReputeCast gửi
+   email tới một địa chỉ `t-` trên tên miền nhận thư và kiểm tra mỗi 3 giây cho đến khi thư quay về. Chọn
+   <UiPath path="senders.receiving.done" />.
+
+</Steps>
+
+Để thay đổi tuyến về sau, chọn <UiPath path="senders.receiving.edit" /> trên thẻ. Lưu một nhà cung cấp gửi thư hoặc tên
+miền khác sẽ gỡ đăng ký của ReputeCast khỏi nhà cung cấp hoặc tên miền cũ. Mật khẩu đã lưu của hộp thư được giữ khi bạn
+để trống trường này, miễn là máy chủ và tên người dùng không đổi; đổi một trong hai thì bạn phải nhập lại mật khẩu.
+
+### Nhận thư qua Amazon SES
+
+Amazon SES nhận thư qua một receipt rule trong AWS console. ReputeCast hiển thị các bước này trong hộp thoại, với tên
+miền, khu vực và địa chỉ nhận của bạn đã được điền sẵn:
+
+<Steps>
+
+1. Trong Amazon SES console, mở **Email receiving** › **Rule sets** và thêm một rule vào rule set đang hoạt động cho tên
+   miền nhận thư, với action **Publish to Amazon SNS topic**, encoding **Base64**, và một SNS topic trong cùng khu vực.
+
+2. Nhập ARN của topic vào <UiPath path="ses.inbound.topicArn" /> và chọn
+   <UiPath path="senders.receiving.saveSettings" />. ReputeCast chỉ chấp nhận thư từ topic đó.
+
+3. Trong Amazon SNS, thêm một subscription vào topic với protocol **HTTPS** và địa chỉ nhận làm endpoint. Đừng tự xác
+   nhận subscription: ReputeCast xác nhận khi SNS yêu cầu, và chỉ cho topic bạn đã nhập.
+
+</Steps>
+
+Bản ghi MX trỏ tới `inbound-smtp.<region>.amazonaws.com` ở khu vực của topic. Không phải khu vực AWS nào cũng nhận thư;
+khi khu vực của kết nối không nhận thư, bước đầu tiên nói rõ điều đó và liệt kê các khu vực có nhận thư. Amazon SES trả
+lại (bounce) thư lớn hơn 150 KB thay vì phát tới SNS, nên thư trả lời có tệp đính kèm lớn không bao giờ đến được
+ReputeCast
+([Amazon SES, "Publish to an Amazon SNS topic action"](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-sns.html),
+kiểm tra tháng 11/2026).
+
+### Nhận thư qua Postal
+
+API của Postal không có route hay endpoint, nên bạn tự thêm cả hai trong Postal:
+
+<Steps>
+
+1. Trong **Routing** › **HTTP Endpoints** của mail server, thêm một endpoint với địa chỉ nhận làm URL, encoding **Sent in
+   the body as JSON** và format **Delivered as the raw message**.
+
+2. Trong **Routing** › **Routes**, thêm một route với tên `*` và tên miền nhận thư, chọn HTTP endpoint đó làm endpoint.
+   Tên miền phải là một trong các tên miền đã xác minh của mail server.
+
+3. Trỏ bản ghi MX của tên miền nhận thư tới máy chủ Postal của bạn, trừ khi bản cài đặt Postal của bạn liệt kê các máy chủ
+   MX khác trong thiết lập `dns.mx_records`.
+
+</Steps>
+
+Postal ký những gì nó gửi đi bằng khóa của server, như cách nó ký webhook, và ReputeCast kiểm tra chữ ký đó.
+
+## Đọc thẻ Nhận thư
+
+<Screenshot
+  id="receiving-card"
+  alt="Thẻ Nhận thư của Acme Newsletter: đang nhận qua Postmark tại reply.news.acme.io kèm thời điểm của thư gần nhất, bản ghi MX 10 inbound.postmarkapp.com ở trạng thái Đã tìm thấy, và các địa chỉ nhận báo cáo DMARC và báo cáo feedback loop kèm nút Sao chép."
+>
+  1. Trạng thái của tuyến.
+  2. Kiểm tra tuyến, thay đổi tuyến hoặc dừng nhận thư.
+  3. Cách không gian làm việc nhận thư: nhà cung cấp gửi thư và tên miền, hoặc hộp thư, kèm thư gần nhất.
+  4. Bản ghi MX mà tên miền nhận thư cần, và kết quả DNS cho bản ghi đó.
+  5. Các địa chỉ cố định cho báo cáo DMARC và báo cáo vòng phản hồi.
+</Screenshot>
+
+<TableScroll label="Các trạng thái nhận thư">
+
+| Trạng thái | Ý nghĩa | Việc cần làm |
+| --- | --- | --- |
+| <UiPath path="senders.receiving.statusNotSetUp" /> | Chưa có tuyến. Thư trả lời đến địa chỉ trả lời (reply-to). | Thiết lập nhận thư. |
+| <UiPath path="senders.receiving.statusPending" /> | Tuyến đã được lưu và chưa có thư nào đến. | Thêm bản ghi MX, hoặc hoàn tất các bước ở nhà cung cấp gửi thư, rồi gửi thư thử. |
+| <UiPath path="senders.receiving.statusReceiving" /> | Đã có thư đến (thư thử cũng được tính), và từ đó không có dấu hiệu nào cho thấy việc nhận thư đã dừng. | Không cần làm gì. |
+| <UiPath path="senders.receiving.statusFailing" /> | Bản ghi MX không còn trỏ tới nhà cung cấp gửi thư, hoặc hộp thư từ chối đăng nhập hay không kết nối được. Thẻ cho biết trường hợp nào. | Trỏ lại bản ghi MX, hoặc kiểm tra tên người dùng và mật khẩu trong <UiPath path="senders.receiving.edit" />. |
+
+</TableScroll>
+
+- ReputeCast kiểm tra bản ghi MX của tuyến qua nhà cung cấp gửi thư đang nhận thư mỗi 15 phút. Khi bản ghi không còn chỉ
+  tới host của nhà cung cấp gửi thư, tuyến chuyển sang <UiPath path="senders.receiving.statusFailing" /> và những thành
+  viên quản lý được tên miền nhận một thông báo "Việc nhận thư đã dừng". Tuyến trở lại
+  <UiPath path="senders.receiving.statusReceiving" /> khi có thư tiếp theo. Resend hiển thị bản ghi MX riêng cho từng
+  tên miền, nên ReputeCast không kiểm tra bản ghi đó với Resend.
+- Một hộp thư từ chối đăng nhập hoặc không kết nối được cũng làm tuyến chuyển sang
+  <UiPath path="senders.receiving.statusFailing" />, kèm một thông báo. ReputeCast thử lại mỗi phút, trong lúc đó thư
+  chờ trong hộp thư, và tuyến nhận thư trở lại ở lần đọc thành công tiếp theo.
+- Khi nhà cung cấp gửi thư từ chối việc đăng ký, thẻ ghi "ReputeCast không thể thiết lập việc nhận thư tại …" kèm câu
+  trả lời của nhà cung cấp gửi thư. Không có thư nào đến cho đến khi bạn khắc phục nguyên nhân ở đó và lưu lại tuyến.
+- Một báo cáo DMARC về một tên miền mà không gian làm việc không dùng để gửi thư sẽ bị bỏ, và thẻ cho biết điều đó.
+
+## Các địa chỉ trên tên miền nhận thư
+
+Mọi địa chỉ ReputeCast cấp đều mang một mã nhận diện (tag): một chữ cái, mã của thư và một chuỗi băm có khóa, nên không ai
+đoán được địa chỉ của thư khác, và một địa chỉ bị sửa được xem là thư khác. Tuyến hộp thư đặt cùng các phần đó sau dấu
+cộng, ví dụ `replies+r-…@acme.io` và `replies+dmarc@acme.io`.
+
+<TableScroll label="Các địa chỉ trên tên miền nhận thư">
+
+| Địa chỉ | Nơi ReputeCast dùng | Điều xảy ra với thư gửi đến đó |
+| --- | --- | --- |
+| `r-<tag>@` | Reply-To của mỗi chiến dịch, email tự động hóa và bản sao kiểm tra vị trí thư, khi thư trả lời được giữ trong hộp thư | Thư vào [hộp thư trả lời](/vi/reference/glossary/#replies-inbox), gắn với liên hệ và email mà nó trả lời; thư trả lời tự động và thư rác được tách riêng |
+| `u-<tag>@` | `mailto:` của `List-Unsubscribe`, khi tuyến đang nhận thư và không gian làm việc bật tùy chọn này | ReputeCast hủy đăng ký cho liên hệ, như liên kết một lần nhấp |
+| `t-<tag>@` | Thư thử của bước thiết lập | Thẻ hiển thị thư đã đến |
+| `dmarc@` | `rua=` trong bản ghi DMARC của bạn | ReputeCast lưu báo cáo tổng hợp |
+| `fbl@` | Địa chỉ bạn đưa cho các vòng phản hồi gửi báo cáo theo định dạng ARF | Khiếu nại được tính là sự kiện khiếu nại của nhà cung cấp gửi thư |
+| Mọi địa chỉ khác | Không dùng ở đâu | Thư vào <UiPath path="replies.viewOther" /> trong hộp thư trả lời |
+
+</TableScroll>
+
+ReputeCast giữ mỗi thư một lần: cùng một Message-ID đến hai lần chỉ được áp dụng một lần.
+
+## Giữ thư trả lời trong hộp thư ReputeCast
+
+Khi thẻ ghi <UiPath path="senders.receiving.statusReceiving" />, mở
+<UiPath path="senders.defaultsTitle > senders.replyHandling" /> trên cùng trang, chọn
+<UiPath path="senders.receiving.keepInInbox" /> và lưu. Trước đó, tùy chọn này hiện mờ ("hãy thiết lập Nhận thư
+trước").
+
+<Screenshot
+  id="settings-senders-defaults"
+  alt="Thẻ Mặc định trong Cài đặt, Người gửi: xử lý thư trả lời đặt là Giữ thư trả lời trong hộp thư ReputeCast, công tắc Thêm địa chỉ mailto: vào List-Unsubscribe đang tắt kèm ghi chú rằng email hủy đăng ký đến ReputeCast, và công tắc Thêm tham số UTM vào liên kết đang tắt kèm ba tham số mà nó thêm."
+>
+  1. Xử lý thư trả lời: chuyển tiếp thư trả lời đến một địa chỉ, dùng địa chỉ trả lời riêng của từng người gửi, hoặc giữ
+     chúng trong ReputeCast.
+  2. Địa chỉ `mailto:` trong `List-Unsubscribe`, mặc định tắt.
+  3. Tham số UTM trên liên kết, mặc định tắt.
+</Screenshot>
+
+Từ đó, chiến dịch, email tự động hóa và bản sao kiểm tra vị trí thư mang một Reply-To trên tên miền nhận thư, mỗi thư một
+địa chỉ, với tên hiển thị lấy từ địa chỉ trả lời của người gửi, nếu không có thì lấy tên của người gửi. Một chiến dịch áp
+dụng thiết lập này khi lần gửi của nó bắt đầu. Thư trả lời của người đọc có thể
+[dừng một tự động hóa](/vi/automations/triggers-and-steps/), và [Độ sẵn sàng gửi](/vi/campaigns/send-readiness/) cảnh
+báo khi thư trả lời sẽ đến ReputeCast trong lúc tuyến chưa nhận được thư đầu tiên hoặc đang lỗi.
+
+## Xử lý email hủy đăng ký
+
+`List-Unsubscribe` chỉ mang liên kết một lần nhấp, trừ khi <UiPath path="senders.listUnsubscribeMailto" /> được bật trong
+cùng thẻ <UiPath path="senders.defaultsTitle" />. Khi tùy chọn này bật và tuyến đang nhận thư, địa chỉ `mailto:` là địa
+chỉ `u-` riêng của thư, với tiêu đề `unsubscribe`. Email gửi tới đó hủy đăng ký cho liên hệ trong vòng một phút, như liên
+kết một lần nhấp: liên hệ rời mọi danh sách, lịch sử đồng ý ghi nguồn `mailto`, và lượt hủy đăng ký được tính cho chiến
+dịch hoặc bước tự động hóa. Không ai phải xóa những người đọc này bằng tay. Hãy đọc
+[hủy đăng ký một lần nhấp](/vi/deliverability/one-click-unsubscribe/) để biết về các header.
+
+## Thu thập báo cáo DMARC và báo cáo khiếu nại
+
+- **Báo cáo tổng hợp DMARC.** Thêm địa chỉ `dmarc@` vào `rua=` của bản ghi DMARC, ví dụ
+  `v=DMARC1; p=none; rua=mailto:dmarc@reply.news.acme.io`. Khi có tuyến nhận thư, bản ghi DMARC mà ReputeCast gợi ý cho
+  một tên miền bạn thêm sẽ liệt kê địa chỉ này, sau địa chỉ của HostRepute khi HostRepute được kết nối. Báo cáo về các
+  tên miền gửi thư của không gian làm việc và tên miền tổ chức của chúng được lưu; các báo cáo khác bị bỏ. Thẻ DMARC
+  trong <UiPath path="nav.deliverability" /> cho biết báo cáo đến đâu và báo cáo gần nhất đến lúc nào. Xem
+  [đọc báo cáo tổng hợp DMARC](/vi/deliverability/dmarc-reports/).
+- **Báo cáo vòng phản hồi.** Một báo cáo khiếu nại theo định dạng ARF đến `fbl@` trở thành sự kiện khiếu nại của nhà cung
+  cấp gửi thư đã gửi thư đó, theo quy tắc áp dụng cho báo cáo không có chữ ký: báo cáo chỉ được tính cho một thư mà
+  ReputeCast đã gửi, tới đúng người nhận đó, và chỉ một lần. Địa chỉ bị đưa vào danh sách chặn gửi, như với mọi khiếu
+  nại. Xem [thư trả lại và khiếu nại](/vi/deliverability/bounces-and-complaints/).
+
+## Dừng nhận thư
+
+Chọn <UiPath path="senders.receiving.remove" /> trên thẻ. Hộp thoại liệt kê những gì thay đổi, rồi
+<UiPath path="senders.receiving.removeConfirm" /> gỡ tuyến:
+
+- Thư trả lời đã nhận vẫn ở trong <UiPath path="nav.audience > replies.tab" />.
+- Xử lý thư trả lời quay về chuyển tiếp thư trả lời, đến địa chỉ trả lời của không gian làm việc.
+- Email hủy đăng ký không còn được xử lý: địa chỉ `mailto:` quay về địa chỉ trả lời.
+- ReputeCast gỡ những gì nó đã thiết lập ở nhà cung cấp gửi thư. Hãy xóa bản ghi MX khi không còn gì dùng tên miền đó.
+  Tuyến hộp thư ngừng được đọc, và thư trong hộp thư vẫn giữ nguyên.
+
+Việc thiết lập, thay đổi, kiểm tra và gỡ tuyến được ghi vào [nhật ký kiểm tra](/vi/team/audit-log/).
+
+## Mặc định và giới hạn
+
+<LimitsTable area="receiving" />
+
+Thư đã nhận được giữ một năm, bản thư gốc lúc đến được giữ 7 ngày; xem
+[đọc và xử lý thư trả lời](/vi/audience/replies/). Xóa vĩnh viễn một liên hệ sẽ xóa thư nhận được từ họ và những gì đã
+đến cho liên hệ đó.
+
+## Kiểm tra kết quả
+
+- Thẻ ghi <UiPath path="senders.receiving.statusReceiving" />, và lần thử hiển thị "Đã nhận lúc …" cùng "Tuyến nhận hoạt
+  động".
+- Một thư trả lời cho chiến dịch gửi sau khi bạn chọn <UiPath path="senders.receiving.keepInInbox" /> hiện trong
+  <UiPath path="nav.audience > replies.tab" />.
+- Thẻ DMARC trong <UiPath path="nav.deliverability" /> ghi "Báo cáo đến dmarc@…" khi một bên nhận thư gửi báo cáo tới
+  đó.
+
+## Khắc phục sự cố
+
+- **<UiPath path="senders.receiving.testMissing" />** sau 2 phút: bản ghi MX chưa trỏ tới host của nhà cung cấp gửi thư,
+  còn thiếu một bước ở nhà cung cấp gửi thư, hoặc, với hộp thư, thư gửi tới địa chỉ của nó không vào được hộp thư hay
+  ReputeCast không đăng nhập được. Thay đổi DNS có thể mất một lúc; hãy gửi thư thử khác khi bản ghi hiển thị
+  <UiPath path="senders.receiving.mxFound" />.
+- **"Một workspace khác đã nhận thư tại …"**: mỗi tên miền thuộc về một không gian làm việc trên hệ thống. Hãy dùng một
+  tên miền phụ khác.
+- **"… không phải là tên miền gửi thư đã xác minh của workspace này, cũng không nằm dưới tên miền nào như vậy"**: hãy xác
+  minh tên miền trước, hoặc chọn một tên miền phụ của một tên miền đã xác minh.
+- **"… đã nhận thư tại …"**: bản ghi MX của tên miền chỉ tới một máy chủ khác, và chuyển chúng đi sẽ cắt thư đó. Hãy dùng
+  một tên miền phụ chỉ dành cho ReputeCast, ví dụ `reply.` ghép với tên miền.
+- **"Hãy nhập địa chỉ hộp thư không có phần sau dấu cộng"**: ReputeCast tự thêm phần sau dấu cộng của nó. Hãy nhập địa
+  chỉ thường.
+- **"Hãy nhập lại mật khẩu: máy chủ hoặc tên người dùng đã thay đổi."**: mật khẩu đã lưu chỉ được gửi tới máy chủ và tên
+  người dùng mà nó được nhập cho.
+- **"ReputeCast không thể gửi thư thử: chưa có nhà cung cấp nào gửi thư Hệ thống."**: hãy định tuyến luồng Hệ thống tới
+  một nhà cung cấp gửi thư trong [định tuyến](/vi/providers/routing/).
+- **"Hãy chờ … giây trước khi gửi thư thử khác."**: mỗi 30 giây chỉ gửi được một thư thử.
+- **Thẻ cho biết ReputeCast không thể thiết lập việc nhận thư tại một nhà cung cấp gửi thư**: hãy đọc câu trả lời của nhà
+  cung cấp. Nguyên nhân thường gặp là khóa SendGrid không có quyền Inbound Parse, gói Mailjet không có Parse API, hoặc
+  một tên miền mà nhà cung cấp gửi thư không có. Hãy khắc phục ở đó, rồi lưu lại tuyến trong
+  <UiPath path="senders.receiving.edit" />.
+- **Amazon SES không bao giờ xác nhận subscription**: hãy nhập và lưu ARN của SNS topic trước khi thêm subscription;
+  ReputeCast từ chối mọi topic khác. Xóa subscription và thêm lại.
+- **Thư trả lời lớn qua Amazon SES bị mất**: Amazon SES trả lại thư lớn hơn 150 KB. Hãy dùng nhà cung cấp gửi thư khác
+  hoặc một hộp thư nếu người đọc của bạn gửi tệp đính kèm lớn.
+- **Nhà cung cấp gửi thư báo lỗi khi gửi tới ReputeCast**: địa chỉ nhận trả lời `401` khi yêu cầu không được ký hoặc xác
+  thực như tuyến yêu cầu, `404` cho một địa chỉ không thuộc tuyến nào, `413` khi vượt quá 25 MiB, và `429` với
+  `Retry-After: 30` khi ReputeCast đang bận hoặc tạm thời không lưu được, để nhà cung cấp gửi thư thử lại.
+
+<Aside type="note">
+ReputeCast chỉ lưu một phần của yêu cầu không vượt qua bước kiểm tra, để chẩn đoán, và không bao giờ xử lý nó. Đổi URL
+công khai không chuyển một tuyến mà nhà cung cấp gửi thư đã thiết lập: hãy lưu lại tuyến trong
+<UiPath path="senders.receiving.edit" /> để ReputeCast đăng ký địa chỉ mới, và tự cập nhật địa chỉ trong Amazon SES hoặc
+Postal.
+</Aside>
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Đọc và xử lý thư trả lời" href="/vi/audience/replies/" />
+  <LinkCard title="Thêm tên miền gửi thư và người gửi" href="/vi/providers/senders-and-domains/" />
+  <LinkCard title="Hủy đăng ký một lần nhấp (RFC 8058)" href="/vi/deliverability/one-click-unsubscribe/" />
+  <LinkCard title="Đọc báo cáo tổng hợp DMARC" href="/vi/deliverability/dmarc-reports/" />
+</CardGrid>

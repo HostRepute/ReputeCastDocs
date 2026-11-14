@@ -14,6 +14,9 @@ sources:
   - internal/providers/smtp
   - internal/providers/manage/review_health.go
   - internal/providers/provider.go
+  - internal/providers/ses/sns.go
+  - internal/providers/webhookauth/replay.go
+  - internal/providers/mailgun/webhook.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
   - internal/app/wire_sending.go
@@ -47,6 +50,15 @@ und teilt jeden Bounce und jede Beschwerde über eine gemeinsame [Sperrliste](/d
    SNS-Signatur bei Amazon SES, ein HMAC bei Mailgun, eine ECDSA-Signatur bei SendGrid, ein gemeinsamer
    Signaturschlüssel bei Anbietern, die nicht signieren). Eine Anfrage, die die Prüfung nicht besteht, wird mit `401`
    beantwortet und nie verarbeitet; ihre ersten 2 KB werden für die Diagnose aufbewahrt.
+   Seit Version 1.5.0 verlangt ReputeCast bei zwei Signaturen mehr als eine gültige Signatur:
+   - **SNS** signiert die Topics aller AWS-Konten gleich, daher nimmt ReputeCast eine Nachricht nur vom eigenen Topic
+     der Verbindung an, signiert mit einem Zertifikat eines regionalen SNS-Endpunkts, `sns.<region>.amazonaws.com`. Es
+     speichert das Topic, bevor es den Webhook abonnieren lässt, und vertraut keinem Topic, solange keines gespeichert
+     ist.
+   - **Mailgun** signiert ein Einmal-Token statt des Ereignisses. ReputeCast bindet jedes Token in seiner Datenbank an
+     das Ereignis, mit dem es zuerst kam, sodass kein ReputeCast-Prozess dieses Token mit einem anderen Ereignis
+     annimmt, auch nicht nach einem Neustart. Eine erneute Zustellung desselben Ereignisses besteht die Prüfung und wird
+     einmal gezählt.
 3. **Es speichert die Roh-Payload und antwortet sofort.** Eine verifizierte Payload wird so gespeichert, wie sie
    ankam, und der Anbieter erhält sofort `200`, damit eine langsame Verarbeitung einen Anbieter nie zu Wiederholungen
    oder zum Aufgeben bringt. Kann ReputeCast sie nicht speichern, antwortet es mit `429` und `Retry-After: 30` statt mit
@@ -73,6 +85,9 @@ Ereignisse, die nicht über einen Webhook kommen, nehmen ab Schritt 4 denselben 
   benachrichtigt, weil Bounces von diesem Server die Sperrliste erst wieder erreichen, wenn das Postfach lesbar ist.
 - **Abfrage**: ReputeCast fragt die Event-API von Mailgun oder SparkPost jede Minute ab, wenn Sie im
   Verbindungsassistenten die Abfrage gewählt haben.
+- **Feedback-Loop-Berichte per E-Mail**: Solange ReputeCast [E-Mails empfängt](/de/providers/receiving-mail/), wird ein
+  Beschwerdebericht im ARF-Format, der an der Adresse `fbl@` der Empfangsdomain ankommt, zu einem `complaint`-Ereignis
+  des Versandanbieters, der die Nachricht gesendet hat. Verfügbar ab der nächsten Version nach 1.6.0.
 
 Ein Anbieter, dessen Ereignisse ausbleiben, während E-Mails hinausgehen, wird mit stummen Webhooks markiert, und einer,
 der nie ein Ereignis gemeldet hat, wird markiert, sobald E-Mails 30 Minuten überfällig sind;
@@ -125,8 +140,12 @@ Ereignistyp, oder suchen Sie nach einem Empfänger oder einer Nachrichten-ID.
 
 <Screenshot
   id="providers-events"
-  alt="Das Ereignisprotokoll: Rohereignisse von Postmark, Amazon SES und Postal neben ihren normalisierten Typen (Zustellung, Hard Bounce, Zurückstellung, Beschwerde, Soft Bounce, abgelehnt), jeweils mit ursprünglichem SMTP-Code und Diagnose."
+  alt="Das Ereignisprotokoll aller Versandanbieter und Ereignisse: jedes Rohereignis, etwa Delivery oder Bounce/Permanent/General von Amazon SES, neben seinem normalisierten Typ, Zustellung oder Hard Bounce, mit dem ursprünglichen Code und der Diagnose, dem maskierten Empfänger und dem Automationsschritt, von dem es stammt."
 />
+
+Empfangene E-Mails wie Antworten sind keine Ereignisse eines Versandanbieters, und die Empfangsadresse, an der sie
+ankommen, `/hooks/inbound/<token>`, ist von den Ereignis-Webhooks getrennt. Lesen Sie
+[E-Mail-Empfang einrichten](/de/providers/receiving-mail/). Verfügbar ab der nächsten Version nach 1.6.0.
 
 <UiPath path="providers.events.exportCsv" /> lädt die gefilterten Ereignisse herunter. Empfänger bleiben maskiert, sofern
 Sie nicht die Berechtigung `subscribers:export` haben, und jeder Export wird im

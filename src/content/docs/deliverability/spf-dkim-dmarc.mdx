@@ -15,6 +15,7 @@ sources:
   - internal/domains/cloudflare.go
   - internal/domains/api.go
   - internal/dnscheck/auth.go
+  - internal/readiness/technical.go
   - internal/dnscheck/domain.go
   - internal/readiness/assemble.go
   - internal/providers/ses/ses.go
@@ -44,14 +45,15 @@ Cloudflare, Amazon Route 53 or any other DNS host, and how to read their live st
 | ------ | ------------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | SPF    | TXT                      | The domain in the envelope sender (MAIL FROM)        | The server that handed over the message may send for that domain.                             |
 | DKIM   | CNAME or TXT             | `<selector>._domainkey.<domain>`                     | The message was signed by the sending provider with a key you published, and wasn't altered. |
-| DMARC  | TXT                      | `_dmarc.<domain>`, or the organizational domain      | What receivers do when neither SPF nor DKIM passes in line with the From address.             |
+| DMARC  | TXT                      | `_dmarc.<domain>`, or a parent domain                | What receivers do when neither SPF nor DKIM passes in line with the From address.             |
 
 </TableScroll>
 
 DMARC passes when SPF or DKIM passes **and** its domain is aligned with the domain in the From address. In relaxed
 mode, the default, both domains need the same organizational domain: `bounce.news.acme.io` aligns with
 `news.acme.io`. In strict mode they must be identical
-([RFC 7489, section 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), checked October 2026).
+([RFC 9989, section 4.4](https://www.rfc-editor.org/rfc/rfc9989#section-4.4), checked November 2026). RFC 9989 replaced
+RFC 7489 as the DMARC standard in May 2026.
 
 That is why ReputeCast asks for a custom return path (MAIL FROM) on your own domain wherever the sending provider
 supports one: SPF is checked against the return path, so with the sending provider's default return path only DKIM
@@ -118,11 +120,30 @@ Proposed:   v=spf1 mx include:spf.mtasv.net -all
 
 ### The DMARC row
 
-When no DMARC record exists for the domain or its organizational domain, ReputeCast suggests
-`v=DMARC1; p=quarantine; adkim=s; aspf=r`, plus `rua=mailto:` with HostRepute's report address when
-[HostRepute](/reference/glossary/#hostrepute) is connected. The row counts as verified as soon as any valid DMARC
-record is published at `_dmarc.<domain>` or at the organizational domain, including `p=none`. Read
-[Choose a DMARC policy](#choose-a-dmarc-policy) before you publish the suggestion.
+When no DMARC record applies to the domain, ReputeCast suggests `v=DMARC1; p=quarantine; adkim=s; aspf=r`, plus
+`rua=mailto:` with HostRepute's report address when [HostRepute](/reference/glossary/#hostrepute) is connected and the
+`dmarc@` address of the receiving domain while [ReputeCast receives mail](/providers/receiving-mail/). The row counts
+as verified as soon as a valid DMARC record applies, at `_dmarc.<domain>` or at a parent domain, including `p=none`.
+Read [Choose a DMARC policy](#choose-a-dmarc-policy) before you publish the suggestion. The `dmarc@` address comes with
+receiving mail. Available from the next release after 1.6.0.
+
+### How ReputeCast reads a DMARC record
+
+Since 1.6.0 ReputeCast reads DMARC records the way RFC 9989 describes
+([RFC 9989, sections 4.7 and 4.10](https://www.rfc-editor.org/rfc/rfc9989#section-4.10), checked November 2026):
+
+- **Policy discovery** starts at `_dmarc.<domain>` and walks up the parent domains, at most 8 lookups, to the first
+  usable record or to one with a `psd=` tag of `y` or `n`. A subdomain takes a parent's `sp=` policy, or its `np=`
+  policy when the subdomain doesn't exist in DNS; both default to `p=`.
+- **Tags RFC 9989 dropped**, `pct=`, `ri=` and `rf=`, are ignored, and so are tags it doesn't define. `t=`, `np=` and
+  `psd=` are read.
+- **A record without a valid `p=`** counts as `p=none` when it has a valid `rua=` address; otherwise receivers ignore
+  it, and at the domain itself ReputeCast shows it as invalid. So do two DMARC records at one name, and a record that
+  only looks like one, such as `v=dmarc1`.
+- **Test mode**, `t=y`, asks receivers to apply the policy one level lower: `quarantine` is treated as `none`, and
+  `reject` as `quarantine`. [Send Readiness](/campaigns/send-readiness/) says so in the <UiPath path="review.technicalDetails" /> of its
+  DMARC row.
+- **A DNS lookup that fails** stops the walk: the policy is unknown, not missing.
 
 ## Before you begin
 
@@ -285,8 +306,10 @@ v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
 
 Then read the reports for a few weeks and raise the policy once every legitimate source passes, as described in
 [Read DMARC aggregate reports](/deliverability/dmarc-reports/). A DMARC record at the organizational domain
-(`_dmarc.acme.io`) also covers subdomains such as `news.acme.io`; its `sp=` tag sets their policy, and ReputeCast
-reads it when the subdomain has no record of its own.
+(`_dmarc.acme.io`) also covers subdomains such as `news.acme.io`; its `sp=` tag sets their policy (`np=` for subdomains
+that don't exist), and ReputeCast reads it when the subdomain has no record of its own. To try a stricter policy
+first, publish it with `t=y`: receivers then apply one level less while the aggregate reports keep coming. RFC 9989 has
+no `pct=` tag any more, so a percentage no longer limits the policy.
 
 ## Check that it worked
 
@@ -313,6 +336,9 @@ reads it when the subdomain has no record of its own.
   a merged value before you publish it, so look at the status after publishing.
 - **SPF ends in `+all`.** ReputeCast treats it as invalid, because it lets anyone send as the domain. Use `~all` or
   `-all`.
+- **DMARC shows Invalid.** The domain publishes two DMARC records at `_dmarc.<domain>`, a record that doesn't start with
+  `v=DMARC1` exactly, or one with neither a valid `p=` nor a valid `rua=`. Keep one record that starts with
+  `v=DMARC1; p=`.
 - **A record stays Missing although you added it.** Check the name for a doubled zone (`news.acme.io.acme.io`) and
   that you edited the zone at the DNS host the nameservers point to.
 - **A DKIM CNAME at Cloudflare stays Pending.** Check that the record is **DNS only**, not proxied.

@@ -1,6 +1,6 @@
 ---
 title: Sichern und wiederherstellen
-description: ReputeCast mit pg_dump sichern, dazu den geheimen Schlüssel und den Dateiordner, dann alle drei in der richtigen Reihenfolge wiederherstellen und testen.
+description: ReputeCast mit pg_dump sichern, samt geheimem Schlüssel und Dateiordner oder Bucket, dann alle drei in der richtigen Reihenfolge wiederherstellen und testen.
 type: how-to
 audience: [operator]
 primaryKeyword: ReputeCast mit pg_dump sichern
@@ -18,15 +18,16 @@ sources:
   - migrations/00300_composer.sql
   - web/src/features/admin/instance/InstancePage.tsx
   - docs/deploy/backup-restore.md
+  - internal/blobstore
 sidebar:
-  order: 9
+  order: 11
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
-Sie sichern ReputeCast mit pg_dump, dem geheimen Schlüssel und dem Dateiordner: Eine Wiederherstellung braucht alle
-drei, die Datenbank allein reicht nicht.
+Sie sichern ReputeCast mit pg_dump, dem geheimen Schlüssel und den hochgeladenen Dateien (dem Dateiordner oder dem
+Bucket, der sie enthält): Eine Wiederherstellung braucht alle drei, die Datenbank allein reicht nicht.
 
 ## Was eine Sicherung enthält
 
@@ -34,7 +35,7 @@ drei, die Datenbank allein reicht nicht.
 | ---------------------- | -------------- | ----------- |
 | PostgreSQL-Datenbank   | Alles andere: Arbeitsbereiche, Kontakte, Kampagnen, hochgeladene Bilder, die Job-Warteschlange, das [Audit-Protokoll](/de/reference/glossary/#audit-log) und alle gespeicherten Zugangsdaten in verschlüsselter Form. | Die Datenbank in `database.url`. |
 | Geheimer Schlüssel     | Der AES-256-GCM-Schlüssel, der die Zugangsdaten der Anbieter, die Client Secrets für OIDC, die HostRepute-Token und die Seeds der Authenticator-Apps (TOTP) in der Datenbank verschlüsselt. | `REPUTECAST_SECRETS__KEY`, wenn Sie ihn setzen; sonst die Schlüsseldatei `secrets.key_file`: `/var/lib/reputecast/secret.key` in Docker, `data/secret.key` bei der Binärdatei (relativ zum Verzeichnis, in dem ReputeCast startet). |
-| Dateiordner            | Dateien digitaler Produkte und Lead-Magneten, die für die Datenbank zu groß sind. | `files.dir`; standardmäßig ein Ordner `files` neben der Schlüsseldatei (`/var/lib/reputecast/files` in Docker). Er entsteht, sobald jemand eine Datei hochlädt. |
+| Dateien                | Dateien digitaler Produkte, Lead-Magneten, laufende Uploads und Exporte der Zielgruppe, die für die Datenbank zu groß sind. | `files.dir`; standardmäßig ein Ordner `files` neben der Schlüsseldatei (`/var/lib/reputecast/files` in Docker). Er entsteht, sobald jemand eine Datei hochlädt. Mit `storage.backend: s3` stattdessen der [Bucket](/de/self-hosting/object-storage/). |
 
 Bewahren Sie auch Ihre Konfiguration auf: die Datei `.env` oder die Shell-Variablen, mit denen Sie Docker Compose
 starten, beziehungsweise bei der Binärdatei Ihre YAML-Konfigurationsdatei und Ihre Umgebungsdatei. Die
@@ -130,6 +131,14 @@ Die mitgelieferte Compose-Datei nennt das Projekt `reputecast`, daher heißen se
 </TabItem>
 </Tabs>
 
+### Bucket sichern
+
+Liegen die Dateien in einem S3-kompatiblen Bucket, sichern Sie den Bucket statt des Ordners: Schalten Sie seine
+Versionierung ein, replizieren Sie ihn in einen Bucket in einem anderen Konto oder einer anderen Region, oder kopieren
+Sie ihn mit den Tools Ihres Anbieters, etwa `aws s3 sync s3://reputecast-files ./files`, `rclone sync` oder
+`mc mirror`. Eine so erstellte Kopie lässt sich gleichermaßen in einen Ordner oder einen Bucket wiederherstellen, weil
+beide dieselben Schlüssel verwenden. Verfügbar ab der nächsten Version nach 1.6.0.
+
 ## Wiederherstellen
 
 Stellen Sie die Datenbank wieder her, bevor ReputeCast startet. Das Docker-Image läuft mit `--auto-install`: Auf einer
@@ -224,7 +233,8 @@ leeren Datenbank gestartet, legt es einen neuen ersten Inhaber an, den Sie bei e
    ```
 
 5. Legen Sie die Schlüsseldatei und den Dateiordner dorthin zurück, wohin `secrets.key_file` und `files.dir` zeigen,
-   lesbar nur für den Benutzer, unter dem ReputeCast läuft:
+   lesbar nur für den Benutzer, unter dem ReputeCast läuft (bei einem Bucket kopieren Sie seine Objekte zurück in den
+   Bucket, den die Schlüssel unter `storage.s3` nennen):
 
    ```sh
    tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
@@ -241,17 +251,21 @@ leeren Datenbank gestartet, legt es einen neuen ersten Inhaber an, den Sie bei e
 
 ## Prüfen, ob es funktioniert hat
 
-- `reputecast doctor` gibt `ok` für die Datenbank, das Schema, den geheimen Schlüssel, den Dateiordner und die Rolle
-  für SQL-Segmente aus. Der Befehl öffnet einige gespeicherte Werte jeder Art mit dem Schlüssel, sodass ein falscher
+- `reputecast doctor` gibt `ok` für die Datenbank, das Schema, den geheimen Schlüssel, den Dateispeicher und die Rolle
+  für SQL-Segmente aus. Der Dateispeicher ist der Dateiordner, der beschreibbar sein muss, oder der Bucket, der
+  antworten und ein Testobjekt annehmen, zurücklesen und löschen muss. Der Befehl öffnet einige gespeicherte Werte jeder Art mit dem Schlüssel, sodass ein falscher
   Schlüssel hier auffällt und nicht erst bei einem Aufruf eines Anbieters, und er endet mit `1`, wenn eine Prüfung
   fehlschlägt:
   - **SQL segments role** warnt auf einem neuen Server: Legen Sie die Rolle an (Schritt 3), führen Sie dann
     `reputecast migrate segments-role` aus und starten Sie ReputeCast neu.
   - **Previous keys** warnt, solange gespeicherte Werte noch einen Schlüssel aus `secrets.previous_keys` verwenden
     ([geheimen Schlüssel rotieren](/de/self-hosting/security/#schlüssel-rotieren)).
-  - **Public URL** warnt, wenn sie nicht mit `https://` beginnt. Hat sich die Adresse des Servers geändert, setzen Sie
+  - **Public URL** warnt, wenn sie nicht mit `https://` beginnt oder wenn `http.public_url_locked` eine Adresse
+    festschreibt, die nur der Server erreicht. Hat sich die Adresse des Servers geändert, setzen Sie
     `REPUTECAST_PUBLIC_URL`; wenn Sie sie unter <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />
     speichern, werden auch die Webhooks der Versandanbieter umgestellt.
+  - **GeoIP** zeigt den Typ und das Build-Datum der Datenbankdatei, `off` ohne eine, und warnt, wenn `geoip.database`
+    eine Datei nennt, die es nicht lesen kann ([GeoIP-Datenbank hinzufügen](/de/self-hosting/geoip/)).
 - `curl -s http://localhost:8080/readyz` antwortet `ready`. Siehe
   [Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/).
 - Die Protokolle der App enthalten kein `generated a new secret key`. Falls doch, hat ReputeCast den wiederhergestellten

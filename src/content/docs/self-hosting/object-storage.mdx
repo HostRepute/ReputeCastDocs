@@ -1,0 +1,254 @@
+---
+title: Keep files in S3-compatible object storage
+description: Keep ReputeCast's uploaded files in S3-compatible object storage such as AWS S3, MinIO, Cloudflare R2 or Spaces, and move the files folder into the bucket.
+type: how-to
+audience: [operator]
+primaryKeyword: S3-compatible object storage
+uiPath: 'shell.userMenuInstanceAdmin > admin.system'
+sources:
+  - internal/blobstore
+  - internal/config/config.go
+  - internal/cli/storage.go
+  - internal/cli/doctor.go
+  - internal/instance/system.go
+  - web/src/features/admin/system
+  - deploy/helm/reputecast/values.yaml
+  - docs/deploy/configuration.md
+  - docs/deploy/backup-restore.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast can keep the files it stores outside the database in S3-compatible object storage instead of the local
+files folder, so several web and worker processes share them without a shared volume. Available from the next release
+after 1.6.0.
+
+The files are digital products' files, lead magnets, uploads in progress (product files arrive in chunks)
+and audience exports. With `storage.backend: local`, the default, they live in the files folder (`files.dir`,
+`/var/lib/reputecast/files` in the Docker image). With `storage.backend: s3`, they live in a bucket: AWS S3, MinIO,
+Cloudflare R2, DigitalOcean Spaces, Backblaze B2, Wasabi or any other service that speaks the S3 API. Both backends name
+the files with the same keys, so moving from one to the other is a copy.
+
+You need a bucket when:
+
+- you run several web or worker processes on different machines ([scale with roles](/self-hosting/scaling/)) and have
+  no ReadWriteMany volume to share between them;
+- you install [on Kubernetes with Helm](/deploy/kubernetes/) in split mode, which refuses local storage;
+- your platform has no persistent disk, such as [DigitalOcean App Platform](/deploy/digitalocean/).
+
+One process with a volume, the [Docker Compose](/self-hosting/docker/) install, needs nothing more than its folder.
+
+## Before you begin
+
+- Create the bucket at your provider. ReputeCast doesn't create it.
+- Create credentials that may use it: an access key and its secret, or, on AWS, a role the default credential chain
+  finds (environment variables, the shared credentials file, an EC2 or ECS role, IRSA or EKS Pod Identity). They need
+  `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on
+  its objects (under the prefix, if you set one). With `aws:kms` encryption, they also need `kms:GenerateDataKey` and
+  `kms:Decrypt` on the key. This AWS policy grants that for the bucket `reputecast-files`:
+
+  ```json title="IAM policy"
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": "arn:aws:s3:::reputecast-files"
+      },
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+        "Resource": "arn:aws:s3:::reputecast-files/*"
+      }
+    ]
+  }
+  ```
+
+- Add a lifecycle rule that aborts incomplete multipart uploads after a day. Files over 16 MB go up in 8 MB parts, and
+  the rule clears the parts of a process stopped in the middle of an upload.
+- Take a [backup](/self-hosting/backups/) of the database, the secret key and the files folder.
+
+## Set the bucket
+
+Set the `storage.s3` keys on every ReputeCast process, with the same values. Leave `storage.backend` at `local` for now:
+the files folder stays in use until you [move it](#move-the-files-folder-to-the-bucket). The
+[configuration reference](/reference/configuration/#storage) describes each key.
+
+<Tabs syncKey="s3">
+<TabItem label="AWS S3">
+
+No endpoint: an empty `storage.s3.endpoint` is AWS. Without access keys, the default AWS credential chain is used.
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=eu-central-1
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=AKIA…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+# Optional: SSE-KMS with your own key instead of the bucket's default encryption.
+# REPUTECAST_STORAGE__S3__SSE=aws:kms
+# REPUTECAST_STORAGE__S3__KMS_KEY_ID=arn:aws:kms:eu-central-1:111122223333:key/…
+```
+
+</TabItem>
+<TabItem label="MinIO">
+
+MinIO and most self-hosted services address the bucket in the path, so set `storage.s3.path_style`. Plain `http://`
+works for a MinIO server on your own network.
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__ENDPOINT=http://minio:9000
+REPUTECAST_STORAGE__S3__PATH_STYLE=true
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+<TabItem label="Cloudflare R2">
+
+The endpoint is `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`, and an R2 bucket's region is `auto`; an empty region
+and `us-east-1` alias to it ([R2 S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/), checked
+November 2026).
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=auto
+REPUTECAST_STORAGE__S3__ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+<TabItem label="DigitalOcean Spaces">
+
+The endpoint is `https://<region>.digitaloceanspaces.com`, with the datacenter region the bucket is in, such as
+`nyc3` ([Spaces with AWS SDKs](https://docs.digitalocean.com/products/spaces/how-to/use-aws-sdks/), checked November
+2026). Create the key in **Spaces Object Storage** › **Access Keys** with Read/Write/Delete on the bucket; its secret is
+shown once ([manage access](https://docs.digitalocean.com/products/spaces/how-to/manage-access/), checked November
+2026).
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=nyc3
+REPUTECAST_STORAGE__S3__ENDPOINT=https://nyc3.digitaloceanspaces.com
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+</Tabs>
+
+- `storage.s3.prefix` (`REPUTECAST_STORAGE__S3__PREFIX`) puts every key under a prefix such as `reputecast/`, to share
+  a bucket with something else. It must not start with `/`.
+- With an endpoint, ReputeCast sends request checksums only where S3 requires them, because several S3-compatible
+  services don't take the ones the AWS SDK sends by default.
+- With Docker Compose, a variable reaches the container only when the Compose file mentions it: add these to
+  `docker-compose.override.yml` ([other settings](/self-hosting/docker/#other-settings-in-docker-composeoverrideyml)).
+- On Kubernetes with Helm, set `storage.backend`, `storage.s3.*` and `storage.s3.existingSecret` in the chart's values
+  ([Kubernetes](/deploy/kubernetes/#split-mode-and-the-bucket)).
+
+## Move the files folder to the bucket
+
+<Steps>
+
+1. With the `storage.s3` keys set and `storage.backend` still `local`, count what the copy would do:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast storage migrate --to s3 --dry-run
+   ```
+
+   ```txt title="Output"
+   30 files, 4.1 MiB in /var/lib/reputecast/files.
+   Dry run: 30 files (4.1 MiB) would be copied to the bucket reputecast-files; 0 are there already at the same size; 0 couldn't be checked.
+   ```
+
+   It stops with what to set when the keys don't name a bucket, and checks that the bucket answers before it counts.
+
+2. Copy the files:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast storage migrate --to s3
+   ```
+
+   It copies every file under the same key, eight at a time, reads each copy back to check its SHA-256 and skips files
+   the bucket already holds at the same size. It never deletes local files, and it is safe while ReputeCast runs and
+   safe to run again. A file that fails is named on standard error, the command exits 1, and the next run copies it.
+   The copy is in the instance audit log.
+
+3. Set `REPUTECAST_STORAGE__BACKEND=s3` on every process.
+
+4. Run `reputecast storage migrate --to s3` once more, for the files uploaded in the meantime, then restart every
+   process (`docker compose up -d`). An upload or an export in progress during the switch starts again.
+
+5. Keep the files folder until downloads work from the bucket.
+
+</Steps>
+
+<Aside type="caution">
+  Every web and worker process must use the same backend. A process still on `local` reads and writes the folder while
+  the others use the bucket, and a product file uploaded through one is missing for the other.
+</Aside>
+
+## How files move through the bucket
+
+- **Product file uploads** arrive in chunks: each chunk is an object of its own, and finishing the upload streams them into the
+  file's final key and checks the result against the file's SHA-256.
+- **Audience exports** write one part per batch and join the parts into the file people download.
+- **Downloads** still go through ReputeCast, never straight from the bucket, so download limits, expiry, counting and
+  resumed downloads (`Range` requests) work as they do with the folder.
+- **Encryption**: `storage.s3.sse` sets server-side encryption of what ReputeCast writes, `AES256` (SSE-S3) or `aws:kms`
+  (SSE-KMS, with `storage.s3.kms_key_id` or the account's default key for S3). Empty keeps the bucket's default.
+
+## Check that it worked
+
+- `reputecast doctor` prints the file storage line as `ok`: the bucket answered, and a test object under `.doctor/`
+  was written, read back and deleted.
+
+  ```txt title="reputecast doctor"
+  [ok  ] File storage       s3 bucket reputecast-files at https://nyc3.digitaloceanspaces.com: 30 objects, 4.1 MiB; a test object was written and deleted
+  ```
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.system" /> shows the backend in
+  <UiPath path="admin.system.filesTitle" />: <UiPath path="admin.system.filesStorage" /> reads
+  <UiPath path="admin.system.filesStorageS3" />, with the <UiPath path="admin.system.filesBucket" />, the
+  <UiPath path="admin.system.filesPrefix" /> when you set one, the <UiPath path="admin.system.filesEndpoint" /> (or AWS
+  S3 and its region) and what the bucket holds, counted every 5 minutes. The access keys are never shown.
+
+  <Screenshot
+    id="instance-file-storage"
+    alt="The File storage card of Instance admin, System, on the demo's local storage: Storage Local folder, the folder data/files, 3 files of 225 B, counted every 5 minutes, and that every web and worker process needs the same folder."
+  />
+
+  With a bucket, the same card reads <UiPath path="admin.system.filesStorageS3" />, names the bucket and its endpoint, and says every web and
+  worker process reads the same bucket.
+
+- A digital product's file downloads from a [product page](/earn/digital-products/), and an audience export opens.
+
+## Troubleshooting
+
+- **ReputeCast doesn't start: `storage.s3.bucket is required with storage.backend s3`**: set
+  `REPUTECAST_STORAGE__S3__BUCKET`. The other start errors name the key to fix: an endpoint that isn't an `http://` or
+  `https://` URL, only one of the two access keys, a prefix starting with `/`, `storage.s3.sse` other than `AES256` or
+  `aws:kms`, or `storage.s3.kms_key_id` without `aws:kms`.
+- **`reputecast doctor`: `the bucket … doesn't exist`**: the name or the region is wrong, or, outside AWS, the endpoint
+  is. MinIO and most self-hosted services also need `REPUTECAST_STORAGE__S3__PATH_STYLE=true`.
+- **`reputecast doctor`: `the credentials may not use the bucket …`**, or `… answers but a test object can't be
+  written`: the key lacks a permission from [before you begin](#before-you-begin).
+- **A missing file shows as "access denied" instead of "not found"**: the credentials lack `s3:ListBucket`, without
+  which S3 answers every missing key with access denied.
+- **`storage migrate` exits 1 and names files**: run it again; it copies only what's missing or failed.
+- **Downloads fail on some processes after the switch**: one process still runs with `storage.backend` `local`. Set the
+  same storage keys everywhere and restart.
+
+## Related
+
+- [Back up and restore](/self-hosting/backups/): the bucket belongs in the backup with the database and the key.
+- [Scale with web, ingest and worker roles](/self-hosting/scaling/)
+- [Deploy on Kubernetes with Helm](/deploy/kubernetes/)
+- [CLI reference](/reference/cli/#storage-migrate): `storage migrate` and `doctor`.
+- [Configuration reference](/reference/configuration/#storage): every `storage` key.

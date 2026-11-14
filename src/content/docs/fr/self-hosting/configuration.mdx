@@ -10,7 +10,12 @@ sources:
   - internal/cli/serve.go
   - internal/app/app.go
   - internal/app/wire_publicurl.go
+  - internal/instance/settings.go
+  - internal/instance/updates.go
+  - internal/publicurl/publicurl.go
+  - web/src/features/admin/instance/messages.ts
   - deploy/docker-compose.yml
+  - docs/deploy/configuration.md
   - README.md
 sidebar:
   order: 5
@@ -36,7 +41,10 @@ Chaque couche remplace la précédente :
    `REPUTECAST_CONFIG` sur son chemin.
 3. **Les variables d’environnement** qui commencent par `REPUTECAST_`.
 4. **`DATABASE_URL`**, la variable que définissent de nombreuses plateformes d’hébergement, mais uniquement quand
-   `REPUTECAST_DATABASE__URL` n’est pas définie.
+   `REPUTECAST_DATABASE__URL` n’est pas définie. De même pour **`PORT`** : quand `REPUTECAST_HTTP__ADDR` n’est pas
+   définie, ReputeCast écoute sur `:<PORT>`. L’image Docker définit `REPUTECAST_HTTP__ADDR=:8080` : un conteneur écoute
+   donc sur 8080 quelle que soit la valeur de `PORT`. Un `PORT` qui n’est pas un numéro de port (1–65535) empêche le
+   démarrage. Disponible à partir de la prochaine version après la 1.6.0.
 5. **Les options** que vous passez explicitement : `--role` (définit `roles`), `--addr` (`http.addr`),
    `--database-url` (`database.url`) et `--log-level` (`log.level`). Une option omise ne change rien.
 
@@ -84,7 +92,9 @@ http:
   addr: 127.0.0.1:8080
   # The address people and sending providers reach. Use https in production.
   public_url: https://news.example.com
-  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  # Pin public_url: Instance admin can't change it (for an instance you run for someone else).
+  # public_url_locked: false
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs, IPs or "private").
   trusted_proxies: [127.0.0.1]
   rate_limit_auth: 30 # sign-in requests per minute per client IP
   rate_limit_api: 600 # API requests per minute per key or signed-in browser session
@@ -107,8 +117,25 @@ secrets:
   key_file: /var/lib/reputecast/secret.key
 
 files:
-  # Product files and lead magnets; shared by every web and worker process.
+  # Product files, lead magnets, uploads in progress and exports, with storage.backend local.
   dir: /var/lib/reputecast/files
+
+storage:
+  backend: local # or s3: the bucket below, shared by every web and worker process
+  # s3:
+  #   bucket: reputecast-files
+  #   region: eu-central-1
+  #   endpoint: "" # empty is AWS; https://nyc3.digitaloceanspaces.com, http://minio:9000…
+  #   path_style: false
+  #   prefix: ""
+  #   access_key_id: "" # better set by environment; empty uses the default AWS credential chain
+  #   secret_access_key: ""
+  #   sse: "" # AES256 or aws:kms
+  #   kms_key_id: ""
+
+geoip:
+  # A MaxMind DB file you download (GeoLite or DB-IP Lite); empty is off.
+  # database: /var/lib/geoip/GeoLite2-City.mmdb
 
 log:
   level: info # debug, info, warn or error
@@ -125,6 +152,7 @@ worker:
 updates:
   check: true # daily release check against GitHub (version number only)
   repo: hostrepute/reputecast
+  # managed_by: Northwind Hosting # who upgrades this instance; Instance admin says so
 
 metrics:
   enabled: true
@@ -155,7 +183,16 @@ Un processus refuse de démarrer, et affiche `Error: …`, quand :
 - `http.public_url` n’est pas une URL absolue (`http.public_url must be an absolute URL, got "news.example.com"`) ;
 - `secrets.key` est défini mais n’est pas l’encodage base64 d’exactement 32 octets ;
 - `auth.password_min_length` est inférieur à 8 ;
-- `metrics.token` est défini mais compte moins de 16 caractères.
+- `metrics.token` est défini mais compte moins de 16 caractères ;
+- les paramètres de stockage ne vont pas ensemble : `storage.backend` ne vaut ni `local` ni `s3`, `s3` sans
+  `storage.s3.bucket`, un endpoint qui n’est pas une URL `http://` ou `https://`, une seule des deux clés d’accès, un
+  préfixe qui commence par `/`, `storage.s3.sse` autre que `AES256` ou `aws:kms`, ou `storage.s3.kms_key_id` sans
+  `aws:kms` ([stockage objet](/fr/self-hosting/object-storage/#dépannage)) ;
+- `PORT` est définie, `REPUTECAST_HTTP__ADDR` ne l’est pas, et `PORT` n’est pas un numéro de port
+  (`PORT must be a port number (1-65535), got "web"`).
+
+Une entrée de `http.trusted_proxies` qui n’est ni une adresse, ni une plage, ni `private` n’empêche pas le démarrage :
+elle est journalisée sous la forme `ignoring invalid trusted proxy` et ignorée.
 
 <Aside type="caution">
   Les clés que ReputeCast ne connaît pas sont ignorées sans avertissement. Une variable mal orthographiée comme
@@ -172,7 +209,15 @@ Les limites fixes du serveur HTTP et les délais d’expiration que vous pouvez 
 ## Quand les modifier
 
 - **Derrière un reverse proxy** : définissez `http.public_url` sur l’adresse https et `http.trusted_proxies` sur le
-  proxy ([reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)).
+  proxy ([reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)). Sur une plateforme d’hébergement ou derrière un
+  contrôleur Ingress Kubernetes, dont vous ne pouvez pas connaître l’adresse à l’avance, le mot-clé `private` fait
+  confiance à tous les réseaux privés, partagés et de bouclage
+  ([proxys de confiance](/fr/deploy/overview/#proxys-de-confiance)). Disponible à partir de la prochaine version après
+  la 1.6.0.
+- **Pays dans les rapports de campagne** : `geoip.database`, un fichier que vous téléchargez
+  ([ajouter une base de données GeoIP](/fr/self-hosting/geoip/)).
+- **Plusieurs machines sans volume partagé** : `storage.backend: s3` et les clés `storage.s3`
+  ([stockage objet](/fr/self-hosting/object-storage/)).
 - **Plusieurs processus** : répartissez `roles` et dimensionnez `database.max_conns` pour que le total reste sous le
   `max_connections` de PostgreSQL ([passage à l’échelle](/fr/self-hosting/scaling/) et
   [PostgreSQL](/fr/self-hosting/postgres/)).
@@ -187,7 +232,10 @@ Les limites fixes du serveur HTTP et les délais d’expiration que vous pouvez 
   cloud restent bloquées.
 - **Aucun fichier de clé sur le disque** : `secrets.key` issu de `reputecast secrets generate-key`, défini avant le
   premier démarrage ([sécurité et durcissement](/fr/self-hosting/security/)).
-- **Serveurs hors ligne** : `updates.check: false`.
+- **Serveurs hors ligne** : `updates.check: false`. Ce réglage verrouille aussi la vérification des mises à jour en
+  position désactivée dans l’administration de l’instance et lors de la première connexion.
+- **Une instance que vous exploitez pour le compte d’autrui** : `http.public_url_locked` et `updates.managed_by`
+  ([paramètres que gère l’exploitant du serveur](#paramètres-que-gère-lexploitant-du-serveur)).
 
 ## Paramètres gérés dans l’application
 
@@ -198,9 +246,45 @@ Les limites fixes du serveur HTTP et les délais d’expiration que vous pouvez 
 - Le nom de l’instance, le logo, le fuseau horaire et la langue par défaut, ainsi que l’URL publique, se trouvent dans
   <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. Une URL publique enregistrée à cet endroit remplace
   `http.public_url` pour les liens, les pages publiques et les webhooks des fournisseurs en moins de 30 secondes sur
-  tous les processus. Les cookies HTTPS uniquement et HSTS suivent toujours `http.public_url` : gardez donc les deux
-  identiques.
+  tous les processus, sauf si le serveur la [verrouille](#paramètres-que-gère-lexploitant-du-serveur). Les cookies
+  HTTPS uniquement et HSTS suivent toujours `http.public_url` : gardez donc les deux identiques.
 - Les fournisseurs d’envoi, les expéditeurs, les équipes et tout le reste relèvent de chaque espace de travail.
+
+## Paramètres que gère l’exploitant du serveur
+
+Quand un hébergeur ou une équipe informatique exploite une instance pour ses utilisateurs, deux paramètres retirent
+aux admins de l’instance ce que seul l’exploitant doit modifier. Tous deux sont arrivés avec la 1.5.0.
+
+### Verrouiller l’URL publique
+
+`http.public_url_locked: true` (`REPUTECAST_HTTP__PUBLIC_URL_LOCKED=true`) fait de `http.public_url` l’adresse
+qu’utilisent chaque lien, chaque page publique, chaque webhook de fournisseur et chaque clé d’accès, quoi qu’un admin
+de l’instance ait enregistré :
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> et l’étape <UiPath path="setup.instanceBasics" /> de
+  la [première connexion](/fr/self-hosting/first-run/) affichent l’URL publique en lecture seule, avec la phrase
+  « Fixée par l’opérateur du serveur (http.public_url_locked). Les liens des e-mails envoyés, les clés d’accès et les
+  webhooks des fournisseurs en dépendent, seul l’opérateur peut donc la modifier. » La vérification de l’URL
+  s’exécute toujours, pour l’adresse verrouillée.
+- Un enregistrement qui demande une autre adresse est refusé avec `409` et le code `operator_locked` ; le reste du
+  formulaire est tout de même enregistré.
+- Au démarrage, l’adresse verrouillée devient l’adresse enregistrée. Quand un admin en avait enregistré une autre, les
+  webhooks des fournisseurs passent une fois à l’adresse verrouillée, avec une entrée au journal d’audit de l’instance
+  au titre du changement de configuration du serveur, et les webhooks que les fournisseurs conservent dans leurs
+  propres paramètres sont listés dans le journal (`provider webhooks to change by hand for the locked public URL`).
+  Activer le verrouillage, ou changer l’adresse verrouillée puis redémarrer, déplace donc l’instance.
+- Les liens de réinitialisation qu’affiche `reputecast user reset-password` utilisent aussi l’adresse verrouillée.
+- `reputecast doctor` avertit quand l’adresse verrouillée n’est joignable que par le serveur lui-même, comme
+  `http://localhost:8080`.
+
+### Indiquer qui met à niveau
+
+`updates.managed_by` (`REPUTECAST_UPDATES__MANAGED_BY`), par exemple `Northwind Hosting`, indique qui met à niveau
+l’instance. La carte <UiPath path="admin.versionCard" /> de
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> affiche alors « Les mises à jour sont gérées par
+Northwind Hosting, qui décide quand cette instance passe à une nouvelle version. Adressez-vous à cet interlocuteur
+pour le calendrier ou une version précise. » au lieu de la commande de mise à niveau `docker compose` et du rappel de
+sauvegarde. La vérification des versions et son interrupteur restent tels quels.
 
 ## Voir aussi
 
@@ -209,3 +293,5 @@ Les limites fixes du serveur HTTP et les délais d’expiration que vous pouvez 
 - [Installer avec Docker Compose](/fr/self-hosting/docker/) : où le fichier Compose définit ces variables.
 - [Installer le binaire](/fr/self-hosting/binary/) : un fichier d’environnement pour systemd.
 - [Référence de la CLI](/fr/reference/cli/) : les options de chaque commande.
+- [Ajouter une base de données GeoIP](/fr/self-hosting/geoip/) et
+  [conserver les fichiers dans un stockage objet compatible S3](/fr/self-hosting/object-storage/).

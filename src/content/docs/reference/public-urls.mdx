@@ -14,6 +14,16 @@ sources:
     internal/app/wire_media.go,
     internal/app/wire_smtprelay.go,
     internal/app/wire_webpush.go,
+    internal/app/wire_tracker.go,
+    internal/app/wire_countdown.go,
+    internal/app/wire_inbound.go,
+    internal/app/wire_leads.go,
+    internal/app/wire_customhost.go,
+    internal/customhost/hosts.go,
+    internal/tracker/public.go,
+    internal/countdown/serve.go,
+    internal/inbound/hook.go,
+    internal/leads/webhook.go,
     internal/publicpages,
     internal/publicurl/publicurl.go,
     internal/forms/domain.go,
@@ -79,22 +89,29 @@ Served by the web role under `/p/<workspace>/…`, where `<workspace>` is the wo
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `/`                                                        | The website home when the newsletter website is on; otherwise a redirect to `/subscribe`.                              |
 | `/subscribe`, `/subscribe/<form>`                          | Hosted signup page, for the default form or one form.                                                                  |
-| `/forms/<id>.js`                                           | Embed script of a signup form. It calls `/forms/<id>/session` and `/forms/<id>/submit`.                                |
+| `/forms/<id>.js`                                           | Embed script of a signup form. It calls `/forms/<id>/session` and `/forms/<id>/submit`, and for a form with [steps](/forms/form-steps/) posts a beacon to `/forms/<id>/step` when a later step shows (it always answers `204`). Available from the next release after 1.6.0. |
 | `/confirm/<token>`                                         | Double opt-in confirmation page. Opening the link shows the <UiPath path="pagelabels.confirm.ask.button" /> button; only its `POST` confirms. An expired link's page offers a new link ([limits and defaults](/reference/limits-and-defaults/)). |
 | `/preferences`, `/preferences/<token>`                     | "Email me my link" form; the preference center.                                                                        |
 | `/unsubscribe/<token>`                                     | Unsubscribe page. A `POST` with the body `List-Unsubscribe=One-Click` is the RFC 8058 one-click unsubscribe target.    |
 | `/view/<token>`                                            | The email in a browser.                                                                                                |
 | `/archive`, `/archive/<issue>`, `/archive.rss`, `/sitemap.xml` | Public archive, one issue, its RSS feed, and the sitemap.                                                          |
+| `/llms.txt`                                                | The website's title, description and posts in Markdown for language models ([llmstxt.org](https://llmstxt.org/), checked November 2026). It lists what the sitemap lists, and answers `404` while the website is off or search engines may not index it. |
 | `/sms-terms`                                               | Text-message terms page.                                                                                               |
 | `/poll/<token>/<answer>`, `/s/<slug>`                      | Poll answer page (the vote is recorded by the page's `POST`, not by opening the link); survey page.                    |
 | `/join/<code>`, `/referrals`, `/referrals/<token>`, `/leaderboard`, `/rewards/<token>` | Referral invite page, referral hub, leaderboard and reward downloads.                      |
 | `/recommends`, `/recommends/<token>`                       | Recommendations page.                                                                                                  |
-| `/upgrade`, `/upgrade/<tier>`, `/billing/<token>`, `/cancel/<token>` | Upgrade page and Stripe Checkout, the Stripe billing portal, and the cancel page.                            |
+| `/upgrade`, `/upgrade/<tier>`, `/billing/<token>`, `/cancel/<token>` | Upgrade page and Stripe Checkout, the Stripe billing portal, and the cancel page. Billing and cancel links in member emails work for 30 days (since 1.5.0); an older link's page offers to email fresh ones. |
+| `POST /billing`                                            | Emails a paid member fresh billing and cancel links, only to the address on file and at most once every ten minutes; the answer is the same whatever happens. |
+| `/upgrade/<tier>/team`, `/team/<token>`, `/team/join/<token>` | A tier's [team subscription](/earn/team-subscriptions/) checkout, the buyer's page that manages the seats, and a seat's invitation. Available from the next release after 1.6.0. |
+| `/resume/<token>`                                          | Resume a paused paid subscription. Opening the link changes nothing; the page's button does. Available from the next release after 1.6.0. |
+| `/sponsor`, `/sponsor/request`, `/sponsor/b/<token>`       | The sponsor page with the media kit, the [booking request form](/earn/sponsor-self-booking/), and a request's status page, whose `POST /sponsor/b/<token>/pay` opens Stripe Checkout. Available from the next release after 1.6.0. |
 | `/gift`, `/gift/redeem/<code>`                             | Buy and redeem a gift subscription.                                                                                    |
 | `/products`, `/products/<slug>`, `/buy/<product>`, `/d/<token>`, `/l/<token>` | Shop, product page, checkout, download page and lead-magnet download.                               |
 | `/<slug>`                                                  | A published landing or sales page (`/<slug>/event.ics` is its calendar file).                                          |
 | `/posts/<slug>`, `/tag/<slug>`, `/feed`                    | Newsletter website posts, tag pages and the site's RSS feed.                                                           |
-| `/signin`, `/account`                                      | Website member sign-in and account.                                                                                    |
+| `POST /posts/<slug>/comments`, `…/comments/<id>/edit`, `…/comments/<id>/delete` | A signed-in member's [comment](/forms/post-comments/) or reply, and editing or deleting it. Only requests from the site itself are taken. Available from the next release after 1.6.0. |
+| `/signin`, `/account`                                      | Website member sign-in and account. `POST /account/comments` saves the account page's comment settings. Available from the next release after 1.6.0. |
+| `/comments/mute/<token>`                                   | The page that turns off the emails a member gets about replies to their comments. Opening the link changes nothing; only the page's button does. Available from the next release after 1.6.0. |
 | `/push/…`                                                  | Endpoints the web push prompt uses to subscribe and unsubscribe a browser.                                             |
 
 Two paths sit outside a workspace:
@@ -102,16 +119,21 @@ Two paths sit outside a workspace:
 - `/p/_/…` serves the pages' shared CSS, scripts and fonts. `GET /p/_/tls-check?domain=<host>` answers `200` when the host is a verified custom domain and `404` otherwise, for Caddy's on-demand TLS `ask` setting.
 - `/p/<code>` with a partner code (`XXXX-XXXX-XXXX`) explains how to paste the code into another ReputeCast instance; opening it doesn't use the code.
 
-Pages reached through a signed link are `noindex`. A `HEAD` request to a token page does nothing, so link scanners can't confirm, unsubscribe or vote. The instance's `robots.txt` disallows everything except `/p/`.
+Pages reached through a signed link are `noindex`. A `HEAD` request to a token page does nothing, so link scanners can't confirm, unsubscribe, vote, resume a subscription or turn emails off. The instance's `robots.txt` disallows everything except `/p/`.
 
 ## Custom domains
 
 When a workspace's custom domain is verified (a `CNAME` to the instance host, matching `A`/`AAAA` records, or the `_reputecast.<domain>` TXT record), the public pages answer at the root of that domain: `https://news.acme.io/subscribe` is the same page as `/p/acme-newsletter/subscribe`. ReputeCast finds the workspace from the `Host` header, so your proxy must forward it unchanged.
 
 - Links on pages served from the custom domain leave out `/p/<workspace>`. Scripts, theme files and shared assets keep their `/p/<workspace>/…` and `/p/_/…` paths.
-- The custom domain gets its own `robots.txt` and `sitemap.xml`.
+- The custom domain gets its own `robots.txt`, `sitemap.xml` and `llms.txt`.
 - Emails keep linking to the public URL.
 - On the instance's own host, root paths such as `/subscribe` belong to the web app.
+- On the website's own custom domain, the addresses of a site [imported from Substack, Ghost or WordPress](/migrate/posts/) keep working: a post's old address answers `301` to the post, the old feed addresses answer `301` to `/feed`, and any other path nobody answers shows the site's own 404 page instead of the web app's. Available from the next release after 1.6.0.
+
+### Which host carries which links
+
+Since 1.5.0, a host a workspace holds carries only that workspace's links and pages. A workspace holds its verified custom domain, its SMS short-link domain, its link tracking domain and its publication website's host. On such a host, another workspace's tracking links (`/t/o`, `/t/c`, `/t/h`), short links (`/t/s`), push clicks (`/t/p`) and `/p/<workspace>` pages answer `404`, so nothing can look as if the host's owner sent or published it. The instance's own host, and a host nobody holds, carry every workspace's links, so links in mail already sent keep working. A host a workspace verifies or lets go answers as such within a minute.
 
 [Brand your pages and use your own domain](/forms/branding-and-domain/) covers the DNS step, and [reverse proxy and TLS](/self-hosting/reverse-proxy/#custom-domains) the certificates.
 
@@ -126,6 +148,9 @@ Served by the web role.
 | `/t/p/<id>.<token>`   | Web push click: redirects to the notification's link.                                                       |
 | `/t/h/<token>`        | The hidden link in a tracked email. No person can see it, so whatever follows it is recorded as a bot's click; it answers `204`. |
 | `/t/s/<code>`         | SMS short link on the instance host. On a verified SMS short-link domain, the six-character code works at the root: `/<code>`. |
+| `/t/cd/<token>.gif`   | A [countdown timer](/campaigns/countdown-timers/) image: drawn for the current second while the countdown runs and never cached; once it has ended, one frame kept for an hour. Available from the next release after 1.6.0. |
+| `/track/v1/rc.js`     | The [website tracker](/integrations/website-tracking/) script that tracked sites load. Available from the next release after 1.6.0. |
+| `POST /p/<workspace>/track/<site>/e` | The tracker's collect endpoint: up to 20 events and 8 KB per request, 240 requests a minute per address and site. It answers browsers only from the tracked site's origin (`OPTIONS` is its CORS preflight). Available from the next release after 1.6.0. |
 
 ## Report links
 
@@ -156,7 +181,9 @@ Served by the ingest role. ReputeCast shows the exact URL, with its token, when 
 | `POST /hooks/sms/<adapter>/<token>`                           | SMS delivery receipts and inbound texts (`twilio`, `vonage`, `plivo`, `telnyx`, `aws_eum`).            |
 | `POST /hooks/stripe/<token>`                                  | Stripe payment events.                                                                                 |
 | `POST /hooks/shopify/<token>`, `POST /hooks/woocommerce/<token>` | Store events.                                                                                       |
-| `GET`, `POST /hooks/whatsapp/<workspace>`                     | Meta's WhatsApp webhook: `GET` verifies the subscription, `POST` delivers events.                      |
+| `GET`, `POST /hooks/whatsapp/<workspace>/<token>`             | Meta's WhatsApp webhook: `GET` verifies the subscription, `POST` delivers events. Each account's callback URL has its own token since 1.5.0; the old `/hooks/whatsapp/<workspace>` answers until Meta calls the new one. |
+| `POST /hooks/inbound/<token>`                                 | [Receiving mail](/providers/receiving-mail/): the mail a sending provider receives for the workspace's receiving domain, up to 25 MiB a request. Some providers add their own path after the token. Available from the next release after 1.6.0. |
+| `GET`, `POST /hooks/meta-leads/<token>`                       | [Meta Lead Ads](/integrations/meta-lead-ads/): `GET` answers Meta's verification with the connection's verify token, `POST` delivers leads signed with the app secret. Available from the next release after 1.6.0. |
 
 [Delivery events and suppression sync](/providers/events-and-sync/) explains what happens to sending-provider events.
 

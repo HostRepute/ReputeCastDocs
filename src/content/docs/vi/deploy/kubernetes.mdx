@@ -1,0 +1,303 @@
+---
+title: Triển khai ReputeCast trên Kubernetes bằng Helm
+description: Chạy ReputeCast trên Kubernetes bằng Helm, dưới dạng một pod có volume hoặc các pod web, worker và ingest dùng chung một bucket tương thích S3.
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast trên Kubernetes
+sources:
+  - deploy/helm/reputecast
+  - .github/workflows/release.yml
+  - internal/config/config.go
+  - internal/cli/migrate.go
+  - internal/cli/install.go
+  - docs/deploy/README.md
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Hướng dẫn này chạy ReputeCast trên Kubernetes bằng Helm và chart có trong kho mã ReputeCast, với một cơ sở dữ liệu
+PostgreSQL do bạn cung cấp và đứng sau Ingress controller của bạn. Các migration chạy trong một Job trước mỗi lần cài
+đặt và nâng cấp. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+Chart có hai kiểu bố trí:
+
+- **`mode: single`** (mặc định): một pod StatefulSet chạy mọi vai trò, gồm ứng dụng web, API, nhận webhook và các
+  worker, với volume 10 Gi tại `/var/lib/reputecast` cho các tệp được tải lên.
+- **`mode: split`**: các Deployment cho ứng dụng web (2 replica) và các worker (1), và, với `ingest.separate`, webhook
+  của nhà cung cấp chạy trong các pod riêng (2). Chúng dùng chung các tệp được tải lên qua một
+  [bucket tương thích S3](/vi/self-hosting/object-storage/), nên chế độ split cần `storage.backend: s3`.
+
+Chart nằm trong kho mã tại `deploy/helm/reputecast`. Mỗi bản phát hành đều đóng gói chart; workflow phát hành chỉ đẩy
+chart lên `oci://ghcr.io/hostrepute/charts` khi những người duy trì bật tính năng xuất bản, nên hướng dẫn này cài chart
+từ một bản checkout.
+
+## Trước khi bắt đầu
+
+- Kubernetes 1.29 trở lên, Helm 3.8 trở lên và `kubectl` cho cluster.
+- PostgreSQL 16, 17 hoặc 18 mà các pod kết nối được: một cluster [CloudNativePG](https://cloudnative-pg.io) hoặc một
+  cơ sở dữ liệu được quản lý. Chart không đi kèm cơ sở dữ liệu nào. Xem thêm
+  [yêu cầu hệ thống](/vi/self-hosting/requirements/) và [PostgreSQL](/vi/self-hosting/postgres/).
+- Một Ingress controller và một chứng chỉ TLS cho tên DNS như `news.example.com`, lưu trong một Secret như
+  `reputecast-tls`. Nhà cung cấp gửi thư gửi webhook tới `<public URL>/hooks/…`, nên tên này phải truy cập được từ
+  internet.
+- Với chế độ split, một bucket và thông tin xác thực của nó
+  ([lưu trữ đối tượng](/vi/self-hosting/object-storage/#trước-khi-bắt-đầu)).
+
+## Cấp cơ sở dữ liệu cho chart
+
+Chart đọc URL cơ sở dữ liệu từ một Secret. Khi đã cài operator CloudNativePG, cluster dưới đây tạo cơ sở dữ liệu
+`reputecast`, chủ sở hữu của nó và Secret `reputecast-db-app`, chứa URL dưới khóa `uri`, là khóa mà chart đọc theo mặc
+định:
+
+```yaml title="reputecast-db.yaml"
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: reputecast-db
+  namespace: reputecast
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  bootstrap:
+    initdb:
+      database: reputecast
+      owner: reputecast
+  storage:
+    size: 20Gi
+```
+
+Với cơ sở dữ liệu được quản lý (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean hoặc dịch vụ khác),
+hãy tự tạo Secret:
+
+```sh
+kubectl create namespace reputecast
+kubectl create secret generic reputecast-db --namespace reputecast \
+  --from-literal=uri='postgres://reputecast:…@db.example.com:5432/reputecast?sslmode=require'
+```
+
+Các migration cần kết nối trực tiếp hoặc ở chế độ session, không dùng PgBouncer ở chế độ transaction. Người dùng ứng
+dụng của CloudNativePG không tạo được role, nên phân khúc SQL vẫn tắt cho đến khi quản trị viên cơ sở dữ liệu thêm role
+của chúng ([phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql)).
+
+## Cài đặt chart
+
+<Steps>
+
+1. Tải chart về:
+
+   ```sh
+   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   ```
+
+2. Viết các giá trị của bạn. Đây là chế độ single đứng sau ingress-nginx:
+
+   ```yaml title="values.yaml"
+   publicURL: https://news.example.com
+   database:
+     existingSecret: reputecast-db-app # or reputecast-db for a managed database
+   admin:
+     email: you@company.com
+   ingress:
+     enabled: true
+     className: nginx
+     annotations:
+       # Imports and uploads can be larger than the controller's default.
+       nginx.ingress.kubernetes.io/proxy-body-size: 100m
+     tls:
+       - secretName: reputecast-tls
+         hosts: [news.example.com]
+   ```
+
+   - `publicURL` là bắt buộc: liên kết trong email, webhook của nhà cung cấp, khóa truy cập và chuyển hướng đăng nhập
+     đều được tạo từ giá trị này. Host của Ingress mặc định là tên máy chủ trong đó.
+   - `admin.email` tạo Chủ sở hữu đầu tiên sau lần cài đặt đầu tiên. Hãy để trống với một cơ sở dữ liệu đã có người
+     dùng, ví dụ khi khôi phục.
+   - Chart cài từ bản checkout chạy image có tag `latest`, bản phát hành mới nhất. Để cố định một bản, hãy đặt
+     `image.tag` thành tag của bản đó hoặc `image.digest` thành digest của nó; digest được ưu tiên hơn tag.
+   - `values.schema.json` kiểm tra tên và kiểu dữ liệu, nên một giá trị viết sai sẽ dừng việc cài đặt thay vì bị bỏ
+     qua.
+
+3. Cài đặt:
+
+   ```sh
+   helm install reputecast ./reputecast/deploy/helm/reputecast \
+     --namespace reputecast --create-namespace -f values.yaml
+   ```
+
+   Helm chạy Job migration trước (`reputecast migrate up`), rồi tạo pod, rồi đến Job cài đặt, Job này tạo Chủ sở hữu
+   đầu tiên. Các pod không bao giờ tự chạy migration.
+
+4. Đọc mật khẩu tạm thời của Chủ sở hữu đầu tiên trong log của Job cài đặt. Job được giữ trong 7 ngày:
+
+   ```sh
+   kubectl logs --namespace reputecast job/reputecast-install
+   ```
+
+   ```txt title="Kết quả"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Với `admin.passwordSecret`, mật khẩu của Chủ sở hữu lấy từ Secret đó.
+
+5. Sao lưu khóa bí mật mà chart đã tạo (xem [khóa bí mật](#khóa-bí-mật)), rồi mở URL công khai và đăng nhập.
+   [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu, thêm khóa truy cập hoặc ứng dụng
+   xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo không gian làm việc.
+
+</Steps>
+
+Không có Ingress, `kubectl port-forward --namespace reputecast service/reputecast 8080:80` cho phép bạn mở ứng dụng từ
+máy tính của mình; nhà cung cấp vẫn cần URL công khai.
+
+## Những gì chart chạy
+
+- **Pod**: image `ghcr.io/hostrepute/reputecast`, chạy dưới user 65532 với hệ thống tệp gốc chỉ đọc, không có
+  capability nào, seccomp profile `RuntimeDefault` và không có service account token. Request là 100m CPU và 256Mi bộ
+  nhớ, giới hạn bộ nhớ 1Gi (`resources`, hoặc `web.resources`, `worker.resources` và `ingest.resources` ở chế độ
+  split).
+- **Probe**: startup probe trên `/healthz` (năm giây một lần, tối đa 5 phút), readiness trên `/readyz` (mười giây một
+  lần) và liveness trên `/healthz` (20 giây một lần). Worker không có HTTP listener, nên các probe của nó hỏi cổng
+  metrics.
+- **Service**: `reputecast` (ClusterIP, cổng 80) cho các pod web, `reputecast-metrics` ở cổng 9464 cho Prometheus, và ở
+  chế độ split với `ingest.separate`, `reputecast-ingest`, nơi Ingress chuyển `/hooks/` tới.
+- **Cấu hình**: ConfigMap `reputecast-env` chứa URL công khai, các proxy tin cậy, mức log (log ở dạng JSON) và các thiết
+  lập lưu trữ; URL cơ sở dữ liệu, khóa bí mật và các khóa của bucket lấy từ Secret. `extraEnv` và `extraEnvFrom` thêm
+  bất kỳ [thiết lập](/vi/reference/configuration/) nào khác, như `REPUTECAST_UPDATES__MANAGED_BY` hoặc
+  `REPUTECAST_HTTP__PUBLIC_URL_LOCKED` cho một hệ thống bạn vận hành cho người khác
+  ([thiết lập do người vận hành máy chủ quản lý](/vi/self-hosting/configuration/#thiết-lập-do-người-vận-hành-máy-chủ-quản-lý)).
+- **Sau Ingress**: `http.trustedProxies` mặc định là `[private]`, nên ReputeCast tin `X-Forwarded-For` từ Ingress
+  controller trên các mạng riêng của cluster và không ở đâu khác
+  ([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+
+## Chế độ split và bucket
+
+<Steps>
+
+1. Tạo bucket và các access key của nó ([lưu trữ đối tượng](/vi/self-hosting/object-storage/)), rồi lưu các khóa
+   trong một Secret:
+
+   ```sh
+   kubectl create secret generic reputecast-s3 --namespace reputecast \
+     --from-literal=access-key-id=… --from-literal=secret-access-key=…
+   ```
+
+2. Thêm kiểu bố trí và bucket vào các giá trị của bạn:
+
+   ```yaml title="values.yaml"
+   mode: split
+   web:
+     replicas: 3
+   worker:
+     replicas: 2
+   ingest:
+     separate: true
+   storage:
+     backend: s3
+     s3:
+       bucket: reputecast-files
+       region: eu-central-1
+       existingSecret: reputecast-s3 # access-key-id and secret-access-key
+   hpa:
+     enabled: true
+   ```
+
+   Với dịch vụ khác AWS, hãy đặt `storage.s3.endpoint`, và `storage.s3.pathStyle: true` cho MinIO. Không có access key,
+   chuỗi thông tin xác thực mặc định của AWS được dùng, nên IRSA hoạt động qua `serviceAccount.annotations`
+   (`eks.amazonaws.com/role-arn`).
+
+3. Cài đặt hoặc nâng cấp với các giá trị này. `mode: split` cùng `storage.backend: local` sẽ dừng với
+   `mode split needs storage.backend s3`: các pod không thể dùng chung một thư mục cục bộ.
+
+</Steps>
+
+- `pdb.enabled` (bật) cấp cho các pod web, và các pod ingest, một PodDisruptionBudget cho phép một pod không sẵn sàng.
+- `hpa.enabled` co giãn các pod web từ 2 đến 6 replica ở mức 70% CPU.
+- `ingest.separate` chạy webhook của nhà cung cấp trong các pod riêng, để một đợt webhook dồn dập không làm chậm ứng
+  dụng ([mở rộng với các vai trò](/vi/self-hosting/scaling/)).
+- Chuyển một bản cài đặt chế độ single đang có sang chế độ split: trước hết hãy sao chép các tệp của nó vào bucket bằng
+  `reputecast storage migrate --to s3`
+  ([chuyển thư mục tệp](/vi/self-hosting/object-storage/#chuyển-thư-mục-tệp-sang-bucket)).
+
+## Khóa bí mật
+
+ReputeCast mã hóa thông tin xác thực của nhà cung cấp, secret OIDC và các thông tin bí mật khác bằng một khóa 32 byte.
+Không có `secretKey.existingSecret`, chart tạo một khóa vào Secret `reputecast-key` khi cài đặt, đọc lại khóa đó ở mỗi
+lần nâng cấp và giữ nguyên nó khi gỡ release. Hãy sao lưu khóa cùng cơ sở dữ liệu; khôi phục cần cả hai:
+
+```sh
+kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.secret-key}' | base64 -d
+```
+
+<Aside type="caution">
+  Các công cụ render chart mà không có cluster, như Argo CD, không đọc lại được khóa và sẽ tạo khóa mới ở mỗi lần đồng
+  bộ, khiến thông tin xác thực đã lưu không còn mở được. Hãy tự tạo Secret với một khóa từ
+  `reputecast secrets generate-key` và đặt `secretKey.existingSecret`.
+</Aside>
+
+## Các phần tùy chọn
+
+- **SMTP relay**: [relay](/vi/transactional/smtp-relay/) lắng nghe trong các pod web khi quản trị viên hệ thống bật nó.
+  `smtpRelay.service.enabled` công bố các cổng của relay qua một LoadBalancer Service, `reputecast-smtp`, với
+  `externalTrafficPolicy: Local` để relay thấy địa chỉ của từng client. Hãy giữ `smtpRelay.starttlsPort` và
+  `smtpRelay.tlsPort` giống các cổng đặt trong ứng dụng (587 và 465). Chứng chỉ Let's Encrypt cho relay được kiểm tra
+  qua HTTP: hãy thêm tên máy chủ của relay vào `ingress.hosts`.
+- **GeoIP**: `geoip.volume` gắn một volume chứa tệp MaxMind DB ở chế độ chỉ đọc tại `/var/lib/geoip`, và `geoip.file`
+  nêu tên tệp ([thêm cơ sở dữ liệu GeoIP](/vi/self-hosting/geoip/)).
+- **Prometheus**: mọi pod phục vụ metrics ở cổng 9464; `serviceMonitor.enabled` thêm một ServiceMonitor của Prometheus
+  Operator ([health check, metrics và log](/vi/self-hosting/monitoring/)).
+- **NetworkPolicy**: `networkPolicy.enabled` cho phép lưu lượng vào cổng HTTP từ `networkPolicy.httpFrom` (mặc định là
+  mọi nơi), vào cổng metrics từ `networkPolicy.metricsFrom` (mặc định là namespace của release) và vào các cổng của relay
+  khi Service của relay được bật. Lưu lượng đi ra vẫn mở, vì nhà cung cấp gửi thư, DNS, PostgreSQL và bucket có thể nằm
+  ở bất cứ đâu.
+
+## Kiểm tra kết quả
+
+- `kubectl get pods --namespace reputecast` cho thấy các pod `Running` và sẵn sàng: `/readyz` trả lời khi kết nối được
+  cơ sở dữ liệu và lược đồ đã có mọi migration.
+- `helm test reputecast --namespace reputecast` gọi `/readyz` qua Service web và đạt khi nhận `200`.
+- `https://news.example.com/readyz` trả về `ready` qua Ingress.
+
+## Nâng cấp
+
+1. Đọc [ghi chú phát hành](/vi/reference/release-notes/) và [sao lưu](/vi/self-hosting/backups/) cơ sở dữ liệu, Secret
+   `reputecast-key` và, ở chế độ split, bucket.
+2. Cập nhật bản checkout (`git -C reputecast pull`), và cả `image.tag` nếu bạn cố định tag.
+3. Chạy nâng cấp với các giá trị của bạn và đủ thời gian cho các migration. Một migration lớn có thể chạy lâu hơn mức
+   năm phút mặc định của Helm:
+
+   ```sh
+   helm upgrade reputecast ./reputecast/deploy/helm/reputecast \
+     --namespace reputecast -f values.yaml --timeout 30m
+   ```
+
+   Job migration chạy trước khi các pod thay đổi, và các pod của release trước vẫn phục vụ cho đến khi Job xong
+   ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+`helm uninstall reputecast --namespace reputecast` giữ lại Secret `reputecast-key` và, ở chế độ single,
+PersistentVolumeClaim `data-reputecast-0`, nên không mất thứ gì không tạo lại được. Hãy tự xóa chúng khi bạn chắc chắn.
+
+## Khắc phục sự cố
+
+- **Việc cài đặt dừng với `Set database.url or database.existingSecret`**, **`Set publicURL …`** hoặc một thông báo
+  khác của chart: mỗi thông báo cho biết cần đặt gì. Chart kiểm tra các giá trị trước khi tạo bất cứ thứ gì.
+- **Job migration thất bại**: đọc `kubectl logs --namespace reputecast job/reputecast-migrate`. Lỗi kết nối nghĩa là có
+  vấn đề ở URL, Secret hoặc mạng. Các migration cần kết nối trực tiếp hoặc ở chế độ session, không dùng PgBouncer ở chế
+  độ transaction.
+- **`helm upgrade` hết thời gian chờ trong khi Job vẫn chạy**: hãy thêm `--timeout 30m`. Trong lúc đó, các pod của
+  release trước vẫn phục vụ.
+- **Job cài đặt thất bại với `ReputeCast is already installed: users exist`**: cơ sở dữ liệu đã có người dùng, ví dụ
+  sau khi khôi phục. Tài khoản của họ vẫn dùng được như cũ; hãy để trống `admin.email`.
+- **Không có Chủ sở hữu đầu tiên vì `admin.email` để trống**: tạo một Chủ sở hữu từ một pod:
+  `kubectl exec --namespace reputecast -it statefulset/reputecast -- reputecast install --email you@company.com`
+  (`deploy/reputecast-web` ở chế độ split).
+- **Tải tệp lên hoặc nhập dữ liệu thất bại với mã trạng thái 413**: đó là giới hạn kích thước body của Ingress
+  controller; hãy nâng giới hạn này, như annotation `proxy-body-size` ở trên làm cho ingress-nginx.
+- **Mọi khách truy cập có cùng một địa chỉ trong phiên và nhật ký kiểm tra**: Ingress controller kết nối từ một địa chỉ
+  nằm ngoài các mạng riêng. Hãy đặt `http.trustedProxies` thành dải địa chỉ của nó.
+
+Tham chiếu chart: `README.md` và `values.yaml` của chart trong `deploy/helm/reputecast` liệt kê mọi giá trị.

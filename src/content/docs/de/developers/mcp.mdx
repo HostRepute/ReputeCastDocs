@@ -16,11 +16,14 @@ sources:
   - internal/mcpserver/resources.go
   - internal/app/wire_mcpserver.go
   - internal/authz/permissions.go
+  - internal/apikeys/apikeys.go
+  - internal/server/prefix.go
   - internal/campaigns/agent.go
   - web/src/features/keys/McpPage.tsx
   - web/src/features/keys/CreateKeyDialog.tsx
+  - web/src/features/keys/AllowedIpsDialog.tsx
 sidebar:
-  order: 9
+  order: 10
 ---
 
 import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
@@ -57,10 +60,14 @@ ausgeführt zu werden.
 
 3. Wählen Sie seine Berechtigungen. Beginnen Sie mit Lesezugriff, etwa `reports:view` und `deliverability:view`, und
    ergänzen Sie später mehr. Eine Berechtigung, die Sie nicht haben, ist gesperrt. Agenten können nie
-   `subscribers:verify`, `placement:run`, `placement:manage`, `integrations:manage`, `ai:use` oder die
-   Agentur-Berechtigungen haben.
+   `subscribers:verify`, `placement:run`, `placement:manage`, `coupons:manage`, `comments:moderate`, `replies:view` und
+   `replies:manage` haben (API-Schlüssel können das), ebenso wenig `integrations:manage`, `ai:use` oder die
+   Agentur-Berechtigungen (nur Personen). Antworten, Website-Kommentare und Pools von Rabattcodes bleiben bei Personen.
+   Verfügbar ab der nächsten Version nach 1.6.0.
 
-4. Beschränken Sie den Agenten optional auf einige Listen und legen Sie ein Ablaufdatum fest; erstellen Sie ihn dann.
+4. Beschränken Sie den Agenten optional auf einige Listen, legen Sie ein Ablaufdatum fest und füllen Sie
+   <UiPath path="keys.allowedIpsLabel" /> aus
+   ([Agenten auf erlaubte IPs beschränken](#agenten-auf-erlaubte-ips-beschränken)); erstellen Sie ihn dann.
 
 5. Kopieren Sie das Token, `rc_agent_…`. Es wird nur einmal angezeigt; ReputeCast speichert nur seinen SHA-256-Hash.
 
@@ -68,7 +75,7 @@ ausgeführt zu werden.
 
 <Screenshot
   id="settings-mcp"
-  alt="Einstellungen, Schlüssel & MCP: die MCP-Karte mit dem Endpunkt und einem Snippet für die Client-Konfiguration sowie die Matrix der Agenten. Ein Agent kann Berichte und Kontakte lesen; ein Ops-Agent liest den Anbieterzustand und darf Versände pausieren, aber nie starten."
+  alt="Einstellungen, Schlüssel & MCP: die MCP-Karte mit dem Endpunkt und einem Snippet für die Client-Konfiguration sowie die Matrix der Agenten. Ein Agent kann Berichte und Kontakte lesen; ein Ops-Agent, auf eine erlaubte IP beschränkt, liest den Anbieterzustand und darf Versände pausieren, aber nie starten. Jede Zeile hat Erlaubte IPs… und Bearbeiten."
 />
 
 Die Matrix der Agenten zeigt, was jeder Agent tun kann, abgeleitet aus seinen Berechtigungen:
@@ -237,6 +244,41 @@ Die Berechtigungen eines Agenten werden bei jedem Aufruf erneut gegen die aktuel
 erstellt hat. Verliert diese Person eine Berechtigung, verliert sie auch der Agent; verlässt sie den Arbeitsbereich
 oder wird sie deaktiviert, kann der Agent nichts mehr tun.
 
+Für seine Listen gilt dieselbe Regel (seit Version 1.5.0): Bei jedem Aufruf werden sie auf die Listen und
+Absenderdomains beschränkt, die die Person, die ihn erstellt hat, in diesem Moment erreicht. Ein Agent, der auf
+bestimmte Listen beschränkt ist, findet mit `search_contacts` und `get_contact` nur die Kontakte auf diesen Listen, und
+`resume_campaign` setzt nur eine Kampagne innerhalb seiner Listen und Absenderdomains fort, so wie es eine Person mit
+derselben Beschränkung in ReputeCast kann.
+
+## Agenten auf erlaubte IPs beschränken
+
+Ein Agent lässt sich auf die Adressen beschränken, von denen sein Client aufruft: bis zu 50 IPv4- oder IPv6-Adressen
+und -Netze, etwa `203.0.113.7` oder `203.0.113.0/24` (seit Version 1.6.0). Eine leere Liste, der Standard, erlaubt jede
+Adresse.
+
+<Steps>
+
+1. Wählen Sie in der Matrix der Agenten in der Zeile des Agenten <UiPath path="keys.allowedIpsButton" />.
+
+2. Geben Sie eine Adresse oder ein Netz pro Zeile ein. Das Feld zeigt, von wo das Token zuletzt verwendet wurde, und
+   Ihre eigene Adresse, wie ReputeCast sie sieht, jeweils mit einem Link, um sie hinzuzufügen.
+
+3. Speichern Sie. Lässt die Liste die Adresse weg, von der das Token zuletzt verwendet wurde, fragt ReputeCast zuerst
+   nach; wählen Sie <UiPath path="keys.saveAnyway" /> nur, wenn dieser Client abgewiesen werden soll.
+
+</Steps>
+
+Die Prüfung läuft, nachdem das Token verifiziert ist. Ein Aufruf von einer anderen Adresse oder von einer, die
+ReputeCast nicht erkennen kann, antwortet mit `401` und
+`this agent can't be used from <address>; add the address to its allowed IPs in Settings › Keys & MCP` und wird
+gezählt. Hinter einem Reverse Proxy tragen Sie den Proxy zuerst in `http.trusted_proxies` ein, sonst scheint jeder
+Aufruf vom Proxy zu kommen; der Dialog warnt, wenn das der Fall sein kann. Damit der Agent von mehr Orten aufgerufen
+werden darf, brauchen Sie jede Berechtigung des Agenten, und seine Listen müssen in Ihrem eigenen Bereich liegen, wie
+beim Rotieren. Die Liste legt eine angemeldete Person fest, hier oder mit
+`PUT /api/v1/workspaces/<workspace>/mcp-agents/<keyId>/allowed-ips`; die Änderung steht im Audit-Protokoll als
+`agent.updated`. Es gelten dieselben Regeln wie für
+[API-Schlüssel](/de/developers/api-authentication/#schlüssel-auf-erlaubte-ips-beschränken).
+
 ## Vorschläge für alles, was sendet
 
 Agenten starten keine Versände.
@@ -280,8 +322,13 @@ Agent über seinem Limit erhält `429` mit `Retry-After: 60`.
 - **401 „this agent was revoked“ oder „… expired“**: Erstellen Sie einen neuen Agenten oder rotieren Sie sein Token
   unter <UiPath path="nav.settings > settings.keys" />.
 - **401 „the MCP server is off“**: Schalten Sie ihn unter <UiPath path="keys.changeLimits" /> ein.
+- **401 „this agent can't be used from …“**: Der Client ruft von außerhalb der erlaubten IPs des Agenten auf. Fügen Sie
+  die Adresse, die der Fehler nennt, mit <UiPath path="keys.allowedIpsButton" /> hinzu, oder tragen Sie Ihren Reverse
+  Proxy in `http.trusted_proxies` ein, wenn es die Adresse des Proxys ist.
 - **Der Client verbindet sich, aber jedes Tool wird verweigert**: Dem Agenten fehlt die Berechtigung, oder die Person,
   die ihn erstellt hat, hat sie nicht mehr. Der Fehler nennt die Berechtigung.
+- **Der Agent findet keine Kontakte oder weniger als erwartet**: Der Agent oder das Mitglied, das ihn erstellt hat, ist
+  auf bestimmte Listen beschränkt.
 - **Claude Code überspringt den Server**: Der Eintrag in `.mcp.json` hat eine `url`, aber kein `"type": "http"`.
 - **Aufrufe hängen oder laufen hinter einem Proxy in eine Zeitüberschreitung**: Der Proxy puffert die Antworten von
   `/mcp`. Schalten Sie die Pufferung für diesen Pfad aus.

@@ -14,6 +14,7 @@ sources:
   - internal/team/manage.go
   - internal/api/auth.go
   - web/src/features/roles
+  - internal/webhooks/access.go
 sidebar:
   order: 3
 ---
@@ -37,9 +38,11 @@ ReputeCast gives you the role-based access control email marketing teams need: e
    not on the role. A scoped member sees and acts only on the chosen lists, and picks only the chosen sender domains in
    the campaign composer. Their email, SMS, push and WhatsApp sends go only to those lists: the composer offers them no
    segments, and a send checks its audience against the scope of whoever sends it. They can't download the
-   whole-workspace export either. An empty scope means everything.
-4. **Changes apply at once.** Editing a role or a member's role applies on their next request. API keys follow their
-   creator: a key's permissions are its own permissions, cut down to what its creator holds right now.
+   whole-workspace export either. An empty scope means everything. See
+   [what a scope reaches](#what-a-scope-reaches).
+4. **Changes apply at once.** Editing a role or a member's role applies on their next request. API keys and MCP agents
+   follow their creator: a key's permissions are its own permissions, cut down to what its creator holds right now,
+   and its scope is the narrower of its own and its creator's current one.
 5. **Every decision is logged.** Role changes, refused grants and denied actions on sensitive permissions are written
    to the [audit log](/team/audit-log/).
 
@@ -54,14 +57,29 @@ ReputeCast gives you the role-based access control email marketing teams need: e
 | ------ | ------------------------------------------------------------------------------------------------------ |
 | Owner  | Everything, including transferring ownership and deleting the workspace. At least one per workspace.   |
 | Admin  | Everything except transferring ownership and deleting the workspace.                                    |
-| Editor | Creates and sends: campaigns, templates, automations, segments without SQL, forms, imports, website and products. No approving, exporting, deleting contacts, providers, team or keys. |
-| Viewer | Read-only. Never sees secrets.                                                                          |
+| Editor | Creates and sends: campaigns, templates, automations, segments without SQL, forms, imports, website and products. Handles replies, discount codes and comments on posts. No approving, exporting contacts, deleting contacts, providers, team or keys. |
+| Viewer | Read-only. Never sees secrets, and doesn't read replies (`replies:view`).                               |
 
 Client workspaces of an [agency](/team/agencies/) add two more built-in roles, Client approver and Client viewer.
 The matrix lists which permission each built-in workspace role includes; every key is described in
 [permissions and roles](/reference/permissions/).
 
 <RolesMatrix scope="workspace" />
+
+### Replies, discount codes and comments
+
+Four permissions cover the [replies inbox](/audience/replies/), [discount codes](/campaigns/discount-codes/) and
+[comments on posts](/forms/post-comments/). Owners, Admins and Editors hold all four; Viewers hold none.
+Available from the next release after 1.6.0.
+
+| Permission          | Group             | Allows                                                                                  |
+| ------------------- | ----------------- | --------------------------------------------------------------------------------------- |
+| `replies:view`      | Contacts          | Reading the replies inbox and the other mail ReputeCast receives.                       |
+| `replies:manage`    | Contacts          | Marking replies done or open, and unsubscribing a contact from a reply. Includes `replies:view`. |
+| `coupons:manage` ⚑  | Campaigns         | Creating, changing and archiving pools, and uploading, creating, removing or exporting their codes. Seeing pools needs `campaigns:view`. |
+| `comments:moderate` | Website and pages | Publishing, hiding, deleting and pinning comments, replying as the publication and blocking commenters. |
+
+MCP agents can't hold any of them, and their actions, apart from reading replies, are for signed-in people only.
 
 ## Custom roles
 
@@ -92,10 +110,11 @@ Nobody can grant a permission they don't hold: not to a role, a member, an invit
 
 ## Sensitive permissions and two-factor authentication
 
-Permissions that send, approve, publish, export, delete contacts or manage providers, the team, keys and agents are
-[sensitive](/reference/glossary/#sensitive-permission) (⚑). By default, the instance requires two-factor
-authentication for everyone who holds one in any workspace, with a 7-day grace period. Editors hold sensitive
-permissions such as `campaigns:send`, so they are covered by it.
+Permissions that send, approve, publish, export, delete contacts or manage providers, the team, keys, webhooks,
+agents and discount codes are [sensitive](/reference/glossary/#sensitive-permission) (⚑). `webhooks:manage` is
+sensitive since 1.5.0: an endpoint sends what its creator can see out of the workspace for as long as it runs. By
+default, the instance requires two-factor authentication for everyone who holds one in any workspace, with a 7-day
+grace period. Editors hold sensitive permissions such as `campaigns:send`, so they are covered by it.
 
 When the grace period ends, the person can still sign in but can't use the app or the API until they add an
 authenticator app or a passkey. Members who sign in with single sign-on are covered when their identity provider
@@ -107,8 +126,31 @@ enforces two-factor. Instance admins choose the policy in
 | Rule         | Permissions                                              | Why                                                                 |
 | ------------ | -------------------------------------------------------- | ------------------------------------------------------------------- |
 | People only  | `integrations:manage`, `ai:use`                          | API keys and MCP agents can't hold them.                            |
-| No agents    | `subscribers:verify`, `placement:run`, `placement:manage` | They send addresses or copies out, or reach seed mailboxes. Keys may hold them. |
+| No agents    | `subscribers:verify`, `placement:run`, `placement:manage`, `replies:view`, `replies:manage`, `coupons:manage`, `comments:moderate` | They send addresses or copies out, reach seed mailboxes, or handle what readers wrote and the codes they get. Keys may hold them. |
 | Owner only   | `workspace:transfer`, `workspace:delete`                 | Only the built-in Owner role holds them; custom roles can't.       |
+
+## What a scope reaches
+
+A member, API key or MCP agent limited to some lists or sender domains stays within them wherever ReputeCast reads
+contacts or sends mail on their behalf. Since 1.5.0 this covers:
+
+- **Every send path.** <UiPath path="composer.reviewSend" /> (send, schedule, schedule as approved), moving a
+  scheduled email, the live monitor's resume, retry, move, send again and continue after a canary, and MCP's
+  `resume_campaign` all check the campaign as it is against the caller's lists and sender domains. Moving an SMS, push
+  or WhatsApp send, or resuming a paused SMS send, does too. Stopping a send never needs a scope.
+- **Senders.** A new draft, a copy and a website post's campaign start from a sender within the author's sender
+  domains.
+- **Automations and digests.** A caller limited to lists publishes or resumes a flow only when every trigger is
+  <UiPath path="automations.graph.kindJoinedList" /> on one of their lists; one limited to sender domains, only when
+  the flow's emails go out from one of their domains. Setting up, turning on and releasing a digest is checked like a
+  campaign's send.
+- **Reads that name contacts.** The contacts at a flow's step, MCP's contact tools, and poll and survey exports leave
+  out contacts that aren't on the caller's lists. Previewing an automation email as a contact needs
+  `subscribers:view` and a contact on those lists.
+- **Webhooks.** Subscribing an endpoint to an event needs the view permission of the data it carries, and events
+  that carry contacts are refused to anyone limited to some lists. An endpoint sends for the person who last set its
+  events or resumed it, and pauses, with the reason, when that person leaves, loses the permission or is limited to
+  some lists. See [receive webhooks](/developers/webhooks/).
 
 ## When your role can't do something
 

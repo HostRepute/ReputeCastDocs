@@ -14,6 +14,9 @@ sources:
   - internal/providers/smtp
   - internal/providers/manage/review_health.go
   - internal/providers/provider.go
+  - internal/providers/ses/sns.go
+  - internal/providers/webhookauth/replay.go
+  - internal/providers/mailgun/webhook.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
   - internal/app/wire_sending.go
@@ -47,6 +50,14 @@ du fournisseur, et partage chaque rebond et chaque plainte au moyen d’une seul
    signe (une signature SNS pour Amazon SES, un HMAC pour Mailgun, une signature ECDSA pour SendGrid, un secret partagé
    pour les fournisseurs qui ne signent pas). Une requête qui échoue reçoit la réponse `401` et n’est jamais traitée ; ses
    2 premiers Ko sont conservés pour le diagnostic.
+   Depuis la version 1.5.0, deux signatures doivent répondre à plus qu’une signature valide :
+   - **SNS** signe de la même façon les topics de tous les comptes AWS : ReputeCast n’accepte donc un message que du
+     topic propre à la connexion, signé avec un certificat d’un endpoint SNS régional, `sns.<region>.amazonaws.com`. Il
+     enregistre le topic avant d’abonner le webhook, et ne fait confiance à aucun topic tant qu’aucun n’est enregistré.
+   - **Mailgun** signe un jeton à usage unique plutôt que l’événement. ReputeCast lie chaque jeton, dans sa base de
+     données, à l’événement avec lequel il est arrivé la première fois : aucun processus ReputeCast n’accepte ce jeton
+     avec un autre événement, même après un redémarrage. Une nouvelle livraison du même événement passe et n’est
+     comptée qu’une fois.
 3. **Il stocke le payload brut et répond immédiatement.** Un payload vérifié est enregistré tel qu’il est arrivé et le
    fournisseur reçoit `200` tout de suite : un traitement lent ne pousse jamais un fournisseur à réessayer ou à
    abandonner. Si ReputeCast ne peut pas le stocker, il répond `429` avec `Retry-After: 30` plutôt qu’un `5xx`, car
@@ -73,6 +84,10 @@ Les événements qui ne passent pas par un webhook suivent le même chemin à pa
   illisible.
 - **Interrogation périodique** : ReputeCast interroge l’API d’événements de Mailgun ou de SparkPost toutes les minutes
   quand vous avez choisi l’interrogation périodique dans l’assistant de connexion.
+- **Rapports de boucle de rétroaction par e-mail** : tant que ReputeCast
+  [reçoit des e-mails](/fr/providers/receiving-mail/), un rapport de plainte au format ARF qui arrive à l’adresse
+  `fbl@` du domaine de réception devient un événement `complaint` du fournisseur d’envoi qui a envoyé le message.
+  Disponible à partir de la prochaine version après la 1.6.0.
 
 Un fournisseur dont les événements cessent d’arriver alors que des e-mails partent est signalé comme ayant des webhooks
 silencieux, et un fournisseur qui n’a jamais signalé d’événement est signalé dès que des e-mails ont 30 minutes de
@@ -126,8 +141,13 @@ d’envoi ou par type d’événement, ou recherchez un destinataire ou un ID de
 
 <Screenshot
   id="providers-events"
-  alt="Le journal des événements : des événements bruts de Postmark, Amazon SES et Postal à côté de leurs types normalisés (délivré, rebond définitif, différé, plainte, rebond temporaire, rejeté), chacun avec son code SMTP d’origine et son diagnostic."
+  alt="Le journal des événements de tous les fournisseurs d’envoi et de tous les événements : chaque événement brut, comme Delivery ou Bounce/Permanent/General d’Amazon SES, à côté de son type normalisé, délivré ou rebond définitif, avec le code et le diagnostic d’origine, le destinataire masqué et l’étape d’automatisation dont il vient."
 />
+
+Les e-mails reçus, comme les réponses, ne sont pas des événements d’un fournisseur d’envoi, et l’adresse entrante où ils
+arrivent, `/hooks/inbound/<token>`, est distincte des webhooks d’événements. Lisez
+[Configurer la réception des e-mails](/fr/providers/receiving-mail/). Disponible à partir de la prochaine version
+après la 1.6.0.
 
 <UiPath path="providers.events.exportCsv" /> télécharge les événements filtrés. Les destinataires restent masqués sauf si
 vous avez l’autorisation `subscribers:export`, et chaque export est consigné dans le [journal d’audit](/fr/team/audit-log/).

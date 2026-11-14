@@ -15,6 +15,7 @@ sources:
   - internal/domains/cloudflare.go
   - internal/domains/api.go
   - internal/dnscheck/auth.go
+  - internal/readiness/technical.go
   - internal/dnscheck/domain.go
   - internal/readiness/assemble.go
   - internal/providers/ses/ses.go
@@ -45,14 +46,15 @@ hébergeur DNS, et la lecture de leur état en direct.
 | -------------- | -------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | SPF            | TXT            | Le domaine de l’expéditeur d’enveloppe (MAIL FROM)        | Le serveur qui a remis le message a le droit d’envoyer pour ce domaine.                                 |
 | DKIM           | CNAME ou TXT   | `<selector>._domainkey.<domain>`                          | Le message a été signé par le fournisseur d’envoi avec une clé que vous avez publiée, et n’a pas été modifié. |
-| DMARC          | TXT            | `_dmarc.<domain>`, ou le domaine organisationnel          | Ce que font les destinataires quand ni SPF ni DKIM ne réussit en accord avec l’adresse From.            |
+| DMARC          | TXT            | `_dmarc.<domain>`, ou un domaine parent                   | Ce que font les destinataires quand ni SPF ni DKIM ne réussit en accord avec l’adresse From.            |
 
 </TableScroll>
 
 DMARC réussit quand SPF ou DKIM réussit **et** que son domaine est aligné sur le domaine de l’adresse From. En mode
 souple (relaxed), le mode par défaut, les deux domaines doivent avoir le même domaine organisationnel :
 `bounce.news.acme.io` est aligné sur `news.acme.io`. En mode strict, ils doivent être identiques
-([RFC 7489, section 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), vérifié en octobre 2026).
+([RFC 9989, section 4.4](https://www.rfc-editor.org/rfc/rfc9989#section-4.4), vérifié en novembre 2026). La RFC 9989 a
+remplacé la RFC 7489 comme norme DMARC en mai 2026.
 
 C’est pourquoi ReputeCast demande un return-path personnalisé (MAIL FROM) sur votre propre domaine partout où le
 fournisseur d’envoi le permet : SPF est vérifié sur le return-path, donc avec le return-path par défaut du fournisseur
@@ -121,11 +123,32 @@ Proposed:   v=spf1 mx include:spf.mtasv.net -all
 
 ### La ligne DMARC
 
-Quand aucun enregistrement DMARC n’existe pour le domaine ou son domaine organisationnel, ReputeCast suggère
-`v=DMARC1; p=quarantine; adkim=s; aspf=r`, avec `rua=mailto:` et l’adresse de rapport de HostRepute quand
-[HostRepute](/fr/reference/glossary/#hostrepute) est connecté. La ligne compte comme vérifiée dès qu’un enregistrement
-DMARC valide est publié sur `_dmarc.<domain>` ou sur le domaine organisationnel, `p=none` compris. Lisez
-[Choisir une politique DMARC](#choisir-une-politique-dmarc) avant de publier la suggestion.
+Quand aucun enregistrement DMARC ne s’applique au domaine, ReputeCast suggère `v=DMARC1; p=quarantine; adkim=s; aspf=r`,
+avec `rua=mailto:` et l’adresse de rapport de HostRepute quand [HostRepute](/fr/reference/glossary/#hostrepute) est
+connecté, et l’adresse `dmarc@` du domaine de réception tant que
+[ReputeCast reçoit des e-mails](/fr/providers/receiving-mail/). La ligne compte comme vérifiée dès qu’un enregistrement
+DMARC valide s’applique, sur `_dmarc.<domain>` ou sur un domaine parent, `p=none` compris. Lisez
+[Choisir une politique DMARC](#choisir-une-politique-dmarc) avant de publier la suggestion. L’adresse `dmarc@` est
+fournie avec la réception des e-mails. Disponible à partir de la prochaine version après la 1.6.0.
+
+### Comment ReputeCast lit un enregistrement DMARC
+
+Depuis la version 1.6.0, ReputeCast lit les enregistrements DMARC comme le décrit la RFC 9989
+([RFC 9989, sections 4.7 et 4.10](https://www.rfc-editor.org/rfc/rfc9989#section-4.10), vérifié en novembre 2026) :
+
+- **La découverte de la politique** commence sur `_dmarc.<domain>` et remonte les domaines parents, en 8 requêtes au
+  plus, jusqu’au premier enregistrement utilisable ou jusqu’à un enregistrement dont la balise `psd=` vaut `y` ou `n`.
+  Un sous-domaine prend la politique `sp=` d’un parent, ou sa politique `np=` quand le sous-domaine n’existe pas dans le
+  DNS ; les deux valent `p=` par défaut.
+- **Les balises que la RFC 9989 a supprimées**, `pct=`, `ri=` et `rf=`, sont ignorées, tout comme celles qu’elle ne
+  définit pas. `t=`, `np=` et `psd=` sont lues.
+- **Un enregistrement sans `p=` valide** compte comme `p=none` quand il a une adresse `rua=` valide ; sinon les
+  destinataires l’ignorent, et sur le domaine lui-même ReputeCast l’affiche comme non valide. Il en va de même de deux
+  enregistrements DMARC sous un même nom, et d’un enregistrement qui n’en a que l’apparence, comme `v=dmarc1`.
+- **Le mode test**, `t=y`, demande aux destinataires d’appliquer la politique d’un niveau inférieur : `quarantine` est
+  traité comme `none`, et `reject` comme `quarantine`. Le [contrôle avant envoi](/fr/campaigns/send-readiness/)
+  l’indique dans les <UiPath path="review.technicalDetails" /> de sa ligne DMARC.
+- **Une requête DNS qui échoue** arrête la remontée : la politique est inconnue, pas manquante.
 
 ## Avant de commencer
 
@@ -307,7 +330,10 @@ v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
 Lisez ensuite les rapports pendant quelques semaines et durcissez la politique quand toutes les sources légitimes
 réussissent, comme l’explique [Lire les rapports agrégés DMARC](/fr/deliverability/dmarc-reports/). Un enregistrement
 DMARC sur le domaine organisationnel (`_dmarc.acme.io`) couvre aussi les sous-domaines comme `news.acme.io` ; sa
-balise `sp=` fixe leur politique, et ReputeCast la lit quand le sous-domaine n’a pas d’enregistrement propre.
+balise `sp=` fixe leur politique (`np=` pour les sous-domaines qui n’existent pas), et ReputeCast la lit quand le
+sous-domaine n’a pas d’enregistrement propre. Pour essayer d’abord une politique plus stricte, publiez-la avec `t=y` :
+les destinataires appliquent alors un niveau de moins, et les rapports agrégés continuent d’arriver. La RFC 9989 n’a
+plus de balise `pct=` : un pourcentage ne limite donc plus la politique.
 
 ## Vérifier le résultat
 
@@ -334,6 +360,9 @@ balise `sp=` fixe leur politique, et ReputeCast la lit quand le sous-domaine n�
   pas les requêtes d’une valeur fusionnée avant que vous la publiiez : regardez donc l’état après la publication.
 - **SPF se termine par `+all`.** ReputeCast le considère comme non valide, car il permet à n’importe qui d’envoyer au
   nom du domaine. Utilisez `~all` ou `-all`.
+- **DMARC s’affiche comme non valide.** Le domaine publie deux enregistrements DMARC sur `_dmarc.<domain>`, un
+  enregistrement qui ne commence pas exactement par `v=DMARC1`, ou un enregistrement sans `p=` valide ni `rua=` valide.
+  Gardez un seul enregistrement, qui commence par `v=DMARC1; p=`.
 - **Un enregistrement reste « Manquant » alors que vous l’avez ajouté.** Vérifiez que le nom ne contient pas la zone en
   double (`news.acme.io.acme.io`) et que vous avez modifié la zone chez l’hébergeur DNS vers lequel pointent les
   serveurs de noms.

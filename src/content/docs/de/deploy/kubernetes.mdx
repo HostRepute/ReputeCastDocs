@@ -1,0 +1,308 @@
+---
+title: ReputeCast auf Kubernetes mit Helm bereitstellen
+description: ReputeCast auf Kubernetes mit Helm betreiben, als ein Pod mit Volume oder als Pods für web, worker und ingest, die einen S3-kompatiblen Bucket teilen.
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast auf Kubernetes
+sources:
+  - deploy/helm/reputecast
+  - .github/workflows/release.yml
+  - internal/config/config.go
+  - internal/cli/migrate.go
+  - internal/cli/install.go
+  - docs/deploy/README.md
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Diese Anleitung betreibt ReputeCast auf Kubernetes mit Helm und dem Chart aus dem ReputeCast-Repository, mit einer
+PostgreSQL-Datenbank, die Sie bereitstellen, und hinter Ihrem Ingress-Controller. Migrationen laufen vor jeder
+Installation und jedem Upgrade in einem Job. Verfügbar ab der nächsten Version nach 1.6.0.
+
+Das Chart kennt zwei Aufteilungen:
+
+- **`mode: single`** (der Standard): Ein StatefulSet-Pod führt alle Rollen aus, die Web-App, die API, den Empfang der
+  Webhooks und die Worker, mit einem Volume von 10 Gi unter `/var/lib/reputecast` für hochgeladene Dateien.
+- **`mode: split`**: Deployments für die Web-App (2 Replikate) und die Worker (1) und, mit `ingest.separate`, Webhooks
+  der Anbieter in eigenen Pods (2). Sie teilen hochgeladene Dateien über einen
+  [S3-kompatiblen Bucket](/de/self-hosting/object-storage/), daher braucht der Split-Modus `storage.backend: s3`.
+
+Das Chart liegt im Repository unter `deploy/helm/reputecast`. Jede Version paketiert es; der Release-Workflow lädt es
+erst nach `oci://ghcr.io/hostrepute/charts` hoch, wenn die Maintainer die Veröffentlichung einschalten. Diese Anleitung
+installiert es daher aus einem Checkout.
+
+## Bevor Sie beginnen
+
+- Kubernetes ab 1.29, Helm ab 3.8 und `kubectl` für den Cluster.
+- PostgreSQL 16, 17 oder 18, das die Pods erreichen: ein [CloudNativePG](https://cloudnative-pg.io)-Cluster oder eine
+  verwaltete Datenbank. Das Chart bringt keine mit. Siehe auch die
+  [Systemanforderungen](/de/self-hosting/requirements/) und [PostgreSQL](/de/self-hosting/postgres/).
+- Ein Ingress-Controller und ein TLS-Zertifikat für einen DNS-Namen wie `news.example.com`, abgelegt in einem Secret
+  wie `reputecast-tls`. Versandanbieter stellen Webhooks an `<public URL>/hooks/…` zu, der Name muss also aus dem
+  Internet erreichbar sein.
+- Für den Split-Modus einen Bucket und seine Zugangsdaten
+  ([Object Storage](/de/self-hosting/object-storage/#bevor-sie-beginnen)).
+
+## Dem Chart eine Datenbank geben
+
+Das Chart liest die URL der Datenbank aus einem Secret. Mit installiertem CloudNativePG-Operator legt dieser Cluster die
+Datenbank `reputecast`, ihren Eigentümer und das Secret `reputecast-db-app` an, das die URL unter `uri` enthält, dem
+Schlüssel, den das Chart standardmäßig liest:
+
+```yaml title="reputecast-db.yaml"
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: reputecast-db
+  namespace: reputecast
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  bootstrap:
+    initdb:
+      database: reputecast
+      owner: reputecast
+  storage:
+    size: 20Gi
+```
+
+Für eine verwaltete Datenbank (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean oder eine andere)
+legen Sie das Secret selbst an:
+
+```sh
+kubectl create namespace reputecast
+kubectl create secret generic reputecast-db --namespace reputecast \
+  --from-literal=uri='postgres://reputecast:…@db.example.com:5432/reputecast?sslmode=require'
+```
+
+Migrationen brauchen eine direkte Verbindung oder eine im Session-Modus, nicht PgBouncer im Transaction-Modus. Der
+Anwendungsbenutzer von CloudNativePG kann keine Rollen anlegen, daher bleiben SQL-Segmente aus, bis ein
+Datenbank-Admin ihre Rolle hinzufügt ([SQL-Segmente](/de/self-hosting/postgres/#sql-segmente)).
+
+## Chart installieren
+
+<Steps>
+
+1. Checken Sie das Chart aus:
+
+   ```sh
+   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   ```
+
+2. Schreiben Sie Ihre Values. Dies ist der Single-Modus hinter ingress-nginx:
+
+   ```yaml title="values.yaml"
+   publicURL: https://news.example.com
+   database:
+     existingSecret: reputecast-db-app # or reputecast-db for a managed database
+   admin:
+     email: you@company.com
+   ingress:
+     enabled: true
+     className: nginx
+     annotations:
+       # Imports and uploads can be larger than the controller's default.
+       nginx.ingress.kubernetes.io/proxy-body-size: 100m
+     tls:
+       - secretName: reputecast-tls
+         hosts: [news.example.com]
+   ```
+
+   - `publicURL` ist erforderlich: Links in E-Mails, Webhooks der Anbieter, Passkeys und Weiterleitungen bei der
+     Anmeldung werden daraus gebildet. Der Host des Ingress ist standardmäßig ihr Hostname.
+   - `admin.email` legt nach der ersten Installation den ersten Inhaber an. Lassen Sie den Wert bei einer Datenbank leer,
+     die schon Benutzer hat, etwa nach einer Wiederherstellung.
+   - Ein Chart aus einem Checkout führt das Image mit dem Tag `latest` aus, die neueste Version. Um eine festzulegen,
+     setzen Sie `image.tag` auf ihr Tag oder `image.digest` auf ihren Digest, der Vorrang vor dem Tag hat.
+   - `values.schema.json` prüft Namen und Typen, sodass ein falsch geschriebener Wert die Installation stoppt, statt
+     ignoriert zu werden.
+
+3. Installieren Sie es:
+
+   ```sh
+   helm install reputecast ./reputecast/deploy/helm/reputecast \
+     --namespace reputecast --create-namespace -f values.yaml
+   ```
+
+   Helm führt zuerst den Migrations-Job aus (`reputecast migrate up`), legt dann den Pod an und danach den
+   Installations-Job, der den ersten Inhaber anlegt. Die Pods migrieren nie von selbst.
+
+4. Lesen Sie das temporäre Passwort des ersten Inhabers im Log des Installations-Jobs. Der Job bleibt 7 Tage erhalten:
+
+   ```sh
+   kubectl logs --namespace reputecast job/reputecast-install
+   ```
+
+   ```txt title="Output"
+     ReputeCast is installed.
+
+     Sign in at  https://news.example.com
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+   Mit `admin.passwordSecret` kommt das Passwort des Inhabers stattdessen aus diesem Secret.
+
+5. Sichern Sie den geheimen Schlüssel, den das Chart generiert hat (siehe
+   [Der geheime Schlüssel](#der-geheime-schlüssel)), öffnen Sie dann die öffentliche URL und melden Sie sich an. Bei
+   der [ersten Anmeldung](/de/self-hosting/first-run/) ersetzen Sie das Passwort, fügen einen Passkey oder eine
+   Authenticator-App hinzu, speichern Wiederherstellungscodes, bestätigen die Grunddaten der Instanz und legen einen
+   Arbeitsbereich an.
+
+</Steps>
+
+Ohne Ingress erreicht `kubectl port-forward --namespace reputecast service/reputecast 8080:80` die App von Ihrem
+Computer aus; Anbieter brauchen trotzdem die öffentliche URL.
+
+## Was das Chart ausführt
+
+- **Pods**: das Image `ghcr.io/hostrepute/reputecast`, als Benutzer 65532 mit schreibgeschütztem Root-Dateisystem,
+  ohne Capabilities, mit dem Seccomp-Profil `RuntimeDefault` und ohne Service-Account-Token. Die Requests betragen
+  100m CPU und 256Mi Arbeitsspeicher, mit einem Speicherlimit von 1Gi (`resources`, im Split-Modus `web.resources`,
+  `worker.resources` und `ingest.resources`).
+- **Probes**: eine Startup-Probe auf `/healthz` (alle 5 Sekunden, bis zu 5 Minuten), Readiness auf `/readyz` (alle
+  10 Sekunden) und Liveness auf `/healthz` (alle 20 Sekunden). Ein Worker hat keinen HTTP-Listener, daher fragen seine
+  Probes den Metrik-Port.
+- **Services**: `reputecast` (ClusterIP, Port 80) für die Web-Pods, `reputecast-metrics` auf Port 9464 für
+  Prometheus und im Split-Modus mit `ingest.separate` `reputecast-ingest`, an den der Ingress `/hooks/` weiterleitet.
+- **Konfiguration**: Die ConfigMap `reputecast-env` enthält die öffentliche URL, die vertrauenswürdigen Proxys, das
+  Log-Level (Logs sind JSON) und die Speichereinstellungen; die URL der Datenbank, der geheime Schlüssel und die
+  Schlüssel des Buckets kommen aus Secrets. `extraEnv` und `extraEnvFrom` fügen jede andere
+  [Einstellung](/de/reference/configuration/) hinzu, etwa `REPUTECAST_UPDATES__MANAGED_BY` oder
+  `REPUTECAST_HTTP__PUBLIC_URL_LOCKED` für eine Instanz, die Sie für jemand anderen betreiben
+  ([Einstellungen, die der Serverbetreiber verwaltet](/de/self-hosting/configuration/#einstellungen-die-der-serverbetreiber-verwaltet)).
+- **Hinter dem Ingress**: `http.trustedProxies` ist standardmäßig `[private]`, ReputeCast vertraut `X-Forwarded-For`
+  also vom Ingress-Controller in den privaten Netzwerken des Clusters und sonst nirgends
+  ([Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)).
+
+## Split-Modus und der Bucket
+
+<Steps>
+
+1. Legen Sie den Bucket und seine Zugriffsschlüssel an ([Object Storage](/de/self-hosting/object-storage/)) und
+   bewahren Sie die Schlüssel in einem Secret auf:
+
+   ```sh
+   kubectl create secret generic reputecast-s3 --namespace reputecast \
+     --from-literal=access-key-id=… --from-literal=secret-access-key=…
+   ```
+
+2. Fügen Sie Ihren Values die Aufteilung und den Bucket hinzu:
+
+   ```yaml title="values.yaml"
+   mode: split
+   web:
+     replicas: 3
+   worker:
+     replicas: 2
+   ingest:
+     separate: true
+   storage:
+     backend: s3
+     s3:
+       bucket: reputecast-files
+       region: eu-central-1
+       existingSecret: reputecast-s3 # access-key-id and secret-access-key
+   hpa:
+     enabled: true
+   ```
+
+   Für einen anderen Dienst als AWS setzen Sie `storage.s3.endpoint`, für MinIO außerdem `storage.s3.pathStyle: true`.
+   Ohne Zugriffsschlüssel wird die Standard-Credential-Chain von AWS verwendet, IRSA funktioniert also über
+   `serviceAccount.annotations` (`eks.amazonaws.com/role-arn`).
+
+3. Installieren oder aktualisieren Sie mit diesen Values. `mode: split` mit `storage.backend: local` bricht mit
+   `mode split needs storage.backend s3` ab: Pods können keinen lokalen Ordner teilen.
+
+</Steps>
+
+- `pdb.enabled` (an) gibt den Web-Pods und den Ingest-Pods ein PodDisruptionBudget von einem nicht verfügbaren Pod.
+- `hpa.enabled` skaliert die Web-Pods bei 70 % CPU zwischen 2 und 6 Replikaten.
+- `ingest.separate` führt Webhooks der Anbieter in eigenen Pods aus, damit eine Welle von Webhooks die App nicht
+  verlangsamt ([mit Rollen skalieren](/de/self-hosting/scaling/)).
+- Eine bestehende Installation im Single-Modus auf den Split-Modus umstellen: Kopieren Sie ihre Dateien zuerst mit
+  `reputecast storage migrate --to s3` in den Bucket
+  ([Dateiordner verschieben](/de/self-hosting/object-storage/#dateiordner-in-den-bucket-verschieben)).
+
+## Der geheime Schlüssel
+
+ReputeCast verschlüsselt Zugangsdaten der Anbieter, OIDC-Secrets und andere vertrauliche Zugangsdaten mit einem
+32-Byte-Schlüssel. Ohne `secretKey.existingSecret` generiert das Chart bei der Installation einen in das Secret
+`reputecast-key`, liest ihn bei jedem Upgrade wieder aus und lässt ihn stehen, wenn das Release deinstalliert wird.
+Sichern Sie ihn zusammen mit der Datenbank; eine Wiederherstellung braucht beide:
+
+```sh
+kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.secret-key}' | base64 -d
+```
+
+<Aside type="caution">
+  Werkzeuge, die das Chart ohne Cluster rendern, etwa Argo CD, können den Schlüssel nicht auslesen und würden bei jeder
+  Synchronisierung einen neuen generieren, sodass sich gespeicherte Zugangsdaten nicht mehr öffnen ließen. Legen Sie das
+  Secret selbst mit einem Schlüssel aus `reputecast secrets generate-key` an und setzen Sie `secretKey.existingSecret`.
+</Aside>
+
+## Optionale Teile
+
+- **SMTP-Relay**: Das [Relay](/de/transactional/smtp-relay/) lauscht in den Web-Pods, sobald ein Instanz-Admin es
+  einschaltet. `smtpRelay.service.enabled` veröffentlicht seine Ports über einen LoadBalancer-Service,
+  `reputecast-smtp`, mit `externalTrafficPolicy: Local`, damit das Relay die Adresse jedes Clients sieht. Halten Sie
+  `smtpRelay.starttlsPort` und `smtpRelay.tlsPort` gleich den in der App gesetzten Ports (587 und 465). Ein
+  Let's-Encrypt-Zertifikat für das Relay wird über HTTP geprüft: Fügen Sie seinen Hostnamen zu `ingress.hosts` hinzu.
+- **GeoIP**: `geoip.volume` hängt ein Volume mit einer MaxMind-DB-Datei schreibgeschützt unter `/var/lib/geoip` ein,
+  und `geoip.file` nennt die Datei ([GeoIP-Datenbank hinzufügen](/de/self-hosting/geoip/)).
+- **Prometheus**: Jeder Pod liefert Metriken auf Port 9464; `serviceMonitor.enabled` fügt einen ServiceMonitor für den
+  Prometheus Operator hinzu ([Zustandsprüfungen, Metriken und Protokolle](/de/self-hosting/monitoring/)).
+- **NetworkPolicy**: `networkPolicy.enabled` lässt den HTTP-Port von `networkPolicy.httpFrom` herein (standardmäßig von
+  überall), den Metrik-Port von `networkPolicy.metricsFrom` (standardmäßig aus dem Namespace des Release) und die Ports
+  des Relays, wenn sein Service an ist. Ausgehender Verkehr bleibt offen: Versandanbieter, DNS, PostgreSQL und der
+  Bucket sind dort, wo sie sind.
+
+## Prüfen, ob es funktioniert hat
+
+- `kubectl get pods --namespace reputecast` zeigt die Pods als `Running` und bereit: `/readyz` antwortet, sobald die
+  Datenbank erreichbar ist und das Schema jede Migration hat.
+- `helm test reputecast --namespace reputecast` fragt den Web-Service nach `/readyz` und ist bei `200` erfolgreich.
+- `https://news.example.com/readyz` antwortet über den Ingress mit `ready`.
+
+## Aktualisieren
+
+1. Lesen Sie die [Versionshinweise](/de/reference/release-notes/) und [sichern](/de/self-hosting/backups/) Sie die
+   Datenbank, das Secret `reputecast-key` und im Split-Modus den Bucket.
+2. Aktualisieren Sie den Checkout (`git -C reputecast pull`) und `image.tag`, falls Sie eines festlegen.
+3. Führen Sie das Upgrade mit Ihren Values und genug Zeit für die Migrationen aus. Eine große kann länger dauern als
+   der Standard von Helm, fünf Minuten:
+
+   ```sh
+   helm upgrade reputecast ./reputecast/deploy/helm/reputecast \
+     --namespace reputecast -f values.yaml --timeout 30m
+   ```
+
+   Der Migrations-Job läuft, bevor sich die Pods ändern, und die Pods des vorherigen Release bedienen weiter, bis er
+   fertig ist ([ReputeCast aktualisieren](/de/self-hosting/upgrades/)).
+
+`helm uninstall reputecast --namespace reputecast` lässt das Secret `reputecast-key` und im Single-Modus den
+PersistentVolumeClaim `data-reputecast-0` stehen, sodass nichts verloren geht, was sich nicht neu anlegen lässt.
+Löschen Sie beides selbst, wenn Sie sicher sind.
+
+## Fehlerbehebung
+
+- **Die Installation bricht mit `Set database.url or database.existingSecret`**, **`Set publicURL …`** oder einer
+  anderen Meldung des Charts ab: Jede sagt, was zu setzen ist. Das Chart prüft die Values, bevor es etwas anlegt.
+- **Der Migrations-Job schlägt fehl**: Lesen Sie `kubectl logs --namespace reputecast job/reputecast-migrate`. Ein
+  Verbindungsfehler betrifft die URL, das Secret oder das Netzwerk. Migrationen brauchen eine direkte Verbindung oder
+  eine im Session-Modus, nicht PgBouncer im Transaction-Modus.
+- **`helm upgrade` läuft in ein Timeout, während der Job noch läuft**: Geben Sie `--timeout 30m` an. Die Pods des
+  vorherigen Release bedienen in der Zwischenzeit weiter.
+- **Der Installations-Job schlägt mit `ReputeCast is already installed: users exist` fehl**: Die Datenbank hatte schon
+  Benutzer, etwa nach einer Wiederherstellung. Deren Konten funktionieren unverändert; lassen Sie `admin.email` leer.
+- **Kein erster Inhaber, weil `admin.email` leer war**: Legen Sie einen aus einem Pod an:
+  `kubectl exec --namespace reputecast -it statefulset/reputecast -- reputecast install --email you@company.com`
+  (im Split-Modus `deploy/reputecast-web`).
+- **Uploads oder Importe schlagen mit Status 413 fehl**: Das ist das Limit des Ingress-Controllers für die Größe des
+  Bodys; erhöhen Sie es, wie es die Annotation `proxy-body-size` oben für ingress-nginx tut.
+- **Jeder Besucher hat in Sitzungen und im Audit-Protokoll dieselbe Adresse**: Der Ingress-Controller verbindet sich
+  von einer Adresse außerhalb der privaten Netzwerke. Setzen Sie `http.trustedProxies` auf seinen Adressbereich.
+
+Referenz des Charts: `README.md` und `values.yaml` des Charts in `deploy/helm/reputecast` listen jeden Wert auf.

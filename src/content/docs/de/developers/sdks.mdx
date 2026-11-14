@@ -1,0 +1,474 @@
+---
+title: Client-SDKs nutzen
+description: Das ReputeCast SDK für TypeScript, Python oder Go installieren, einen Client erstellen, Transaktions-E-Mails senden, Kontakte abrufen und Webhooks prüfen.
+type: how-to
+audience: [developer]
+permissions: ['apikeys:manage', 'transactional:send', 'subscribers:view']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: ReputeCast SDK
+sources:
+  - sdk/client-ts
+  - sdk/client-python
+  - sdk/client-go
+  - sdk/openapi
+  - sdk/scripts/set-version.mjs
+  - docs/api/README.md
+  - internal/app/openapi_public.go
+  - internal/cli/openapi.go
+  - internal/integrations/calls.go
+  - .github/workflows/release.yml
+  - Makefile
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Das ReputeCast SDK gibt es in drei Sprachen, TypeScript, Python und Go, generiert aus dem öffentlichen
+OpenAPI-Dokument: jede Operation, die ein [API-Schlüssel](/de/reference/glossary/#api-key) aufrufen darf, mit
+eingebauter Authentifizierung, Wiederholungen, Fehlern als Exceptions und Prüfung von Webhook-Signaturen. Diese Seite
+installiert eines, erstellt einen Client, sendet eine Transaktions-E-Mail, ruft Kontakte seitenweise ab und prüft einen
+Webhook. Verfügbar ab der nächsten Version nach 1.6.0.
+
+## Bevor Sie beginnen
+
+- Ein API-Schlüssel aus <UiPath path="nav.settings > settings.keys" /> mit den Berechtigungen, die Ihre Aufrufe
+  brauchen: Die Beispiele nutzen `transactional:send` und `subscribers:view` (siehe
+  [Authentifizierung und API-Schlüssel](/de/developers/api-authentication/)). Die SDKs nehmen auch ein Token eines
+  MCP-Agenten (`rc_agent_…`).
+- Die öffentliche URL Ihrer Instanz, etwa `https://reputecast.example.com`, und der Slug Ihres Arbeitsbereichs, etwa
+  `acme-newsletter`.
+- Eine dieser Laufzeitumgebungen:
+
+| Sprache                   | Paket                                            | Voraussetzungen                                                       |
+| ------------------------- | ------------------------------------------------ | --------------------------------------------------------------------- |
+| TypeScript und JavaScript | `@reputecast/client`                             | Node.js ab 20, als ES-Modul. Eine Abhängigkeit: `openapi-fetch`.      |
+| Python                    | `reputecast`                                     | Python ab 3.11, mit `httpx` und `attrs`.                              |
+| Go                        | `github.com/hostrepute/reputecast/sdk/client-go` | Go ab 1.27.3.                                                         |
+
+Die Beispiele lesen den Schlüssel aus der Umgebungsvariable `REPUTECAST_KEY`. Belassen Sie ihn auf Ihrem Server:
+API-Schlüssel gehören nie in Browser- oder Mobil-Code.
+
+## SDK installieren
+
+Jede Version soll die drei SDKs mit der Version des Servers veröffentlichen, zum Beispiel `@reputecast/client` und
+`reputecast` 1.7.0 für ReputeCast 1.7.0 und das Go-Modul unter dem Tag `sdk/client-go/v1.7.0`. Das Release taggt das
+Go-Modul selbst; die Pakete auf npm und PyPI erscheinen, sobald die Konten des Projekts dort eingerichtet sind. Im
+November 2026 ist keines der beiden Pakete auf npm oder PyPI, installieren Sie die SDKs daher aus dem Repository:
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+Bauen Sie das Paket aus einem Klon und installieren Sie dann die erzeugte Datei in Ihrem Projekt. Der Build nutzt den
+pnpm-Workspace in `sdk/` (pnpm 12 und Node.js ab 24.11):
+
+```sh title="Terminal"
+git clone https://github.com/hostrepute/reputecast.git
+cd reputecast/sdk
+pnpm install --frozen-lockfile
+pnpm --filter @reputecast/client build
+cd client-ts && pnpm pack
+# In your project:
+npm install /path/to/reputecast/sdk/client-ts/reputecast-client-0.0.0-dev.tgz
+```
+
+Sobald es auf npm ist: `npm install @reputecast/client`.
+
+</TabItem>
+<TabItem label="Python">
+
+```sh title="Terminal"
+pip install "reputecast @ git+https://github.com/hostrepute/reputecast.git#subdirectory=sdk/client-python"
+```
+
+Sobald es auf PyPI ist: `pip install reputecast`.
+
+</TabItem>
+<TabItem label="Go">
+
+```sh title="Terminal"
+go get github.com/hostrepute/reputecast/sdk/client-go@main
+```
+
+Sobald ein Release das Modul getaggt hat: `go get github.com/hostrepute/reputecast/sdk/client-go@v1.7.0`, mit der
+Version Ihres Servers.
+
+</TabItem>
+</Tabs>
+
+Nutzen Sie das SDK der Version Ihres Servers oder einer früheren. Ein aus `main` gebautes SDK kennt jede Operation, die
+`main` hat; eine aufzurufen, die Ihr Server noch nicht hat, ergibt `404` mit dem Code `not_found`.
+
+## Client erstellen
+
+Die Basis-URL ist die öffentliche URL der Instanz, ohne `/api/v1`: Die Pfade der SDKs beginnen damit.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="client.ts"
+import { createClient, unwrap } from '@reputecast/client'
+
+const rc = createClient({ baseUrl: 'https://reputecast.example.com', apiKey: process.env.REPUTECAST_KEY! })
+
+const lists = unwrap(
+  await rc.GET('/api/v1/workspaces/{workspace}/lists', { params: { path: { workspace: 'acme-newsletter' } } }),
+)
+```
+
+Der Client ist [openapi-fetch](https://openapi-ts.dev/openapi-fetch/), typisiert mit den Pfaden der API (geprüft im
+November 2026): `rc.GET`, `rc.POST`, `rc.PUT`, `rc.PATCH` und `rc.DELETE` nehmen den Pfad genau so, wie das
+OpenAPI-Dokument ihn schreibt. `unwrap` gibt die Daten der Antwort zurück oder wirft. Optionen: `fetch` (Ihr eigenes)
+und `maxRetries` (0 schaltet Wiederholungen aus).
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="client.py"
+import os
+
+from reputecast import ReputeCast, unwrap
+from reputecast.api.audience import list_lists
+
+rc = ReputeCast(api_key=os.environ["REPUTECAST_KEY"], base_url="https://reputecast.example.com")
+
+lists = unwrap(list_lists.sync_detailed(client=rc, workspace="acme-newsletter"))
+```
+
+Jede Operation ist ein Modul von `reputecast.api`, gruppiert nach den Tags der API-Referenz, mit den Funktionen `sync`,
+`sync_detailed`, `asyncio` und `asyncio_detailed`; Bodys und Antworten sind Klassen von `reputecast.models`. `unwrap`
+nimmt ein Ergebnis von `*_detailed` und gibt seine Daten zurück oder löst eine Exception aus. `ReputeCast` nimmt
+außerdem `timeout` (Sekunden, standardmäßig 30) und `max_retries`.
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="client.go"
+rc, err := reputecast.New("https://reputecast.example.com", os.Getenv("REPUTECAST_KEY"))
+if err != nil {
+	return err
+}
+res, err := rc.ListListsWithResponse(ctx, "acme-newsletter")
+if err != nil {
+	return err // an error answer is a *reputecast.Error
+}
+for _, l := range res.JSON200.Items {
+	fmt.Println(l.Name)
+}
+```
+
+Importieren Sie das Paket als `reputecast "github.com/hostrepute/reputecast/sdk/client-go"`. Jede Operation ist eine
+Methode `<Operation>WithResponse`; ist ihr Fehler nil, ist das Erfolgsfeld (`JSON200`, `JSON202` und so weiter)
+gesetzt. Optionen: `reputecast.WithMaxRetries`, `reputecast.WithTimeout` (pro Versuch, standardmäßig 30 Sekunden; eine
+Deadline im Kontext begrenzt den ganzen Aufruf), `reputecast.WithTransport` und `reputecast.WithClientOptions`.
+
+</TabItem>
+</Tabs>
+
+Jede Anfrage trägt den Schlüssel als `Authorization: Bearer <key>` und den eigenen `User-Agent` des SDK:
+`ReputeCast-SDK-TS/<version>`, `ReputeCast-SDK-Python/<version>` oder `ReputeCast-SDK-Go/<version>`. Gehört der
+Schlüssel zu einer Integration, nennt <UiPath path="nav.settings > settings.integrations" /> den Aufrufer danach, zum
+Beispiel „ReputeCast SDK for Python 1.7.0“.
+
+## Transaktions-E-Mail senden
+
+Dieses Beispiel sendet die veröffentlichte Vorlage `password-reset` (alle Felder stehen unter
+[Transaktions-E-Mails mit der API senden](/de/developers/transactional-api/)). Mit einem `Idempotency-Key` sendet eine
+Wiederholung innerhalb von 24 Stunden, die des SDK oder Ihre eigene, nie doppelt.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="send.ts"
+const msg = unwrap(
+  await rc.POST('/api/v1/workspaces/{workspace}/transactional/messages', {
+    params: {
+      path: { workspace: 'acme-newsletter' },
+      header: { 'Idempotency-Key': `pwreset-${user.id}-${token.id}` },
+    },
+    body: {
+      template: 'password-reset',
+      to: { email: user.email, name: user.name },
+      data: { first_name: user.firstName, reset_url: resetUrl },
+    },
+  }),
+)
+console.log(msg.id, msg.status) // status: queued
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="send.py"
+from reputecast.api.transactional_messages import send_transactional_message
+from reputecast.models import TransactionalSend
+
+msg = unwrap(send_transactional_message.sync_detailed(
+    client=rc,
+    workspace="acme-newsletter",
+    idempotency_key=f"pwreset-{user.id}-{token.id}",
+    body=TransactionalSend.from_dict({
+        "template": "password-reset",
+        "to": {"email": user.email, "name": user.name},
+        "data": {"first_name": user.first_name, "reset_url": reset_url},
+    }),
+))
+print(msg.id, msg.status)  # status: queued
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="send.go"
+key := fmt.Sprintf("pwreset-%s-%s", user.ID, token.ID)
+data := map[string]any{"first_name": user.FirstName, "reset_url": resetURL}
+res, err := rc.SendTransactionalMessageWithResponse(ctx, "acme-newsletter",
+	&reputecast.SendTransactionalMessageParams{IdempotencyKey: &key},
+	reputecast.TransactionalSend{
+		Template: "password-reset",
+		To:       reputecast.TransactionalAddress{Email: user.Email, Name: &user.Name},
+		Data:     &data,
+	})
+if err != nil {
+	return err
+}
+fmt.Println(res.JSON202.Id, res.JSON202.Status) // status: queued
+```
+
+</TabItem>
+</Tabs>
+
+Die Codebeispiele unter <UiPath path="nav.transactional > transactional.common.tabSetup" /> und im
+[Leitfaden für den ersten Versand](/de/transactional/first-send/) sind dieselben Aufrufe, gefüllt mit den Variablen
+Ihrer Vorlage; ihr Umschalter <UiPath path="transactional.codeStyleSdk" /> · <UiPath path="transactional.codeStyleHttp" />
+zeigt stattdessen die reine HTTP-Anfrage.
+
+## Kontakte auflisten
+
+Listen, die mit einem Cursor paginieren, etwa Kontakte, Sperrliste und Audit-Protokoll, antworten mit `items` und
+`nextCursor`; geben Sie `nextCursor` als `cursor` zurück, bis er leer ist ([Paginierung](/de/developers/api-pagination/)).
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+`paginate` ruft jede Seite ab, sobald die Schleife sie erreicht:
+
+```ts title="contacts.ts"
+import { paginate } from '@reputecast/client'
+
+for await (const contact of paginate(rc, '/api/v1/workspaces/{workspace}/contacts', {
+  params: { path: { workspace: 'acme-newsletter' }, query: { pageSize: 100 } },
+})) {
+  console.log(contact.email)
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="contacts.py"
+from reputecast import UNSET
+from reputecast.api.audience import list_contacts
+
+cursor = UNSET
+while True:
+    page = unwrap(list_contacts.sync_detailed(client=rc, workspace="acme-newsletter", page_size=100, cursor=cursor))
+    for contact in page.items:
+        print(contact.email)
+    if not page.next_cursor:
+        break
+    cursor = page.next_cursor
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="contacts.go"
+size := int64(100)
+params := &reputecast.ListContactsParams{PageSize: &size}
+for {
+	page, err := rc.ListContactsWithResponse(ctx, "acme-newsletter", params)
+	if err != nil {
+		return err
+	}
+	for _, c := range page.JSON200.Items {
+		fmt.Println(c.Email)
+	}
+	if page.JSON200.NextCursor == nil || *page.JSON200.NextCursor == "" {
+		break
+	}
+	params.Cursor = page.JSON200.NextCursor
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Wiederholungen
+
+Die SDKs senden eine Anfrage nach einer Antwort `429`, `502`, `503` oder `504` erneut, standardmäßig zweimal:
+
+- Nur Anfragen, die sich gefahrlos wiederholen lassen: `GET`, `HEAD`, `PUT` und `DELETE` sowie ein `POST` mit dem
+  Header `Idempotency-Key`, den der Server mit dem ersten Ergebnis beantwortet, statt zweimal zu handeln. Ein `POST`
+  ohne diesen Header wird nie wiederholt. Python und Go überspringen außerdem eine Anfrage, deren Body sich nicht erneut
+  senden lässt, etwa einen gestreamten Upload.
+- Jede Wartezeit folgt dem Header `Retry-After` der Antwort (Sekunden oder ein HTTP-Datum), höchstens 30 Sekunden. Ohne
+  den Header wächst die Wartezeit exponentiell ab einer halben Sekunde, mit Jitter, ebenfalls bis höchstens
+  30 Sekunden.
+- `maxRetries: 0` (TypeScript), `max_retries=0` (Python) oder `reputecast.WithMaxRetries(0)` (Go) schaltet
+  Wiederholungen aus.
+
+Die Antworten, die Wiederholungen auslösen, beschreiben die [Rate-Limits](/de/developers/api-rate-limits/).
+
+## Fehler behandeln
+
+Eine Fehlerantwort, ein [RFC-9457-Problem](/de/developers/api-errors/), wird in TypeScript (von `unwrap` und
+`paginate` geworfen) und Python (von `unwrap` ausgelöst) zu einem `ReputeCastError` und in Go zu einem
+`*reputecast.Error` (dem Fehler des Aufrufs). Jeder hat die Felder des Problems: `status`, den stabilen `code`
+(`permission_denied`, `validation_failed`, `not_found`…), `title`, `detail` (der anzuzeigende Satz), `errors` (die
+fehlerhaften Felder), `meta` und bei einer fehlenden Berechtigung `permission` und `helpers`, die Mitglieder, die sie
+haben. Eine Fehlerseite, die kein Problem ist, etwa die eines Proxys, behält ihren Status, und ihr Text wird zum
+Detail.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="errors.ts"
+import { ReputeCastError, unwrap } from '@reputecast/client'
+
+try {
+  unwrap(await rc.GET('/api/v1/workspaces/{workspace}/members', { params: { path: { workspace: 'acme-newsletter' } } }))
+} catch (err) {
+  if (err instanceof ReputeCastError && err.code === 'permission_denied') console.log(err.detail, err.helpers)
+  else throw err
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="errors.py"
+from reputecast import ReputeCastError
+from reputecast.api.team import list_members
+
+try:
+    unwrap(list_members.sync_detailed(client=rc, workspace="acme-newsletter"))
+except ReputeCastError as err:
+    print(err.status, err.code, err.detail)
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="errors.go"
+_, err := rc.ListMembersWithResponse(ctx, "acme-newsletter", nil)
+var apiErr *reputecast.Error
+if errors.As(err, &apiErr) && apiErr.Code == "permission_denied" {
+	log.Print(apiErr.Detail, apiErr.Helpers)
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Webhook-Signaturen prüfen
+
+Jedes SDK prüft eine Zustellung eines [Webhooks](/de/developers/webhooks/) für Sie. Übergeben Sie den rohen Body,
+genau so, wie er ankam, die Header der Anfrage und den Signaturschlüssel des Endpunkts (`whsec_…`) oder mehrere
+Schlüssel, während Sie Ihren eigenen rotieren. Die Prüfung lehnt einen Zeitstempel ab, der mehr als 5 Minuten von Ihrer
+Uhr abweicht, akzeptiert am Tag nach einer Rotation des Schlüssels beide Signaturen und vergleicht in konstanter Zeit.
+Eine Zustellung, die die Prüfung nicht besteht, wirft eine Exception (in Go wird ein Fehler zurückgegeben);
+beantworten Sie sie mit `400` oder `401`.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="webhook.ts"
+import { verifyWebhook, WebhookVerificationError } from '@reputecast/client'
+
+try {
+  await verifyWebhook({ secrets: process.env.REPUTECAST_WEBHOOK_SECRET!, body: rawBody, headers: req.headers })
+} catch (err) {
+  if (err instanceof WebhookVerificationError) return res.writeHead(401).end() // err.reason: missing_header, timestamp or signature
+  throw err
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="webhook.py"
+from reputecast import webhooks
+
+try:
+    webhooks.verify(os.environ["REPUTECAST_WEBHOOK_SECRET"], request.get_data(), request.headers)
+except webhooks.WebhookVerificationError:
+    abort(401)
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="webhook.go"
+import "github.com/hostrepute/reputecast/sdk/client-go/webhooks"
+
+if err := webhooks.Verify([]string{os.Getenv("REPUTECAST_WEBHOOK_SECRET")}, body, r.Header, time.Now()); err != nil {
+	http.Error(w, "invalid signature", http.StatusUnauthorized) // ErrMissingHeader, ErrTimestamp or ErrSignature
+	return
+}
+```
+
+</TabItem>
+</Tabs>
+
+Alle drei werden gegen dieselben vom Server signierten Zustellungen getestet, sie akzeptieren also, was ReputeCast
+sendet, und sonst nichts.
+
+## Client in einer anderen Sprache generieren
+
+Die SDKs werden aus dem öffentlichen OpenAPI-Dokument generiert: nur die Operationen, die ein API-Schlüssel aufrufen
+darf. Die Binärdatei Ihrer Instanz gibt es aus, ohne Datenbank oder Konfigurationsdatei:
+
+```sh title="Terminal"
+reputecast openapi --public > reputecast-public.json
+reputecast openapi --public --openapi 3.0 > reputecast-public-3.0.json
+```
+
+`--openapi 3.0` ist für Generatoren, die OpenAPI 3.1 nicht lesen, und `--yaml` gibt YAML aus. Das Repository enthält
+dieselben zwei Dokumente in `sdk/openapi/public.json` und `sdk/openapi/public-3.0.json`. Das vollständige Dokument, mit
+den Operationen, die nur die Web-App aufruft, beschreibt
+[Auf ReputeCast aufbauen](/de/developers/overview/#openapi-dokument-abrufen).
+
+## Prüfen, ob es funktioniert hat
+
+- Der Aufruf von `unwrap` (oder in Go der Fehler nil) im Listenbeispiel gibt die Listen Ihres Arbeitsbereichs zurück.
+- Die Zeile des Schlüssels unter <UiPath path="nav.settings > settings.keys" /> zeigt, wann und von welcher Adresse er
+  zuletzt genutzt wurde.
+- Eine gesendete Nachricht erscheint unter <UiPath path="nav.transactional > transactional.common.tabMessages" /> mit
+  ihrem Zustellverlauf.
+
+## Fehlerbehebung
+
+- **`TypeError: createClient: apiKey is empty`, `ValueError: api_key is empty` oder in Go „the API key is empty“**:
+  `REPUTECAST_KEY` ist in dem Prozess, der Ihren Code ausführt, nicht gesetzt.
+- **`401` mit dem Code `unauthenticated`**: Der Schlüssel ist unbekannt, widerrufen oder abgelaufen. Prüfen Sie ihn
+  unter <UiPath path="nav.settings > settings.keys" />.
+- **`403` mit dem Code `ip_not_allowed`**: Der Schlüssel ist auf erlaubte IPs beschränkt, und Ihr Server ruft von einer
+  anderen Adresse auf; das Detail nennt sie
+  ([erlaubte IPs](/de/developers/api-authentication/#schlüssel-auf-erlaubte-ips-beschränken)).
+- **`404` mit dem Code `not_found` auf einem Pfad, den das SDK kennt**: Das SDK ist neuer als Ihr Server. Nutzen Sie
+  das SDK der Version Ihres Servers.
+- **Doppelte Nachrichten nach Timeouts**: Senden Sie bei jedem Transaktionsversand einen `Idempotency-Key` mit und
+  verwenden Sie ihn bei Ihren eigenen Wiederholungen erneut.
+- **Die Prüfung von Webhooks schlägt bei jeder Zustellung fehl**: Ihr Framework hat den Body geparst, bevor Sie ihn
+  gelesen haben. Übergeben Sie die rohen Bytes.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="Ihren ersten API-Aufruf machen" href="/de/developers/api-quickstart/" description="Einen Schlüssel erstellen und die API mit curl aufrufen." />
+  <LinkCard title="Authentifizierung und API-Schlüssel" href="/de/developers/api-authentication/" description="Schlüsseltypen, Berechtigungen, Bereich, erlaubte IPs und Abweisungen." />
+  <LinkCard title="Webhooks empfangen" href="/de/developers/webhooks/" description="Endpunkte, Ereignisse, Wiederholungen und Prüfung der Signatur." />
+  <LinkCard title="API-Referenz" href="/api/" description="Jede Operation, die ein API-Schlüssel aufrufen kann, mit Parametern und Antworten." />
+</CardGrid>

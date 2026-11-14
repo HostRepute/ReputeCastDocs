@@ -15,6 +15,8 @@ sources:
   - internal/providers/apiclient
   - internal/providers/webhookauth
   - internal/providers/bounce
+  - internal/providers/received
+  - internal/inbound/hook.go
   - internal/providers/resend
   - internal/sms
   - internal/app/wire_adapters.go
@@ -50,7 +52,7 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
    | Phương thức                                   | Chức năng                                                                                                                                                  |
    | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `Adapter() string`                            | Khóa trong sổ đăng ký, như `"mailgun"`.                                                                                                                    |
-   | `Capabilities() Capabilities`                 | Các huy hiệu: chính sách gửi hàng loạt, webhook, API tên miền, đồng bộ danh sách chặn gửi, kích thước lô, IP riêng, sandbox, tự phát hiện hạn mức và tốc độ, giá, theo dõi. |
+   | `Capabilities() Capabilities`                 | Các huy hiệu: chính sách gửi hàng loạt, webhook, API tên miền, đồng bộ danh sách chặn gửi, kích thước lô, IP riêng, sandbox, tự phát hiện hạn mức và tốc độ, giá, theo dõi, nhận thư (`Inbound`). |
    | `Send(ctx, msgs) ([]SendResult, error)`       | Gửi tối đa `BatchSize` thư và trả về một kết quả cho mỗi thư, theo đúng thứ tự đầu vào.                                                                   |
    | `ParseWebhook(ctx, r, body) ([]Event, error)` | Xác minh yêu cầu và ánh xạ payload của yêu cầu thành sự kiện chuẩn hóa.                                                                                   |
 
@@ -76,6 +78,9 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
    | `StatusPage`, `StatusReporter`           | Nút trạng thái và nội dung sự cố khi có sự cố gián đoạn.                                                                                        |
    | `BroadcastStreamCreator`                 | Nhà cung cấp có điều khoản yêu cầu một luồng riêng cho thư hàng loạt (Postmark).                                                               |
    | `ExtrasSender`                           | Gửi bản sao và tệp đính kèm; thư có phần bổ sung (extras) chỉ đi qua nhà cung cấp hỗ trợ chúng.                                                 |
+   | `InboundReceiver`                        | Nhận thư (<UiPath path="nav.settings > settings.senders > senders.receiving.title" />): `InboundSetup` (các bản ghi MX, các bước và các thiết lập mà hộp thoại thiết lập hiển thị), `VerifyInbound` tại hook nhận thư, `ParseInbound` trong tác vụ. Đặt `Capabilities.Inbound` cùng với interface này. Xem [nhận thư](#nhận-thư). |
+   | `InboundRegistrar`                       | Trỏ phần nhận thư của nhà cung cấp cho tên miền của tuyến tới hook nhận thư, và gỡ cấu hình đó. Chỉ dùng khi `Capabilities.Inbound` là `"automatic"`. |
+   | `InboundHandshaker`                      | Trả lời lần bắt tay đăng ký trên hook nhận thư (một `SubscriptionConfirmation` của SNS), được kiểm tra theo các thiết lập của tuyến. |
 
    </TableScroll>
 
@@ -166,6 +171,12 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
 
 5. Xử lý settings và thông tin xác thực. `providers.Config.Settings` chứa các trường không bí mật; `Config.Credentials` chứa các giá trị bí mật đã giải mã dưới dạng một đối tượng JSON phẳng, có khóa là khóa của các trường `Secret`. Thông tin xác thực là chỉ ghi: được niêm phong khi lưu trữ, không bao giờ được API trả về, và được thay thế từng khóa một. Hãy đánh dấu `Secret` cho mọi trường có khóa trông giống bí mật (`password`, `token`, `secret`, hoặc kết thúc bằng `api_key`), nếu không bộ kiểm thử hợp đồng sẽ báo lỗi.
 
+   Hãy đánh dấu `Endpoint: true` cho thiết lập cho biết các yêu cầu của adapter được gửi tới đâu, chẳng hạn URL máy
+   chủ, endpoint API hoặc host. Một khóa bí mật đã lưu chỉ được gửi tới địa chỉ mà nó được nhập cho, nên khi một biểu
+   mẫu thay đổi một thiết lập `Endpoint`, ReputeCast sẽ yêu cầu nhập lại các khóa bí mật. Bộ kiểm thử hợp đồng báo lỗi
+   một trường có khóa chứa `url`, `endpoint`, `host` hoặc `server` mà không phải là `Endpoint` (`providers.AddressKey`),
+   và một trường vừa là `Endpoint` vừa là `Secret`.
+
    `New` không được thực hiện I/O mạng và không được thất bại vì thiếu một giá trị tùy chọn; hãy báo thiếu thông tin xác thực từ lệnh gọi đầu tiên. Factory tạo một adapter cho mỗi yêu cầu, nên hãy giữ những gì đáng dùng lại trong một bộ nhớ đệm cấp package, theo khóa là tài khoản. Hãy giữ vật liệu ký (signing material) đọc từ API của nhà cung cấp trong một `webhookauth.Material`; nó đọc lại vật liệu này khi một chữ ký không khớp (tối đa mỗi phút một lần) và mỗi giờ.
 
 6. Triển khai `Send`:
@@ -181,10 +192,14 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
    - `ParseWebhook` xác minh, trừ khi `providers.SignatureVerified(ctx)` đã được đặt. Tác vụ chuẩn hóa đặt giá trị này khi phân tích lại một payload đã lưu, vốn không còn URL gốc hay header `Authorization`.
    - Dùng cơ chế mà nhà cung cấp dùng để ký; `internal/providers/webhookauth` có Standard Webhooks, các hàm hỗ trợ HMAC và phép so sánh thời gian hằng định. Nếu nhà cung cấp không ký, hãy đăng ký webhook bằng basic auth hoặc một bearer token mang `Config.WebhookSecret`; giá trị này đi trong `Authorization` và không bao giờ được lưu.
    - Giới hạn timestamp đã ký: năm phút với `webhookauth.Fresh`, hoặc một khoảng bao trùm các lần thử lại của nhà cung cấp với `webhookauth.Within`.
+   - Khi chữ ký bao gồm một token dùng một lần nhưng không bao gồm sự kiện (Mailgun), hãy gắn mỗi token với payload mà nó đi kèm lần đầu qua `webhookauth.Replay` và `Config.Tokens`. Mối gắn kết này được giữ trong Postgres, nên mọi tiến trình và mọi lần khởi động lại đều thấy nó trong suốt thời gian chữ ký còn có thể được chấp nhận. Một lần gửi lại cùng sự kiện vẫn đạt; bộ tiếp nhận bỏ bản trùng.
+   - Khi một chữ ký hợp lệ chỉ chứng minh ai đã gửi yêu cầu, chứ không chứng minh gửi cho ai (SNS ký các topic của mọi tài khoản AWS như nhau), hãy kiểm tra thêm rằng yêu cầu đến từ những gì kết nối đã thiết lập: Amazon SES chỉ chấp nhận các topic của chính nó, với chứng chỉ ký từ một endpoint SNS theo khu vực, và lưu một topic qua `ProvisionInput.Save` trước khi đăng ký webhook vào topic đó.
    - Ánh xạ mọi sự kiện liên quan đến việc gửi thành `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` hoặc `unsubscribe`. Giữ loại sự kiện của nhà cung cấp trong `OriginalType`, mã của họ trong `OriginalCode` (tách bằng `bounce.Split`), phần còn lại trong `Diagnostic`, và đặt `BounceClass` bằng `bounce.Classify`. Viết thường địa chỉ người nhận, giữ JSON gốc trong `Raw`, và không trả về sự kiện nào cho những thứ không phải kết quả gửi (sent, processed, thư trả lời tự động, ping thử).
    - Đừng chặn gửi dựa trên phỏng đoán: một thất bại vĩnh viễn do phía người gửi gây ra (bị chặn vì spam hoặc uy tín, hết lượt thử lại) là trả thư tạm thời. Chỉ lỗi về địa chỉ mới là trả thư vĩnh viễn, vì các trường hợp trả thư vĩnh viễn và khiếu nại được đưa vào [danh sách chặn gửi](/vi/audience/suppressions/) dùng chung.
 
-8. Kiểm thử bằng bộ kiểm thử hợp đồng. Mọi adapter đều phải vượt qua `internal/providers/contracttest`. Bộ kiểm thử này kiểm tra việc đăng ký, khả năng, một lần gửi, một lần từ chối vĩnh viễn, một sự cố gián đoạn và thông tin xác thực bị từ chối với API giả lập của bạn, cùng mọi webhook đã ghi lại: được xác minh, được chuẩn hóa, được phân tích lại với context đã xác minh, và bị từ chối khi bị sửa đổi. Bài kiểm thử con `Texts` kiểm tra văn bản cho người đọc: một adapter có sẵn thuộc loại `api`, `smtp`, `self_hosted` hoặc `http` phải có catalog, mọi văn bản nó khai báo đều có một thông điệp với câu tiếng Anh đúng bằng văn bản đó, và mọi thông điệp đều được dịch sang từng ngôn ngữ của ứng dụng. `contracttest.CheckText` kiểm tra một văn bản mà adapter viết lúc chạy.
+8. Nếu nhà cung cấp nhận thư và chuyển tiếp chúng, hãy thêm phần nhận thư: xem [nhận thư](#nhận-thư) bên dưới.
+
+9. Kiểm thử bằng bộ kiểm thử hợp đồng. Mọi adapter đều phải vượt qua `internal/providers/contracttest`. Bộ kiểm thử này kiểm tra việc đăng ký, khả năng, một lần gửi, một lần từ chối vĩnh viễn, một sự cố gián đoạn và thông tin xác thực bị từ chối với API giả lập của bạn, cùng mọi webhook đã ghi lại: được xác minh, được chuẩn hóa, được phân tích lại với context đã xác minh, và bị từ chối khi bị sửa đổi. Bài kiểm thử con `Texts` kiểm tra văn bản cho người đọc: một adapter có sẵn thuộc loại `api`, `smtp`, `self_hosted` hoặc `http` phải có catalog, mọi văn bản nó khai báo đều có một thông điệp với câu tiếng Anh đúng bằng văn bản đó, và mọi thông điệp đều được dịch sang từng ngôn ngữ của ứng dụng. `contracttest.CheckText` kiểm tra một văn bản mà adapter viết lúc chạy.
 
    ```go title="internal/providers/example/example_test.go"
    func TestContract(t *testing.T) {
@@ -208,13 +223,48 @@ Hướng dẫn này cho bạn biết cách đóng góp adapter email bằng Go c
 
    Kiểm thử không dùng mạng: hãy chạy một bản giả lập API của nhà cung cấp, ghi lại payload webhook từ tài liệu của nhà cung cấp làm fixture, và ký chúng ngay trong kiểm thử bằng một khóa thử. Nếu nhà cung cấp công bố vector kiểm thử chữ ký, hãy kiểm thử với vector đó. Hãy kiểm thử các interface tùy chọn, việc ánh xạ lỗi và mọi điểm bất thường mà bạn phải xử lý riêng (mã lớn hơn 2^53, một trường lúc là chuỗi lúc là mảng, một phản hồi 400 mang kết quả theo từng thư).
 
-9. Đăng ký adapter vào bản dựng:
-   - Thêm một blank import của package vào `internal/app/wire_adapters.go`. Đăng ký cùng một khóa hai lần sẽ gây panic khi khởi động.
-   - Thêm khóa vào `adapterOrder` trong `internal/providers/manage/adapters.go` (thứ tự trên tab Adapter) và vào `catalogOrder` trong `internal/connect/catalog.go` (thứ tự trong danh mục thiết lập).
-   - Không bắt buộc: thêm câu chữ cho trình hướng dẫn kết nối trong `copyTable` tại `internal/connect/copy.go`, với câu chữ là các thông điệp `adapter.<key>.*` trong `internal/connect/messages/en.json` và `vi.json`; nếu không có mục nào, trình hướng dẫn dùng tên và các trường của descriptor.
-   - Adapter có sẵn mang phiên bản ReputeCast (`version.Version`) và người duy trì "HostRepute".
+10. Đăng ký adapter vào bản dựng:
+    - Thêm một blank import của package vào `internal/app/wire_adapters.go`. Đăng ký cùng một khóa hai lần sẽ gây panic khi khởi động.
+    - Thêm khóa vào `adapterOrder` trong `internal/providers/manage/adapters.go` (thứ tự trên tab Adapter) và vào `catalogOrder` trong `internal/connect/catalog.go` (thứ tự trong danh mục thiết lập).
+    - Không bắt buộc: thêm câu chữ cho trình hướng dẫn kết nối trong `copyTable` tại `internal/connect/copy.go`, với câu chữ là các thông điệp `adapter.<key>.*` trong `internal/connect/messages/en.json` và `vi.json`; nếu không có mục nào, trình hướng dẫn dùng tên và các trường của descriptor.
+    - Adapter có sẵn mang phiên bản ReputeCast (`version.Version`) và người duy trì "HostRepute".
 
 </Steps>
+
+## Nhận thư
+
+Một không gian làm việc có thể nhận thư qua một tuyến nhận thư: phần nhận thư của một nhà cung cấp, hoặc một hộp thư mà
+ReputeCast đọc. Adapter bổ sung cách thứ nhất. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+Nhà cung cấp gửi những gì nó nhận được tới `POST /hooks/inbound/{token}` (và `/hooks/inbound/{token}/*`, cho các nhà
+cung cấp như Mailgun gửi tới `<url>/mime`). Hook gọi `HandshakeInbound` khi adapter có hàm này, rồi gọi `VerifyInbound`
+với yêu cầu trực tiếp, và lưu phần thân cùng các header, trừ `Authorization`, `Cookie` và các `WebhookSecrets` của
+adapter. Sau đó một tác vụ dựng lại yêu cầu và gọi `ParseInbound`; hàm này không bao giờ xác minh lại và có thể gọi API
+của nhà cung cấp (sự kiện của Resend chỉ mang siêu dữ liệu của thư).
+
+- **`Capabilities.Inbound`** là `"automatic"` (adapter tự đăng ký tuyến bằng `InboundRegistrar`; người dùng thêm bản
+  ghi MX), `"manual"` (người dùng làm theo `InboundSetup.Steps` trong bảng điều khiển của nhà cung cấp) hoặc để trống.
+  Đặt giá trị này trên descriptor và trong `Capabilities()`; bộ kiểm thử hợp đồng đối chiếu giá trị này với các
+  interface.
+- **`InboundSetup(route)`** trả về các bản ghi MX, với `Purpose: "inbound"` và tên miền của tuyến làm `Name`, các bước
+  dưới dạng thông điệp đã giữ, với tên miền và URL của tuyến làm đối số, và mọi thiết lập mà người dùng nhập (`topic_arn`
+  của Amazon SES). Một tuyến thủ công phải có các bước, và mỗi bước cần một văn bản bằng mọi ngôn ngữ của ứng dụng.
+- **Xác thực bằng khóa bí mật riêng của tuyến** (`InboundRoute.Secret`), không bao giờ bằng khóa bí mật webhook của nhà
+  cung cấp: basic auth với người dùng `providers.InboundUser` và khóa bí mật nằm trong URL mà nhà cung cấp gửi tới
+  (`received.HookURL`), một header token, hoặc chữ ký riêng của nhà cung cấp khi nhà cung cấp có ký (Mailgun, Resend,
+  Postal, SNS), được kiểm tra theo những gì tuyến chỉ định. Một yêu cầu không đạt là `providers.ErrBadSignature`.
+- **Trả về `Raw`** khi nhà cung cấp chuyển nguyên cả thư, và ReputeCast sẽ phân tích thư; nếu không, hãy điền các trường
+  đã phân tích và tệp đính kèm. Dù theo cách nào, người nhận trong phong bì (envelope), mã thư của nhà cung cấp và các
+  kết luận spam, SPF, DKIM và DMARC của nhà cung cấp đều nằm trong trường riêng của chúng; `internal/providers/received`
+  ánh xạ các kết luận và điểm số theo cùng một cách cho mọi adapter.
+- **Kiểm thử** bằng `Suite.Inbound`: các trường hợp lấy từ payload mẫu trong tài liệu của nhà cung cấp, đặt trong
+  `testdata/inbound*`, mỗi trường hợp kèm các thư mà nó phải được phân tích thành. Bộ kiểm thử kiểm tra rằng một yêu cầu
+  hợp lệ được xác minh, được phân tích mà không cần thông tin xác thực của nó, và một yêu cầu bị sửa đổi sẽ thất bại;
+  trường hợp của adapter dùng basic auth hoặc token đặt `Tamper` để thay đổi thông tin xác thực. `InboundLifecycle` đăng
+  ký, hủy đăng ký rồi hủy đăng ký lần nữa một tuyến tự động.
+
+Hướng dẫn [thiết lập nhận thư](/vi/providers/receiving-mail/) liệt kê những gì từng adapter có sẵn làm được. Adapter
+cộng đồng và adapter HTTP chung không nhận thư.
 
 ## Kiểm tra kết quả
 

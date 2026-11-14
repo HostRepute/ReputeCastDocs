@@ -17,11 +17,13 @@ sources:
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
+  - internal/blobstore
   - deploy/docker-compose.yml
+  - deploy/helm/reputecast
   - docs/deploy/performance.md
   - README.md
 sidebar:
-  order: 8
+  order: 10
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -64,8 +66,10 @@ holds the data and the job queue, and the sending providers deliver the mail.
    file; with Docker, copy the existing key out with `docker compose cp app:/var/lib/reputecast/secret.key .` and use
    its contents.
 
-2. Give web and worker processes the same `files.dir` (product files and lead magnets), on a shared volume or network
-   file system.
+2. Give web and worker processes the same `files.dir` (product files, lead magnets, uploads in progress and
+   exports), on a shared volume or network file system. Without one, keep the files in an
+   [S3-compatible bucket](/self-hosting/object-storage/) with `storage.backend: s3` on every process. Available from
+   the next release after 1.6.0.
 
 3. Run one or more `serve --role=web,ingest` processes behind your [reverse proxy](/self-hosting/reverse-proxy/), and
    at least one `worker`. Several workers share the queue through PostgreSQL. To grow webhook capacity separately, run
@@ -109,6 +113,14 @@ services:
 
 The worker starts once `app` is healthy, so the secret key and the migrations are in place.
 
+## Split the roles on Kubernetes
+
+On Kubernetes, the chart you install with Helm ([Kubernetes](/deploy/kubernetes/)) runs the same split as Deployments
+with `mode: split`: web pods (2 by default,
+with an optional autoscaler), worker pods (1) and, with `ingest.separate`, webhook ingest pods that the Ingress routes
+`/hooks/` to. Pods don't share a folder, so split mode needs `storage.backend: s3` and stops the install without it;
+migrations run in a Job before every install and upgrade. Available from the next release after 1.6.0.
+
 <Aside type="caution">
   Split an instance after its first start, when the secret key file exists. A worker that starts on an empty volume
   before the app could create a different key.
@@ -120,7 +132,7 @@ The worker starts once `app` is healthy, so the secret key and the migrations ar
   (default 20) and `worker.concurrency` (default 50) sets how many jobs a worker runs at once.
 - **Settings saved in the app**: every process reads the public URL saved in Instance admin again every 30 seconds,
   and installed community adapters every 15 seconds.
-- **Files**: `files.dir`, as above.
+- **Files**: `files.dir`, or the bucket, as above. Every process must use the same backend.
 - **Not the rate limits**: each web process counts requests on its own, so behind a load balancer with three web
   processes a caller can reach three times the [limits](/self-hosting/security/#defaults-and-limits).
 
@@ -157,7 +169,8 @@ webhook ingest against it.
 - **Nothing is sent and imports never finish**: no process runs the `worker` role.
 - **Stored provider credentials can't be decrypted in one process**: its secret key differs; give every process the
   same `secrets.key` or key file.
-- **Product downloads fail from some processes**: `files.dir` is not shared.
+- **Product downloads fail from some processes**: `files.dir` is not shared, or the processes don't all use the same
+  `storage.backend`.
 - **`FATAL: sorry, too many clients already`**: lower `database.max_conns` per process.
 - **A process logs `metrics listener not started`**: another process on the host already holds port 9464. Give each
   process on a host its own `metrics.addr`.

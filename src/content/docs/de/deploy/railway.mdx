@@ -1,10 +1,11 @@
 ---
 title: ReputeCast auf Railway bereitstellen
-description: ReputeCast auf Railway mit der PostgreSQL-Vorlage, dem Docker-Image, einem Volume, öffentlicher Domain, Zustandsprüfung und Passwort des ersten Inhabers.
+description: 'ReputeCast auf Railway mit der Railway-CLI oder von Hand bereitstellen: PostgreSQL von Railway, Docker-Image, Volume, öffentliche Domain und Zustandsprüfung.'
 type: how-to
 audience: [operator]
 primaryKeyword: ReputeCast auf Railway
 sources:
+  - deploy/railway
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
@@ -16,10 +17,12 @@ sidebar:
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
 
 Diese Anleitung betreibt ReputeCast auf Railway als zwei Services in einem Projekt, die PostgreSQL-Datenbank von Railway
 und das Docker-Image von ReputeCast, mit einem Volume für hochgeladene Dateien und HTTPS auf einer Railway-Domain oder
-Ihrer eigenen.
+Ihrer eigenen. Legen Sie das Projekt mit der Railway-CLI aus der Konfiguration des Repositorys an oder von Hand im
+Dashboard.
 
 ## Bevor Sie beginnen
 
@@ -29,7 +32,51 @@ Ihrer eigenen.
 - Docker oder OpenSSL auf Ihrem Computer, um den geheimen Schlüssel zu generieren. Siehe auch die
   [Systemanforderungen](/de/self-hosting/requirements/).
 
-## ReputeCast bereitstellen
+## Mit der Railway-CLI bereitstellen
+
+Die Datei `deploy/railway/railway.ts` des Repositorys beschreibt das Projekt als Railway
+[Infrastructure as Code](https://docs.railway.com/infrastructure-as-code) (geprüft im November 2026). Verfügbar ab der
+nächsten Version nach 1.6.0.
+
+<Steps>
+
+1. Installieren Sie die Railway-CLI ab Version 5.42.1 und melden Sie sich mit `railway login` an.
+
+2. Installieren Sie in einem Checkout des Repositorys die Bibliothek der Konfiguration und verknüpfen Sie ein neues,
+   leeres Projekt:
+
+   ```sh
+   git clone --depth 1 https://github.com/hostrepute/reputecast.git && cd reputecast
+   npm install --prefix deploy/railway --no-save railway@3
+   railway link
+   ```
+
+3. Wenden Sie die Konfiguration mit der E-Mail-Adresse des ersten Inhabers an:
+
+   ```sh
+   REPUTECAST_ADMIN_EMAIL=you@company.com railway config apply --file deploy/railway/railway.ts
+   ```
+
+   Sie legt die Datenbank `Postgres` und den Service `ReputeCast` aus `ghcr.io/hostrepute/reputecast:latest` an, mit
+   dem Volume `reputecast-data` unter `/var/lib/reputecast`, der Zustandsprüfung `/readyz` mit einem Timeout von
+   300 Sekunden und diesen Variablen: `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
+   `REPUTECAST_PUBLIC_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}`, `REPUTECAST_ADMIN_EMAIL`,
+   `REPUTECAST_HTTP__TRUSTED_PROXIES=private` ([vertrauenswürdige Proxys](/de/deploy/overview/#vertrauenswürdige-proxys)),
+   `PORT=8080` und `RAILWAY_RUN_UID=0`.
+
+4. Klicken Sie im Service von ReputeCast unter **Settings** → **Networking** → **Public Networking** auf
+   **Generate Domain** mit Port `8080`. Die öffentliche URL folgt dieser Domain.
+
+5. Lesen Sie das temporäre Passwort des ersten Inhabers in den Logs des Deployments und melden Sie sich an, wie es die
+   Schritte 10 und 11 unter [von Hand bereitstellen](#reputecast-von-hand-bereitstellen) beschreiben.
+
+</Steps>
+
+ReputeCast legt seinen geheimen Schlüssel beim ersten Start auf dem Volume an, als `/var/lib/reputecast/secret.key`:
+Sichern Sie das Volume zusammen mit der Datenbank unter **Backups** des Service. Um den Schlüssel auch außerhalb von
+Railway aufzubewahren, stellen Sie von Hand mit `REPUTECAST_SECRETS__KEY` bereit.
+
+## ReputeCast von Hand bereitstellen
 
 <Steps>
 
@@ -39,13 +86,13 @@ Ihrer eigenen.
    Service namens `Postgres` bereit, mit eigenem Volume und einer Variable `DATABASE_URL`, die das private Netzwerk
    nutzt.
 
-3. Klicken Sie auf **+ New** und dann auf **Docker Image**, geben Sie `ghcr.io/hostrepute/reputecast:v1.4.0` ein,
+3. Klicken Sie auf **+ New** und dann auf **Docker Image**, geben Sie `ghcr.io/hostrepute/reputecast:v1.6.0` ein,
    drücken Sie Enter und klicken Sie auf **Deploy**. Dieses erste Deployment schlägt fehl, weil der Service noch keine
    Einstellungen hat.
 
 4. Generieren Sie den geheimen Schlüssel auf Ihrem Computer und speichern Sie ihn in Ihrem Passwortmanager. Beide
    Befehle geben einen Schlüssel im selben Format aus (44 Zeichen, endet auf `=`):
-   `docker run --rm ghcr.io/hostrepute/reputecast:v1.4.0 secrets generate-key` oder `openssl rand -base64 32`.
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.6.0 secrets generate-key` oder `openssl rand -base64 32`.
 
 5. Öffnen Sie den Service von ReputeCast. Klicken Sie unter **Settings** → **Networking** → **Public Networking** auf
    **Generate Domain** (fragt Railway nach einem Port, geben Sie `8080` ein, nicht 9464: Das ist der Metrik-Port, der
@@ -70,13 +117,15 @@ Ihrer eigenen.
      tragen Sie stattdessen die URL ein.
    - `REPUTECAST_ADMIN_EMAIL` ist die E-Mail-Adresse des ersten Inhabers und wird nur genutzt, solange die Datenbank
      keine Benutzer hat.
-   - `PORT=8080` teilt der Zustandsprüfung von Railway mit, welchen Port sie aufrufen soll. ReputeCast lauscht auf 8080
-     und liest `PORT` nicht.
+   - `PORT=8080` teilt der Zustandsprüfung von Railway mit, welchen Port sie aufrufen soll. Das Image lauscht auf 8080,
+     was auch immer in `PORT` steht, denn es setzt `REPUTECAST_HTTP__ADDR=:8080`, das Vorrang vor `PORT` hat.
    - `RAILWAY_RUN_UID=0` führt die App als root aus: Railway hängt Volumes ein, die root gehören und in die der
      Benutzer des Images (uid 65532) nicht schreiben kann.
    - Railway dokumentiert den Adressbereich seines Edge-Proxys nicht, lassen Sie `REPUTECAST_HTTP__TRUSTED_PROXIES`
-     daher leer ([vertrauenswürdige Proxys](/de/self-hosting/docker/#vertrauenswürdige-proxys)). Weitere
-     Einstellungen: [Konfiguration](/de/self-hosting/configuration/).
+     mit 1.6.0 daher leer ([vertrauenswürdige Proxys](/de/deploy/overview/#vertrauenswürdige-proxys)). Die
+     CLI-Konfiguration setzt stattdessen das Schlüsselwort `private`, das dem privaten Netzwerk von Railway vertraut.
+     Verfügbar ab der nächsten Version nach 1.6.0. Weitere Einstellungen:
+     [Konfiguration](/de/self-hosting/configuration/).
 
 7. Klicken Sie mit der rechten Maustaste auf die Arbeitsfläche des Projekts (oder drücken Sie <kbd>⌘</kbd> <kbd>K</kbd>
    oder <kbd>Ctrl</kbd> <kbd>K</kbd>), legen Sie ein Volume an, verbinden Sie es mit dem Service von ReputeCast und
@@ -121,7 +170,9 @@ Ihrer eigenen.
    verifiziert die Domain (grünes Häkchen) und stellt ein Let's-Encrypt-Zertifikat aus, meist innerhalb einer Stunde.
 3. Setzen Sie auf dem Tab **Variables** `REPUTECAST_PUBLIC_URL=https://news.example.com` und stellen Sie die Änderung
    bereit. Tun Sie das vor der ersten Anmeldung: ReputeCast bindet Passkeys an die Domain der öffentlichen URL und setzt
-   sie in jeden Link, den es versendet.
+   sie in jeden Link, den es versendet. Ändern Sie die Adresse danach auch unter
+   <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />: Die dort gespeicherte Adresse hat Vorrang vor der Variable,
+   und das Speichern zieht die Webhooks der Anbieter mit um.
 
 Hinter dem Proxy von Cloudflare stellen Sie den SSL/TLS-Modus von Cloudflare auf **Full**; laut Railway funktioniert
 **Full (Strict)** nicht wie vorgesehen. Der Trial-Tarif erlaubt 1 eigene Domain, der Hobby-Tarif 2 pro Service.
@@ -138,7 +189,8 @@ Hinter dem Proxy von Cloudflare stellen Sie den SSL/TLS-Modus von Cloudflare auf
 1. Lesen Sie die Versionshinweise und erstellen Sie ein [Backup](/de/self-hosting/backups/). Der Tab **Backups** des
    PostgreSQL-Service sichert dessen Volume von Hand oder nach einem täglichen, wöchentlichen oder monatlichen Zeitplan.
 2. Klicken Sie im Service von ReputeCast unter **Settings** → **Source** → **Source Image** auf das Bearbeiten-Symbol
-   und ändern Sie das Tag, zum Beispiel auf `ghcr.io/hostrepute/reputecast:v1.4.0`. Zeigt Railway ein Update für das
+   und ändern Sie das Tag, zum Beispiel auf `ghcr.io/hostrepute/reputecast:v1.6.0`. Ein mit der CLI angelegter Service
+   läuft mit `latest`: Stellen Sie ihn erneut bereit, damit er das Image neu abruft. Zeigt Railway ein Update für das
    Image an, merkt sein Upgrade-Button das neue Tag für Sie vor.
 3. Klicken Sie auf **Deploy**. ReputeCast führt beim Start neue Migrationen aus. Ein Service mit Volume führt nie zwei
    Deployments gleichzeitig aus, rechnen Sie also mit einer kurzen Ausfallzeit. Das Upgrade auf 1.3.0 wandelt

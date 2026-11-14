@@ -17,11 +17,13 @@ sources:
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
+  - internal/blobstore
   - deploy/docker-compose.yml
+  - deploy/helm/reputecast
   - docs/deploy/performance.md
   - README.md
 sidebar:
-  order: 8
+  order: 10
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -66,8 +68,10 @@ nền; PostgreSQL giữ dữ liệu và hàng đợi tác vụ, còn các nhà c
    khóa; với Docker, sao chép khóa hiện có ra bằng `docker compose cp app:/var/lib/reputecast/secret.key .` rồi dùng nội
    dung của nó.
 
-2. Cấp cho các tiến trình web và worker cùng một `files.dir` (tệp sản phẩm và quà tặng đăng ký), trên một volume dùng chung
-   hoặc một hệ thống tệp mạng.
+2. Cấp cho các tiến trình web và worker cùng một `files.dir` (tệp sản phẩm, quà tặng đăng ký, tệp đang tải lên dở và tệp
+   xuất), trên một volume dùng chung hoặc một hệ thống tệp mạng. Nếu không có, hãy lưu tệp trong một
+   [bucket tương thích S3](/vi/self-hosting/object-storage/) với `storage.backend: s3` trên mọi tiến trình. Có từ bản
+   phát hành tiếp theo sau 1.6.0.
 
 3. Chạy một hoặc nhiều tiến trình `serve --role=web,ingest` sau [reverse proxy](/vi/self-hosting/reverse-proxy/), và ít
    nhất một `worker`. Nhiều worker dùng chung hàng đợi qua PostgreSQL. Để tăng năng lực nhận webhook một cách riêng
@@ -112,6 +116,14 @@ services:
 
 Worker khởi động khi `app` đã `healthy`, nên khóa bí mật và các migration đều đã sẵn sàng.
 
+## Tách các vai trò trên Kubernetes
+
+Trên Kubernetes, chart bạn cài bằng Helm ([Kubernetes](/vi/deploy/kubernetes/)) chạy cùng cách tách đó dưới dạng các
+Deployment với `mode: split`: các pod web (mặc định 2, có thể kèm autoscaler), các pod worker (1) và, với
+`ingest.separate`, các pod nhận webhook mà Ingress định tuyến `/hooks/` đến. Các pod không dùng chung thư mục, nên chế
+độ split cần `storage.backend: s3` và dừng việc cài đặt nếu thiếu; các migration chạy trong một Job trước mỗi lần cài
+đặt và nâng cấp. Có từ bản phát hành tiếp theo sau 1.6.0.
+
 <Aside type="caution">
   Hãy tách hệ thống sau lần khởi động đầu tiên, khi tệp khóa bí mật đã tồn tại. Một worker khởi động trên volume trống
   trước ứng dụng có thể tạo ra một khóa khác.
@@ -123,7 +135,7 @@ Worker khởi động khi `app` đã `healthy`, nên khóa bí mật và các mi
   (mặc định 20), và `worker.concurrency` (mặc định 50) quyết định một worker chạy bao nhiêu tác vụ cùng lúc.
 - **Thiết lập lưu trong ứng dụng**: mọi tiến trình đọc lại URL công khai đã lưu trong Quản trị hệ thống mỗi 30 giây, và
   danh sách adapter cộng đồng đã cài mỗi 15 giây.
-- **Tệp**: `files.dir`, như ở trên.
+- **Tệp**: `files.dir`, hoặc bucket, như ở trên. Mọi tiến trình phải dùng cùng một backend.
 - **Không dùng chung giới hạn tần suất**: mỗi tiến trình web tự đếm yêu cầu của riêng nó, nên sau load balancer với ba
   tiến trình web, một client có thể đạt gấp ba lần [giới hạn](/vi/self-hosting/security/#mặc-định-và-giới-hạn).
 
@@ -161,7 +173,8 @@ gửi thư và nhận webhook trên đó.
 - **Không có thư nào được gửi và việc nhập dữ liệu không bao giờ xong**: không tiến trình nào chạy vai trò `worker`.
 - **Một tiến trình không giải mã được thông tin xác thực của nhà cung cấp đã lưu**: khóa bí mật của tiến trình đó khác;
   hãy cấp cho mọi tiến trình cùng `secrets.key` hoặc cùng tệp khóa.
-- **Tải sản phẩm thất bại ở một số tiến trình**: `files.dir` không được dùng chung.
+- **Tải sản phẩm thất bại ở một số tiến trình**: `files.dir` không được dùng chung, hoặc các tiến trình không cùng dùng
+  một `storage.backend`.
 - **`FATAL: sorry, too many clients already`**: hãy giảm `database.max_conns` cho mỗi tiến trình.
 - **Một tiến trình ghi log `metrics listener not started`**: một tiến trình khác trên máy đã giữ cổng 9464. Hãy cho mỗi
   tiến trình trên một máy một `metrics.addr` riêng.

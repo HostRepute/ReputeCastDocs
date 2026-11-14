@@ -1,0 +1,388 @@
+---
+title: Configurer la réception des e-mails
+description: Recevoir les réponses à la newsletter, les désabonnements par e-mail et les rapports DMARC dans ReputeCast, via un fournisseur d’envoi ou en IMAP ou POP3.
+type: how-to
+audience: [admin]
+permissions: ['domains:manage']
+uiPath: 'nav.settings > settings.senders > senders.receiving.title'
+primaryKeyword: recevoir les réponses à la newsletter
+sources:
+  - internal/inbound
+  - internal/optout
+  - internal/providers/optional.go
+  - internal/providers/provider.go
+  - internal/providers/received
+  - internal/providers/{ses,postal,mailgun,postmark,sendgrid,resend,sparkpost,mailjet,brevo}/inbound.go
+  - internal/providers/{ses,postal,mailgun,sendgrid,resend,sparkpost,mailjet,brevo}/messages/en.json
+  - internal/sending/engine/inbound.go
+  - internal/domains/service.go
+  - internal/domains/records.go
+  - internal/deliverability/dmarc.go
+  - internal/ingest/normalize.go
+  - internal/readiness/assemble.go
+  - internal/app/wire_inbound.go
+  - web/src/features/senders/ReceivingCard.tsx
+  - web/src/features/senders/InboundSetupDialog.tsx
+  - web/src/features/senders/SendersPage.tsx
+  - web/src/features/senders/receiving.messages.ts
+sidebar:
+  order: 21
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Configurez <UiPath path="nav.settings > settings.senders > senders.receiving.title" /> pour recevoir les réponses à la
+newsletter, les désabonnements par `mailto:`, les rapports agrégés DMARC et les rapports de plainte dans ReputeCast.
+Chaque espace de travail a une seule route de réception : la réception d’un fournisseur d’envoi que vous avez connecté,
+ou une boîte aux lettres IMAP ou POP3 que ReputeCast lit chaque minute. ReputeCast ne fait tourner aucun serveur de
+messagerie à lui. Disponible à partir de la prochaine version après la 1.6.0.
+
+## Avant de commencer
+
+- Il vous faut l’autorisation `domains:manage`, dont disposent les rôles Propriétaire et Admin, pour configurer,
+  modifier, tester ou supprimer la route. Ces actions sont réservées aux personnes : les clés API et les agents MCP ne
+  peuvent pas les effectuer. Les membres qui ont `providers:view` voient la carte ; les autres ne la voient pas du tout.
+- Pour la réception via un fournisseur d’envoi, l’espace de travail a besoin d’un domaine d’envoi vérifié. La route
+  reçoit sur ce domaine ou sur l’un de ses sous-domaines ; ReputeCast propose `reply.` suivi de votre premier domaine
+  d’envoi vérifié, comme `reply.news.acme.io`. Utilisez un sous-domaine réservé à ReputeCast : un domaine dont les
+  enregistrements MX pointent déjà ailleurs est refusé, car ses e-mails cesseraient d’arriver. Lisez
+  [Ajouter des domaines d’envoi et des expéditeurs](/fr/providers/senders-and-domains/).
+- Une route via un fournisseur d’envoi a besoin d’une adresse HTTPS publique à laquelle le fournisseur d’envoi peut
+  envoyer ses requêtes : `<public URL>/hooks/inbound/<token>`. Une route de boîte aux lettres n’en a pas besoin : c’est
+  ReputeCast qui se connecte au serveur de messagerie.
+- Le message de test de la configuration part comme e-mail Système : un fournisseur d’envoi doit donc transporter le
+  flux Système.
+- Lisez ensuite les réponses dans <UiPath path="nav.audience > replies.tab" /> ; voir
+  [Lire et traiter les réponses](/fr/audience/replies/).
+
+## Choisir comment ReputeCast reçoit
+
+Sept fournisseurs d’envoi configurent eux-mêmes leur réception : ReputeCast la déclare par leur API quand vous
+enregistrez la route, et vous ajoutez l’enregistrement MX du
+[domaine de réception](/fr/reference/glossary/#receiving-domain). Pour Amazon SES et Postal, vous suivez dans leur
+console les étapes qu’affiche ReputeCast.
+
+<TableScroll label="Réception des e-mails par fournisseur d’envoi">
+
+| Fournisseur d’envoi | Configuration | Enregistrement MX du domaine de réception | Ce que vous vérifiez chez le fournisseur d’envoi |
+| --- | --- | --- | --- |
+| [Postmark](/fr/providers/postmark/) | ReputeCast définit le webhook entrant et le domaine entrant du serveur | `10 inbound.postmarkapp.com` | Rien |
+| [Mailgun](/fr/providers/mailgun/) | ReputeCast ajoute une route qui transmet chaque message du domaine | `10 mxa.mailgun.org` et `10 mxb.mailgun.org` (région UE : `mxa.eu.mailgun.org`, `mxb.eu.mailgun.org`) | Le domaine figure dans Mailgun › Domains |
+| [SendGrid](/fr/providers/sendgrid/) | ReputeCast ajoute un réglage Inbound Parse avec le message brut et le contrôle anti-spam, signé quand le compte le permet | `10 mx.sendgrid.net` | Le domaine est un domaine authentifié ou l’un de ses sous-domaines ; une clé Restricted Access a l’autorisation Inbound Parse |
+| [Resend](/fr/providers/resend/) | ReputeCast ajoute un webhook pour `email.received` | L’enregistrement que Resend affiche pour le domaine | Receiving est activé pour le domaine dans Resend › Domains |
+| [SparkPost](/fr/providers/sparkpost/) | ReputeCast ajoute le domaine entrant et un relay webhook | `rx1`, `rx2` et `rx3.sparkpostmail.com` (UE : `rx1.eu.sparkpostmail.com` et ainsi de suite) ; un compte Enterprise utilise son propre hôte | Rien |
+| [Mailjet](/fr/providers/mailjet/) | ReputeCast ajoute une route de parsing pour chaque adresse du domaine | `10 parse.mailjet.com` | Le domaine est validé dans Mailjet, et le forfait payant du compte inclut la Parse API |
+| [Brevo](/fr/providers/brevo/) | ReputeCast ajoute un webhook entrant pour le domaine | `10 inbound1.sendinblue.com` et `20 inbound2.sendinblue.com` | Le domaine n’est pas celui depuis lequel vous envoyez, et il appartient à un domaine vérifié dans Brevo |
+| [Amazon SES](/fr/providers/amazon-ses/) | Vous ajoutez une règle de réception qui publie vers un SNS topic, et un abonnement HTTPS | `10 inbound-smtp.<region>.amazonaws.com` | Voir [Recevoir via Amazon SES](#recevoir-via-amazon-ses) |
+| [Postal](/fr/providers/postal/) | Vous ajoutez un HTTP endpoint et une route | `10 <your Postal host>` | Voir [Recevoir via Postal](#recevoir-via-postal) |
+| Une boîte aux lettres IMAP ou POP3 | ReputeCast se connecte chaque minute et lit ce qui est arrivé | Celui de votre boîte aux lettres | Utilisez une boîte aux lettres réservée à ReputeCast |
+
+</TableScroll>
+
+[Azure Communication Services](/fr/providers/azure-communication-services/), [un serveur SMTP](/fr/providers/smtp/),
+l’[adaptateur HTTP générique](/fr/providers/generic-http/) et les adaptateurs communautaires ne reçoivent pas d’e-mails.
+La configuration les affiche grisés avec « ne reçoit pas d’e-mails. Utilisez plutôt une boîte aux lettres. »
+
+## Configurer la réception
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.senders" />. Tant qu’aucune route n’existe, la carte
+   <UiPath path="senders.receiving.title" /> indique <UiPath path="senders.receiving.statusNotSetUp" />, les réponses
+   vont à l’adresse de réponse et les rapports DMARC aux adresses de vos enregistrements DMARC. Choisissez
+   <UiPath path="senders.receiving.setUp" />.
+
+   <Screenshot
+     id="receiving-not-set-up"
+     alt="La carte Réception des e-mails indique Non configurée : ReputeCast peut recevoir les réponses, les e-mails de désabonnement et les rapports DMARC via un fournisseur connecté ou une boîte aux lettres, et d’ici là les réponses vont à l’adresse de réponse, avec le bouton Configurer la réception."
+   />
+
+2. Dans <UiPath path="senders.receiving.step1" />, choisissez l’un des fournisseurs d’envoi que vous avez connectés ou
+   <UiPath path="senders.receiving.choiceMailbox" />. Chaque fournisseur indique qui configure la route ; un fournisseur
+   qui ne peut pas recevoir d’e-mails est grisé. Choisissez <UiPath path="senders.receiving.continue" />.
+
+   <Screenshot
+     id="receiving-setup-how"
+     alt="Étape 1 sur 3, Comment ReputeCast reçoit : Postmark est sélectionné et configure lui-même son webhook entrant, Amazon SES et Postal demandent une règle de réception ou une route ajoutée à la main, et une boîte aux lettres lue en IMAP ou POP3 est l’autre possibilité."
+   />
+
+3. Dans <UiPath path="senders.receiving.step2" />, indiquez où arrivent les e-mails :
+
+   - **Un fournisseur d’envoi :** le <UiPath path="senders.receiving.domain" /> sur lequel recevoir. La remarque en
+     dessous indique les adresses auxquelles reviennent les réponses, les e-mails de désabonnement et les rapports.
+
+     <Screenshot
+       id="receiving-setup-domain"
+       alt="Étape 2, Détails, pour Postmark : le domaine reply.news.acme.io, et une remarque indiquant que les réponses reviennent à des adresses r- sur ce domaine, les e-mails de désabonnement à des adresses u- et les rapports à dmarc@ et fbl@, le webhook entrant de Postmark pointant vers ReputeCast pour ce domaine seulement."
+     />
+
+   - **Une boîte aux lettres :** son <UiPath path="senders.receiving.mbAddress" /> (sans partie après le signe plus,
+     22 caractères au plus avant le `@`), le <UiPath path="senders.receiving.mbProtocol" /> (IMAP ou POP3), le
+     <UiPath path="senders.receiving.mbServer" />, le <UiPath path="senders.receiving.mbPort" /> (993 sauf si vous le
+     changez), la <UiPath path="senders.receiving.mbSecurity" /> (TLS ou STARTTLS), le
+     <UiPath path="senders.receiving.mbUser" /> et le <UiPath path="senders.receiving.mbPassword" />. Les réponses
+     reviennent à des adresses `<mailbox>+r-…` : la boîte aux lettres les reçoit donc sans aucune règle. Une fois que
+     ReputeCast a un message, IMAP le marque comme lu et POP3 le supprime.
+
+     <Screenshot
+       id="receiving-setup-mailbox"
+       alt="Étape 2, Détails, pour une boîte aux lettres : l’adresse, IMAP avec le port 993 et TLS, les champs serveur, nom d’utilisateur et mot de passe, et une remarque invitant à utiliser une boîte aux lettres réservée à ReputeCast, car les messages sont marqués comme lus ou supprimés dès que ReputeCast les a."
+     />
+
+4. Choisissez <UiPath path="senders.receiving.continue" />. ReputeCast enregistre la route et, pour les sept
+   fournisseurs d’envoi qui configurent eux-mêmes leur réception, la déclare aussitôt chez le fournisseur d’envoi.
+
+5. Dans <UiPath path="senders.receiving.step3" />, ajoutez chez votre hébergeur DNS l’enregistrement MX affiché.
+   ReputeCast le recherche tant que la boîte de dialogue est ouverte et affiche
+   <UiPath path="senders.receiving.mxFound" />, <UiPath path="senders.receiving.mxMissing" />,
+   <UiPath path="senders.receiving.mxWrong" /> ou <UiPath path="senders.receiving.mxUnknown" />. Pour Amazon SES,
+   Postal et les fournisseurs d’envoi qui ont quelque chose à vérifier, les étapes à suivre dans la console du
+   fournisseur d’envoi viennent ensuite, dans l’ordre, avec l’<UiPath path="senders.receiving.hookAddress" /> à coller là où une étape la demande.
+
+6. Choisissez <UiPath path="senders.receiving.sendTest" />. Ce bouton est disponible une fois l’enregistrement MX trouvé.
+   ReputeCast envoie un e-mail à une adresse `t-` du domaine de réception et vérifie toutes les 3 secondes jusqu’au
+   retour du message. Choisissez <UiPath path="senders.receiving.done" />.
+
+</Steps>
+
+Pour modifier la route plus tard, choisissez <UiPath path="senders.receiving.edit" /> sur la carte. Enregistrer un
+autre fournisseur d’envoi ou un autre domaine retire la déclaration de ReputeCast chez l’ancien. Le mot de passe
+enregistré d’une boîte aux lettres est conservé quand vous laissez le champ vide, tant que le serveur et le nom
+d’utilisateur restent les mêmes ; si vous changez l’un ou l’autre, le mot de passe doit être saisi de nouveau.
+
+### Recevoir via Amazon SES
+
+Amazon SES reçoit les e-mails grâce à une règle de réception dans la console AWS. ReputeCast affiche ces étapes dans la
+boîte de dialogue, avec votre domaine, votre région et votre adresse entrante déjà renseignés :
+
+<Steps>
+
+1. Dans la console Amazon SES, ouvrez **Email receiving** › **Rule sets** et ajoutez au jeu de règles actif une règle
+   pour le domaine de réception, avec l’action **Publish to Amazon SNS topic**, l’encodage **Base64** et un SNS topic
+   dans la même région.
+
+2. Saisissez l’ARN du topic sous <UiPath path="ses.inbound.topicArn" /> et choisissez
+   <UiPath path="senders.receiving.saveSettings" />. ReputeCast n’accepte les e-mails que de ce topic.
+
+3. Dans Amazon SNS, ajoutez au topic un abonnement avec le protocole **HTTPS** et l’adresse entrante comme endpoint. Ne
+   le confirmez pas vous-même : ReputeCast le confirme quand SNS le demande, et uniquement pour le topic que vous avez
+   saisi.
+
+</Steps>
+
+L’enregistrement MX pointe vers `inbound-smtp.<region>.amazonaws.com` dans la région du topic. Toutes les régions AWS ne
+reçoivent pas d’e-mails ; quand la région de la connexion n’en reçoit pas, la première étape l’indique et liste les
+régions qui en reçoivent. Amazon SES renvoie en rebond un message de plus de 150 Ko au lieu de le publier vers SNS : une
+réponse avec de grosses pièces jointes n’atteint donc jamais ReputeCast
+([Amazon SES, « Publish to an Amazon SNS topic action »](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-sns.html),
+vérifié en novembre 2026).
+
+### Recevoir via Postal
+
+L’API de Postal n’a ni routes ni endpoints : vous ajoutez donc les deux dans Postal.
+
+<Steps>
+
+1. Dans **Routing** › **HTTP Endpoints** du serveur de messagerie, ajoutez un endpoint avec l’adresse entrante comme
+   URL, l’encodage **Sent in the body as JSON** et le format **Delivered as the raw message**.
+
+2. Sous **Routing** › **Routes**, ajoutez une route nommée `*` pour le domaine de réception, avec ce HTTP endpoint comme
+   endpoint. Le domaine doit faire partie des domaines vérifiés du serveur de messagerie.
+
+3. Faites pointer l’enregistrement MX du domaine de réception vers votre serveur Postal, sauf si votre installation
+   Postal liste d’autres hôtes MX dans son réglage `dns.mx_records`.
+
+</Steps>
+
+Postal signe ce qu’il envoie avec la clé du serveur, comme il signe ses webhooks, et ReputeCast vérifie cette signature.
+
+## Lire la carte de réception des e-mails
+
+<Screenshot
+  id="receiving-card"
+  alt="La carte Réception des e-mails d’Acme Newsletter : réception via Postmark sur reply.news.acme.io avec l’heure du dernier message, l’enregistrement MX 10 inbound.postmarkapp.com Trouvé, et les adresses des rapports DMARC et de boucle de rétroaction avec des boutons Copier."
+>
+  1. L’état de la route.
+  2. Tester la route, la modifier ou arrêter la réception.
+  3. Comment l’espace de travail reçoit : le fournisseur d’envoi et le domaine, ou la boîte aux lettres, avec le dernier
+     message.
+  4. L’enregistrement MX dont le domaine de réception a besoin, et ce qu’en dit le DNS.
+  5. Les adresses fixes des rapports DMARC et de boucle de rétroaction.
+</Screenshot>
+
+<TableScroll label="États de la réception des e-mails">
+
+| État | Ce que cela signifie | Que faire |
+| --- | --- | --- |
+| <UiPath path="senders.receiving.statusNotSetUp" /> | Aucune route. Les réponses vont à l’adresse de réponse. | Configurez la réception. |
+| <UiPath path="senders.receiving.statusPending" /> | La route est enregistrée et aucun message n’est encore arrivé. | Ajoutez l’enregistrement MX, ou terminez les étapes chez le fournisseur d’envoi, puis envoyez un message de test. |
+| <UiPath path="senders.receiving.statusReceiving" /> | Un message est arrivé (un message de test compte), et rien n’indique depuis que la réception s’est arrêtée. | Rien. |
+| <UiPath path="senders.receiving.statusFailing" /> | L’enregistrement MX ne pointe plus vers le fournisseur d’envoi, ou la boîte aux lettres a refusé la connexion ou était injoignable. La carte précise la cause. | Rétablissez l’enregistrement MX, ou vérifiez le nom d’utilisateur et le mot de passe dans <UiPath path="senders.receiving.edit" />. |
+
+</TableScroll>
+
+- ReputeCast vérifie toutes les 15 minutes l’enregistrement MX d’une route via un fournisseur d’envoi qui reçoit. Quand
+  il ne désigne plus l’hôte du fournisseur d’envoi, la route passe à <UiPath path="senders.receiving.statusFailing" />
+  et les membres qui peuvent gérer les domaines reçoivent une seule notification « La réception des e-mails s’est
+  arrêtée ». La route repasse à <UiPath path="senders.receiving.statusReceiving" /> avec le message suivant. Resend affiche
+  son propre enregistrement MX pour chaque domaine : ReputeCast ne le vérifie donc pas pour Resend.
+- Une boîte aux lettres qui refuse la connexion ou qui est injoignable fait aussi passer la route à
+  <UiPath path="senders.receiving.statusFailing" />, avec une seule notification. ReputeCast réessaie chaque minute, les
+  messages attendent entre-temps dans la boîte aux lettres, et la route reçoit de nouveau à la première lecture qui
+  réussit.
+- Quand un fournisseur d’envoi refuse la déclaration, la carte indique « ReputeCast n’a pas pu configurer la réception
+  chez … » avec la réponse du fournisseur d’envoi. Rien n’arrive tant que vous n’avez pas corrigé la cause chez lui et
+  enregistré de nouveau la route.
+- Un rapport DMARC sur un domaine depuis lequel l’espace de travail n’envoie pas est écarté, et la carte l’indique.
+
+## Les adresses du domaine de réception
+
+Chaque adresse que ReputeCast distribue porte une étiquette : une lettre, l’ID du message et un condensé à clé, pour que
+personne ne puisse deviner l’adresse d’un autre message ; une adresse modifiée relève des autres e-mails. Une route de
+boîte aux lettres place les mêmes parties après un signe plus, comme `replies+r-…@acme.io` et `replies+dmarc@acme.io`.
+
+<TableScroll label="Adresses du domaine de réception">
+
+| Adresse | Où ReputeCast l’utilise | Ce que deviennent les e-mails envoyés à cette adresse |
+| --- | --- | --- |
+| `r-<tag>@` | Le Reply-To de chaque campagne, e-mail d’automatisation et copie de test de placement, tant que les réponses restent dans la boîte | Ils arrivent dans [la boîte des réponses](/fr/reference/glossary/#replies-inbox), rattachés au contact et à l’e-mail auquel ils répondent ; les réponses automatiques et le spam sont triés à part |
+| `u-<tag>@` | Le `mailto:` de `List-Unsubscribe`, tant que la route reçoit et que l’espace de travail l’inclut | ReputeCast désabonne le contact, comme le fait le lien en un clic |
+| `t-<tag>@` | Le message de test de la configuration | La carte indique qu’il est arrivé |
+| `dmarc@` | Le `rua=` de vos enregistrements DMARC | ReputeCast stocke le rapport agrégé |
+| `fbl@` | L’adresse que vous donnez aux boucles de rétroaction qui envoient des rapports au format ARF | La plainte compte comme événement de plainte du fournisseur d’envoi |
+| Toute autre adresse | Nulle part | Ils arrivent sous <UiPath path="replies.viewOther" /> dans la boîte des réponses |
+
+</TableScroll>
+
+ReputeCast conserve chaque message une seule fois : le même Message-ID qui arrive deux fois n’est appliqué qu’une fois.
+
+## Garder les réponses dans la boîte ReputeCast
+
+Une fois que la carte indique <UiPath path="senders.receiving.statusReceiving" />, ouvrez
+<UiPath path="senders.defaultsTitle > senders.replyHandling" /> sur la même page, choisissez
+<UiPath path="senders.receiving.keepInInbox" /> et enregistrez. Avant cela, l’option est grisée (« configurez d’abord la
+Réception des e-mails »).
+
+<Screenshot
+  id="settings-senders-defaults"
+  alt="La carte Valeurs par défaut de Paramètres, Expéditeurs : la gestion des réponses réglée sur Garder les réponses dans la boîte ReputeCast, l’interrupteur Inclure une adresse mailto: dans List-Unsubscribe désactivé avec la remarque que les e-mails de désabonnement vont à ReputeCast, et l’interrupteur Ajouter des paramètres UTM aux liens désactivé avec les trois paramètres qu’il ajoute."
+>
+  1. La gestion des réponses : transférer les réponses à une seule adresse, utiliser l’adresse de réponse de chaque
+     expéditeur, ou les garder dans ReputeCast.
+  2. L’adresse `mailto:` de `List-Unsubscribe`, désactivée par défaut.
+  3. Les paramètres UTM des liens, désactivés par défaut.
+</Screenshot>
+
+Dès lors, les campagnes, les e-mails d’automatisation et les copies des tests de placement portent une adresse Reply-To
+sur le domaine de réception, une adresse par message, avec le nom de l’adresse de réponse de l’expéditeur, ou à défaut
+celui de l’expéditeur. Une campagne prend le réglage au début de son envoi. Les réponses des personnes peuvent
+[arrêter une automatisation](/fr/automations/triggers-and-steps/), et le
+[contrôle avant envoi](/fr/campaigns/send-readiness/) avertit quand les réponses iraient à ReputeCast alors que la route
+n’a pas encore reçu son premier message ou est en échec.
+
+## Traiter les e-mails de désabonnement
+
+`List-Unsubscribe` ne contient que le lien en un clic, sauf si <UiPath path="senders.listUnsubscribeMailto" /> est
+activé dans la même carte <UiPath path="senders.defaultsTitle" />. Quand il est activé et que la route reçoit, l’adresse
+`mailto:` est l’adresse `u-` propre au message, avec l’objet `unsubscribe`. Un e-mail envoyé à cette adresse désabonne
+le contact en moins d’une minute, comme le lien en un clic : le contact quitte toutes les listes, l’historique de
+consentement enregistre la source `mailto`, et le désabonnement compte pour la campagne ou l’étape d’automatisation.
+Personne n’a à retirer ces lecteurs à la main. Lisez
+[Désabonnement en un clic](/fr/deliverability/one-click-unsubscribe/) pour les en-têtes.
+
+## Collecter les rapports DMARC et de plainte
+
+- **Rapports agrégés DMARC.** Ajoutez l’adresse `dmarc@` à la balise `rua=` de votre enregistrement DMARC, par exemple
+  `v=DMARC1; p=none; rua=mailto:dmarc@reply.news.acme.io`. Tant qu’une route existe, l’enregistrement DMARC que
+  ReputeCast propose pour un domaine que vous ajoutez la contient, après l’adresse de HostRepute quand HostRepute est
+  connecté. Les rapports sur les domaines d’envoi de l’espace de travail et leurs domaines organisationnels sont
+  conservés ; les autres sont écartés. La carte DMARC de <UiPath path="nav.deliverability" /> indique où arrivent les
+  rapports et quand le dernier est arrivé. Voir [Lire les rapports agrégés DMARC](/fr/deliverability/dmarc-reports/).
+- **Rapports de boucle de rétroaction.** Un rapport de plainte au format ARF qui arrive à `fbl@` devient un événement de
+  plainte du fournisseur d’envoi qui a envoyé le message, selon la règle que suivent les rapports non signés : il ne
+  compte que pour un message envoyé par ReputeCast, à ce destinataire, et une seule fois. L’adresse est exclue, comme
+  pour toute plainte. Voir [Rebonds, plaintes et limites des fournisseurs](/fr/deliverability/bounces-and-complaints/).
+
+## Arrêter la réception
+
+Choisissez <UiPath path="senders.receiving.remove" /> sur la carte. La boîte de dialogue liste ce qui change, puis
+<UiPath path="senders.receiving.removeConfirm" /> supprime la route :
+
+- Les réponses déjà reçues restent dans <UiPath path="nav.audience > replies.tab" />.
+- La gestion des réponses revient au transfert des réponses, vers l’adresse de réponse de l’espace de travail.
+- Les e-mails de désabonnement ne sont plus traités : l’adresse `mailto:` redevient l’adresse de réponse.
+- ReputeCast retire ce qu’il a configuré chez le fournisseur d’envoi. Supprimez l’enregistrement MX dès que plus rien
+  n’utilise le domaine. Une route de boîte aux lettres n’est plus lue, et ses messages restent où ils sont.
+
+La configuration, la modification, le test et la suppression de la route sont consignés dans le
+[journal d’audit](/fr/team/audit-log/).
+
+## Valeurs par défaut et limites
+
+<LimitsTable area="receiving" />
+
+Les e-mails reçus sont conservés un an, le message tel qu’il est arrivé 7 jours ; voir
+[Lire et traiter les réponses](/fr/audience/replies/). Effacer un contact supprime les e-mails reçus de sa part et ce qui
+est arrivé pour ces e-mails.
+
+## Vérifier le résultat
+
+- La carte indique <UiPath path="senders.receiving.statusReceiving" />, et le test affiche « Reçu à … » avec « La route
+  fonctionne ».
+- Une réponse à une campagne envoyée après que vous avez choisi <UiPath path="senders.receiving.keepInInbox" /> apparaît
+  dans <UiPath path="nav.audience > replies.tab" />.
+- La carte DMARC sous <UiPath path="nav.deliverability" /> indique « Les rapports arrivent à dmarc@… » dès qu’un
+  fournisseur de messagerie y envoie un rapport.
+
+## Dépannage
+
+- **<UiPath path="senders.receiving.testMissing" />** après 2 minutes : l’enregistrement MX ne pointe pas encore vers
+  l’hôte du fournisseur d’envoi, une étape manque chez le fournisseur d’envoi ou, pour une boîte aux lettres, les
+  e-mails envoyés à son adresse ne lui parviennent pas ou ReputeCast ne peut pas s’y connecter. Les modifications DNS
+  peuvent prendre du temps ; envoyez un autre test une fois que l’enregistrement affiche
+  <UiPath path="senders.receiving.mxFound" />.
+- **« Un autre espace de travail reçoit déjà des e-mails sur … »** : chaque domaine appartient à un seul espace de
+  travail de l’instance. Utilisez un autre sous-domaine.
+- **« … n’est pas un domaine d’envoi vérifié de cet espace de travail ni un de ses sous-domaines »** : vérifiez d’abord
+  le domaine, ou choisissez un sous-domaine d’un domaine vérifié.
+- **« … reçoit déjà des e-mails sur … »** : les enregistrements MX du domaine désignent un autre serveur, et les
+  déplacer couperait ces e-mails. Utilisez un sous-domaine réservé à ReputeCast, comme `reply.` suivi du domaine.
+- **« Saisissez l’adresse de la boîte aux lettres sans partie après le signe plus »** : ReputeCast ajoute ses propres
+  parties après le signe plus. Saisissez l’adresse simple.
+- **« Saisissez de nouveau le mot de passe : le serveur ou le nom d’utilisateur a changé. »** : un mot de passe
+  enregistré n’est envoyé qu’au serveur et à l’utilisateur pour lesquels il a été saisi.
+- **« ReputeCast ne peut pas envoyer le message de test : aucun fournisseur n’envoie les e-mails système. »** : faites
+  passer le flux Système par un fournisseur d’envoi dans le [routage](/fr/providers/routing/).
+- **« Patientez … secondes avant d’envoyer un autre message de test. »** : un test toutes les 30 secondes.
+- **La carte indique que ReputeCast n’a pas pu configurer la réception chez un fournisseur d’envoi** : lisez sa
+  réponse. Une clé SendGrid sans l’autorisation Inbound Parse, un forfait Mailjet sans la Parse API ou un domaine que le
+  fournisseur d’envoi n’a pas en sont les causes habituelles. Corrigez-la chez lui, puis enregistrez de nouveau la route
+  dans <UiPath path="senders.receiving.edit" />.
+- **Amazon SES ne confirme jamais l’abonnement** : saisissez et enregistrez l’ARN du SNS topic avant d’ajouter
+  l’abonnement ; ReputeCast refuse tous les autres topics. Supprimez l’abonnement et ajoutez-le de nouveau.
+- **Les grosses réponses via Amazon SES disparaissent** : Amazon SES renvoie en rebond les messages de plus de 150 Ko.
+  Utilisez un autre fournisseur d’envoi ou une boîte aux lettres si vos lecteurs envoient de grosses pièces jointes.
+- **Le fournisseur d’envoi signale des erreurs en envoyant ses requêtes à ReputeCast** : l’adresse entrante répond `401`
+  quand la requête n’est pas signée ou authentifiée comme la route l’attend, `404` pour une adresse qui n’est celle
+  d’aucune route, `413` au-delà de 25 Mio, et `429` avec `Retry-After: 30` quand ReputeCast est occupé ou ne peut
+  brièvement pas la stocker, pour que le fournisseur d’envoi réessaie.
+
+<Aside type="note">
+ReputeCast ne stocke qu’en partie une requête qui échoue à son contrôle, pour le diagnostic, et ne la traite jamais.
+Changer l’URL publique ne déplace pas une route qu’un fournisseur d’envoi a configurée : enregistrez de nouveau la route
+dans <UiPath path="senders.receiving.edit" /> pour que ReputeCast déclare la nouvelle adresse, et mettez à jour l’adresse
+à la main dans Amazon SES ou Postal.
+</Aside>
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Lire et traiter les réponses" href="/fr/audience/replies/" />
+  <LinkCard title="Ajouter des domaines d’envoi et des expéditeurs" href="/fr/providers/senders-and-domains/" />
+  <LinkCard title="Désabonnement en un clic (RFC 8058)" href="/fr/deliverability/one-click-unsubscribe/" />
+  <LinkCard title="Lire les rapports agrégés DMARC" href="/fr/deliverability/dmarc-reports/" />
+</CardGrid>

@@ -10,7 +10,12 @@ sources:
   - internal/cli/serve.go
   - internal/app/app.go
   - internal/app/wire_publicurl.go
+  - internal/instance/settings.go
+  - internal/instance/updates.go
+  - internal/publicurl/publicurl.go
+  - web/src/features/admin/instance/messages.ts
   - deploy/docker-compose.yml
+  - docs/deploy/configuration.md
   - README.md
 sidebar:
   order: 5
@@ -36,7 +41,10 @@ Cada capa sustituye a la anterior:
    ruta.
 3. **Variables de entorno** que empiezan por `REPUTECAST_`.
 4. **`DATABASE_URL`**, la variable que definen muchas plataformas de alojamiento, pero solo cuando
-   `REPUTECAST_DATABASE__URL` no está definida.
+   `REPUTECAST_DATABASE__URL` no está definida. Del mismo modo, **`PORT`**: cuando `REPUTECAST_HTTP__ADDR` no está
+   definida, ReputeCast escucha en `:<PORT>`. La imagen de Docker define `REPUTECAST_HTTP__ADDR=:8080`, así que un
+   contenedor escucha en el 8080 diga lo que diga `PORT`. Un `PORT` que no es un número de puerto (1–65535) impide el
+   arranque. Disponible a partir de la próxima versión después de la 1.6.0.
 5. **Opciones** que pasas de forma explícita: `--role` (define `roles`), `--addr` (`http.addr`), `--database-url`
    (`database.url`) y `--log-level` (`log.level`). Una opción que no pasas no cambia nada.
 
@@ -83,7 +91,9 @@ http:
   addr: 127.0.0.1:8080
   # The address people and sending providers reach. Use https in production.
   public_url: https://news.example.com
-  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  # Pin public_url: Instance admin can't change it (for an instance you run for someone else).
+  # public_url_locked: false
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs, IPs or "private").
   trusted_proxies: [127.0.0.1]
   rate_limit_auth: 30 # sign-in requests per minute per client IP
   rate_limit_api: 600 # API requests per minute per key or signed-in browser session
@@ -106,8 +116,25 @@ secrets:
   key_file: /var/lib/reputecast/secret.key
 
 files:
-  # Product files and lead magnets; shared by every web and worker process.
+  # Product files, lead magnets, uploads in progress and exports, with storage.backend local.
   dir: /var/lib/reputecast/files
+
+storage:
+  backend: local # or s3: the bucket below, shared by every web and worker process
+  # s3:
+  #   bucket: reputecast-files
+  #   region: eu-central-1
+  #   endpoint: "" # empty is AWS; https://nyc3.digitaloceanspaces.com, http://minio:9000…
+  #   path_style: false
+  #   prefix: ""
+  #   access_key_id: "" # better set by environment; empty uses the default AWS credential chain
+  #   secret_access_key: ""
+  #   sse: "" # AES256 or aws:kms
+  #   kms_key_id: ""
+
+geoip:
+  # A MaxMind DB file you download (GeoLite or DB-IP Lite); empty is off.
+  # database: /var/lib/geoip/GeoLite2-City.mmdb
 
 log:
   level: info # debug, info, warn or error
@@ -124,6 +151,7 @@ worker:
 updates:
   check: true # daily release check against GitHub (version number only)
   repo: hostrepute/reputecast
+  # managed_by: Northwind Hosting # who upgrades this instance; Instance admin says so
 
 metrics:
   enabled: true
@@ -153,7 +181,16 @@ Un proceso se niega a arrancar, y muestra `Error: …`, cuando:
 - `http.public_url` no es una URL absoluta (`http.public_url must be an absolute URL, got "news.example.com"`);
 - `secrets.key` está definida pero no es la codificación en base64 de exactamente 32 bytes;
 - `auth.password_min_length` es inferior a 8;
-- `metrics.token` está definido pero tiene menos de 16 caracteres.
+- `metrics.token` está definido pero tiene menos de 16 caracteres;
+- las opciones de almacenamiento no encajan entre sí: `storage.backend` no es `local` ni `s3`, `s3` sin
+  `storage.s3.bucket`, un endpoint que no es una URL `http://` o `https://`, solo una de las dos claves de acceso, un
+  prefijo que empieza por `/`, un `storage.s3.sse` distinto de `AES256` o `aws:kms`, o `storage.s3.kms_key_id` sin
+  `aws:kms` ([almacenamiento de objetos](/es/self-hosting/object-storage/#solución-de-problemas));
+- `PORT` está definida, `REPUTECAST_HTTP__ADDR` no lo está y `PORT` no es un número de puerto
+  (`PORT must be a port number (1-65535), got "web"`).
+
+Una entrada de `http.trusted_proxies` que no es una dirección, un rango ni `private` no impide el arranque: se registra
+como `ignoring invalid trusted proxy` y se ignora.
 
 <Aside type="caution">
   ReputeCast ignora sin ningún aviso las claves que no conoce. Una variable mal escrita, como
@@ -170,7 +207,15 @@ Los límites fijos del servidor HTTP y los tiempos de espera que puedes cambiar:
 ## Cuándo cambiarlos
 
 - **Detrás de un proxy inverso**: define `http.public_url` con la dirección https y `http.trusted_proxies` con el
-  proxy ([proxy inverso y TLS](/es/self-hosting/reverse-proxy/)).
+  proxy ([proxy inverso y TLS](/es/self-hosting/reverse-proxy/)). En una plataforma de hosting o detrás de un
+  controlador de Ingress de Kubernetes, cuya dirección no puedes conocer de antemano, la palabra clave `private` confía
+  en todas las redes privadas, compartidas y de loopback
+  ([proxies de confianza](/es/deploy/overview/#proxies-de-confianza)). Disponible a partir de la próxima versión después
+  de la 1.6.0.
+- **Países en los informes de campaña**: `geoip.database`, un archivo que descargas
+  ([añadir una base de datos GeoIP](/es/self-hosting/geoip/)).
+- **Varias máquinas sin un volumen compartido**: `storage.backend: s3` y las claves `storage.s3`
+  ([almacenamiento de objetos](/es/self-hosting/object-storage/)).
 - **Varios procesos**: reparte `roles` y dimensiona `database.max_conns` para que el total quede por debajo de
   `max_connections` de PostgreSQL ([escalado](/es/self-hosting/scaling/) y [PostgreSQL](/es/self-hosting/postgres/)).
 - **Herramientas de envío de logs**: `log.format: json` (la imagen de Docker ya lo usa).
@@ -183,7 +228,10 @@ Los límites fijos del servidor HTTP y los tiempos de espera que puedes cambiar:
   la nube siguen bloqueadas.
 - **Sin archivo de clave en disco**: `secrets.key` generada con `reputecast secrets generate-key`, definida antes del
   primer arranque ([seguridad y protección](/es/self-hosting/security/)).
-- **Servidores sin conexión**: `updates.check: false`.
+- **Servidores sin conexión**: `updates.check: false`. También bloquea la comprobación de actualizaciones como
+  desactivada en la administración de la instancia y en el primer inicio de sesión.
+- **Una instancia que ejecutas para otra persona**: `http.public_url_locked` y `updates.managed_by`
+  ([configuración que gestiona el operador del servidor](#configuración-que-gestiona-el-operador-del-servidor)).
 
 ## Configuración que se gestiona en la aplicación
 
@@ -194,9 +242,46 @@ Los límites fijos del servidor HTTP y los tiempos de espera que puedes cambiar:
 - El nombre de la instancia, el logo, la zona horaria y el idioma predeterminados, y la URL pública están en
   <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. Una URL pública guardada ahí sustituye a
   `http.public_url` para los enlaces, las páginas públicas y los webhooks de los proveedores en menos de 30 segundos en
-  todos los procesos. Las cookies solo HTTPS y HSTS siguen dependiendo de `http.public_url`, así que mantén las dos
-  iguales.
+  todos los procesos, salvo que el servidor [la fije](#configuración-que-gestiona-el-operador-del-servidor). Las cookies solo HTTPS
+  y HSTS siguen dependiendo de `http.public_url`, así que mantén las dos iguales.
 - Los proveedores de envío, los remitentes, los equipos y todo lo demás pertenecen a cada espacio de trabajo.
+
+## Configuración que gestiona el operador del servidor
+
+Cuando una empresa de hosting o un equipo de TI ejecuta una instancia para sus usuarios, dos opciones dejan fuera del
+alcance de quienes administran la instancia lo que solo debe cambiar quien gestiona el servidor. Las dos llegaron con
+la versión 1.5.0.
+
+### Fijar la URL pública
+
+`http.public_url_locked: true` (`REPUTECAST_HTTP__PUBLIC_URL_LOCKED=true`) hace de `http.public_url` la dirección que
+usan todos los enlaces, las páginas públicas, los webhooks de los proveedores y las llaves de acceso, guarde lo que
+guarde quien administra la instancia:
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> y el paso <UiPath path="setup.instanceBasics" /> del
+  [primer inicio de sesión](/es/self-hosting/first-run/) muestran la URL pública en solo lectura, con la frase "La fijó
+  quien gestiona el servidor (http.public_url_locked). Los enlaces de los correos enviados, las llaves de acceso y los
+  webhooks de los proveedores dependen de ella, así que solo quien gestiona el servidor puede cambiarla." La
+  comprobación de la URL sigue ejecutándose, para la dirección fijada.
+- Un guardado que pide otra dirección se rechaza con `409` y el código `operator_locked`; el resto del formulario se
+  guarda igualmente.
+- Al arrancar, la dirección fijada pasa a ser la guardada. Si alguien de la administración había guardado otra, los
+  webhooks de los proveedores pasan una vez a la dirección fijada, lo que queda en el registro de auditoría de la
+  instancia como cambio de la configuración del servidor, y los webhooks que los proveedores guardan en su propia
+  configuración se enumeran en el log (`provider webhooks to change by hand for the locked public URL`). Así que
+  activar el bloqueo, o cambiar la dirección fijada y reiniciar, traslada la instancia.
+- Los enlaces de restablecimiento que muestra `reputecast user reset-password` también usan la dirección fijada.
+- `reputecast doctor` avisa cuando la dirección fijada es una a la que solo llega el propio servidor, como
+  `http://localhost:8080`.
+
+### Indicar quién actualiza
+
+`updates.managed_by` (`REPUTECAST_UPDATES__MANAGED_BY`), como `Northwind Hosting`, indica quién actualiza la
+instancia. La tarjeta <UiPath path="admin.versionCard" /> de
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> dice entonces "Las actualizaciones las gestiona
+Northwind Hosting, que decide cuándo pasa esta instancia a una nueva versión. Consúltale el momento o una versión
+concreta." en lugar del comando de actualización de `docker compose` y el recordatorio de la copia de seguridad. La
+comprobación de versiones y su interruptor siguen como están.
 
 ## Relacionado
 
@@ -205,3 +290,5 @@ Los límites fijos del servidor HTTP y los tiempos de espera que puedes cambiar:
 - [Instalar con Docker Compose](/es/self-hosting/docker/): dónde define estas variables el archivo Compose.
 - [Instalar el binario](/es/self-hosting/binary/): un archivo de entorno para systemd.
 - [Referencia de la CLI](/es/reference/cli/): las opciones de cada comando.
+- [Añadir una base de datos GeoIP](/es/self-hosting/geoip/) y
+  [guardar los archivos en un almacenamiento de objetos compatible con S3](/es/self-hosting/object-storage/).

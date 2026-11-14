@@ -52,6 +52,19 @@ describe('parseApiErrorCodes', () => {
     expect(parseApiErrorCodes([{ path, src: readFileSync(`${root}${path}`, 'utf8') }]).codes).toEqual(['rate_limited'])
   })
 
+  it('reads dotted literal codes such as "inbound.unsupported"', () => {
+    const src = `package inbound
+
+func (s *Service) Save(ctx context.Context) error {
+	return api.Err(409, "inbound.unsupported", say(ctx, "problem.unsupported", nil))
+}
+`
+    expect(parseApiErrorCodes([{ path: 'internal/inbound/inbound.go', src }])).toEqual({
+      codes: ['inbound.unsupported'],
+      unresolved: [],
+    })
+  })
+
   it("reads local variables and expands a source error's Code to the package's Code constants", () => {
     expect(parseApiErrorCodes(only('internal/imports/sources.go', 'internal/imports/connect.go')).codes.sort()).toEqual(
       [

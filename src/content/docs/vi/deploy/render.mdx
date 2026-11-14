@@ -1,10 +1,11 @@
 ---
 title: Triển khai ReputeCast trên Render
-description: Triển khai ReputeCast trên Render với Render Postgres, Docker image chạy dạng web service, disk tùy chọn, tên miền riêng qua HTTPS và kiểm tra /readyz.
+description: Triển khai ReputeCast trên Render từ Blueprint hoặc thủ công, với Render Postgres, Docker image chạy dạng web service, một disk và tên miền riêng qua HTTPS.
 type: how-to
 audience: [operator]
 primaryKeyword: triển khai ReputeCast trên Render
 sources:
+  - render.yaml
   - deploy/docker-compose.yml
   - deploy/Dockerfile.release
   - internal/config/config.go
@@ -16,9 +17,11 @@ sidebar:
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
 
-Hướng dẫn này chạy ReputeCast trên Render bằng hai tài nguyên tạo trong Render Dashboard: một cơ sở dữ liệu Render
-Postgres và một web service kéo Docker image của ReputeCast, phục vụ qua HTTPS trên tên miền riêng của bạn.
+Hướng dẫn này chạy ReputeCast trên Render bằng hai tài nguyên: một cơ sở dữ liệu Render Postgres và một web service kéo
+Docker image của ReputeCast, phục vụ qua HTTPS trên tên miền riêng của bạn. Hãy tạo cả hai cùng lúc từ Blueprint có sẵn
+trong kho mã, hoặc tạo lần lượt trong Render Dashboard.
 
 ## Trước khi bắt đầu
 
@@ -28,13 +31,52 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
   [yêu cầu hệ thống](/vi/self-hosting/requirements/).
 - Một tên miền cho ReputeCast, ví dụ `news.example.com`, tại một nhà cung cấp DNS cho phép bạn thêm bản ghi `CNAME`.
 
-## Triển khai ReputeCast
+## Triển khai bằng render.yaml
+
+Tệp `render.yaml` trong kho mã là một Render Blueprint tạo cả hai tài nguyên. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+<Steps>
+
+1. Mở `https://render.com/deploy?repo=https://github.com/hostrepute/reputecast`, liên kết Deploy to Render trong README
+   của kho mã, rồi đăng nhập Render.
+
+2. Render hiển thị những gì Blueprint tạo:
+
+   - web service `reputecast`, từ image `ghcr.io/hostrepute/reputecast:latest` trên gói `0.5c-512mb` (0,5 CPU,
+     512 MB), với health check `/readyz` và một disk 10 GB, `reputecast-data`, tại `/var/lib/reputecast`;
+   - cơ sở dữ liệu `reputecast-db`, PostgreSQL 18 trên gói `0.1c-256mb`, với cơ sở dữ liệu và người dùng cùng tên
+     `reputecast`, chỉ truy cập được qua mạng riêng của Render.
+
+3. Nhập hai giá trị Render yêu cầu: `REPUTECAST_PUBLIC_URL`, URL tên miền của bạn không có dấu gạch chéo ở cuối (hoặc
+   địa chỉ `onrender.com` của dịch vụ, ví dụ `https://reputecast.onrender.com`, cho đến khi bạn thêm tên miền), và
+   `REPUTECAST_ADMIN_EMAIL`, email của Chủ sở hữu đầu tiên. Render chỉ hỏi hai giá trị này khi tạo Blueprint
+   ([Blueprint reference](https://render.com/docs/blueprint-spec), kiểm tra tháng 11/2026).
+
+4. Xác nhận, và Render tạo cả hai tài nguyên. Dịch vụ lấy các thiết lập còn lại từ tệp:
+
+   - `DATABASE_URL`, chuỗi kết nối của cơ sở dữ liệu. ReputeCast đọc biến này khi `REPUTECAST_DATABASE__URL` chưa được
+     đặt.
+   - `REPUTECAST_HTTP__TRUSTED_PROXIES=private`, tin cậy proxy của Render trên mạng riêng của nó
+     ([proxy tin cậy](/vi/deploy/overview/#proxy-tin-cậy)).
+   - `PORT=8080`, cổng mà Render định tuyến đến và image lắng nghe.
+
+5. Khi lần triển khai đã Live, hãy đọc mật khẩu tạm của Chủ sở hữu đầu tiên trong **Logs** của dịch vụ, thêm tên miền
+   của bạn rồi đăng nhập, như bước 9 đến 11 của [triển khai thủ công](#triển-khai-reputecast-thủ-công) mô tả.
+
+</Steps>
+
+ReputeCast tạo khóa bí mật của nó trên disk ở lần khởi động đầu tiên, tại `/var/lib/reputecast/secret.key`. Render chụp
+snapshot disk mỗi 24 giờ và giữ mỗi snapshot trong bảy ngày ([persistent disks](https://render.com/docs/disks), kiểm
+tra tháng 11/2026), nhưng image không có shell, nên không thể sao chép tệp ra ngoài qua shell hay SSH của Render. Để
+giữ một bản sao của khóa bên ngoài Render, hãy triển khai thủ công với `REPUTECAST_SECRETS__KEY`.
+
+## Triển khai ReputeCast thủ công
 
 <Steps>
 
 1. Tạo khóa bí mật và lưu nó vào trình quản lý mật khẩu. Hai lệnh sau in ra khóa cùng định dạng (44 ký tự, kết thúc
    bằng `=`): `openssl rand -base64 32` hoặc
-   `docker run --rm ghcr.io/hostrepute/reputecast:v1.4.0 secrets generate-key`.
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.6.0 secrets generate-key`.
 
 2. Trong Render Dashboard, nhấn **+ New** → **Postgres**. Nhập **Name**, ví dụ `reputecast-db`, chọn **Region**, giữ
    **PostgreSQL Version** là 18, chọn một gói tính toán khác **Free** rồi nhấn **Create Database**. Để trống
@@ -45,7 +87,7 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
    (ReputeCast dùng TLS khi cơ sở dữ liệu hỗ trợ), hoặc thêm `?sslmode=require` để từ chối kết nối không mã hóa.
 
 4. Nhấn **+ New** → **Web Service**. Trong **Source Code**, nhấn **Existing Image**, nhập **Image URL**
-   `ghcr.io/hostrepute/reputecast:v1.4.0` rồi nhấn **Connect**. Image này công khai nên không cần thông tin xác thực.
+   `ghcr.io/hostrepute/reputecast:v1.6.0` rồi nhấn **Connect**. Image này công khai nên không cần thông tin xác thực.
 
 5. Nhập **Name**, ví dụ `reputecast` (tên này trở thành một phần của địa chỉ `onrender.com` của dịch vụ), chọn đúng
    **Region** của cơ sở dữ liệu và một **Compute Plan** khác **Free**.
@@ -60,8 +102,9 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
    REPUTECAST_SECRETS__KEY=paste-the-key-from-step-1
    ```
 
-   - `PORT=8080` cho Render biết ReputeCast lắng nghe ở cổng nào; mặc định của Render là 10000. Bản thân ReputeCast
-     không đọc `PORT`. ReputeCast cũng lắng nghe ở cổng 9464 cho metrics Prometheus, cổng này phải giữ riêng tư: Render
+   - `PORT=8080` cho Render biết ReputeCast lắng nghe ở cổng nào; mặc định của Render là 10000. Image luôn lắng nghe
+     ở cổng 8080 dù `PORT` ghi gì, vì nó đặt `REPUTECAST_HTTP__ADDR=:8080`, giá trị được ưu tiên hơn `PORT`.
+     ReputeCast cũng lắng nghe ở cổng 9464 cho metrics Prometheus, cổng này phải giữ riêng tư: Render
      chỉ chuyển tiếp cổng `PORT` ([port binding](https://render.com/docs/web-services#port-binding), kiểm tra tháng
      11/2026).
    - `REPUTECAST_PUBLIC_URL` là URL tên miền của bạn, không có dấu gạch chéo ở cuối. Nếu muốn dùng địa chỉ
@@ -69,14 +112,15 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
    - `REPUTECAST_ADMIN_EMAIL` là email của Chủ sở hữu đầu tiên, chỉ được dùng khi cơ sở dữ liệu chưa có người dùng nào.
      Khi đã đặt `REPUTECAST_SECRETS__KEY`, ReputeCast không bao giờ đọc hay ghi tệp `secret.key`.
    - Render không công bố dải địa chỉ mà bộ cân bằng tải của Render dùng để kết nối, nên hãy để trống
-     `REPUTECAST_HTTP__TRUSTED_PROXIES` ([proxy tin cậy](/vi/self-hosting/docker/#proxy-tin-cậy)). Các thiết lập khác:
-     [cấu hình](/vi/self-hosting/configuration/).
+     `REPUTECAST_HTTP__TRUSTED_PROXIES` với 1.6.0 ([proxy tin cậy](/vi/deploy/overview/#proxy-tin-cậy)). Blueprint thì
+     đặt từ khóa `private`, vốn tin cậy mạng riêng của Render. Có từ bản phát hành tiếp theo sau 1.6.0. Các thiết lập
+     khác: [cấu hình](/vi/self-hosting/configuration/).
 
 7. Mở **Advanced** ở cuối biểu mẫu và đặt **Health Check Path** là `/readyz`. Nếu cần, nhấn **Add disk**, đặt
-   **Mount path** là `/var/lib/reputecast` và **Size** là 1 GB. Disk giữ các tệp bạn tải lên cho sản phẩm số và quà
-   tặng đăng ký; không có disk, các tệp này mất sau mỗi lần triển khai và khởi động lại. Khi có disk, Render dừng
-   instance đang chạy trước khi khởi động instance mới (không còn triển khai không gián đoạn) và dịch vụ không mở rộng
-   ra nhiều instance được.
+   **Mount path** là `/var/lib/reputecast` và **Size** là 1 GB. Disk giữ các tệp bạn tải lên cho sản phẩm số, quà
+   tặng đăng ký và tệp xuất người đăng ký; không có disk, các tệp này mất sau mỗi lần triển khai và khởi động lại. Khi
+   có disk, Render dừng instance đang chạy trước khi khởi động instance mới (không còn triển khai không gián đoạn) và
+   dịch vụ không mở rộng ra nhiều instance được.
 
 8. Nhấn **Deploy Web Service**. Render kéo image và khởi động ReputeCast; ReputeCast áp dụng các migration cơ sở dữ liệu
    và tạo Chủ sở hữu đầu tiên. Render chỉ chuyển lưu lượng đến instance mới khi `/readyz` trả về `200`.
@@ -103,6 +147,10 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
 
 </Steps>
 
+Nếu bạn thêm tên miền sau lần đăng nhập đầu tiên, hãy đổi cả URL công khai trong
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" />: địa chỉ lưu ở đó được ưu tiên hơn
+`REPUTECAST_PUBLIC_URL`, và lưu nó sẽ chuyển webhook của nhà cung cấp theo.
+
 <Aside type="caution">
   Hãy giữ một bản sao của `REPUTECAST_SECRETS__KEY` bên ngoài Render: thiếu nó, thông tin xác thực của nhà cung cấp
   lưu trong cơ sở dữ liệu không thể giải mã được.
@@ -121,7 +169,8 @@ Postgres và một web service kéo Docker image của ReputeCast, phục vụ q
 1. Đọc ghi chú phát hành và [sao lưu](/vi/self-hosting/backups/). Cơ sở dữ liệu Render Postgres trả phí còn có khôi
    phục theo thời điểm (point-in-time recovery).
 2. Trên trang **Settings** của dịch vụ, trong phần **Deploy**, đổi tag trong URL của image, ví dụ thành
-   `ghcr.io/hostrepute/reputecast:v1.4.0`, rồi lưu.
+   `ghcr.io/hostrepute/reputecast:v1.6.0`, rồi lưu. Dịch vụ tạo từ Blueprint chạy `latest`: hãy nhấn
+   **Manual Deploy** → **Deploy latest reference** để tải lại image.
 3. Nếu không có lần triển khai nào bắt đầu, nhấn **Manual Deploy** → **Deploy latest reference**: Render kéo image của
    tag vừa đặt. ReputeCast áp dụng các migration mới khi khởi động. Khi có disk, dịch vụ gián đoạn vài giây. Nâng cấp
    lên 1.3.0 chia `delivery_events` thành các phân vùng theo tháng và giữ khóa migration trong lúc chạy

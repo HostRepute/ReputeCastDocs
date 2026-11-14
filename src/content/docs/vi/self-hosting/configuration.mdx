@@ -10,7 +10,12 @@ sources:
   - internal/cli/serve.go
   - internal/app/app.go
   - internal/app/wire_publicurl.go
+  - internal/instance/settings.go
+  - internal/instance/updates.go
+  - internal/publicurl/publicurl.go
+  - web/src/features/admin/instance/messages.ts
   - deploy/docker-compose.yml
+  - docs/deploy/configuration.md
   - README.md
 sidebar:
   order: 5
@@ -35,6 +40,9 @@ Mỗi lớp ghi đè lớp trước nó:
    của tệp.
 3. **Biến môi trường** bắt đầu bằng `REPUTECAST_`.
 4. **`DATABASE_URL`**, biến mà nhiều nền tảng hosting đặt sẵn, nhưng chỉ khi `REPUTECAST_DATABASE__URL` chưa được đặt.
+   Tương tự với **`PORT`**: khi `REPUTECAST_HTTP__ADDR` chưa được đặt, ReputeCast lắng nghe ở `:<PORT>`. Docker image
+   đặt `REPUTECAST_HTTP__ADDR=:8080`, nên container luôn lắng nghe ở cổng 8080 dù `PORT` ghi gì. Một `PORT` không phải
+   số cổng (1–65535) sẽ chặn việc khởi động. Có từ bản phát hành tiếp theo sau 1.6.0.
 5. **Cờ** mà bạn truyền rõ ràng: `--role` (đặt `roles`), `--addr` (`http.addr`), `--database-url` (`database.url`) và
    `--log-level` (`log.level`). Cờ bạn không truyền thì không thay đổi gì.
 
@@ -81,7 +89,9 @@ http:
   addr: 127.0.0.1:8080
   # The address people and sending providers reach. Use https in production.
   public_url: https://news.example.com
-  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs or IPs).
+  # Pin public_url: Instance admin can't change it (for an instance you run for someone else).
+  # public_url_locked: false
+  # Reverse proxies whose X-Forwarded-For header is trusted (CIDRs, IPs or "private").
   trusted_proxies: [127.0.0.1]
   rate_limit_auth: 30 # sign-in requests per minute per client IP
   rate_limit_api: 600 # API requests per minute per key or signed-in browser session
@@ -104,8 +114,25 @@ secrets:
   key_file: /var/lib/reputecast/secret.key
 
 files:
-  # Product files and lead magnets; shared by every web and worker process.
+  # Product files, lead magnets, uploads in progress and exports, with storage.backend local.
   dir: /var/lib/reputecast/files
+
+storage:
+  backend: local # or s3: the bucket below, shared by every web and worker process
+  # s3:
+  #   bucket: reputecast-files
+  #   region: eu-central-1
+  #   endpoint: "" # empty is AWS; https://nyc3.digitaloceanspaces.com, http://minio:9000…
+  #   path_style: false
+  #   prefix: ""
+  #   access_key_id: "" # better set by environment; empty uses the default AWS credential chain
+  #   secret_access_key: ""
+  #   sse: "" # AES256 or aws:kms
+  #   kms_key_id: ""
+
+geoip:
+  # A MaxMind DB file you download (GeoLite or DB-IP Lite); empty is off.
+  # database: /var/lib/geoip/GeoLite2-City.mmdb
 
 log:
   level: info # debug, info, warn or error
@@ -122,6 +149,7 @@ worker:
 updates:
   check: true # daily release check against GitHub (version number only)
   repo: hostrepute/reputecast
+  # managed_by: Northwind Hosting # who upgrades this instance; Instance admin says so
 
 metrics:
   enabled: true
@@ -152,7 +180,16 @@ Một tiến trình từ chối khởi động và in `Error: …` khi:
 - `http.public_url` không phải URL tuyệt đối (`http.public_url must be an absolute URL, got "news.example.com"`);
 - `secrets.key` được đặt nhưng không phải chuỗi base64 mã hóa đúng 32 byte;
 - `auth.password_min_length` nhỏ hơn 8;
-- `metrics.token` được đặt nhưng ngắn hơn 16 ký tự.
+- `metrics.token` được đặt nhưng ngắn hơn 16 ký tự;
+- các thiết lập lưu trữ không khớp với nhau: `storage.backend` không phải `local` cũng không phải `s3`, `s3` mà thiếu
+  `storage.s3.bucket`, một endpoint không phải URL `http://` hoặc `https://`, chỉ có một trong hai access key, một
+  prefix bắt đầu bằng `/`, `storage.s3.sse` khác `AES256` hoặc `aws:kms`, hoặc `storage.s3.kms_key_id` mà không có
+  `aws:kms` ([object storage](/vi/self-hosting/object-storage/#khắc-phục-sự-cố));
+- `PORT` được đặt, `REPUTECAST_HTTP__ADDR` thì không, và `PORT` không phải số cổng
+  (`PORT must be a port number (1-65535), got "web"`).
+
+Một mục trong `http.trusted_proxies` không phải địa chỉ, dải địa chỉ hay `private` không chặn việc khởi động: mục đó
+được ghi vào log dưới dạng `ignoring invalid trusted proxy` rồi bị bỏ qua.
 
 <Aside type="caution">
   ReputeCast bỏ qua các khóa mà nó không biết, không kèm cảnh báo nào. Một biến viết sai như
@@ -169,7 +206,13 @@ Các giới hạn cố định của máy chủ HTTP và những thời gian ch�
 ## Khi nào nên thay đổi
 
 - **Đứng sau reverse proxy**: đặt `http.public_url` thành địa chỉ https và `http.trusted_proxies` thành địa chỉ của
-  proxy ([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)).
+  proxy ([reverse proxy và TLS](/vi/self-hosting/reverse-proxy/)). Trên một nền tảng hosting hoặc sau một Kubernetes
+  Ingress controller, nơi bạn không thể biết trước địa chỉ, từ khóa `private` tin cậy mọi mạng nội bộ, mạng dùng chung
+  và loopback ([proxy tin cậy](/vi/deploy/overview/#proxy-tin-cậy)). Có từ bản phát hành tiếp theo sau 1.6.0.
+- **Quốc gia trong báo cáo chiến dịch**: `geoip.database`, một tệp bạn tải về
+  ([thêm cơ sở dữ liệu GeoIP](/vi/self-hosting/geoip/)).
+- **Nhiều máy không có volume dùng chung**: `storage.backend: s3` và các khóa `storage.s3`
+  ([object storage](/vi/self-hosting/object-storage/)).
 - **Nhiều tiến trình**: tách `roles` và chọn `database.max_conns` sao cho tổng số kết nối luôn dưới `max_connections`
   của PostgreSQL ([mở rộng quy mô](/vi/self-hosting/scaling/) và [PostgreSQL](/vi/self-hosting/postgres/)).
 - **Công cụ thu thập log**: `log.format: json` (Docker image đã dùng sẵn giá trị này).
@@ -181,7 +224,10 @@ Các giới hạn cố định của máy chủ HTTP và những thời gian ch�
   đám mây vẫn bị chặn.
 - **Không lưu tệp khóa trên đĩa**: `secrets.key` lấy từ `reputecast secrets generate-key`, đặt trước lần khởi động đầu
   tiên ([bảo mật và tăng cường an toàn](/vi/self-hosting/security/)).
-- **Máy chủ không có internet**: `updates.check: false`.
+- **Máy chủ không có internet**: `updates.check: false`. Thiết lập này cũng khóa ở trạng thái tắt việc kiểm tra cập
+  nhật trong <UiPath path="shell.userMenuInstanceAdmin" /> và ở lần đăng nhập đầu tiên.
+- **Một hệ thống bạn vận hành cho người khác**: `http.public_url_locked` và `updates.managed_by`
+  ([thiết lập do người vận hành máy chủ quản lý](#thiết-lập-do-người-vận-hành-máy-chủ-quản-lý)).
 
 ## Thiết lập được quản lý trong ứng dụng
 
@@ -190,9 +236,43 @@ Các giới hạn cố định của máy chủ HTTP và những thời gian ch�
   ([quản trị hệ thống](/vi/self-hosting/instance-admin/)).
 - Tên hệ thống, logo, múi giờ và ngôn ngữ mặc định, cùng URL công khai nằm trong
   <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />. URL công khai lưu ở đó thay thế `http.public_url` cho
-  liên kết, trang công khai và webhook của nhà cung cấp trong vòng 30 giây trên mọi tiến trình. Cookie chỉ dùng qua HTTPS
-  và HSTS vẫn theo `http.public_url`, nên hãy giữ hai giá trị giống nhau.
+  liên kết, trang công khai và webhook của nhà cung cấp trong vòng 30 giây trên mọi tiến trình, trừ khi máy chủ
+  [khóa nó](#thiết-lập-do-người-vận-hành-máy-chủ-quản-lý). Cookie chỉ dùng qua HTTPS và HSTS vẫn theo
+  `http.public_url`, nên hãy giữ hai giá trị giống nhau.
 - Nhà cung cấp gửi thư, người gửi, nhóm và mọi thứ khác thuộc về từng không gian làm việc.
+
+## Thiết lập do người vận hành máy chủ quản lý
+
+Khi một công ty hosting hoặc một đội IT vận hành hệ thống cho người dùng của họ, hai thiết lập giữ những gì chỉ người
+vận hành mới nên đổi nằm ngoài tầm tay của quản trị viên hệ thống. Cả hai đều có từ bản 1.5.0.
+
+### Khóa URL công khai
+
+`http.public_url_locked: true` (`REPUTECAST_HTTP__PUBLIC_URL_LOCKED=true`) biến `http.public_url` thành địa chỉ mà mọi
+liên kết, trang công khai, webhook của nhà cung cấp và khóa truy cập dùng, bất kể quản trị viên hệ thống đã lưu gì:
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> và bước <UiPath path="setup.instanceBasics" /> của
+  [lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) hiện URL công khai ở chế độ chỉ đọc, kèm câu "Do người vận hành
+  máy chủ đặt (http.public_url_locked). Liên kết trong email đã gửi, khóa truy cập và webhook của nhà cung cấp đều phụ
+  thuộc vào nó, nên chỉ họ mới đổi được." Bước kiểm tra URL vẫn chạy, cho địa chỉ đã khóa.
+- Một lần lưu yêu cầu địa chỉ khác bị từ chối với `409` và mã `operator_locked`; phần còn lại của biểu mẫu vẫn được
+  lưu.
+- Khi khởi động, địa chỉ đã khóa trở thành địa chỉ được lưu. Nếu quản trị viên đã lưu một địa chỉ khác, webhook của
+  nhà cung cấp chuyển sang địa chỉ đã khóa một lần, được ghi trong nhật ký kiểm tra của hệ thống là thay đổi của cấu
+  hình máy chủ, và các webhook mà nhà cung cấp giữ trong cài đặt của riêng họ được liệt kê trong log
+  (`provider webhooks to change by hand for the locked public URL`). Vì vậy, bật khóa, hoặc đổi địa chỉ đã khóa rồi
+  khởi động lại, sẽ chuyển hệ thống sang địa chỉ đó.
+- Liên kết đặt lại mà `reputecast user reset-password` in ra cũng dùng địa chỉ đã khóa.
+- `reputecast doctor` cảnh báo khi địa chỉ đã khóa là địa chỉ chỉ chính máy chủ truy cập được, như
+  `http://localhost:8080`.
+
+### Nêu tên người nâng cấp
+
+`updates.managed_by` (`REPUTECAST_UPDATES__MANAGED_BY`), như `Northwind Hosting`, nêu tên người nâng cấp hệ thống. Khi
+đó thẻ <UiPath path="admin.versionCard" /> trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> hiện
+"Việc nâng cấp do Northwind Hosting quản lý. Họ quyết định khi nào hệ thống này lên bản phát hành mới; hãy hỏi họ về
+thời điểm hoặc một phiên bản cụ thể." thay cho lệnh nâng cấp `docker compose` và lời nhắc sao lưu. Bước kiểm tra bản
+phát hành và công tắc của nó vẫn giữ nguyên.
 
 ## Liên quan
 
@@ -200,3 +280,5 @@ Các giới hạn cố định của máy chủ HTTP và những thời gian ch�
 - [Cài đặt bằng Docker Compose](/vi/self-hosting/docker/): nơi tệp Compose đặt các biến này.
 - [Cài đặt bằng tệp nhị phân](/vi/self-hosting/binary/): một tệp biến môi trường cho systemd.
 - [Tham chiếu CLI](/vi/reference/cli/): các cờ của từng lệnh.
+- [Thêm cơ sở dữ liệu GeoIP](/vi/self-hosting/geoip/) và
+  [lưu tệp trong object storage tương thích S3](/vi/self-hosting/object-storage/).
