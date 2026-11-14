@@ -1,6 +1,6 @@
 ---
 title: Sao lưu và khôi phục
-description: Sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và thư mục tệp, rồi khôi phục cả ba theo đúng thứ tự và chạy thử bản khôi phục.
+description: Sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và thư mục tệp hoặc bucket, rồi khôi phục cả ba theo đúng thứ tự và chạy thử bản khôi phục.
 type: how-to
 audience: [operator]
 primaryKeyword: sao lưu ReputeCast bằng pg_dump
@@ -18,15 +18,16 @@ sources:
   - migrations/00300_composer.sql
   - web/src/features/admin/instance/InstancePage.tsx
   - docs/deploy/backup-restore.md
+  - internal/blobstore
 sidebar:
-  order: 9
+  order: 11
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
-Hãy sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và thư mục tệp: một lần khôi phục cần đủ cả ba, chỉ riêng cơ sở
-dữ liệu là không đủ.
+Hãy sao lưu ReputeCast bằng pg_dump cùng khóa bí mật và các tệp đã tải lên (thư mục tệp, hoặc bucket chứa chúng): một
+lần khôi phục cần đủ cả ba, chỉ riêng cơ sở dữ liệu là không đủ.
 
 ## Bản sao lưu gồm những gì
 
@@ -34,7 +35,7 @@ dữ liệu là không đủ.
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Cơ sở dữ liệu PostgreSQL | Mọi thứ còn lại: không gian làm việc, liên hệ, chiến dịch, hình ảnh đã tải lên, hàng đợi công việc, [nhật ký kiểm tra](/vi/reference/glossary/#audit-log) và mọi thông tin xác thực đã lưu ở dạng mã hóa. | Cơ sở dữ liệu trong `database.url`.                                                                                                                                                                            |
 | Khóa bí mật          | Khóa AES-256-GCM dùng để mã hóa thông tin xác thực của nhà cung cấp, client secret OIDC, token HostRepute và seed của ứng dụng xác thực (TOTP) trong cơ sở dữ liệu.                                 | `REPUTECAST_SECRETS__KEY` nếu bạn đặt biến này; nếu không thì là tệp khóa `secrets.key_file`: `/var/lib/reputecast/secret.key` trong Docker, `data/secret.key` với tệp nhị phân (tính từ thư mục mà ReputeCast khởi động). |
-| Thư mục tệp          | Tệp của sản phẩm số và quà tặng đăng ký, vốn quá lớn để lưu trong cơ sở dữ liệu.                                                                                                                     | `files.dir`; mặc định là thư mục `files` nằm cạnh tệp khóa (`/var/lib/reputecast/files` trong Docker). Thư mục này chỉ xuất hiện khi có người tải lên một tệp.                                                     |
+| Tệp                  | Tệp của sản phẩm số, quà tặng đăng ký, tệp đang tải lên dở và tệp xuất người đăng ký, vốn quá lớn để lưu trong cơ sở dữ liệu.                                                                   | `files.dir`; mặc định là thư mục `files` nằm cạnh tệp khóa (`/var/lib/reputecast/files` trong Docker). Thư mục này chỉ xuất hiện khi có người tải lên một tệp. Với `storage.backend: s3`, thay vào đó là [bucket](/vi/self-hosting/object-storage/). |
 
 Hãy giữ cả cấu hình: tệp `.env` hoặc các biến shell bạn dùng để khởi động Docker Compose, hoặc tệp cấu hình YAML và tệp
 môi trường của tệp nhị phân. [Tham chiếu cấu hình](/vi/reference/configuration/) liệt kê mọi thiết lập.
@@ -121,6 +122,13 @@ Tệp compose đi kèm đặt tên dự án là `reputecast`, nên các volume c
 
 </TabItem>
 </Tabs>
+
+### Sao lưu bucket
+
+Khi tệp nằm trong một bucket tương thích S3, hãy sao lưu bucket thay cho thư mục: bật versioning cho bucket, sao chép
+(replicate) nó sang một bucket ở tài khoản hoặc region khác, hoặc sao chép nó bằng công cụ của nhà cung cấp, như
+`aws s3 sync s3://reputecast-files ./files`, `rclone sync` hoặc `mc mirror`. Bản sao lấy theo cách này khôi phục được
+vào thư mục hay bucket như nhau, vì cả hai dùng cùng các khóa (key) đối tượng. Có từ bản phát hành tiếp theo sau 1.6.0.
 
 ## Khôi phục
 
@@ -216,7 +224,7 @@ một cơ sở dữ liệu trống, nó tạo một Chủ sở hữu đầu tiê
    ```
 
 5. Đưa tệp khóa và thư mục tệp về đúng nơi `secrets.key_file` và `files.dir` trỏ tới, và chỉ cho user chạy ReputeCast
-   đọc được:
+   đọc được (với bucket, hãy sao chép các đối tượng trở lại bucket mà các khóa `storage.s3` chỉ định):
 
    ```sh
    tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
@@ -232,16 +240,19 @@ một cơ sở dữ liệu trống, nó tạo một Chủ sở hữu đầu tiê
 
 ## Kiểm tra kết quả
 
-- `reputecast doctor` báo `ok` cho cơ sở dữ liệu, schema, khóa bí mật, thư mục tệp và role của phân khúc SQL. Lệnh này
+- `reputecast doctor` báo `ok` cho cơ sở dữ liệu, schema, khóa bí mật, nơi lưu tệp và role của phân khúc SQL. Nơi lưu
+  tệp là thư mục tệp, phải ghi được, hoặc bucket, phải trả lời và nhận, đọc lại rồi xóa được một đối tượng thử. Lệnh này
   mở thử vài giá trị đã lưu thuộc mọi loại bằng khóa, nên khóa sai sẽ báo lỗi ngay tại đây thay vì trong một lần gọi
   nhà cung cấp, và lệnh thoát với mã `1` khi có kiểm tra thất bại:
   - **SQL segments role** cảnh báo trên máy chủ mới: hãy tạo role (bước 3), rồi chạy
     `reputecast migrate segments-role` và khởi động lại ReputeCast.
   - **Previous keys** cảnh báo chừng nào giá trị đã lưu vẫn dùng một khóa trong `secrets.previous_keys`
     ([xoay vòng khóa bí mật](/vi/self-hosting/security/#xoay-vòng-khóa)).
-  - **Public URL** cảnh báo khi URL không phải `https://`. Nếu địa chỉ của máy chủ đã đổi, hãy đặt
-    `REPUTECAST_PUBLIC_URL`; lưu địa chỉ đó trong <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> cũng
-    chuyển webhook của nhà cung cấp theo.
+  - **Public URL** cảnh báo khi URL không phải `https://`, hoặc khi `http.public_url_locked` ghim một địa chỉ chỉ máy
+    chủ truy cập được. Nếu địa chỉ của máy chủ đã đổi, hãy đặt `REPUTECAST_PUBLIC_URL`; lưu địa chỉ đó trong
+    <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> cũng chuyển webhook của nhà cung cấp theo.
+  - **GeoIP** hiện loại và ngày dựng của tệp cơ sở dữ liệu, `off` khi không có tệp, và cảnh báo khi `geoip.database` trỏ
+    đến một tệp không đọc được ([thêm cơ sở dữ liệu GeoIP](/vi/self-hosting/geoip/)).
 - `curl -s http://localhost:8080/readyz` trả về `ready`. Xem [health check, metrics và log](/vi/self-hosting/monitoring/).
 - Log của ứng dụng không chứa `generated a new secret key`. Nếu có, nghĩa là ReputeCast không tìm thấy khóa đã khôi
   phục: hãy dừng nó, đặt lại khóa rồi khởi động lại.

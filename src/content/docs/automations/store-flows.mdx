@@ -1,0 +1,272 @@
+---
+title: Set up browse abandonment and back-in-stock flows
+description: Send a browse abandonment email from ReputeCast when a contact views or carts a product and doesn't buy, and email them when it's back in stock or cheaper.
+type: how-to
+audience: [publisher]
+permissions: ['automations:edit', 'automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: browse abandonment email
+sources:
+  - internal/automations/{storeflows.go,stores.go,engine.go,graph.go}
+  - internal/tracker/{flows.go,writer.go,static/rc.js}
+  - internal/commerce/{stock.go,recommend.go,blocks.go,jobs.go,webhooks.go,api.go}
+  - internal/store/queries/{tracker_flows.sql,commerce.sql}
+  - web/src/features/commerce/{automation.tsx,composer.tsx,flows.messages.ts}
+  - web/src/features/automations/{panels.tsx,graph.ts}
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Send a browse abandonment email when a contact looks at a product in your store and leaves without buying, or adds it
+to their cart and doesn't check out, and email the people who wanted a product when it is back in stock or its price
+drops. These [store flows](/reference/glossary/#store-flow) start on what your store's site reports through website
+tracking. Available from the next release after 1.6.0.
+
+## Before you begin
+
+- You need `automations:edit` to build the flow and `automations:publish` to publish it; the Owner, Admin and Editor
+  roles hold both. [Build automations](/automations/overview/) explains the editor.
+- Connect the Shopify or WooCommerce store, so ReputeCast knows its products, collections, orders and checkouts (see
+  [connect Shopify or WooCommerce](/integrations/shopify-woocommerce/)).
+- Add the store's site in website tracking and link the site to the store, so its product views and add-to-carts name
+  the store's products (see [track visits on your website](/integrations/website-tracking/)). Only a back-in-stock flow
+  for people who ask through the API, without its viewers, works without it.
+- Only contacts enter. A visitor becomes a known contact when they click a link in one of your emails, sign up through
+  a ReputeCast form on the same page, or your site identifies them with a signed call; their last 30 days on the site
+  then count. Anonymous visitors never enter a flow.
+
+## How store flows work
+
+The four triggers are in the palette's <UiPath path="commerce.flows.storeGroup" /> group, after
+<UiPath path="automations.graph.kindAbandonedCheckout" />:
+
+<Screenshot
+  id="automation-palette"
+  alt="The flow editor of the demo's Browse abandonment flow with the whole palette: the Store group with Order placed, First order, Abandoned checkout, Viewed a product, Added to cart, Back in stock and Price drop, then the Paid members and Lead ads groups."
+>
+  1. Store, with the four store flow triggers after the store's order and checkout triggers.
+  2. Paid members.
+  3. Lead ads.
+</Screenshot>
+
+| Trigger                                            | Starts when                                                                                                                                                  | Who enters                                                                                                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="commerce.flows.kindViewedProduct" /> | The set hours have passed since the contact last viewed one of the store's products, with no order and no checkout in the store since.                       | Contacts who viewed one of the products at least the set number of times, optionally only products in some collections.                                   |
+| <UiPath path="commerce.flows.kindAddedToCart" />   | The same, counted from the last add-to-cart.                                                                                                                 | Contacts who added one of the products to their cart at least the set number of times.                                                                    |
+| <UiPath path="commerce.flows.kindBackInStock" />   | A sold-out product of the store is available again.                                                                                                          | Contacts who asked to hear about it and weren't told yet, and with <UiPath path="commerce.flows.viewersTooLabel" />, those who viewed it in the last days. |
+| <UiPath path="commerce.flows.kindPriceDrop" />     | A product's price falls by at least the set share, in the same currency.                                                                                     | Contacts who viewed it or added it to their cart in the last days.                                                                                         |
+
+In the automations list and the publish diff, the first two read <UiPath path="commerce.flows.startsViewed" /> and
+<UiPath path="commerce.flows.startsCarted" />, such as "Viewed a product and didn't buy · Acme Merch · after 4 hours".
+
+Rules every store flow follows:
+
+- ReputeCast looks for contacts only while a live flow starts on the trigger. Browse and cart flows are checked every
+  minute; stock and price flows run when the store reports the change.
+- Only active contacts enter: unsubscribed, bounced, complained, suppressed and erased contacts never do.
+- A flow takes the same contact again only after 7 days. The trigger has no
+  <UiPath path="automations.panels.reentry" /> choice.
+- A store flow trigger can only be a flow's first trigger, never an added one (see
+  [more than one trigger](/automations/triggers-and-steps/#more-than-one-trigger)).
+
+## Set up a browse or cart abandonment flow
+
+<Steps>
+
+1. Go to <UiPath path="nav.automations" />, select <UiPath path="automations.newAutomation" /> and pick
+   <UiPath path="automations.blankCanvas" />.
+
+2. From the palette's <UiPath path="commerce.flows.storeGroup" /> group, drag
+   <UiPath path="commerce.flows.kindViewedProduct" /> onto the canvas, or <UiPath path="commerce.flows.kindAddedToCart" />
+   to follow up on carts, and select it.
+
+3. Under <UiPath path="commerce.flows.store" />, pick the store. With one connected store, it is already picked. The
+   note below the settings says which tracked site sends the store's product views, or that none is linked yet, with
+   <UiPath path="commerce.flows.setUpTracking" />.
+
+4. Set the trigger:
+   - <UiPath path="commerce.flows.wait" />: how many hours after the last view, without an order or a checkout, the
+     flow starts: 1 to 24, 4 to start with.
+   - <UiPath path="commerce.flows.only" />: <UiPath path="commerce.flows.addCollection" /> keeps only products in up to
+     20 of the store's collections. With none, any product in the store counts.
+   - <UiPath path="commerce.flows.after" />: how many times the contact viewed one of the products, or added it to their
+     cart: 1 to 5, 1 to start with.
+
+   <Screenshot
+     id="store-flow-browse"
+     alt="The demo's Browse abandonment flow with its trigger selected: Viewed a product on Acme Merch after 4 hours on the canvas, then two emails 2 days apart and an exit, and in the right panel the store, Wait 4 hours, no collections, after 1 view and the note that shop.acme.io sends Acme Merch's product views."
+   >
+     1. The trigger on the canvas: the store and the wait.
+     2. Hours without an order or a checkout.
+     3. Collections the products must be in.
+     4. Views of a product before the flow starts.
+     5. The tracked site that sends the store's product views.
+   </Screenshot>
+
+5. Add the emails. Drag <UiPath path="automations.graph.typeEmail" /> below the trigger and write an email that shows
+   the products the contact looked at (see [show the products in the emails](#show-the-products-in-the-emails)). The
+   demo's flow sends a second email two days later through a <UiPath path="automations.graph.typeDelay" />.
+
+6. Publish the flow (see [publish automation changes safely](/automations/publish-and-versions/)). From then on,
+   ReputeCast checks every minute.
+
+</Steps>
+
+Each minute, a contact enters when all of this holds:
+
+- Their last view (or add-to-cart) of a matching product happened in the hour that ended the set hours ago, so a late
+  or skipped minute misses no one.
+- They haven't viewed or carted any of the store's products since: a contact still browsing waits.
+- They placed no order and started no checkout in the store since that view. A contact who started a checkout is
+  for the <UiPath path="automations.graph.kindAbandonedCheckout" /> trigger instead.
+- The flow didn't take them in the last 7 days.
+
+The event names the products they viewed (or carted) in the 24 hours before, newest first, at most 6.
+
+## Set up a back-in-stock or price-drop flow
+
+<Steps>
+
+1. Go to <UiPath path="nav.automations" />, select <UiPath path="automations.newAutomation" /> and pick
+   <UiPath path="automations.blankCanvas" />.
+
+2. From the palette's <UiPath path="commerce.flows.storeGroup" /> group, drag
+   <UiPath path="commerce.flows.kindBackInStock" /> or <UiPath path="commerce.flows.kindPriceDrop" /> onto the canvas,
+   select it and pick the <UiPath path="commerce.flows.store" />.
+
+3. Set who hears about it:
+   - <UiPath path="commerce.flows.kindBackInStock" />: the people who asked to hear when the sold-out product is back
+     (see [let readers ask for a sold-out product](#let-readers-ask-for-a-sold-out-product)). Each of them hears once.
+     Turn on <UiPath path="commerce.flows.viewersTooLabel" /> to add those who viewed it in the last 1 to 60 days (14
+     to start with); it starts off.
+   - <UiPath path="commerce.flows.kindPriceDrop" />: <UiPath path="commerce.flows.dropDays" /> 1 to 60 days (14 to
+     start with), and <UiPath path="commerce.flows.dropPercent" /> 1% to 90% (10%).
+
+   <Screenshot
+     id="store-flow-stock"
+     alt="The trigger settings of the demo's Back in stock flow: Back in stock on Acme Merch, with the switch to add people who viewed it in the last 14 days turned off, and the note that people who asked from the site's Notify me button or the API each hear once."
+   >
+     1. Also take people who viewed the product in the last 14 days.
+     2. Who hears by default: the people who asked.
+   </Screenshot>
+
+4. Add the email. Name the product with `{{ stock.product.title }}` and link to it with `{{ stock.product.url }}` (see
+   [show the products in the emails](#show-the-products-in-the-emails)).
+
+5. Publish the flow.
+
+</Steps>
+
+ReputeCast notices the change when it stores the product: a product that was sold out and is available again, or whose
+price is lower than before. The change starts every live flow of the workspace on that store; a price drop starts only
+the flows whose share it reaches. A product that is removed from the store or isn't active starts nothing.
+
+How soon that is depends on the store:
+
+- WooCommerce reports changed products with its product webhooks.
+- Shopify reports stock changes with `inventory_levels/update` when the store granted `read_inventory`. Without that
+  scope, ReputeCast reads the products changed since its last check every 15 minutes while a back-in-stock or
+  price-drop flow watches the store. Price changes arrive with the product webhooks either way.
+
+### Let readers ask for a sold-out product
+
+A back-in-stock flow takes the people who asked to be told. There are two ways to ask:
+
+- **On the tracked site**, call the tracker from your "Notify me" button with the store's own id of the product. It
+  counts for a visitor ReputeCast knows as a contact, on a site linked to the store:
+
+  ```js title="Notify me button"
+  reputecast('notifyWhenAvailable', { id: '8237401' })
+  ```
+
+- **From your server**, [ask for a contact](/api/operations/create-stock-request/) with
+  `POST /api/v1/workspaces/{workspace}/commerce/stock-requests` and an API key with `subscribers:create`. Send the
+  contact's `email` and the `productId` (ReputeCast's id or the store's own); add `storeId` when two connected stores
+  have a product with the same id. The contact must exist, and the audit log records each request as
+  `store_stock_request.created`.
+
+Once the flow takes them, the request is answered. Asking again waits for the product's next return.
+
+## Show the products in the emails
+
+The flow's emails get the trigger's data as Liquid (see
+[personalize emails with Liquid](/campaigns/personalization/)):
+
+| Variable                                                                                                         | In flows                                                                                                  | Holds                                                                                                 |
+| ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `{{ browse.products }}`                                                                                          | <UiPath path="commerce.flows.kindViewedProduct" />, <UiPath path="commerce.flows.kindAddedToCart" />      | The products the event names, newest first, at most 6: each with `title`, `url`, `image` and `price`. |
+| `{{ stock.product.title }}`, `{{ stock.product.url }}`, `{{ stock.product.image }}`, `{{ stock.product.price }}` | <UiPath path="commerce.flows.kindBackInStock" />, <UiPath path="commerce.flows.kindPriceDrop" />          | The product that came back or got cheaper, with its current price.                                    |
+| `{{ stock.previous_price }}`, `{{ stock.drop_percent }}`                                                         | <UiPath path="commerce.flows.kindPriceDrop" />                                                            | The price before the drop, and how much it fell, in whole percent.                                    |
+
+```liquid title="Browse abandonment email: the products they looked at"
+{% for product in browse.products %}
+  <a href="{{ product.url }}"><img src="{{ product.image }}" alt="{{ product.title }}" width="160"></a>
+  <p>{{ product.title }} · {{ product.price }}</p>
+{% endfor %}
+```
+
+The trigger's settings also point to a block for them: the product grid with its
+<UiPath path="commerce.flows.products" /> set to <UiPath path="commerce.flows.viewed" />, which fills its places with
+the same products when the email goes out. The composer lists that choice under
+<UiPath path="commerce.flows.eachReader" />, greyed out, because only the emails of browse, cart and stock flows can
+fill it; the demo's Browse abandonment emails show it.
+
+Every email can also recommend products from a connected store. The product grid's
+<UiPath path="commerce.flows.products" /> choices are:
+
+- <UiPath path="commerce.flows.sameForEveryone" />: <UiPath path="commerce.flows.chosen" />,
+  <UiPath path="commerce.flows.newest" />, or <UiPath path="commerce.flows.bestSellers" />, the most units sold in the
+  last 30 days, optionally in one collection.
+- <UiPath path="commerce.flows.eachReader" />: <UiPath path="commerce.flows.recentlyViewed" />, what the reader viewed
+  or added to their cart on the store's site, newest first, without what they bought; and
+  <UiPath path="commerce.flows.boughtTogether" />, what is often bought with what the reader bought or viewed, from 180
+  days of orders, rebuilt every night. Readers without any history get the best sellers.
+
+A grid shows 2, 3, 4 or 6 products, and each reader's list is read when their message is queued, so the email's links
+keep their places. [Design emails in the composer](/campaigns/composer/#blocks) covers the product blocks.
+
+## Check that it worked
+
+- The flow's row in <UiPath path="nav.automations" /> shows <UiPath path="automations.statusLive" />, its trigger with
+  the store, such as "Back in stock · Acme Merch", and how many contacts entered in the last 30 days.
+- On the canvas, the trigger step counts the contacts who entered, and each email step its sends, opens and clicks.
+- A contact's profile shows a line for each day they were on the tracked site, such as "Viewed 3 products on
+  shop.acme.io", and the flows they are in (see [read a contact's profile](/audience/contacts/#read-a-contacts-profile)).
+
+## Troubleshooting
+
+- **The trigger says to connect a Shopify or WooCommerce store first.** The workspace has no connected store. Connect
+  one in <UiPath path="nav.settings > settings.integrations" />.
+- **The trigger says no tracked site is linked to the store yet.** Add the store's site in website tracking, or link
+  the site you added to the store, then check the note again.
+- **Publishing says to pick the store, or that the trigger's store isn't connected any more.** Pick a connected store,
+  or reconnect the store in <UiPath path="nav.settings > settings.integrations" />.
+- **Nobody enters a browse or cart flow.** The visitors aren't known contacts yet, the site waits for their consent and
+  your banner never calls `reputecast('consent', true)`, or their browser sends Global Privacy Control, which the
+  tracker always respects. Contacts who ordered, started a checkout or kept browsing don't enter either.
+- **A contact entered once and not again.** A store flow takes the same contact again only after 7 days.
+- **A back-in-stock flow starts late for a Shopify store.** The store's app didn't grant `read_inventory`, so stock
+  changes are read every 15 minutes. [Connect Shopify or WooCommerce](/integrations/shopify-woocommerce/) lists the
+  scopes the app asks for.
+- **A price drop started nobody.** The price fell by less than the trigger's share, the currency changed, or nobody
+  viewed or carted the product in the set days.
+
+<Aside type="note">
+  Store flows send on the Automations route like any other flow: their emails follow the step's sending rules and the
+  workspace's [marketing cap](/reference/glossary/#marketing-cap), and contacts in the holdout group pass them without
+  an email (see [triggers and steps](/automations/triggers-and-steps/#held-out-contacts)).
+</Aside>
+
+## Related
+
+- [Triggers and steps](/automations/triggers-and-steps/) lists every trigger, including the store's order and checkout
+  triggers.
+- [Track visits on your website](/integrations/website-tracking/) adds the tracker to the store's site.
+- [Connect Shopify or WooCommerce](/integrations/shopify-woocommerce/) connects the store and its webhooks.
+- [Design emails in the composer](/campaigns/composer/) covers the product card, product grid and checkout items
+  blocks.
+- [Publish automation changes safely](/automations/publish-and-versions/) explains the publish dialog.

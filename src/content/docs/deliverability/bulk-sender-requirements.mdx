@@ -8,6 +8,10 @@ sources:
   - internal/readiness/assemble.go
   - internal/readiness/gather.go
   - internal/readiness/infra.go
+  - internal/readiness/audience.go
+  - internal/readiness/facts.go
+  - internal/emailaddr
+  - internal/domains/service.go
   - internal/providers/manage/usage.go
   - internal/sending/engine/loop.go
   - internal/contentcheck/contentcheck.go
@@ -43,11 +47,14 @@ checked in October 2026; mailbox providers change them, so follow the linked sou
 - **Microsoft:** domains that send more than 5,000 messages a day to Outlook.com consumer addresses (hotmail.com,
   live.com, outlook.com). Since May 5, 2025, mail that fails the authentication rules is rejected with
   `550; 5.7.515 Access denied, sending domain [SendingDomain] does not meet the required authentication level.`
-  ([Microsoft, "Outlook's new requirements for high-volume senders"](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730)).
-  See [Outlook 550 5.7.515](/smtp-errors/outlook-550-5-7-515/).
+  ([Microsoft, "Outlook's new requirements for high-volume senders"](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730),
+  checked November 2026). See [Outlook 550 5.7.515](/smtp-errors/outlook-550-5-7-515/).
 
 ReputeCast doesn't count your daily volume against these thresholds. Send Readiness applies the same checks to every
-email campaign, whatever its size, so the rules it covers are already in place when your list grows past 5,000.
+email campaign, whatever its size, so the rules it covers are already in place when your list grows past 5,000. One
+count is per send: since 1.6.0, a campaign to 5,000 or more Outlook.com, Hotmail, Live or MSN addresses from a domain
+whose DMARC record is missing or invalid is a Block ("Outlook.com rejects this send without DMARC"), because that send
+alone reaches Microsoft's threshold. Microsoft 365 company domains don't count toward it.
 
 ## The requirements and where ReputeCast checks them
 
@@ -57,9 +64,9 @@ email campaign, whatever its size, so the rules it covers are already in place w
 | ------------------------------------------ | ------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | SPF and DKIM                               | Both; SPF or DKIM for smaller senders       | Both; SPF or DKIM for smaller senders                      | SPF must pass, DKIM must pass                  | [Send Readiness](/campaigns/send-readiness/), Authentication: blocks when SPF doesn't authorize the sending provider or DKIM isn't verified ([set them up](/deliverability/spf-dkim-dmarc/)) |
 | DKIM key of 1024 bits or more              | Required                                    | Recommended                                                | —                                              | Authentication: warns when a key is shorter than 1024 bits                                                                                                                                    |
-| DMARC record, at least `p=none`            | Required                                    | Required, and DMARC must pass                              | Required                                       | Authentication: blocks without a valid DMARC record, and when mail through a sending provider can't pass DMARC. Compliance, bulk-sender row: warns as well                                  |
+| DMARC record, at least `p=none`            | Required                                    | Required, and DMARC must pass                              | Required                                       | Authentication: blocks without a valid DMARC record, and when mail through a sending provider can't pass DMARC. Compliance, bulk-sender row: warns as well, and blocks a send to 5,000 or more Outlook.com, Hotmail, Live or MSN addresses |
 | From domain aligned with SPF or DKIM       | Required                                    | Required; relaxed alignment is enough                      | Required; both preferred                       | Authentication: warns when under 90% of mail aligned in the last 7 days of [DMARC reports](/deliverability/dmarc-reports/), and when the return path keeps SPF from aligning           |
-| One-click unsubscribe (RFC 8058)           | Required for marketing mail                 | Required for marketing mail; POST recommended, mailto accepted | Not required; a working unsubscribe link is recommended | Added to every Broadcast and Automation message. Compliance: passes with the headers, warns when the public URL isn't HTTPS or a sending provider doesn't sign the headers with DKIM ([how it works](/deliverability/one-click-unsubscribe/)) |
+| One-click unsubscribe (RFC 8058)           | Required for marketing mail                 | Required for marketing mail; POST recommended, mailto accepted | Not required; a working unsubscribe link is recommended | Added to every Broadcast and Automation message. Compliance: passes with the headers, warns when the public URL isn't HTTPS or a sending provider doesn't sign the headers with DKIM. With the optional `mailto:` address, it warns that someone must remove readers who unsubscribe by email and asks for an acknowledgement, unless ReputeCast [receives the mail](/providers/receiving-mail/) ([how it works](/deliverability/one-click-unsubscribe/)) |
 | Visible unsubscribe link in the body       | Required                                    | Required; it may lead to a preference page                 | Recommended                                    | Compliance, footer: blocks when the body has no unsubscribe link or postal address                                                                                                          |
 | Unsubscribes honored quickly               | Within 48 hours                             | Within 2 days                                              | —                                              | Not a check: a one-click unsubscribe takes effect in the same request                                                                                                                         |
 | Spam rate                                  | Below 0.3% in Postmaster Tools; aim below 0.1% | Below 0.3%                                              | No number published                            | Compliance, bulk-sender row: the route's complaint rate and Gmail's spam rate from Postmaster Tools each warn at 0.1% and block at 0.3%; Google's Compliant or Needs work status shows there too. While sending, [auto-pause](/campaigns/live-monitor/) at 0.10% |
@@ -81,10 +88,14 @@ its [FAQ](https://support.google.com/a/answer/14229414),
   provider in the route needs. A missing SPF authorization, unverified DKIM, a missing or invalid DMARC record, or a
   provider whose mail can't align with DMARC is a Block: the send can't start. A DNS lookup that fails is Unknown, not a
   Block.
-- **Compliance** has three rows. "One-click unsubscribe headers present" passes when the instance's public URL uses
-  HTTPS and every sending provider of the route signs the headers with DKIM. The footer row looks for an unsubscribe
-  link and a postal address in the compiled email of every version. The bulk-sender row passes as "Bulk-sender
-  requirements met" when DMARC passes and the complaint rate is under 0.1%.
+- **Compliance** has three rows, and more when the workspace adds a `mailto:` unsubscribe address or receives mail
+  ([Send Readiness](/campaigns/send-readiness/) lists them). "One-click unsubscribe headers present" passes when the
+  instance's public URL uses HTTPS and every sending provider of the route signs the headers with DKIM. The footer row
+  looks for an unsubscribe link and a postal address in the compiled email of every version. The bulk-sender row,
+  "Gmail, Yahoo and Microsoft bulk-sender rules", passes as "Bulk-sender requirements met" when DMARC passes and the
+  complaint rate is under 0.1%. Without a DMARC pass it warns, and the warning needs an acknowledgement; for a send to
+  5,000 or more Outlook.com, Hotmail, Live or MSN addresses from a domain without a valid DMARC record it blocks
+  instead. A DMARC lookup that fails is Unknown, not missing, and never blocks.
 - **The complaint rate** in the bulk-sender row is the 7-day complaint rate of the route's sending providers, weighted
   by recipients, and counts only mail delivered to mailbox providers that report complaints. Gmail and iCloud never
   report them, so their mail is left out of the rate; with no reporting mail the row says the rate isn't measured yet.
@@ -92,14 +103,15 @@ its [FAQ](https://support.google.com/a/answer/14229414),
   brings Postmaster data for the sending domain (or its parent). It warns and blocks at the same levels.
 - **Gmail Postmaster's compliance status** shows on the bulk-sender row when Postmaster has data for the domain:
   "Gmail Postmaster: Compliant (yesterday)", or "Needs work", which warns, when Google measured SPF, DKIM, DMARC or TLS
-  under 98% of mail or a spam rate of 0.3% or more. Yahoo has no such report, so the row also lists the same rules
-  ReputeCast checks itself: DMARC aligned, one-click unsubscribe and the complaint rate. Without Postmaster data the row
+  under 98% of mail or a spam rate of 0.3% or more. Yahoo and Microsoft have no such report, so the row also lists the
+  same rules ReputeCast checks itself: SPF and DKIM pass (only when every SPF and DKIM record of the route is known to
+  pass), DMARC aligned, one-click unsubscribe and the complaint rate. Without Postmaster data the row
   says Gmail Postmaster isn't connected, with <UiPath path="readiness.fix.connectPostmaster" />, or that it has no data for the domain yet; Google
   reports only domains with enough Gmail volume.
 
 <Screenshot
   id="review-send"
-  alt="Review & send for Weekly Digest #142, scheduled for Wednesday 4 Nov at 09:00 New York time to 31,192 recipients via SES and Postal, with tiles for the time left, the A/B test, auto-pause and who scheduled it. Needs attention · 2 lists a workspace rule about UTM tags and a Postal IP listed on UCEPROTECT, each with its fixes and what they change; on the right, the audience leaves out 412 unengaged contacts, with Include them, and the route breakdown follows."
+  alt="Review & send for Weekly Digest #142, scheduled at 09:00 New York time to 31,192 recipients via SES and Postal, with tiles for the time left, the A/B test, auto-pause and who scheduled it. Needs attention · 2 lists a workspace rule about UTM tags and a Postal IP listed on UCEPROTECT, each with its fixes and what they change; on the right, the audience leaves out 412 unengaged contacts, with Include them, and the breakdown by language version follows."
 >
   1. The status banner. This campaign is scheduled, and the checks run again before it starts.
   2. Needs attention: here two warnings, each with its fix and <UiPath path="review.technicalDetails" />. A bulk-sender

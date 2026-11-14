@@ -1,0 +1,167 @@
+---
+title: Desplegar ReputeCast en DigitalOcean App Platform
+description: Despliega ReputeCast en DigitalOcean App Platform con la plantilla del repositorio, PostgreSQL, un bucket de Spaces para los archivos y tu propio dominio.
+type: how-to
+audience: [operator]
+primaryKeyword: ReputeCast en DigitalOcean
+sources:
+  - .do/deploy.template.yaml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/blobstore
+  - internal/cli/install.go
+  - docs/deploy/README.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Esta guía ejecuta ReputeCast en DigitalOcean App Platform a partir de la plantilla Deploy to DigitalOcean del
+repositorio: la imagen Docker de ReputeCast como servicio, una base de datos PostgreSQL a su lado y un bucket de Spaces
+para los archivos subidos. Disponible a partir de la próxima versión después de la 1.6.0.
+
+App Platform no tiene discos persistentes, así que la plantilla guarda los archivos subidos en un bucket de Spaces
+(`storage.backend: s3`, consulta [almacenamiento de objetos](/es/self-hosting/object-storage/)) y la clave secreta en
+una variable que introduces tú, en lugar del volumen `/var/lib/reputecast` que usan las demás plataformas.
+
+## Antes de empezar
+
+- Una cuenta de DigitalOcean. Consulta también los [requisitos del sistema](/es/self-hosting/requirements/): la
+  plantilla ejecuta una instancia `apps-s-1vcpu-1gb` (1 vCPU, 1 GB).
+- OpenSSL o Docker en tu equipo, para generar la clave secreta.
+- Opcional: un dominio para ReputeCast, como `news.example.com`, en un proveedor de DNS donde puedas añadir un registro
+  `CNAME`.
+
+## Desplegar ReputeCast
+
+<Steps>
+
+1. En el panel de control de DigitalOcean, crea un bucket de Spaces, como `reputecast-files`. La plantilla espera la
+   región `nyc3`; para otra región, cambia dos variables en el paso 6.
+
+2. En **Spaces Object Storage** › **Access Keys**, haz clic en **Create Access Key**, elige **Limited access**, dale
+   **Read/Write/Delete** sobre el bucket y créala. Copia la clave de acceso y su secreto, que solo se muestra una vez
+   ([manage access to Spaces](https://docs.digitalocean.com/products/spaces/how-to/manage-access/), comprobado en
+   noviembre de 2026).
+
+3. Genera la clave secreta y guárdala en tu gestor de contraseñas: `openssl rand -base64 32` o
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.6.0 secrets generate-key`. Los dos comandos generan 44 caracteres
+   que terminan en `=`.
+
+4. Abre la plantilla:
+   `https://cloud.digitalocean.com/apps/new?repo=https://github.com/hostrepute/reputecast/tree/main`. App Platform lee
+   `.do/deploy.template.yaml` del repositorio: un servicio, `reputecast`, que ejecuta
+   `ghcr.io/hostrepute/reputecast:latest` en el puerto 8080, y una base de datos de desarrollo, `db`, con
+   PostgreSQL 18.
+
+5. Introduce las variables que la plantilla deja vacías:
+
+   ```sh title="Environment variables"
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-3
+   REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+   REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=paste-the-access-key
+   REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=paste-its-secret
+   ```
+
+   La plantilla marca como secretas la clave secreta y las claves del bucket, y define el resto:
+
+   - `REPUTECAST_PUBLIC_URL=${APP_URL}`, la dirección de la aplicación, que sigue a su dominio principal.
+   - `DATABASE_URL=${db.DATABASE_URL}`, la base de datos de desarrollo. ReputeCast lee `DATABASE_URL` cuando
+     `REPUTECAST_DATABASE__URL` no está definida.
+   - `REPUTECAST_HTTP__TRUSTED_PROXIES=private`: el proxy de App Platform llega a la aplicación por una red privada
+     ([proxies de confianza](/es/deploy/overview/#proxies-de-confianza)).
+   - `REPUTECAST_STORAGE__BACKEND=s3`, con `REPUTECAST_STORAGE__S3__REGION=nyc3` y
+     `REPUTECAST_STORAGE__S3__ENDPOINT=https://nyc3.digitaloceanspaces.com`.
+
+6. Para un bucket fuera de `nyc3`, cambia `REPUTECAST_STORAGE__S3__REGION` y la región de
+   `REPUTECAST_STORAGE__S3__ENDPOINT` por las del bucket, como `fra1` y `https://fra1.digitaloceanspaces.com`.
+
+7. Crea la aplicación. App Platform descarga la imagen e inicia ReputeCast, que aplica las migraciones y crea el primer
+   Propietario. La comprobación de estado llama a `/readyz` cada 10 segundos y concede al primer arranque 30
+   comprobaciones fallidas, unos cinco minutos, antes de darse por vencida.
+
+8. Abre la pestaña **Runtime Logs** de la aplicación, elige el componente `reputecast` y busca
+   `ReputeCast is installed`. El aviso contiene la contraseña temporal del primer Propietario:
+
+   ```txt title="Runtime Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://reputecast-abcde.ondigitalocean.app
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+9. Abre la URL de la aplicación e inicia sesión. El [primer inicio de sesión](/es/self-hosting/first-run/) te pide
+   reemplazar la contraseña, añadir una llave de acceso o una aplicación de autenticación, guardar los códigos de
+   recuperación, confirmar los datos básicos de la instancia y crear un espacio de trabajo.
+
+10. Antes de confiar en la base de datos, conviértela: en la pestaña **Settings** de la aplicación, selecciona el
+    componente `db` y, en **Database Type & Scale**, haz clic en **Convert to a Managed Database**. App Platform migra
+    los datos a una base de datos gestionada
+    ([manage databases](https://docs.digitalocean.com/products/app-platform/how-to/manage-databases/), comprobado en
+    noviembre de 2026).
+
+</Steps>
+
+<Aside type="caution">
+  Guarda `REPUTECAST_SECRETS__KEY` fuera de DigitalOcean junto con las copias de seguridad de la base de datos: sin
+  ella, las credenciales de los proveedores almacenadas en la base de datos no se pueden descifrar, y los enlaces de los
+  correos ya enviados dejan de funcionar.
+</Aside>
+
+### Usar tu propio dominio
+
+1. En la pestaña **Networking** de la aplicación, en **Domains**, haz clic en **Add domain**, introduce
+   `news.example.com`, elige **You manage your domain** y añade en tu proveedor de DNS el registro `CNAME` que muestra
+   App Platform, que termina en `ondigitalocean.app`
+   ([manage domains](https://docs.digitalocean.com/products/app-platform/how-to/manage-domains/), comprobado en
+   noviembre de 2026).
+2. En cuanto el dominio sea el dominio principal de la aplicación, `${APP_URL}` lo sigue en el siguiente despliegue.
+3. En ReputeCast, abre <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, cambia la
+   <UiPath path="admin.publicUrl" /> a `https://news.example.com` y guarda. La dirección guardada en el primer inicio de
+   sesión prevalece sobre la variable, y al guardar se trasladan los webhooks de los proveedores a la nueva dirección.
+
+## Comprobar que funciona
+
+- La pestaña **Activity** de la aplicación muestra el despliegue como activo: la comprobación de estado de `/readyz` se
+  superó.
+- `https://news.example.com/readyz` responde `ready`, o 503 con el motivo, como `database unavailable`.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.system" /> muestra
+  <UiPath path="admin.system.filesStorageS3" /> en <UiPath path="admin.system.filesTitle" />, con tu bucket y tu
+  endpoint.
+
+## Actualizar
+
+1. Lee las notas de la versión y haz una [copia de seguridad](/es/self-hosting/backups/) de la base de datos y del
+   bucket de Spaces.
+2. Vuelve a desplegar la aplicación: App Platform descarga la imagen de la etiqueta que indica el servicio, `latest` en
+   la plantilla. Para fijar una versión, define esa etiqueta como etiqueta de imagen del servicio en la configuración de
+   la aplicación.
+3. ReputeCast aplica las migraciones nuevas al arrancar ([actualizar ReputeCast](/es/self-hosting/upgrades/)).
+
+## Solución de problemas
+
+- **El despliegue falla y los registros muestran `secrets.key: key must be base64-encoded`** o `key must be 32 bytes`:
+  `REPUTECAST_SECRETS__KEY` no es una clave del paso 3. Vuelve a pegarla, sin espacios.
+- **Los registros muestran `storage.s3.bucket is required with storage.backend s3`**:
+  `REPUTECAST_STORAGE__S3__BUCKET` está vacía.
+- **Las subidas fallan con un error de acceso**: la clave de acceso no tiene Read/Write/Delete sobre el bucket, o la
+  región de `REPUTECAST_STORAGE__S3__ENDPOINT` no es la del bucket
+  ([solución de problemas del almacenamiento de objetos](/es/self-hosting/object-storage/#solución-de-problemas)).
+- **Los enlaces de los correos siguen usando la dirección `ondigitalocean.app`**: la URL pública guardada en la
+  administración de la instancia sigue siendo esa dirección. Cámbiala allí (paso 3 de
+  [usar tu propio dominio](#usar-tu-propio-dominio)).
+- **El despliegue nunca llega a estar activo**: `/readyz` no respondió `ready` en los 30 intentos de la comprobación de
+  estado. Lee los registros de ejecución: puede que las migraciones sigan en curso o que no se pueda llegar a la base de
+  datos.
+
+Documentación de la plataforma (comprobada en noviembre de 2026):
+[Deploy to DigitalOcean button](https://docs.digitalocean.com/products/app-platform/how-to/add-deploy-do-button/),
+[Manage databases](https://docs.digitalocean.com/products/app-platform/how-to/manage-databases/),
+[Environment variables](https://docs.digitalocean.com/products/app-platform/how-to/use-environment-variables/),
+[Manage domains](https://docs.digitalocean.com/products/app-platform/how-to/manage-domains/),
+[View logs](https://docs.digitalocean.com/products/app-platform/how-to/view-logs/),
+[Spaces access keys](https://docs.digitalocean.com/products/spaces/how-to/manage-access/).

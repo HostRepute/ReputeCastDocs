@@ -10,6 +10,8 @@ sources:
   - web/src/features/channels/ChannelMenu.tsx
   - internal/sms
   - internal/texting
+  - internal/customhost
+  - internal/holdout
   - internal/channels/quiet.go
   - internal/authz/permissions.go
   - web/src/features/sms
@@ -67,6 +69,11 @@ durch Netzbetreiber, Abmeldungen oder Ihr Budget eine Grenze überschreiten.
 
    ReputeCast registriert seinen Webhook beim Anbieter. Schlägt das fehl, zeigt es einmalig eine Webhook-Adresse und
    einen Signaturschlüssel an, die Sie in der Konsole des Anbieters einfügen.
+
+   Bei AWS End User Messaging kommen Zustellbestätigungen und Antworten über Amazon SNS an, und ReputeCast vertraut
+   ihnen nur, wenn sie von einem regionalen SNS-Endpunkt und vom eigenen Topic des Anbieters stammen. Es speichert das
+   Topic, bevor es den Webhook abonniert. Ein Webhook, den Sie in AWS von Hand eingerichtet haben, behält das Topic der
+   ersten Abonnementbestätigung, die SNS signiert, und weist jedes andere Topic ab.
 
 3. **Absender.** Importieren Sie die Nummern des Anbieters und fügen Sie Absenderkennungen hinzu. Twilio-Nummern werden
    für Sie in gebührenfreie Nummern, 10DLC und Ortsnetznummern eingeordnet.
@@ -197,7 +204,7 @@ WhatsApp-Nachrichten nutzen dasselbe Zeitfenster.
    <UiPath path="smsRules.messageRulesTitle" /> (ein CNAME auf Ihre Instanz, zum Beispiel `go.acme.io`). Jeder Empfänger
    erhält seinen eigenen 6-stelligen Code, und Klicks erhalten die Tags `utm_source=sms`, `utm_medium=sms` und
    `utm_campaign`. Öffentliche URL-Kürzer wie bit.ly oder tinyurl.com blockieren den Versand, und ein Link ohne
-   verifizierte Kurzlink-Domain blockiert ihn ebenfalls.
+   verifizierte Kurzlink-Domain blockiert ihn ebenfalls. Siehe [Ihre Kurzlink-Domain](#ihre-kurzlink-domain).
 
 5. **Test senden** schickt SMS an Ihre Testnummern. Wählen Sie dann **Prüfen & senden**. Die Prüfung kontrolliert
    Zielgruppe, Absender, Registrierung und Routen, Einwilligung, Sperreinträge, Ruhezeiten, Zeitzonen, Abmeldehinweis,
@@ -212,7 +219,30 @@ WhatsApp-Nachrichten nutzen dasselbe Zeitfenster.
 SMS-Kampagnen stehen zusammen mit E-Mail-Kampagnen in der [Kampagnenliste](/de/campaigns/overview/): Löschen,
 archivieren, taggen und mehrfach auswählen funktioniert auf dieselbe Weise. Um eine geplante zu verschieben, ziehen Sie
 sie im [Kampagnenkalender](/de/campaigns/calendar/): Jede eingereihte SMS erhält ihren neuen Zeitpunkt in der Zeitzone
-ihres Empfängers, innerhalb der Ruhezeiten.
+ihres Empfängers, innerhalb der Ruhezeiten. Wer einen Versand verschiebt, plant ihn in eigenem Namen neu: Ein Mitglied,
+das auf bestimmte Listen beschränkt ist, kann ihn daher nur verschieben, wenn die Zielgruppe des Versands auf seinen
+Listen liegt, wie beim Senden.
+
+### Ihre Kurzlink-Domain
+
+Die Domain muss mit einem CNAME auf Ihre Instanz zeigen. Seit Version 1.5.0 braucht eine Domain, die ein anderer
+Arbeitsbereich der Instanz zuerst verifiziert hat oder die unter der eigenen Adresse der Instanz liegt, zusätzlich den
+TXT-Eintrag `_reputecast.<domain>` dieses Arbeitsbereichs: <UiPath path="smsRules.messageRulesTitle" /> zeigt den
+Eintrag, den Sie hinzufügen, und sein Wert gehört nur diesem Arbeitsbereich. Die eigenen Adressen der Instanz lassen
+sich nie als Kurzlink-Domain verifizieren. Eine Domain, die diese Prüfung nicht besteht, wird sofort gestoppt: SMS mit
+Links nutzen sie nicht mehr, und ihre Links antworten dort nicht mehr. Verifizierte Domains werden jeden Tag erneut
+geprüft.
+
+Eine Kurzlink-Domain trägt nur die Links dieses Arbeitsbereichs: Der Code eines anderen Arbeitsbereichs leitet dort
+nicht weiter. Die eigene Adresse der Instanz beantwortet weiterhin die Links jedes Arbeitsbereichs, sodass bereits
+gesendete SMS weiter funktionieren.
+
+### Die Kontrollgruppe
+
+Solange die [Kontrollgruppe](/de/audience/holdout-group/) des Arbeitsbereichs für Kampagnen gilt, sendet eine
+SMS-Kampagne den Kontakten darin nichts: Ihre SMS werden als übersprungen protokolliert, mit dem Grund Kontrollgruppe.
+Gilt die Kontrollgruppe für Automationen, lässt ein SMS-Schritt einen ausgenommenen Kontakt ohne SMS weitergehen.
+Verfügbar ab der nächsten Version nach 1.6.0.
 
 ## Budget und Auto-Pause
 
@@ -224,7 +254,8 @@ Budget erhöhen.
 Eine laufende Kampagne pausiert sich außerdem selbst, wenn nach ihren ersten 50 SMS mehr als 5 % fehlschlagen, mehr als
 2 % von Netzbetreibern gefiltert werden oder sich mehr als 3 % der Empfänger abmelden. Sie können die Schwellenwerte für
 den Arbeitsbereich oder je Kampagne unter „Prüfen & senden“ ändern. Bereits Gesendetes wird nicht zurückgeholt; zum
-Fortsetzen brauchen Sie `campaigns:send` und `sms:send`.
+Fortsetzen brauchen Sie `campaigns:send` und `sms:send` und, als Mitglied mit Beschränkung auf bestimmte Listen, eine
+Zielgruppe auf Ihren Listen.
 
 <LimitsTable area="sms" />
 
@@ -255,6 +286,14 @@ Der Inhalt von SMS wird standardmäßig 30 Tage aufbewahrt (keine, 7, 30, 60 ode
   überschritten hat, beheben Sie die Ursache und setzen Sie dann unverändert oder mit Änderungen fort.
 - **Ein Anbieter zeigt Beeinträchtigt**: Zustellbestätigungen kommen nicht an. Prüfen Sie den Webhook beim Anbieter und
   den Tab <UiPath path="nav.providers > channels.sms > sms.tabEvents" />.
+- **Zustellbestätigungen von AWS End User Messaging werden nach dem Upgrade auf 1.5.0 abgewiesen**: Der Webhook wurde
+  von Hand eingerichtet, und seine Ereignisse kamen von mehreren SNS-Topics, oder es war noch keines angekommen. Lassen
+  Sie SNS das Abonnement erneut bestätigen: Löschen Sie in der SNS-Konsole das HTTPS-Abonnement auf die Adresse von
+  ReputeCast und legen Sie es neu an, oder wählen Sie beim Anbieter <UiPath path="smsDialogs.registerAgain" />, wenn
+  seine API Webhooks registrieren kann.
+- **Die Kurzlink-Domain besteht ihre Prüfung nicht**: Ein anderer Arbeitsbereich der Instanz hat sie zuerst verifiziert,
+  oder sie liegt unter der Adresse der Instanz. Fügen Sie den TXT-Eintrag hinzu, den
+  <UiPath path="smsRules.messageRulesTitle" /> zeigt, oder nutzen Sie eine andere Domain.
 
 ## Verwandte Themen
 

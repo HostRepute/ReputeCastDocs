@@ -1,6 +1,6 @@
 ---
 title: Autenticación y claves de API
-description: "Autenticación con clave de API en la API REST de ReputeCast: prefijos, la cabecera Bearer, permisos y ámbito de listas, caducidad, rotación y respuestas 401."
+description: "Autenticación con clave de API en la API REST de ReputeCast: prefijos, cabecera Bearer, permisos, ámbito, IP permitidas, caducidad, rotación y rechazos."
 type: reference
 audience: [developer, admin]
 permissions: ['apikeys:manage']
@@ -10,6 +10,8 @@ sources:
   - internal/api/auth.go
   - internal/api/api.go
   - internal/apikeys
+  - internal/server/prefix.go
+  - internal/transactional/raw.go
   - internal/authn/tokens.go
   - internal/authz/authz.go
   - internal/app/app.go
@@ -18,16 +20,19 @@ sources:
   - internal/readiness/types.go
   - internal/campaigns/presence.go
 sidebar:
-  order: 3
+  order: 4
 ---
 
+import { Steps } from '@astrojs/starlight/components'
 import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import UiPath from '~/components/UiPath.astro'
 
 Esta página trata la autenticación con clave de API en la API REST de ReputeCast: las credenciales que acepta, lo que
-puede hacer una clave y cómo se crean, rotan, revocan y rechazan las claves. Para una primera llamada, sigue
-[hacer tu primera llamada a la API](/es/developers/api-quickstart/).
+puede hacer una clave, desde dónde se puede llamar con ella y cómo se crean, rotan, revocan y rechazan las claves. Para
+una primera llamada, sigue [hacer tu primera llamada a la API](/es/developers/api-quickstart/); los
+[SDK de cliente](/es/developers/sdks/) envían la clave por ti.
 
 ## Enviar la clave
 
@@ -75,7 +80,9 @@ claves.
   `403`; una clave de integración responde `owner_deactivated` en su lugar, y alguien con `integrations:manage` puede
   hacerse cargo de ella.
 - **Ámbito de listas.** Una clave se puede limitar a unas listas (hasta 100; ninguna significa todas las listas). No
-  puede llegar a listas fuera del ámbito de quien la creó.
+  puede llegar a listas fuera del ámbito de quien la creó, ni al crearla ni después: en cada llamada, sus listas y sus
+  dominios de remitente se reducen a lo que alcanza en ese momento quien la creó, así que reducir el ámbito de un
+  miembro reduce sus claves al instante (desde la versión 1.5.0).
 - **Las claves de integración** solo sirven para las operaciones de los disparadores y las acciones activados para su
   integración; cualquier otra llamada responde `403` con el código `integration_operation_denied`. Doce operaciones
   solo aceptan la clave de una integración (o de un sitio de WordPress).
@@ -104,7 +111,7 @@ en la aplicación, con la sesión iniciada.
 | Acción                                | Qué ocurre                                                                                                                                                                                                                                                               |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Crear                                 | El secreto se muestra una vez. El registro de auditoría guarda `apikey.created` con los permisos y el ámbito, nunca el secreto.                                                                                                                                            |
-| <UiPath path="keys.rotate" />         | Se muestra una vez un secreto nuevo con el mismo nombre, los mismos permisos y el mismo ámbito. **El secreto anterior deja de funcionar al momento.** Una clave con caducidad recibe otra vez la misma duración, contada desde hoy. Rotar una clave caducada la reemplaza. |
+| <UiPath path="keys.rotate" />         | Se muestra una vez un secreto nuevo con el mismo nombre, los mismos permisos, el mismo ámbito y las mismas IP permitidas. **El secreto anterior deja de funcionar al momento.** Una clave con caducidad recibe otra vez la misma duración, contada desde hoy. Rotar una clave caducada la reemplaza. |
 | Rotar una clave de integración        | Usa <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: la clave anterior sigue funcionando 24 horas. Rotarla en Claves y MCP responde `409` con el código `managed_by_integration`.                                         |
 | <UiPath path="keys.revoke" />         | La clave deja de funcionar al momento; las llamadas reciben `401`. En el mismo diálogo puedes crear un reemplazo con los mismos permisos y el mismo ámbito.                                                                                                                 |
 | Caducidad                             | Tras su fecha de caducidad, la clave responde `401`. Las claves caducadas siguen en la lista con el número de llamadas que aún intentan usarlas, para que encuentres qué actualizar.                                                                                        |
@@ -114,6 +121,62 @@ en la aplicación, con la sesión iniciada.
 
 La lista de claves muestra cuándo se usó cada clave por última vez y desde qué dirección IP. Las acciones de una clave
 aparecen en el [registro de auditoría](/es/team/audit-log/) con la clave como actor.
+
+## Limitar una clave a IP permitidas
+
+Una clave se puede limitar a las direcciones desde las que se la llama: hasta 50 direcciones y redes IPv4 o IPv6, como
+`203.0.113.7`, `203.0.113.0/24` o `2001:db8::/48` (desde la versión 1.6.0). Una lista vacía, el valor predeterminado,
+permite cualquier dirección. Lo mismo vale para las claves solo de envío, las credenciales SMTP y los
+[agentes MCP](/es/developers/mcp/#limitar-un-agente-a-ip-permitidas).
+
+<Steps>
+
+1. En <UiPath path="nav.settings > settings.keys" />, selecciona <UiPath path="keys.allowedIpsButton" /> en la fila de
+   la clave, o rellena <UiPath path="keys.allowedIpsLabel" /> al crear la clave.
+
+2. Escribe una dirección o una red por línea. El campo muestra desde dónde se usó la clave por última vez y tu propia
+   dirección tal como la ve ReputeCast, cada una con un enlace para añadirla.
+
+3. Guarda. Una lista que deja fuera la dirección desde la que se usó la clave por última vez pregunta antes: las
+   llamadas desde allí se detienen al momento. Elige <UiPath path="keys.saveAnyway" /> solo si hay que rechazar a quien
+   llama desde allí.
+
+</Steps>
+
+<Screenshot
+  id="settings-keys-allowed-ips"
+  alt="El diálogo IP permitidas de la clave Data warehouse sync: dos redes, 10.0.4.0/24 y 10.0.5.0/24, el último uso de la clave desde 10.0.4.22, dentro de ellas, y la dirección que ReputeCast ve para la persona que edita, con un enlace para añadirla."
+>
+
+1. <UiPath path="keys.allowedIpsLabel" />: una dirección o una red por línea.
+2. Desde dónde se usó la clave por última vez.
+3. Tu propia dirección tal como la ve ReputeCast, con un enlace para añadirla.
+
+</Screenshot>
+
+Cómo funcionan las IP permitidas:
+
+- **La comprobación va después del token.** Una clave conocida y válida a la que se llama desde otra dirección, o desde
+  una dirección que ReputeCast no puede determinar, responde `403` con el código `ip_not_allowed`, y el detalle nombra
+  la dirección que vio ReputeCast. Una clave desconocida sigue respondiendo `401`, así que la comprobación nunca revela
+  a nadie qué claves existen. ReputeCast cuenta las llamadas rechazadas con su dirección y su cliente.
+- **Detrás de un proxy inverso**, ReputeCast solo ve las direcciones de quienes llaman cuando el proxy figura en
+  `http.trusted_proxies` ([proxy inverso y TLS](/es/self-hosting/reverse-proxy/)); si no, todas las llamadas parecen
+  venir del proxy. El diálogo avisa cuando las solicitudes llegan a través de un proxy que esa configuración no incluye.
+- **Para restringir basta con `apikeys:manage`.** Permitir que se llame a la clave desde más sitios, vaciando la lista
+  o añadiendo una red que la lista anterior no cubre, necesita lo mismo que rotarla: tener todos los permisos de la
+  clave y que sus listas estén dentro de tu propio ámbito. Si no, la respuesta es `403` con el código
+  `escalation_denied`.
+- **Las claves de integración nunca tienen lista**: Zapier, Make, n8n y WordPress llaman desde los servidores de sus
+  plataformas. Definir una responde `409` con el código `managed_by_integration`. Una clave revocada conserva su lista.
+- **Rotar conserva la lista**, y cada cambio queda en el [registro de auditoría](/es/team/audit-log/) como
+  `apikey.updated`, con la lista antes y después.
+- **Las credenciales SMTP** fuera de su lista se rechazan al iniciar sesión: el
+  [SMTP relay](/es/transactional/smtp-relay/) responde `535 5.7.8` y nombra la dirección.
+
+Una persona con la sesión iniciada define la lista; la operación,
+`PUT /api/v1/workspaces/<workspace>/api-keys/<keyId>/allowed-ips` con `{ "allowedIps": [ … ] }`, no se puede llamar con
+una clave de API. La llamada de creación acepta el mismo campo como `allowedIps`.
 
 ## Límites
 
@@ -132,13 +195,15 @@ Una clave rechazada responde `401` con el código `unauthenticated` y la cabecer
 | Una clave caducada                                 | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
 
 Las claves de integración responden `401` con los códigos `key_revoked` y `key_expired` en su lugar, y su detalle
-nombra la integración que hay que volver a conectar. Cuando la base de datos no puede confirmar quién llama, la
-respuesta es `503` con el código `unavailable`: vuelve a intentarlo, la clave sigue siendo válida. Todos los códigos
-están en [errores](/es/developers/api-errors/).
+nombra la integración que hay que volver a conectar. Una clave válida a la que se llama desde fuera de sus
+[IP permitidas](#limitar-una-clave-a-ip-permitidas) responde `403` con el código `ip_not_allowed`. Cuando la base de
+datos no puede confirmar quién llama, la respuesta es `503` con el código `unavailable`: vuelve a intentarlo, la clave
+sigue siendo válida. Todos los códigos están en [errores](/es/developers/api-errors/).
 
 ## Relacionado
 
 - [Hacer tu primera llamada a la API](/es/developers/api-quickstart/)
+- [Usar los SDK de cliente](/es/developers/sdks/)
 - [Límites de solicitudes](/es/developers/api-rate-limits/)
 - [Roles y permisos](/es/team/roles-and-permissions/)
 - [Seguridad y endurecimiento](/es/self-hosting/security/)

@@ -151,7 +151,7 @@ async function goto(page: Page, url: string): Promise<void> {
   }
 }
 
-async function runStep(page: Page, step: NonNullable<Shot['before']>[number]): Promise<void> {
+async function runStep(page: Page, step: NonNullable<Shot['before']>[number], locale: Locale): Promise<void> {
   if ('click' in step)
     await page
       .locator(step.click)
@@ -160,8 +160,13 @@ async function runStep(page: Page, step: NonNullable<Shot['before']>[number]): P
   else if ('dblclick' in step) await page.locator(step.dblclick).first().dblclick()
   else if ('hover' in step) await page.locator(step.hover).first().hover()
   else if ('press' in step) await page.keyboard.press(step.press)
-  else if ('fill' in step) await page.locator(step.fill[0]).first().fill(step.fill[1])
-  else await page.waitForTimeout(step.wait)
+  else if ('fill' in step) {
+    const [selector, text] = step.fill
+    await page
+      .locator(selector)
+      .first()
+      .fill(typeof text === 'string' ? text : text[locale])
+  } else await page.waitForTimeout(step.wait)
 }
 
 /** Captures one shot in one locale; returns the WebP size in bytes. Throws with the reason on failure. */
@@ -192,13 +197,18 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
     viewport: { width: vp.width, height: vp.height },
     deviceScaleFactor: s.clip ? 2 : vp.deviceScaleFactor,
     reducedMotion: 'reduce',
-    colorScheme: 'light',
+    colorScheme: s.theme ?? 'light',
     // The browser stays en-US so the "Your browser prefers Tiếng Việt" suggestion never shows.
     locale: 'en-US',
     timezoneId: 'America/New_York',
     storageState: auth?.storage,
   })
   try {
+    // The app reserves the scrollbar's room (scrollbar-gutter: stable), which hidden scrollbars leave as a blank strip
+    // on Linux and Windows. macOS overlays them and reserves nothing; this captures every OS alike.
+    await ctx.addInitScript(`document.addEventListener('DOMContentLoaded', () => {
+      const s = document.createElement('style'); s.textContent = 'html { scrollbar-gutter: auto !important }'
+      document.head.append(s) })`)
     // Visitors (sign-in) pick their language in the card's menu, stored as JSON in rc.language.
     if (!auth) await ctx.addInitScript(`localStorage.setItem('rc.language', ${JSON.stringify(JSON.stringify(locale))})`)
     const page = await ctx.newPage()
@@ -210,7 +220,9 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
     await page.evaluate('document.fonts.ready')
     // A draft's first open re-runs Send Readiness in the background, which can take most of a minute in development.
     if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 60_000 })
-    for (const step of s.before ?? []) await runStep(page, step)
+    for (const step of s.before ?? []) await runStep(page, step, locale)
+    // A font first used by what the steps opened (IBM Plex Mono in a detail pane) loads only then.
+    await page.evaluate('document.fonts.ready')
     await page.waitForTimeout(400)
     if (rateLimited) throw new RateLimited()
     const landed = new URL(page.url()).pathname
@@ -339,7 +351,12 @@ async function main(): Promise<void> {
   console.log(`Building the ReputeCast CLI from ${u.src} …`)
   await buildCli(u)
   await waitForApi(app)
-  browser = await chromium.launch({ headless: true, ...(opts.channel === 'chrome' ? { channel: 'chrome' } : {}) })
+  // Linux and Windows draw classic scrollbars that take a gutter; macOS overlays them. Hidden, every OS captures alike.
+  browser = await chromium.launch({
+    headless: true,
+    args: ['--hide-scrollbars'],
+    ...(opts.channel === 'chrome' ? { channel: 'chrome' } : {}),
+  })
   try {
     if (fresh.length) {
       console.log('Fresh install …')

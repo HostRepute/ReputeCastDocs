@@ -15,6 +15,7 @@ sources:
   - internal/domains/cloudflare.go
   - internal/domains/api.go
   - internal/dnscheck/auth.go
+  - internal/readiness/technical.go
   - internal/dnscheck/domain.go
   - internal/readiness/assemble.go
   - internal/providers/ses/ses.go
@@ -45,14 +46,15 @@ nhà cung cấp DNS nào khác, và cách đọc trạng thái trực tiếp c�
 | ------- | -------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | SPF     | TXT            | Tên miền trong địa chỉ người gửi phong bì (MAIL FROM)  | Máy chủ đã chuyển giao thư được phép gửi thư thay cho tên miền đó.                       |
 | DKIM    | CNAME hoặc TXT | `<selector>._domainkey.<domain>`                       | Thư được nhà cung cấp gửi thư ký bằng khóa bạn đã công bố và không bị sửa đổi.           |
-| DMARC   | TXT            | `_dmarc.<domain>`, hoặc tên miền tổ chức               | Bên nhận xử lý ra sao khi cả SPF lẫn DKIM đều không đạt theo cách căn chỉnh với địa chỉ From. |
+| DMARC   | TXT            | `_dmarc.<domain>`, hoặc một tên miền cha               | Bên nhận xử lý ra sao khi cả SPF lẫn DKIM đều không đạt theo cách căn chỉnh với địa chỉ From. |
 
 </TableScroll>
 
 DMARC đạt khi SPF hoặc DKIM đạt **và** tên miền của nó căn chỉnh với tên miền trong địa chỉ From. Ở chế độ nới lỏng
 (relaxed), là chế độ mặc định, hai tên miền cần có cùng tên miền tổ chức: `bounce.news.acme.io` căn chỉnh với
 `news.acme.io`. Ở chế độ nghiêm ngặt (strict), hai tên miền phải giống hệt nhau
-([RFC 7489, mục 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), kiểm tra tháng 10/2026).
+([RFC 9989, mục 4.4](https://www.rfc-editor.org/rfc/rfc9989#section-4.4), kiểm tra tháng 11/2026). RFC 9989 đã thay
+thế RFC 7489 làm tiêu chuẩn DMARC từ tháng 5/2026.
 
 Vì vậy, ReputeCast yêu cầu một return path (MAIL FROM) tùy chỉnh trên tên miền của bạn ở mọi nơi nhà cung cấp gửi thư
 hỗ trợ: SPF được kiểm tra theo return path, nên với return path mặc định của nhà cung cấp gửi thư thì chỉ DKIM có thể
@@ -119,11 +121,30 @@ Proposed:   v=spf1 mx include:spf.mtasv.net -all
 
 ### Dòng DMARC
 
-Khi cả tên miền lẫn tên miền tổ chức của nó đều chưa có bản ghi DMARC, ReputeCast gợi ý
-`v=DMARC1; p=quarantine; adkim=s; aspf=r`, kèm `rua=mailto:` với địa chỉ nhận báo cáo của HostRepute khi đã kết nối
-[HostRepute](/vi/reference/glossary/#hostrepute). Dòng này được tính là đã xác minh ngay khi có bất kỳ bản ghi DMARC
-hợp lệ nào được công bố tại `_dmarc.<domain>` hoặc tại tên miền tổ chức, kể cả `p=none`. Hãy đọc
-[Chọn chính sách DMARC](#chọn-chính-sách-dmarc) trước khi công bố bản ghi gợi ý.
+Khi chưa có bản ghi DMARC nào áp dụng cho tên miền, ReputeCast gợi ý `v=DMARC1; p=quarantine; adkim=s; aspf=r`, kèm
+`rua=mailto:` với địa chỉ nhận báo cáo của HostRepute khi đã kết nối [HostRepute](/vi/reference/glossary/#hostrepute)
+và địa chỉ `dmarc@` của tên miền nhận thư khi [ReputeCast nhận thư](/vi/providers/receiving-mail/). Dòng này được tính
+là đã xác minh ngay khi có một bản ghi DMARC hợp lệ áp dụng, tại `_dmarc.<domain>` hoặc tại một tên miền cha, kể cả
+`p=none`. Hãy đọc [Chọn chính sách DMARC](#chọn-chính-sách-dmarc) trước khi công bố bản ghi gợi ý. Địa chỉ `dmarc@` đi
+kèm tính năng nhận thư. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+### Cách ReputeCast đọc bản ghi DMARC
+
+Từ bản 1.6.0, ReputeCast đọc bản ghi DMARC theo cách RFC 9989 mô tả
+([RFC 9989, mục 4.7 và 4.10](https://www.rfc-editor.org/rfc/rfc9989#section-4.10), kiểm tra tháng 11/2026):
+
+- **Tìm chính sách** bắt đầu tại `_dmarc.<domain>` và đi ngược lên các tên miền cha, tối đa 8 lượt tra cứu, đến bản ghi
+  dùng được đầu tiên hoặc đến bản ghi có thẻ `psd=` là `y` hoặc `n`. Một tên miền con nhận chính sách `sp=` của tên miền
+  cha, hoặc chính sách `np=` khi tên miền con không tồn tại trong DNS; cả hai đều mặc định theo `p=`.
+- **Các thẻ RFC 9989 đã bỏ**, `pct=`, `ri=` và `rf=`, bị bỏ qua, cũng như các thẻ mà RFC này không định nghĩa. `t=`,
+  `np=` và `psd=` được đọc.
+- **Bản ghi không có `p=` hợp lệ** được tính là `p=none` khi có địa chỉ `rua=` hợp lệ; nếu không, bên nhận bỏ qua bản
+  ghi đó, và tại chính tên miền đó ReputeCast hiển thị nó là không hợp lệ. Hai bản ghi DMARC tại cùng một tên, và một
+  bản ghi chỉ trông giống bản ghi DMARC, như `v=dmarc1`, cũng vậy.
+- **Chế độ thử nghiệm**, `t=y`, yêu cầu bên nhận áp dụng chính sách thấp hơn một mức: `quarantine` được xử lý như
+  `none`, và `reject` như `quarantine`. [Độ sẵn sàng gửi](/vi/campaigns/send-readiness/) nêu điều này trong
+  <UiPath path="review.technicalDetails" /> của dòng DMARC.
+- **Lần tra cứu DNS thất bại** sẽ dừng việc đi ngược: chính sách là chưa biết, không phải bị thiếu.
 
 ## Trước khi bắt đầu
 
@@ -290,8 +311,10 @@ v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
 
 Sau đó, hãy đọc báo cáo trong vài tuần và nâng chính sách khi mọi nguồn hợp lệ đều đạt, như mô tả trong
 [Đọc báo cáo tổng hợp DMARC](/vi/deliverability/dmarc-reports/). Bản ghi DMARC tại tên miền tổ chức (`_dmarc.acme.io`)
-cũng áp dụng cho các tên miền con như `news.acme.io`; thẻ `sp=` của bản ghi đặt chính sách cho các tên miền con, và
-ReputeCast đọc thẻ này khi tên miền con không có bản ghi riêng.
+cũng áp dụng cho các tên miền con như `news.acme.io`; thẻ `sp=` của bản ghi đặt chính sách cho các tên miền con (`np=`
+cho các tên miền con không tồn tại), và ReputeCast đọc thẻ này khi tên miền con không có bản ghi riêng. Để thử một chính
+sách chặt hơn trước, hãy công bố chính sách đó với `t=y`: khi đó bên nhận áp dụng thấp hơn một mức trong khi báo cáo
+tổng hợp vẫn tiếp tục đến. RFC 9989 không còn thẻ `pct=`, nên một tỷ lệ phần trăm không còn giới hạn chính sách.
 
 ## Kiểm tra kết quả
 
@@ -318,6 +341,9 @@ ReputeCast đọc thẻ này khi tên miền con không có bản ghi riêng.
   trị đã gộp trước khi bạn công bố, nên hãy xem trạng thái sau khi công bố.
 - **SPF kết thúc bằng `+all`.** ReputeCast coi bản ghi này là không hợp lệ, vì nó cho phép bất kỳ ai gửi thư dưới tên
   miền. Hãy dùng `~all` hoặc `-all`.
+- **DMARC hiển thị Không hợp lệ.** Tên miền công bố hai bản ghi DMARC tại `_dmarc.<domain>`, một bản ghi không bắt đầu
+  chính xác bằng `v=DMARC1`, hoặc một bản ghi không có `p=` hợp lệ lẫn `rua=` hợp lệ. Hãy giữ một bản ghi bắt đầu bằng
+  `v=DMARC1; p=`.
 - **Một bản ghi vẫn Còn thiếu dù bạn đã thêm.** Kiểm tra xem tên có bị lặp tên zone không (`news.acme.io.acme.io`) và bạn
   đã sửa zone tại đúng nhà cung cấp DNS mà máy chủ tên miền trỏ đến chưa.
 - **Bản ghi CNAME DKIM trên Cloudflare vẫn Đang chờ.** Kiểm tra bản ghi đang ở chế độ **DNS only**, không phải proxy.

@@ -1,6 +1,6 @@
 ---
 title: Back up and restore
-description: Back up ReputeCast with pg_dump, the secret key and the files folder, then restore all three in the right order and test the restore.
+description: Back up ReputeCast with pg_dump, the secret key and the files folder or bucket, then restore all three in the right order and test the restore.
 type: how-to
 audience: [operator]
 primaryKeyword: back up ReputeCast with pg_dump
@@ -18,15 +18,16 @@ sources:
   - migrations/00300_composer.sql
   - web/src/features/admin/instance/InstancePage.tsx
   - docs/deploy/backup-restore.md
+  - internal/blobstore
 sidebar:
-  order: 9
+  order: 11
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
-Back up ReputeCast with pg_dump, the secret key and the files folder: a restore needs all three, and the database alone
-is not enough.
+Back up ReputeCast with pg_dump, the secret key and the uploaded files (the files folder, or the bucket that holds
+them): a restore needs all three, and the database alone is not enough.
 
 ## What a backup contains
 
@@ -34,7 +35,7 @@ is not enough.
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | PostgreSQL database    | Everything else: workspaces, contacts, campaigns, uploaded images, the job queue, the [audit log](/reference/glossary/#audit-log), and every stored credential in encrypted form.             | The database in `database.url`.                                                                                                                             |
 | Secret key             | The AES-256-GCM key that encrypts provider credentials, OIDC client secrets, HostRepute tokens and authenticator (TOTP) seeds in the database.                                               | `REPUTECAST_SECRETS__KEY` when you set it; otherwise the key file `secrets.key_file`: `/var/lib/reputecast/secret.key` in Docker, `data/secret.key` for the binary (relative to the directory ReputeCast starts in). |
-| Files folder           | Digital products' files and lead magnets, which are too large for the database.                                                                                                               | `files.dir`; by default a `files` folder next to the key file (`/var/lib/reputecast/files` in Docker). It appears once someone uploads a file.              |
+| Files                  | Digital products' files, lead magnets, uploads in progress and audience exports, which are too large for the database.                                                                       | `files.dir`; by default a `files` folder next to the key file (`/var/lib/reputecast/files` in Docker). It appears once someone uploads a file. With `storage.backend: s3`, the [bucket](/self-hosting/object-storage/) instead. |
 
 Keep your configuration too: the `.env` file or shell variables you start Docker Compose with, or your YAML config file
 and environment file for the binary. The [configuration reference](/reference/configuration/) lists every setting.
@@ -121,6 +122,13 @@ The shipped compose file names the project `reputecast`, so its volumes are `rep
 
 </TabItem>
 </Tabs>
+
+### Back up the bucket
+
+With the files in an S3-compatible bucket, back the bucket up instead of the folder: turn on its versioning, replicate
+it to a bucket in another account or region, or copy it with your provider's tools, such as `aws s3 sync
+s3://reputecast-files ./files`, `rclone sync` or `mc mirror`. A copy taken this way restores into a folder or a bucket
+alike, because both use the same keys. Available from the next release after 1.6.0.
 
 ## Restore
 
@@ -215,7 +223,7 @@ database, it creates a new first Owner, which you don't want on top of a restore
    ```
 
 5. Put the key file and the files folder back where `secrets.key_file` and `files.dir` point, readable only by the user
-   ReputeCast runs as:
+   ReputeCast runs as (with a bucket, copy its objects back into the bucket the `storage.s3` keys name):
 
    ```sh
    tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
@@ -231,15 +239,19 @@ database, it creates a new first Owner, which you don't want on top of a restore
 
 ## Check that it worked
 
-- `reputecast doctor` prints `ok` for the database, the schema, the secret key, the files folder and the SQL segments
-  role. It opens a few stored values of every kind with the key, so a wrong key fails here rather than in a provider
+- `reputecast doctor` prints `ok` for the database, the schema, the secret key, the file storage and the SQL segments
+  role. File storage is the files folder, which must be writable, or the bucket, which must answer and take, read back
+  and delete a test object. It opens a few stored values of every kind with the key, so a wrong key fails here rather than in a provider
   call, and it exits with `1` when a check fails:
   - **SQL segments role** warns on a new server: create the role (step 3), then run `reputecast migrate segments-role`
     and restart ReputeCast.
   - **Previous keys** warns while stored values still use a key in `secrets.previous_keys`
     ([rotate the secret key](/self-hosting/security/#rotate-the-key)).
-  - **Public URL** warns when it isn't `https://`. If the server's address changed, set `REPUTECAST_PUBLIC_URL`; saving
-    it in <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> also moves the provider webhooks.
+  - **Public URL** warns when it isn't `https://`, or when `http.public_url_locked` pins an address only the server
+    reaches. If the server's address changed, set `REPUTECAST_PUBLIC_URL`; saving it in
+    <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> also moves the provider webhooks.
+  - **GeoIP** shows the database file's type and build date, `off` without one, and warns when `geoip.database` names
+    a file it can't read ([add a GeoIP database](/self-hosting/geoip/)).
 - `curl -s http://localhost:8080/readyz` answers `ready`. See [health checks, metrics and logs](/self-hosting/monitoring/).
 - The app logs don't contain `generated a new secret key`. If they do, ReputeCast didn't find the restored key: stop it,
   put the key back and start it again.

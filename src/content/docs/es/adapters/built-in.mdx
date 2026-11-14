@@ -15,6 +15,8 @@ sources:
   - internal/providers/apiclient
   - internal/providers/webhookauth
   - internal/providers/bounce
+  - internal/providers/received
+  - internal/inbound/hook.go
   - internal/providers/resend
   - internal/sms
   - internal/app/wire_adapters.go
@@ -50,7 +52,7 @@ Esta guía explica cómo contribuir con el código de un adaptador de correo en 
    | Método                                        | Qué hace                                                                                                 |
    | --------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
    | `Adapter() string`                            | La clave en el registro, como `"mailgun"`.                                                               |
-   | `Capabilities() Capabilities`                 | Las insignias: política de envío masivo, webhooks, API de dominios, sincronización de supresiones, tamaño de lote, IP dedicadas, sandbox, detección de cuota y de velocidad, precios, seguimiento. |
+   | `Capabilities() Capabilities`                 | Las insignias: política de envío masivo, webhooks, API de dominios, sincronización de supresiones, tamaño de lote, IP dedicadas, sandbox, detección de cuota y de velocidad, precios, seguimiento, recepción de correo (`Inbound`). |
    | `Send(ctx, msgs) ([]SendResult, error)`       | Envía como máximo `BatchSize` mensajes y devuelve un resultado por mensaje, en el orden de entrada.      |
    | `ParseWebhook(ctx, r, body) ([]Event, error)` | Verifica la solicitud y convierte su payload en eventos normalizados.                                    |
 
@@ -76,6 +78,9 @@ Esta guía explica cómo contribuir con el código de un adaptador de correo en 
    | `StatusPage`, `StatusReporter`                           | El botón de estado y el texto del incidente durante una caída.                                                             |
    | `BroadcastStreamCreator`                                 | Proveedores cuyas condiciones exigen un flujo aparte para el correo masivo (Postmark).                                     |
    | `ExtrasSender`                                           | Enviar copias y archivos adjuntos; un mensaje con extras solo va a un proveedor que la implementa.                          |
+   | `InboundReceiver`                                        | Recibir correo (<UiPath path="nav.settings > settings.senders > senders.receiving.title" />): `InboundSetup` (los registros MX, los pasos y la configuración que muestra el diálogo de configuración), `VerifyInbound` en el hook de entrada, `ParseInbound` en la tarea. Activa `Capabilities.Inbound` junto con ella. Consulta [recibir correo](#recibir-correo). |
+   | `InboundRegistrar`                                       | Apuntar la recepción del proveedor para el dominio de la ruta al hook de entrada, y quitarla. Solo con `Capabilities.Inbound` `"automatic"`. |
+   | `InboundHandshaker`                                      | Responder a un handshake de suscripción en el hook de entrada (una `SubscriptionConfirmation` de SNS), comprobado con la configuración de la ruta. |
 
    </TableScroll>
 
@@ -166,6 +171,12 @@ Esta guía explica cómo contribuir con el código de un adaptador de correo en 
 
 5. Gestiona la configuración y las credenciales. `providers.Config.Settings` contiene los campos que no son secretos; `Config.Credentials` contiene los secretos descifrados como un objeto JSON plano cuyas claves son las de los campos `Secret`. Las credenciales son de solo escritura: se guardan selladas, la API nunca las devuelve y se reemplazan de una en una. Marca como `Secret` todo campo cuya clave parezca secreta (`password`, `token`, `secret`, o que termine en `api_key`), o el conjunto de pruebas de contrato falla.
 
+   Marca con `Endpoint: true` la configuración que indica adónde van las solicitudes del adaptador, como la URL de un
+   servidor, un endpoint de la API o un host. Un secreto guardado solo se envía a la dirección para la que se escribió,
+   así que cuando un formulario cambia una configuración `Endpoint`, ReputeCast vuelve a pedir los secretos. El conjunto
+   de pruebas de contrato falla con un campo cuya clave contiene `url`, `endpoint`, `host` o `server` y que no es
+   `Endpoint` (`providers.AddressKey`), y con uno que es a la vez `Endpoint` y `Secret`.
+
    `New` no debe hacer E/S de red ni fallar porque falte un valor opcional; informa de las credenciales que faltan desde la primera llamada. La fábrica crea un adaptador por solicitud, así que guarda lo que valga la pena reutilizar en una caché a nivel de paquete con la cuenta como clave. Guarda el material de firma leído de la API del proveedor en un `webhookauth.Material`, que lo vuelve a leer cuando falla una firma (como mucho una vez por minuto) y cada hora.
 
 6. Implementa `Send`:
@@ -181,10 +192,14 @@ Esta guía explica cómo contribuir con el código de un adaptador de correo en 
    - `ParseWebhook` verifica salvo que `providers.SignatureVerified(ctx)` esté definido. La tarea de normalización lo define cuando vuelve a analizar un payload guardado, que ya no tiene la URL original ni la cabecera `Authorization`.
    - Usa el esquema con el que firma el proveedor; `internal/providers/webhookauth` incluye Standard Webhooks, helpers de HMAC y comparaciones de tiempo constante. Si el proveedor no firma, registra el webhook con autenticación básica o con un token bearer que lleve `Config.WebhookSecret`, que viaja en `Authorization` y nunca se guarda.
    - Acota la marca de tiempo firmada: cinco minutos con `webhookauth.Fresh`, o un periodo que abarque los reintentos del proveedor con `webhookauth.Within`.
+   - Cuando la firma cubre un token de un solo uso pero no el evento (Mailgun), vincula cada token al payload con el que llegó por primera vez mediante `webhookauth.Replay` y `Config.Tokens`, que guarda el vínculo en Postgres para que todos los procesos y todos los reinicios lo vean mientras la firma se pueda aceptar. Una nueva entrega del mismo evento pasa; la ingesta descarta el duplicado.
+   - Cuando una firma válida solo demuestra quién envió la solicitud, no para quién (SNS firma igual los temas de todas las cuentas de AWS), comprueba también que viene de lo que configuró la conexión: Amazon SES solo acepta sus propios temas, con el certificado de firma de un endpoint regional de SNS, y guarda un tema mediante `ProvisionInput.Save` antes de suscribir el webhook.
    - Convierte cada evento relevante para la entrega en `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` o `unsubscribe`. Guarda el tipo del proveedor en `OriginalType`, su código en `OriginalCode` (sepáralo con `bounce.Split`) y el resto en `Diagnostic`, y define `BounceClass` con `bounce.Classify`. Pon el destinatario en minúsculas, guarda el JSON sin procesar en `Raw` y no devuelvas ningún evento para lo que no sea un resultado (enviado, procesado, respuestas automáticas, pings de prueba).
    - No suprimas por suposición: un fallo permanente causado por el remitente (un bloqueo por spam o por reputación, reintentos agotados) es un rebote temporal. Solo un problema de la dirección es un rebote permanente, porque los rebotes permanentes y las quejas van a la [lista de supresión](/es/audience/suppressions/) compartida.
 
-8. Prueba con el conjunto de pruebas de contrato. Todo adaptador pasa `internal/providers/contracttest`, que comprueba con tu API simulada el registro, las capacidades, un envío, un rechazo permanente, una caída y unas credenciales rechazadas, y todos los webhooks grabados: verificados, normalizados, vueltos a analizar con un contexto verificado y rechazados una vez manipulados. Su subprueba `Texts` comprueba el texto que leen las personas: un adaptador integrado de tipo `api`, `smtp`, `self_hosted` o `http` tiene un catálogo, cada texto que declara tiene un mensaje cuyo inglés es ese texto, y cada mensaje está traducido a todos los idiomas de la aplicación. `contracttest.CheckText` comprueba un texto que el adaptador escribe en tiempo de ejecución.
+8. Si el proveedor recibe correo y lo transmite, añade la recepción: consulta [recibir correo](#recibir-correo) más abajo.
+
+9. Prueba con el conjunto de pruebas de contrato. Todo adaptador pasa `internal/providers/contracttest`, que comprueba con tu API simulada el registro, las capacidades, un envío, un rechazo permanente, una caída y unas credenciales rechazadas, y todos los webhooks grabados: verificados, normalizados, vueltos a analizar con un contexto verificado y rechazados una vez manipulados. Su subprueba `Texts` comprueba el texto que leen las personas: un adaptador integrado de tipo `api`, `smtp`, `self_hosted` o `http` tiene un catálogo, cada texto que declara tiene un mensaje cuyo inglés es ese texto, y cada mensaje está traducido a todos los idiomas de la aplicación. `contracttest.CheckText` comprueba un texto que el adaptador escribe en tiempo de ejecución.
 
    ```go title="internal/providers/example/example_test.go"
    func TestContract(t *testing.T) {
@@ -208,13 +223,50 @@ Esta guía explica cómo contribuir con el código de un adaptador de correo en 
 
    Las pruebas no usan la red: ejecuta una simulación de la API del proveedor, graba como fixtures los payloads de webhook de la documentación del proveedor y fírmalos en la prueba con una clave de prueba. Si el proveedor publica un vector de prueba de firma, prueba con él. Prueba las interfaces opcionales, la correspondencia de errores y cada peculiaridad que tengas que sortear (ID mayores que 2^53, un campo que es una cadena o un array, un 400 que incluye resultados por mensaje).
 
-9. Registra el adaptador en la compilación:
-   - Añade un import en blanco del paquete a `internal/app/wire_adapters.go`. Registrar dos veces la misma clave provoca un panic al arrancar.
-   - Añade la clave a `adapterOrder` en `internal/providers/manage/adapters.go` (el orden de la pestaña Adaptadores) y a `catalogOrder` en `internal/connect/catalog.go` (el orden del catálogo de configuración).
-   - Si quieres, da al asistente de conexión sus textos en `copyTable` de `internal/connect/copy.go`, con los textos como mensajes `adapter.<key>.*` en `internal/connect/messages/en.json` y `vi.json`; sin una entrada, el asistente usa el nombre y los campos del descriptor.
-   - Los adaptadores integrados llevan la versión de ReputeCast (`version.Version`) y el mantenedor "HostRepute".
+10. Registra el adaptador en la compilación:
+    - Añade un import en blanco del paquete a `internal/app/wire_adapters.go`. Registrar dos veces la misma clave provoca un panic al arrancar.
+    - Añade la clave a `adapterOrder` en `internal/providers/manage/adapters.go` (el orden de la pestaña Adaptadores) y a `catalogOrder` en `internal/connect/catalog.go` (el orden del catálogo de configuración).
+    - Si quieres, da al asistente de conexión sus textos en `copyTable` de `internal/connect/copy.go`, con los textos como mensajes `adapter.<key>.*` en `internal/connect/messages/en.json` y `vi.json`; sin una entrada, el asistente usa el nombre y los campos del descriptor.
+    - Los adaptadores integrados llevan la versión de ReputeCast (`version.Version`) y el mantenedor "HostRepute".
 
 </Steps>
+
+## Recibir correo
+
+Un espacio de trabajo puede recibir correo a través de una sola ruta de entrada: la recepción de un proveedor o un
+buzón que lee ReputeCast. Un adaptador añade la primera. Disponible a partir de la próxima versión después de la 1.6.0.
+
+El proveedor envía lo que recibe a `POST /hooks/inbound/{token}` (y a `/hooks/inbound/{token}/*`, para proveedores
+como Mailgun que envían a `<url>/mime`). El hook llama a `HandshakeInbound` cuando el adaptador lo implementa, después
+a `VerifyInbound` con la solicitud en curso, y guarda el cuerpo y las cabeceras, sin `Authorization`, `Cookie` ni las
+`WebhookSecrets` del adaptador. Más tarde, una tarea reconstruye la solicitud y llama a `ParseInbound`, que nunca
+vuelve a verificar y puede llamar a la API del proveedor (el evento de Resend solo trae los metadatos del mensaje).
+
+- **`Capabilities.Inbound`** es `"automatic"` (el adaptador registra la ruta por su cuenta con `InboundRegistrar`; las
+  personas añaden el registro MX), `"manual"` (las personas siguen `InboundSetup.Steps` en la consola del proveedor) o
+  vacío. Defínelo en el descriptor y en `Capabilities()`; el conjunto de pruebas de contrato comprueba que el valor
+  coincide con las interfaces.
+- **`InboundSetup(route)`** devuelve los registros MX, con `Purpose: "inbound"` y el dominio de la ruta como `Name`,
+  los pasos como mensajes guardados con el dominio y la URL de la ruta como argumentos, y la configuración que
+  escriben las personas (el `topic_arn` de Amazon SES). Una ruta manual debe tener pasos, y cada paso necesita un
+  texto en todos los idiomas de la aplicación.
+- **Autentica con el secreto propio de la ruta** (`InboundRoute.Secret`), nunca con el secreto del webhook del
+  proveedor: autenticación básica con el usuario `providers.InboundUser` y el secreto en la URL a la que envía el
+  proveedor (`received.HookURL`), una cabecera con un token, o la firma del propio proveedor cuando firma (Mailgun,
+  Resend, Postal, SNS), comprobada con lo que indica la ruta. Una solicitud que no pasa la comprobación es
+  `providers.ErrBadSignature`.
+- **Devuelve `Raw`** cuando el proveedor pasa el mensaje completo, y ReputeCast lo analiza; si no, rellena los campos
+  analizados y los adjuntos. Los destinatarios del sobre, el ID de mensaje del proveedor y sus veredictos de spam, SPF,
+  DKIM y DMARC van en sus campos en los dos casos; `internal/providers/received` convierte los veredictos y las
+  puntuaciones de la misma forma para todos los adaptadores.
+- **Pruébalo** con `Suite.Inbound`: casos sacados del payload de ejemplo que documenta el proveedor, en
+  `testdata/inbound*`, cada uno con los mensajes que debe dar al analizarse. El conjunto comprueba que una solicitud
+  válida se verifica, que se analiza sin sus credenciales y que una manipulada falla; el caso de un adaptador con
+  autenticación básica o con token define `Tamper` para cambiar la credencial. `InboundLifecycle` registra una ruta
+  automática, anula su registro y lo vuelve a anular.
+
+La guía de [recepción de correo](/es/providers/receiving-mail/) indica qué hace cada adaptador integrado. Los
+adaptadores de la comunidad y el adaptador HTTP genérico no reciben correo.
 
 ## Comprobar que funciona
 

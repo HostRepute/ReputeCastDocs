@@ -1,0 +1,238 @@
+---
+title: Añadir una base de datos GeoIP
+description: Añade a ReputeCast una base de datos GeoIP, un archivo GeoLite o DB-IP Lite que descargas tú, para ver países y ciudades en informes y segmentar formularios.
+type: how-to
+audience: [operator]
+primaryKeyword: base de datos GeoIP
+sources:
+  - internal/geoip
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/cli/doctor.go
+  - internal/tracking/record.go
+  - internal/reports/breakdown.go
+  - internal/forms/targeting.go
+  - web/src/features/reports/PlacesCard.tsx
+  - web/src/features/reports/messages.ts
+  - web/src/features/forms/builder.messages.ts
+  - deploy/helm/reputecast/values.yaml
+  - docs/deploy/configuration.md
+sidebar:
+  order: 6
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Una base de datos GeoIP convierte la dirección IP de un lector en un país y una ciudad. Desde la versión 1.6.0,
+ReputeCast usa una que aportas tú, un archivo MaxMind DB (`.mmdb`), para situar las aperturas y los clics en los
+informes de campaña. Nunca descarga el archivo por su cuenta: lo descargas tú, apuntas `geoip.database` a él y
+reinicias.
+
+Sin ella, todo lo demás funciona; los informes no muestran países.
+
+## Qué la usa
+
+- **Los informes de campaña.** La tarjeta <UiPath path="reports.placesTitle" /> del [informe](/es/campaigns/reports/)
+  de una campaña cuenta las aperturas y los clics humanos por país, con las ciudades principales. ReputeCast busca la
+  dirección del lector en la primera apertura o el primer clic humano de un mensaje, en las campañas enviadas desde la
+  versión 1.6.0, y solo guarda el código del país y el nombre de la ciudad en inglés; la dirección IP no se guarda para
+  esto. Los dos se borran junto con la IP del lector mediante la
+  [conservación de datos](/es/team/workspaces/#configurar-la-conservación-de-datos) y el borrado definitivo. Las
+  aperturas a través de los proxies de imágenes de Gmail y Yahoo no llevan ubicación, las aperturas de Apple Mail
+  Privacy Protection se excluyen y los enlaces de solo lectura de los informes solo muestran países. Las aperturas
+  registradas antes de cargar la base de datos se quedan sin país.
+- **Las reglas de país de los formularios de suscripción.** Un formulario emergente o insertado puede mostrarse solo en
+  algunos países, o en todas partes menos en ellos ([segmentación de formularios](/es/forms/form-targeting/)). La
+  dirección del visitante se busca solo para esa respuesta y no se guarda. Disponible a partir de la próxima versión
+  después de la 1.6.0.
+
+Sin base de datos, el informe dice "Los países aparecen cuando el servidor tiene una base de datos GeoIP
+(geoip.database)." con <UiPath path="reports.geoHow" />, un enlace a esta documentación, y el constructor de
+formularios desactiva <UiPath path="forms.builder.countriesGroup" /> y explica por qué.
+
+## Antes de empezar
+
+- Elige una base de datos. ReputeCast lee estas cuatro:
+
+  | Base de datos            | De      | Ofrece          |
+  | ------------------------ | ------- | --------------- |
+  | GeoLite City             | MaxMind | País y ciudad   |
+  | GeoLite Country          | MaxMind | País            |
+  | DB-IP IP to City Lite    | DB-IP   | País y ciudad   |
+  | DB-IP IP to Country Lite | DB-IP   | País            |
+
+  Los archivos de MaxMind se llaman `GeoLite2-City.mmdb` y `GeoLite2-Country.mmdb`; MaxMind los llama ahora GeoLite,
+  con el mismo significado. Una base de datos Country no encuentra ciudades. ReputeCast carga el archivo completo en
+  memoria: una base de datos City ocupa más o menos lo que su archivo, como 121,0 MB para la IP to City Lite de DB-IP de
+  noviembre de 2026, frente a 8,1 MB para su IP to Country Lite.
+
+- Lee la licencia del proveedor. Las dos son gratuitas y piden atribución:
+
+  - El [GeoLite End User License Agreement](https://www.maxmind.com/en/geolite2/eula) de MaxMind incorpora la licencia
+    Creative Commons Attribution-ShareAlike 4.0, pide atribución ("This product includes GeoLite Data created by
+    MaxMind, available from https://www.maxmind.com.") y pide que dejes de usar una versión antigua en los 30 días
+    siguientes a una nueva publicación. Una cuenta de GeoLite puede descargar 30 bases de datos al día (comprobado en
+    noviembre de 2026).
+  - Las bases de datos Lite de DB-IP están bajo la
+    [licencia Creative Commons Attribution 4.0](https://db-ip.com/db/lite.php), con atribución a DB-IP.com y, en una
+    aplicación web, un enlace a DB-IP.com en las páginas que muestran resultados. Se actualizan cada mes (comprobado en
+    noviembre de 2026).
+
+  ReputeCast no muestra ninguna línea de atribución propia en los informes.
+
+## Descargar la base de datos
+
+<Tabs syncKey="geoip">
+<TabItem label="MaxMind GeoLite">
+
+<Steps>
+
+1. Regístrate en GeoLite en la [página de GeoLite de MaxMind](https://www.maxmind.com/en/geolite-free-ip-geolocation-data)
+   e inicia sesión en tu cuenta de MaxMind.
+
+2. Genera una clave de licencia en el portal de la cuenta. Las descargas se autentican con el ID de tu cuenta y esa
+   clave.
+
+3. Descarga la base de datos GeoLite City (o Country) en su formato binario GZIP desde la página de descargas de la
+   cuenta, o copia allí su enlace permanente y descárgala desde el servidor:
+
+   ```sh
+   curl -O -J -L -u YOUR_ACCOUNT_ID:YOUR_LICENSE_KEY '<permalink from the account portal>'
+   tar xzf GeoLite2-City_*.tar.gz --strip-components=1 --wildcards '*/GeoLite2-City.mmdb'
+   ```
+
+   El propio programa GeoIP Update de MaxMind descarga y reemplaza el archivo de forma programada: indícale la edición
+   `GeoLite2-City` y reinicia ReputeCast después de cada actualización
+   ([updating databases](https://dev.maxmind.com/geoip/updating-databases), comprobado en noviembre de 2026).
+
+</Steps>
+
+</TabItem>
+<TabItem label="DB-IP Lite">
+
+<Steps>
+
+1. Abre [IP to City Lite](https://db-ip.com/db/download/ip-to-city-lite) (o
+   [IP to Country Lite](https://db-ip.com/db/download/ip-to-country-lite)) en db-ip.com, acepta las condiciones de la
+   licencia y descarga el formato MMDB.
+
+2. Descomprímelo en el servidor y dale un nombre que no cambie de un mes a otro:
+
+   ```sh
+   gunzip -c dbip-city-lite-2026-11.mmdb.gz > dbip-city-lite.mmdb
+   ```
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Indicar a ReputeCast dónde está el archivo
+
+Todos los procesos que registran aperturas y clics o que responden a formularios necesitan el archivo en la misma ruta:
+dáselo a todos los procesos web y worker. La imagen Docker se ejecuta como uid 65532, así que el archivo tiene que ser
+legible por los demás usuarios (`chmod 644`).
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Pon el archivo en una carpeta `geoip` junto a `docker-compose.yml`, por ejemplo
+   `/opt/reputecast/geoip/GeoLite2-City.mmdb`.
+
+2. Monta la carpeta en solo lectura y define la ruta en `docker-compose.override.yml`:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     app:
+       environment:
+         REPUTECAST_GEOIP__DATABASE: /var/lib/geoip/GeoLite2-City.mmdb
+       volumes:
+         - ./geoip:/var/lib/geoip:ro
+   ```
+
+   Compose añade el montaje a los de `docker-compose.yml`
+   ([merge rules](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/), comprobado en noviembre de
+   2026). Un contenedor `worker` aparte necesita las mismas líneas.
+
+3. Reinicia la aplicación: `docker compose up -d`.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Binario">
+
+<Steps>
+
+1. Pon el archivo en un lugar que pueda leer el usuario del servicio, como `/var/lib/geoip/GeoLite2-City.mmdb`.
+
+2. Añade la ruta al archivo de entorno del servicio (`/etc/reputecast/env` en
+   [instalar el binario](/es/self-hosting/binary/)):
+
+   ```sh title="/etc/reputecast/env"
+   REPUTECAST_GEOIP__DATABASE=/var/lib/geoip/GeoLite2-City.mmdb
+   ```
+
+3. Reinicia el servicio: `sudo systemctl restart reputecast`.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Helm">
+
+Pon el archivo en un volumen y define `geoip.volume` (cualquier origen de volumen) y `geoip.file`. El chart lo monta en
+solo lectura en `/var/lib/geoip` en todos los pods y define `REPUTECAST_GEOIP__DATABASE`
+([Kubernetes](/es/deploy/kubernetes/)).
+
+```yaml title="values.yaml"
+geoip:
+  volume:
+    persistentVolumeClaim:
+      claimName: geoip
+  file: GeoLite2-City.mmdb
+```
+
+</TabItem>
+</Tabs>
+
+Al arrancar, ReputeCast lee el archivo en memoria en segundo plano y lo verifica, así que un archivo grande o dañado ni
+retrasa el arranque ni da ubicaciones erróneas: las búsquedas no encuentran nada hasta que está verificado. Un archivo
+que no se puede usar se anota en el log y se queda desactivado. Reemplazar el archivo en el disco no cambia nada en un
+proceso en marcha; reinicia para cargar el nuevo.
+
+## Comprobar que funciona
+
+- El log tiene `geoip database loaded` con el archivo, su tipo y su fecha de compilación.
+- `reputecast doctor` muestra la base de datos en su línea GeoIP:
+
+  ```txt title="reputecast doctor"
+  [ok  ] GeoIP              GeoLite2-City, built 2026-11-04
+  ```
+
+  Sin `geoip.database`, la línea dice `off (geoip.database isn't set): reports show no countries`.
+
+- Tras las primeras aperturas de la siguiente campaña, la tarjeta <UiPath path="reports.placesTitle" /> de su informe
+  muestra países en lugar de la nota sobre GeoIP.
+
+## Solución de problemas
+
+- **El log tiene `geoip database unusable`, o `reputecast doctor` avisa en su línea GeoIP**: el archivo falta, el
+  usuario del proceso no puede leerlo o no es un archivo MaxMind DB válido (un `.tar.gz` o `.gz` todavía sin
+  descomprimir, o una descarga en CSV). El mensaje nombra el archivo y el error. Corrígelo y reinicia.
+- **Los países siguen vacíos tras una campaña**: las aperturas a través de los proxies de imágenes de Gmail y Yahoo no
+  llevan ubicación, y las aperturas automáticas y las de Apple Mail Privacy Protection se excluyen. Comprueba que
+  `reputecast doctor` muestra la base de datos y espera a las aperturas desde otras aplicaciones de correo.
+- **Faltan ciudades**: una base de datos Country no tiene, y las ciudades con menos de 5 aperturas humanas se agrupan
+  en Otras ciudades. Los enlaces de solo lectura de los informes solo muestran países.
+- **Un formulario configurado como "Solo en" algunos países no se muestra nunca**: un país desconocido lo oculta. Los
+  visitantes desde direcciones privadas, como la red de tu propia oficina detrás de ReputeCast, no tienen país.
+
+## Relacionado
+
+- [Configurar ReputeCast](/es/self-hosting/configuration/): cómo llega la configuración al servidor.
+- [Referencia de configuración](/es/reference/configuration/#geoip): `geoip.database`.
+- [Leer los informes de campaña](/es/campaigns/reports/)
+- [Mostrar un formulario en algunas páginas, a algunos visitantes](/es/forms/form-targeting/)
+- [Comprobaciones de estado, métricas y logs](/es/self-hosting/monitoring/)

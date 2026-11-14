@@ -15,6 +15,7 @@ sources:
   - internal/domains/cloudflare.go
   - internal/domains/api.go
   - internal/dnscheck/auth.go
+  - internal/readiness/technical.go
   - internal/dnscheck/domain.go
   - internal/readiness/assemble.go
   - internal/providers/ses/ses.go
@@ -45,14 +46,15 @@ ihren Live-Status lesen.
 | ------- | ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | SPF     | TXT                      | Die Domain im Envelope-Absender (MAIL FROM)          | Der Server, der die Nachricht übergeben hat, darf für diese Domain senden.                             |
 | DKIM    | CNAME oder TXT           | `<selector>._domainkey.<domain>`                     | Der Versandanbieter hat die Nachricht mit einem von Ihnen veröffentlichten Schlüssel signiert, und sie wurde nicht verändert. |
-| DMARC   | TXT                      | `_dmarc.<domain>` oder die Organisationsdomain        | Was Empfänger tun, wenn weder SPF noch DKIM passend zur From-Adresse besteht.                          |
+| DMARC   | TXT                      | `_dmarc.<domain>` oder eine übergeordnete Domain     | Was Empfänger tun, wenn weder SPF noch DKIM passend zur From-Adresse besteht.                          |
 
 </TableScroll>
 
 DMARC besteht, wenn SPF oder DKIM besteht **und** dessen Domain mit der Domain der From-Adresse ausgerichtet ist. Im
 lockeren Modus (relaxed), dem Standard, brauchen beide Domains dieselbe Organisationsdomain: `bounce.news.acme.io` ist
 mit `news.acme.io` ausgerichtet. Im strikten Modus (strict) müssen sie identisch sein
-([RFC 7489, Abschnitt 3.1](https://www.rfc-editor.org/rfc/rfc7489#section-3.1), geprüft im Oktober 2026).
+([RFC 9989, Abschnitt 4.4](https://www.rfc-editor.org/rfc/rfc9989#section-4.4), geprüft im November 2026). RFC 9989
+hat RFC 7489 im Mai 2026 als DMARC-Standard abgelöst.
 
 Deshalb verlangt ReputeCast einen eigenen Return-Path (MAIL FROM) auf Ihrer eigenen Domain, wo immer der
 Versandanbieter das unterstützt: SPF wird gegen den Return-Path geprüft, daher kann mit dem Standard-Return-Path des
@@ -121,11 +123,32 @@ Proposed:   v=spf1 mx include:spf.mtasv.net -all
 
 ### Die DMARC-Zeile
 
-Wenn für die Domain oder ihre Organisationsdomain kein DMARC-Eintrag existiert, schlägt ReputeCast
-`v=DMARC1; p=quarantine; adkim=s; aspf=r` vor, dazu `rua=mailto:` mit der Berichtsadresse von HostRepute, wenn
-[HostRepute](/de/reference/glossary/#hostrepute) verbunden ist. Die Zeile gilt als verifiziert, sobald ein gültiger
-DMARC-Eintrag unter `_dmarc.<domain>` oder auf der Organisationsdomain veröffentlicht ist, auch mit `p=none`. Lesen
-Sie [DMARC-Richtlinie wählen](#dmarc-richtlinie-wählen), bevor Sie den Vorschlag veröffentlichen.
+Wenn für die Domain kein DMARC-Eintrag gilt, schlägt ReputeCast `v=DMARC1; p=quarantine; adkim=s; aspf=r` vor, dazu
+`rua=mailto:` mit der Berichtsadresse von HostRepute, wenn [HostRepute](/de/reference/glossary/#hostrepute) verbunden
+ist, und mit der Adresse `dmarc@` der Empfangsdomain, solange [ReputeCast E-Mails empfängt](/de/providers/receiving-mail/).
+Die Zeile gilt als verifiziert, sobald ein gültiger DMARC-Eintrag gilt, unter `_dmarc.<domain>` oder auf einer
+übergeordneten Domain, auch mit `p=none`. Lesen Sie [DMARC-Richtlinie wählen](#dmarc-richtlinie-wählen), bevor Sie den
+Vorschlag veröffentlichen. Die Adresse `dmarc@` gehört zum E-Mail-Empfang. Verfügbar ab der nächsten Version nach
+1.6.0.
+
+### Wie ReputeCast einen DMARC-Eintrag liest
+
+Seit Version 1.6.0 liest ReputeCast DMARC-Einträge so, wie RFC 9989 es beschreibt
+([RFC 9989, Abschnitte 4.7 und 4.10](https://www.rfc-editor.org/rfc/rfc9989#section-4.10), geprüft im November 2026):
+
+- **Die Suche nach der Richtlinie** beginnt bei `_dmarc.<domain>` und geht die übergeordneten Domains hinauf, mit
+  höchstens 8 Abfragen, bis zum ersten verwendbaren Eintrag oder zu einem mit dem Tag `psd=` mit dem Wert `y` oder
+  `n`. Eine Subdomain übernimmt die Richtlinie `sp=` einer übergeordneten Domain oder ihre Richtlinie `np=`, wenn die
+  Subdomain im DNS nicht existiert; beide fallen auf `p=` zurück.
+- **Tags, die RFC 9989 gestrichen hat**, `pct=`, `ri=` und `rf=`, werden ignoriert, ebenso Tags, die es nicht
+  definiert. `t=`, `np=` und `psd=` werden gelesen.
+- **Ein Eintrag ohne gültiges `p=`** gilt als `p=none`, wenn er eine gültige `rua=`-Adresse hat; sonst ignorieren
+  Empfänger ihn, und auf der Domain selbst zeigt ReputeCast ihn als ungültig. Dasselbe gilt für zwei DMARC-Einträge
+  unter einem Namen und für einen Eintrag, der nur wie einer aussieht, etwa `v=dmarc1`.
+- **Der Testmodus**, `t=y`, bittet Empfänger, die Richtlinie eine Stufe niedriger anzuwenden: `quarantine` wird wie
+  `none` behandelt und `reject` wie `quarantine`. Die [Versandbereitschaft](/de/campaigns/send-readiness/) weist in
+  ihrer DMARC-Zeile unter <UiPath path="review.technicalDetails" /> darauf hin.
+- **Eine fehlgeschlagene DNS-Abfrage** beendet die Suche: Die Richtlinie ist unbekannt, nicht fehlend.
 
 ## Bevor Sie beginnen
 
@@ -302,7 +325,10 @@ v=DMARC1; p=none; rua=mailto:dmarc-reports@acme.io
 Lesen Sie dann einige Wochen lang die Berichte und verschärfen Sie die Richtlinie, sobald jede legitime Quelle besteht,
 wie unter [DMARC-Sammelberichte lesen](/de/deliverability/dmarc-reports/) beschrieben. Ein DMARC-Eintrag auf der
 Organisationsdomain (`_dmarc.acme.io`) deckt auch Subdomains wie `news.acme.io` ab; sein `sp=`-Tag legt deren
-Richtlinie fest, und ReputeCast liest ihn, wenn die Subdomain keinen eigenen Eintrag hat.
+Richtlinie fest (`np=` für Subdomains, die nicht existieren), und ReputeCast liest ihn, wenn die Subdomain keinen
+eigenen Eintrag hat. Um eine strengere Richtlinie zuerst zu erproben, veröffentlichen Sie sie mit `t=y`: Empfänger
+wenden dann eine Stufe weniger an, während die Sammelberichte weiter eintreffen. RFC 9989 kennt kein `pct=`-Tag mehr,
+ein Prozentsatz begrenzt die Richtlinie also nicht mehr.
 
 ## Prüfen, ob es funktioniert hat
 
@@ -330,6 +356,9 @@ Richtlinie fest, und ReputeCast liest ihn, wenn die Subdomain keinen eigenen Ein
   Veröffentlichen den Status an.
 - **SPF endet auf `+all`.** ReputeCast wertet das als ungültig, weil es jedem erlaubt, als die Domain zu senden. Nutzen
   Sie `~all` oder `-all`.
+- **DMARC zeigt Ungültig.** Die Domain veröffentlicht zwei DMARC-Einträge unter `_dmarc.<domain>`, einen Eintrag, der
+  nicht genau mit `v=DMARC1` beginnt, oder einen ohne gültiges `p=` und ohne gültiges `rua=`. Behalten Sie einen
+  Eintrag, der mit `v=DMARC1; p=` beginnt.
 - **Ein Eintrag bleibt auf Fehlt, obwohl Sie ihn hinzugefügt haben.** Prüfen Sie den Namen auf eine doppelte Zone
   (`news.acme.io.acme.io`) und ob Sie die Zone bei dem DNS-Hoster bearbeitet haben, auf den die Nameserver zeigen.
 - **Ein DKIM-CNAME bei Cloudflare bleibt Ausstehend.** Prüfen Sie, ob der Eintrag auf **DNS only** steht und nicht

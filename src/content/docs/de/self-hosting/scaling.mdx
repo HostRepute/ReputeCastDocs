@@ -17,11 +17,13 @@ sources:
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
+  - internal/blobstore
   - deploy/docker-compose.yml
+  - deploy/helm/reputecast
   - docs/deploy/performance.md
   - README.md
 sidebar:
-  order: 8
+  order: 10
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -67,8 +69,10 @@ aus; PostgreSQL enthält die Daten und die Job-Warteschlange, und die Versandanb
    statt einer Schlüsseldatei; mit Docker kopieren Sie den vorhandenen Schlüssel mit
    `docker compose cp app:/var/lib/reputecast/secret.key .` heraus und verwenden seinen Inhalt.
 
-2. Geben Sie Web- und Worker-Prozessen dasselbe `files.dir` (Produktdateien und Lead-Magneten), auf einem gemeinsamen
-   Volume oder einem Netzwerkdateisystem.
+2. Geben Sie Web- und Worker-Prozessen dasselbe `files.dir` (Produktdateien, Lead-Magneten, laufende Uploads und
+   Exporte), auf einem gemeinsamen Volume oder einem Netzwerkdateisystem. Ohne ein solches legen Sie die Dateien mit
+   `storage.backend: s3` auf jedem Prozess in einem [S3-kompatiblen Bucket](/de/self-hosting/object-storage/) ab.
+   Verfügbar ab der nächsten Version nach 1.6.0.
 
 3. Betreiben Sie einen oder mehrere Prozesse `serve --role=web,ingest` hinter Ihrem
    [Reverse Proxy](/de/self-hosting/reverse-proxy/) und mindestens einen `worker`. Mehrere Worker teilen sich die
@@ -114,6 +118,14 @@ services:
 
 Der Worker startet, sobald `app` fehlerfrei läuft, damit der geheime Schlüssel und die Migrationen bereitstehen.
 
+## Rollen auf Kubernetes aufteilen
+
+Auf Kubernetes führt das Chart, das Sie mit Helm installieren ([Kubernetes](/de/deploy/kubernetes/)), dieselbe
+Aufteilung als Deployments mit `mode: split` aus: Web-Pods (standardmäßig 2, mit optionalem Autoscaler), Worker-Pods (1)
+und mit `ingest.separate` Pods für den Webhook-Empfang, an die der Ingress `/hooks/` leitet. Pods teilen keinen Ordner,
+daher braucht der Split-Modus `storage.backend: s3` und bricht die Installation ohne ihn ab; Migrationen laufen vor
+jeder Installation und jedem Upgrade in einem Job. Verfügbar ab der nächsten Version nach 1.6.0.
+
 <Aside type="caution">
   Teilen Sie eine Instanz erst nach ihrem ersten Start auf, wenn die Datei mit dem geheimen Schlüssel existiert. Ein
   Worker, der vor der App auf einem leeren Volume startet, könnte einen anderen Schlüssel anlegen.
@@ -126,7 +138,7 @@ Der Worker startet, sobald `app` fehlerfrei läuft, damit der geheime Schlüssel
   Worker gleichzeitig ausführt.
 - **In der App gespeicherte Einstellungen**: Jeder Prozess liest die in der Instanzverwaltung gespeicherte öffentliche
   URL alle 30 Sekunden neu ein, installierte Community-Adapter alle 15 Sekunden.
-- **Dateien**: `files.dir`, wie oben.
+- **Dateien**: `files.dir` oder der Bucket, wie oben. Jeder Prozess muss dasselbe Backend verwenden.
 - **Nicht die Ratenlimits**: Jeder Web-Prozess zählt Anfragen für sich, daher kann ein Aufrufer hinter einem Load
   Balancer mit drei Web-Prozessen das Dreifache der [Limits](/de/self-hosting/security/#standardwerte-und-grenzen)
   erreichen.
@@ -164,7 +176,8 @@ Kontaktliste, Segmentzählungen, die Sende-API und den Empfang von Webhooks.
 - **Nichts wird gesendet, und Importe werden nie fertig**: Kein Prozess führt die Rolle `worker` aus.
 - **Gespeicherte Zugangsdaten der Anbieter lassen sich in einem Prozess nicht entschlüsseln**: Sein geheimer Schlüssel
   weicht ab; geben Sie jedem Prozess denselben `secrets.key` oder dieselbe Schlüsseldatei.
-- **Produkt-Downloads schlagen in manchen Prozessen fehl**: `files.dir` wird nicht gemeinsam genutzt.
+- **Produkt-Downloads schlagen in manchen Prozessen fehl**: `files.dir` wird nicht gemeinsam genutzt, oder die
+  Prozesse verwenden nicht alle dasselbe `storage.backend`.
 - **`FATAL: sorry, too many clients already`**: Senken Sie `database.max_conns` je Prozess.
 - **Ein Prozess protokolliert `metrics listener not started`**: Ein anderer Prozess auf dem Host belegt bereits
   Port 9464. Geben Sie jedem Prozess auf einem Host eine eigene `metrics.addr`.

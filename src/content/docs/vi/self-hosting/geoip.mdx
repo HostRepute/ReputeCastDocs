@@ -1,0 +1,231 @@
+---
+title: Thêm cơ sở dữ liệu GeoIP
+description: Thêm cơ sở dữ liệu GeoIP, một tệp GeoLite hoặc DB-IP Lite bạn tự tải về, để báo cáo chiến dịch hiện quốc gia và thành phố, còn biểu mẫu nhắm theo quốc gia.
+type: how-to
+audience: [operator]
+primaryKeyword: cơ sở dữ liệu GeoIP
+sources:
+  - internal/geoip
+  - internal/config/config.go
+  - internal/app/app.go
+  - internal/cli/doctor.go
+  - internal/tracking/record.go
+  - internal/reports/breakdown.go
+  - internal/forms/targeting.go
+  - web/src/features/reports/PlacesCard.tsx
+  - web/src/features/reports/messages.ts
+  - web/src/features/forms/builder.messages.ts
+  - deploy/helm/reputecast/values.yaml
+  - docs/deploy/configuration.md
+sidebar:
+  order: 6
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Cơ sở dữ liệu GeoIP chuyển địa chỉ IP của người đọc thành một quốc gia và một thành phố. Từ bản 1.6.0, ReputeCast dùng
+một cơ sở dữ liệu do bạn cung cấp, ở dạng tệp MaxMind DB (`.mmdb`), để xác định nơi diễn ra các lượt mở và lượt nhấp
+trong báo cáo chiến dịch. ReputeCast không bao giờ tự tải tệp này: bạn tải nó về, trỏ `geoip.database` tới nó rồi khởi
+động lại.
+
+Không có cơ sở dữ liệu này, mọi thứ khác vẫn hoạt động; báo cáo chỉ không hiện quốc gia.
+
+## Những tính năng dùng GeoIP
+
+- **Báo cáo chiến dịch.** Thẻ <UiPath path="reports.placesTitle" /> trong [báo cáo](/vi/campaigns/reports/) của một
+  chiến dịch đếm lượt mở và lượt nhấp bởi người đọc theo từng quốc gia, kèm các thành phố hàng đầu. ReputeCast tra địa
+  chỉ của người đọc ở lượt mở hoặc lượt nhấp đầu tiên bởi người đọc của một thư, với các chiến dịch gửi từ bản 1.6.0, và
+  chỉ giữ mã quốc gia cùng tên thành phố bằng tiếng Anh; địa chỉ IP không được lưu cho mục đích này. Cả hai được xóa cùng
+  IP của người đọc theo [thời gian lưu giữ dữ liệu](/vi/team/workspaces/#đặt-thời-gian-lưu-giữ-dữ-liệu) và khi xóa vĩnh
+  viễn. Lượt mở qua proxy hình ảnh của Gmail và Yahoo không mang thông tin vị trí, lượt mở của Apple Mail Privacy
+  Protection bị loại ra, và liên kết báo cáo chỉ xem chỉ hiện quốc gia. Các lượt mở ghi nhận trước khi cơ sở dữ liệu được
+  tải vẫn không có quốc gia.
+- **Quy tắc quốc gia của biểu mẫu đăng ký.** Một biểu mẫu bật lên hoặc nhúng có thể chỉ hiện ở một số quốc gia, hoặc ở
+  mọi nơi trừ các quốc gia đó ([nhắm mục tiêu biểu mẫu](/vi/forms/form-targeting/)). Địa chỉ của khách truy cập chỉ
+  được tra để trả lời đúng câu hỏi đó và không được giữ lại. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+Khi không có cơ sở dữ liệu, báo cáo ghi "Quốc gia sẽ hiện khi máy chủ có cơ sở dữ liệu GeoIP (geoip.database)." kèm
+<UiPath path="reports.geoHow" />, một liên kết tới tài liệu này, còn trình dựng biểu mẫu tắt
+<UiPath path="forms.builder.countriesGroup" /> và cho biết lý do.
+
+## Trước khi bắt đầu
+
+- Chọn một cơ sở dữ liệu. ReputeCast đọc được bốn loại sau:
+
+  | Cơ sở dữ liệu            | Nhà cung cấp | Cho biết              |
+  | ------------------------ | ------------ | --------------------- |
+  | GeoLite City             | MaxMind      | Quốc gia và thành phố |
+  | GeoLite Country          | MaxMind      | Quốc gia              |
+  | DB-IP IP to City Lite    | DB-IP        | Quốc gia và thành phố |
+  | DB-IP IP to Country Lite | DB-IP        | Quốc gia              |
+
+  Tệp của MaxMind có tên `GeoLite2-City.mmdb` và `GeoLite2-Country.mmdb`; MaxMind hiện gọi chúng là GeoLite, với cùng ý
+  nghĩa. Cơ sở dữ liệu Country không tìm được thành phố nào. ReputeCast giữ toàn bộ tệp trong bộ nhớ: cơ sở dữ liệu City
+  chiếm khoảng bằng kích thước tệp, ví dụ 121,0 MB với IP to City Lite của DB-IP bản tháng 11/2026, so với 8,1 MB của IP
+  to Country Lite.
+
+- Đọc giấy phép của nhà cung cấp. Cả hai đều miễn phí và yêu cầu ghi nguồn:
+
+  - [GeoLite End User License Agreement](https://www.maxmind.com/en/geolite2/eula) của MaxMind bao gồm giấy phép
+    Creative Commons Attribution-ShareAlike 4.0, yêu cầu ghi nguồn ("This product includes GeoLite Data created by
+    MaxMind, available from https://www.maxmind.com.") và yêu cầu bạn ngừng dùng bản cũ trong vòng 30 ngày sau khi có
+    bản mới. Một tài khoản GeoLite được tải 30 cơ sở dữ liệu mỗi ngày (kiểm tra tháng 11/2026).
+  - Các cơ sở dữ liệu Lite của DB-IP theo
+    [giấy phép Creative Commons Attribution 4.0](https://db-ip.com/db/lite.php), ghi nguồn cho DB-IP.com và, trong một
+    ứng dụng web, đặt liên kết về DB-IP.com trên các trang hiển thị kết quả. Chúng được cập nhật hằng tháng (kiểm tra
+    tháng 11/2026).
+
+  ReputeCast không tự hiện dòng ghi nguồn nào trong báo cáo.
+
+## Tải cơ sở dữ liệu
+
+<Tabs syncKey="geoip">
+<TabItem label="MaxMind GeoLite">
+
+<Steps>
+
+1. Đăng ký GeoLite trên [trang GeoLite của MaxMind](https://www.maxmind.com/en/geolite-free-ip-geolocation-data) và đăng
+   nhập vào tài khoản MaxMind của bạn.
+
+2. Tạo một license key trong cổng tài khoản. Các lượt tải xác thực bằng account ID của bạn và key đó.
+
+3. Tải cơ sở dữ liệu GeoLite City (hoặc Country) ở định dạng nhị phân GZIP từ trang tải xuống của tài khoản, hoặc sao
+   chép permalink của nó ở đó và tải từ máy chủ:
+
+   ```sh
+   curl -O -J -L -u YOUR_ACCOUNT_ID:YOUR_LICENSE_KEY '<permalink from the account portal>'
+   tar xzf GeoLite2-City_*.tar.gz --strip-components=1 --wildcards '*/GeoLite2-City.mmdb'
+   ```
+
+   Chương trình GeoIP Update của chính MaxMind tải và thay tệp theo lịch: hãy cấp cho nó edition `GeoLite2-City` và khởi
+   động lại ReputeCast sau mỗi lần cập nhật
+   ([updating databases](https://dev.maxmind.com/geoip/updating-databases), kiểm tra tháng 11/2026).
+
+</Steps>
+
+</TabItem>
+<TabItem label="DB-IP Lite">
+
+<Steps>
+
+1. Mở [IP to City Lite](https://db-ip.com/db/download/ip-to-city-lite) (hoặc
+   [IP to Country Lite](https://db-ip.com/db/download/ip-to-country-lite)) trên db-ip.com, chấp nhận điều khoản cấp
+   phép và tải định dạng MMDB.
+
+2. Giải nén trên máy chủ và đặt cho tệp một cái tên không đổi qua các tháng:
+
+   ```sh
+   gunzip -c dbip-city-lite-2026-11.mmdb.gz > dbip-city-lite.mmdb
+   ```
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Trỏ ReputeCast tới tệp
+
+Mọi tiến trình ghi nhận lượt mở và lượt nhấp hoặc trả lời biểu mẫu đều cần tệp ở cùng một đường dẫn: hãy cấp tệp cho
+mọi tiến trình web và worker. Docker image chạy dưới uid 65532, nên người dùng khác phải đọc được tệp (`chmod 644`).
+
+<Tabs syncKey="install">
+<TabItem label="Docker Compose">
+
+<Steps>
+
+1. Đặt tệp vào thư mục `geoip` cạnh `docker-compose.yml`, ví dụ `/opt/reputecast/geoip/GeoLite2-City.mmdb`.
+
+2. Gắn thư mục ở chế độ chỉ đọc và đặt đường dẫn trong `docker-compose.override.yml`:
+
+   ```yaml title="docker-compose.override.yml"
+   services:
+     app:
+       environment:
+         REPUTECAST_GEOIP__DATABASE: /var/lib/geoip/GeoLite2-City.mmdb
+       volumes:
+         - ./geoip:/var/lib/geoip:ro
+   ```
+
+   Compose thêm điểm gắn này vào các điểm gắn trong `docker-compose.yml`
+   ([merge rules](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/), kiểm tra tháng 11/2026). Một
+   container `worker` riêng cũng cần đúng các dòng này.
+
+3. Khởi động lại ứng dụng: `docker compose up -d`.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Tệp nhị phân">
+
+<Steps>
+
+1. Đặt tệp ở nơi người dùng của service đọc được, ví dụ `/var/lib/geoip/GeoLite2-City.mmdb`.
+
+2. Thêm đường dẫn vào tệp môi trường của service (`/etc/reputecast/env` trong
+   [cài đặt bằng tệp nhị phân](/vi/self-hosting/binary/)):
+
+   ```sh title="/etc/reputecast/env"
+   REPUTECAST_GEOIP__DATABASE=/var/lib/geoip/GeoLite2-City.mmdb
+   ```
+
+3. Khởi động lại service: `sudo systemctl restart reputecast`.
+
+</Steps>
+
+</TabItem>
+<TabItem label="Helm">
+
+Đặt tệp trên một volume và đặt `geoip.volume` (nguồn volume bất kỳ) và `geoip.file`. Chart gắn volume ở chế độ chỉ đọc
+tại `/var/lib/geoip` trong mọi pod và đặt `REPUTECAST_GEOIP__DATABASE` ([Kubernetes](/vi/deploy/kubernetes/)).
+
+```yaml title="values.yaml"
+geoip:
+  volume:
+    persistentVolumeClaim:
+      claimName: geoip
+  file: GeoLite2-City.mmdb
+```
+
+</TabItem>
+</Tabs>
+
+Khi khởi động, ReputeCast đọc tệp vào bộ nhớ ở chế độ nền và xác minh nó, nên một tệp lớn hoặc bị hỏng không làm chậm
+việc khởi động cũng không cho ra vị trí sai: việc tra cứu không tìm thấy gì cho đến khi tệp được xác minh. Một tệp không
+dùng được sẽ được ghi vào log và tính năng vẫn tắt. Thay tệp trên đĩa không thay đổi gì trong một tiến trình đang chạy;
+hãy khởi động lại để tải tệp mới.
+
+## Kiểm tra kết quả
+
+- Log có `geoip database loaded` kèm tệp, loại và ngày build của nó.
+- `reputecast doctor` hiển thị cơ sở dữ liệu trên dòng GeoIP:
+
+  ```txt title="reputecast doctor"
+  [ok  ] GeoIP              GeoLite2-City, built 2026-11-04
+  ```
+
+  Không có `geoip.database`, dòng này ghi `off (geoip.database isn't set): reports show no countries`.
+
+- Sau những lượt mở đầu tiên của chiến dịch tiếp theo, thẻ <UiPath path="reports.placesTitle" /> trong báo cáo của nó
+  liệt kê các quốc gia thay cho ghi chú về GeoIP.
+
+## Khắc phục sự cố
+
+- **Log có `geoip database unusable`, hoặc `reputecast doctor` cảnh báo trên dòng GeoIP**: tệp không tồn tại, người dùng
+  của tiến trình không đọc được, hoặc không phải tệp MaxMind DB hợp lệ (một tệp `.tar.gz` hay `.gz` chưa giải nén, hoặc
+  một bản tải CSV). Thông báo nêu tên tệp và lỗi. Hãy sửa rồi khởi động lại.
+- **Quốc gia vẫn trống sau một chiến dịch**: lượt mở qua proxy hình ảnh của Gmail và Yahoo không mang thông tin vị trí,
+  còn lượt mở bởi máy và của Apple Mail Privacy Protection bị loại ra. Hãy kiểm tra `reputecast doctor` có báo cơ sở dữ
+  liệu hay không, rồi chờ lượt mở từ các ứng dụng thư khác.
+- **Thiếu thành phố**: cơ sở dữ liệu Country không có thành phố, và các thành phố có dưới 5 lượt mở bởi người đọc được
+  gộp vào Thành phố khác. Liên kết báo cáo chỉ xem chỉ hiện quốc gia.
+- **Một biểu mẫu đặt "Chỉ ở" một số quốc gia không bao giờ hiện**: quốc gia không xác định sẽ ẩn biểu mẫu. Khách truy
+  cập từ địa chỉ riêng, như mạng văn phòng của chính bạn đứng sau ReputeCast, không có quốc gia.
+
+## Liên quan
+
+- [Cấu hình ReputeCast](/vi/self-hosting/configuration/): cách các thiết lập đến được máy chủ.
+- [Tham chiếu cấu hình](/vi/reference/configuration/#geoip): `geoip.database`.
+- [Đọc báo cáo chiến dịch](/vi/campaigns/reports/)
+- [Hiện biểu mẫu trên một số trang, cho một số khách truy cập](/vi/forms/form-targeting/)
+- [Health check, metrics và log](/vi/self-hosting/monitoring/)

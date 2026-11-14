@@ -1,6 +1,6 @@
 ---
 title: Leer los informes agregados de DMARC
-description: Recopila cada informe agregado de DMARC con HostRepute o en tu propio buzón, súbelo a ReputeCast y descubre qué orígenes de envío pasan, fallan o se alinean.
+description: Recopila cada informe agregado de DMARC con HostRepute, el dominio de recepción de ReputeCast o tu buzón, y descubre qué orígenes pasan, fallan o se alinean.
 type: how-to
 audience: [admin]
 permissions: ['deliverability:view', 'domains:manage']
@@ -10,12 +10,15 @@ sources:
   - internal/deliverability/dmarc.go
   - internal/deliverability/api.go
   - internal/deliverability/deliverability.go
+  - internal/deliverability/types.go
+  - internal/inbound/process.go
   - internal/domains/records.go
   - internal/hostrepute/client.go
   - internal/hostrepute/sync.go
   - internal/readiness/assemble.go
   - web/src/features/deliverability/DmarcCard.tsx
   - web/src/features/deliverability/dmarc.messages.ts
+  - web/src/features/senders/ReceivingCard.tsx
 sidebar:
   order: 4
 ---
@@ -30,11 +33,11 @@ en nombre de tu dominio y si ese correo superó DMARC. Esta guía muestra cómo 
 ReputeCast y leerlos en <UiPath path="nav.deliverability > placement.health" />, para que puedas pasar tu política
 [DMARC](/es/reference/glossary/#dmarc) de `p=none` a `quarantine` o `reject` sin perder correo real.
 
-Los proveedores de buzón compatibles con DMARC envían estos informes como archivos XML, por defecto una vez al día, a
-las direcciones de la etiqueta `rua` de tu registro DMARC ([RFC 7489, sección 6.3](https://www.rfc-editor.org/rfc/rfc7489#section-6.3),
-comprobado en octubre de 2026). ReputeCast no tiene una bandeja de entrada propia para ellos: o bien
-[HostRepute](/es/reference/glossary/#hostrepute) los recopila y los analiza por ti, o bien los recibes en tu propio
-buzón y los subes.
+Los proveedores de buzón compatibles con DMARC envían estos informes como archivos XML, normalmente una vez al día, a
+las direcciones de la etiqueta `rua` de tu registro DMARC ([RFC 9990, sección 3](https://www.rfc-editor.org/rfc/rfc9990#section-3),
+comprobado en noviembre de 2026). [HostRepute](/es/reference/glossary/#hostrepute) puede recopilarlos y analizarlos
+por ti, ReputeCast puede recibirlos en la dirección `dmarc@` de su [dominio de recepción](/es/providers/receiving-mail/),
+o bien los recibes en tu propio buzón y los subes.
 
 ## Antes de empezar
 
@@ -42,8 +45,8 @@ buzón y los subes.
   [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/).
 - Para leer los informes necesitas `deliverability:view`, que tienen todos los roles integrados. Para subir un informe
   necesitas `domains:manage` (Propietario y Administrador).
-- Decide adónde van los informes: a HostRepute, a un buzón tuyo o a ambos. `rua` admite varias direcciones separadas
-  por comas.
+- Decide adónde van los informes: a HostRepute, al dominio de recepción de ReputeCast, a un buzón tuyo o a más de uno.
+  `rua` admite varias direcciones separadas por comas.
 
 ## Recopilar los informes
 
@@ -63,6 +66,41 @@ buzón y los subes.
 
 HostRepute analiza los informes, y ReputeCast lee los resultados de los últimos 7 días en su sincronización horaria.
 
+### En el dominio de recepción de ReputeCast
+
+Cuando el espacio de trabajo [recibe correo](/es/providers/receiving-mail/), los informes agregados enviados a `dmarc@`
+de su dominio de recepción se guardan a medida que llegan, sin subirlos. Disponible a partir de la próxima versión
+después de la 1.6.0.
+
+<Steps>
+
+1. Configura <UiPath path="nav.settings > settings.senders > senders.receiving.title" />. La tarjeta muestra la
+   dirección en <UiPath path="senders.receiving.dmarcReports" />, como `dmarc@reply.news.acme.io`. Mientras el espacio
+   de trabajo no reciba correo, la tarjeta DMARC vacía ofrece <UiPath path="deliverability.dmarc.collectSetUp" /> en
+   <UiPath path="deliverability.dmarc.collectTitle" />.
+
+2. Añade la dirección a la etiqueta `rua` de tu registro DMARC. El registro DMARC que sugiere ReputeCast para un dominio
+   que añades mientras existe la ruta ya la incluye, después de la dirección de HostRepute cuando HostRepute está
+   conectado.
+
+   ```txt title="_dmarc.news.acme.io TXT"
+   v=DMARC1; p=none; rua=mailto:dmarc@reply.news.acme.io
+   ```
+
+3. Cuando el dominio de recepción no está bajo el mismo dominio organizativo que el dominio de envío, publica en el
+   dominio de recepción el registro de destino externo que se describe en [En tu propio buzón](#en-tu-propio-buzón).
+
+</Steps>
+
+ReputeCast solo conserva un informe cuando trata de uno de los dominios de envío del espacio de trabajo o de sus
+dominios organizativos; descarta los demás, y la tarjeta <UiPath path="senders.receiving.title" /> indica que lo hizo.
+La tarjeta DMARC muestra adónde llegan los informes y cuándo llegó el último.
+
+<Screenshot
+  id="deliverability-dmarc"
+  alt="La tarjeta de informes DMARC de los últimos 7 días con un 99,6 % de pass: los informes agregados van a HostRepute y también llegan a dmarc@reply.news.acme.io, el último ayer; Amazon SES, Postal y Postmark están alineados, y un origen desconocido en 198.51.100.77 falló y se puso en cuarentena, con Investigar el origen."
+/>
+
 ### En tu propio buzón
 
 <Steps>
@@ -76,7 +114,7 @@ HostRepute analiza los informes, y ReputeCast lee los resultados de los últimos
 2. Si el buzón está en un dominio organizativo distinto del registro DMARC, ese otro dominio tiene que aceptar los
    informes publicando un registro TXT `v=DMARC1` en `<your domain>._report._dmarc.<its domain>`, por ejemplo
    `acme.io._report._dmarc.example.net`. Sin él, los proveedores de buzón no envían los informes allí
-   ([RFC 7489, sección 7.1](https://www.rfc-editor.org/rfc/rfc7489#section-7.1), comprobado en octubre de 2026).
+   ([RFC 9990, sección 4](https://www.rfc-editor.org/rfc/rfc9990#section-4), comprobado en noviembre de 2026).
 
 3. Guarda los adjuntos de los informes a medida que lleguen. Suelen llegar como archivos `.xml.gz` o `.zip`.
 
@@ -101,6 +139,11 @@ HostRepute analiza los informes, y ReputeCast lee los resultados de los últimos
 ReputeCast solo guarda los recuentos del informe: la política que estaba publicada y, por cada IP de envío, el número
 de mensajes, lo que hizo el receptor y los resultados de SPF y DKIM. Si vuelves a subir el mismo informe (misma
 organización e ID de informe), sustituye a la copia anterior, así que nada se cuenta dos veces.
+
+Desde la versión 1.6.0, se leen los informes en el formato de la RFC 9990 además de los antiguos. La política guardada
+conserva las etiquetas que indica el nuevo formato (`np`, `fo`, `testing` y `discovery_method`, además de `p`, `sp`,
+`adkim` y `aspf`), y la disposición `pass`, que la RFC 9990 añadió para el correo que superó DMARC, cuenta como
+entregado.
 
 El botón de subida solo aparece en la tarjeta vacía. Cuando ya se muestran informes de los últimos 7 días, sube más
 informes con la operación de la API [Upload a DMARC aggregate report](/api/operations/upload-dmarc-report/), que recibe
@@ -129,7 +172,9 @@ mensajes. Consulta [Autenticación y claves de API](/es/developers/api-authentic
 </Screenshot>
 
 La tarjeta se titula **Informes DMARC · últimos 7 días** y resume todos los informes cuyo periodo terminó en los últimos
-7 días. Su insignia es la tasa de pass: la proporción de mensajes que superaron DMARC mediante SPF o DKIM. Es verde a
+7 días, vengan de donde vengan. Debajo del título indica de dónde vienen los informes: la dirección de informes de
+HostRepute, el número de informes subidos y, mientras ReputeCast recibe correo, "Los informes llegan a …" con la hora
+del último. Su insignia es la tasa de pass: la proporción de mensajes que superaron DMARC mediante SPF o DKIM. Es verde a
 partir del 98 %, ámbar a partir del 90 % y roja por debajo.
 
 <TableScroll label="Columnas de la tarjeta DMARC">
@@ -201,8 +246,9 @@ FAQ, comprobado en octubre de 2026).
 
 </Steps>
 
-[BIMI](/es/deliverability/bimi/) necesita `p=quarantine` o `p=reject` aplicado a todo el correo, así que no bajes `pct`
-de 100 si quieres mostrar tu logo.
+[BIMI](/es/deliverability/bimi/) necesita `p=quarantine` o `p=reject`. Para probar la política más estricta antes de
+que se aplique, publícala con `t=y`: los receptores aplican un nivel menos, y el campo `testing` de los informes lo
+indica ([RFC 9989, sección 4.7](https://www.rfc-editor.org/rfc/rfc9989#section-4.7), comprobado en noviembre de 2026).
 
 ## Comprobar que funciona
 
@@ -216,7 +262,8 @@ de 100 si quieres mostrar tu logo.
 
 - **No llega ningún informe.** Revisa si la dirección `rua` tiene erratas y, para un buzón de otro dominio, el registro
   `_report._dmarc` de [En tu propio buzón](#en-tu-propio-buzón). Los informes suelen enviarse una vez al día, así que
-  espera al menos un día después de publicar.
+  espera al menos un día después de publicar. Para la dirección `dmarc@`, comprueba que
+  [la recepción de correo](/es/providers/receiving-mail/) indica <UiPath path="senders.receiving.statusReceiving" />.
 - **"Este informe es de …, que no es un dominio de envío de este espacio de trabajo."** El dominio del informe no
   comparte dominio organizativo con ningún dominio de este espacio de trabajo. Súbelo en el espacio de trabajo que envía
   como ese dominio, o [añade el dominio](/es/providers/senders-and-domains/) primero.
@@ -232,5 +279,6 @@ de 100 si quieres mostrar tu logo.
 
 - [Configurar SPF, DKIM y DMARC](/es/deliverability/spf-dkim-dmarc/)
 - [Conectar HostRepute](/es/deliverability/hostrepute/)
+- [Configurar la recepción de correo](/es/providers/receiving-mail/)
 - [Supervisar el estado de los dominios y los proveedores](/es/deliverability/health/)
 - [Requisitos de Gmail, Yahoo y Microsoft para envíos masivos](/es/deliverability/bulk-sender-requirements/)

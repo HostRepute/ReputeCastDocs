@@ -7,9 +7,10 @@
 // - the "code" of a problem body written by hand, `json.Marshal(map[string]any{"status": …, "title": …, "code": …})`
 //   (middleware outside huma, e.g. app's read-only guard and server's rate limits);
 // - the Code… constants of internal/api, minus UNUSED_CODES (declared there but never returned).
-// A code argument resolves when it is a literal, a constant (package-local or qualified), a local variable the same
-// function assigns literals to, `<sourceErr>.Code` (any Code… constant of the package: the importers' source errors)
-// or a DYNAMIC_CODES entry. Anything else fails the check, so a person reads it and adds it.
+// A code argument resolves when it is a literal (dotted ones too, such as "inbound.unsupported"), a constant
+// (package-local or qualified), a local variable the same function assigns literals to, `<sourceErr>.Code` (any Code…
+// constant of the package: the importers' source errors) or a DYNAMIC_CODES entry. Anything else fails the check, so a
+// person reads it and adds it.
 import { globSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { closingIndex, splitTopLevel } from './cli.ts'
@@ -163,7 +164,7 @@ export function parseApiErrorCodes(
       ]
       for (const { at, expr } of sites) {
         if (expr === undefined || (fn.params.includes(expr) && isWrapper(f.dir, fn.name))) continue
-        const literal = expr.match(/^"([a-z0-9_]+)"$/)?.[1]
+        const literal = expr.match(/^"([a-z0-9_]+(?:\.[a-z0-9_]+)*)"$/)?.[1]
         const ref = expr.match(/^(\w+)\.(\w+)$/)
         let found: string[] | undefined
         if (literal) found = [literal]

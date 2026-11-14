@@ -1,0 +1,159 @@
+---
+title: Triển khai ReputeCast trên DigitalOcean App Platform
+description: Triển khai ReputeCast trên DigitalOcean App Platform từ template của kho mã, với cơ sở dữ liệu PostgreSQL, một bucket Spaces cho tệp và tên miền riêng.
+type: how-to
+audience: [operator]
+primaryKeyword: triển khai ReputeCast trên DigitalOcean
+sources:
+  - .do/deploy.template.yaml
+  - deploy/Dockerfile.release
+  - internal/config/config.go
+  - internal/blobstore
+  - internal/cli/install.go
+  - docs/deploy/README.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+Hướng dẫn này triển khai ReputeCast trên DigitalOcean App Platform từ template Deploy to DigitalOcean của kho mã: Docker
+image của ReputeCast chạy dạng service, một cơ sở dữ liệu PostgreSQL bên cạnh và một bucket Spaces cho các tệp được tải
+lên. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+App Platform không có disk lưu trữ lâu dài, nên template giữ các tệp được tải lên trong một bucket Spaces
+(`storage.backend: s3`, xem [lưu trữ đối tượng](/vi/self-hosting/object-storage/)) và khóa bí mật trong một biến do bạn
+nhập, thay cho volume `/var/lib/reputecast` mà các nền tảng khác dùng.
+
+## Trước khi bắt đầu
+
+- Một tài khoản DigitalOcean. Xem thêm [yêu cầu hệ thống](/vi/self-hosting/requirements/): template chạy một instance
+  `apps-s-1vcpu-1gb` (1 vCPU, 1 GB).
+- OpenSSL hoặc Docker trên máy tính của bạn, để tạo khóa bí mật.
+- Nếu muốn, một tên miền cho ReputeCast, ví dụ `news.example.com`, tại một nhà cung cấp DNS cho phép bạn thêm bản ghi
+  `CNAME`.
+
+## Triển khai ReputeCast
+
+<Steps>
+
+1. Trong bảng điều khiển của DigitalOcean, tạo một bucket Spaces, ví dụ `reputecast-files`. Template dùng region `nyc3`;
+   với region khác, hãy đổi hai biến ở bước 6.
+
+2. Trong **Spaces Object Storage** › **Access Keys**, nhấn **Create Access Key**, chọn **Limited access**, cấp quyền
+   **Read/Write/Delete** trên bucket rồi tạo khóa. Sao chép access key và secret của nó; secret chỉ hiện một lần
+   ([manage access to Spaces](https://docs.digitalocean.com/products/spaces/how-to/manage-access/), kiểm tra tháng
+   11/2026).
+
+3. Tạo khóa bí mật và lưu nó vào trình quản lý mật khẩu: `openssl rand -base64 32` hoặc
+   `docker run --rm ghcr.io/hostrepute/reputecast:v1.6.0 secrets generate-key`. Cả hai lệnh đều in ra 44 ký tự, kết
+   thúc bằng `=`.
+
+4. Mở template:
+   `https://cloud.digitalocean.com/apps/new?repo=https://github.com/hostrepute/reputecast/tree/main`. App Platform đọc
+   `.do/deploy.template.yaml` từ kho mã: một service, `reputecast`, chạy `ghcr.io/hostrepute/reputecast:latest` ở cổng
+   8080, và một dev database, `db`, chạy PostgreSQL 18.
+
+5. Nhập các biến mà template để trống:
+
+   ```sh title="Environment variables"
+   REPUTECAST_ADMIN_EMAIL=you@company.com
+   REPUTECAST_SECRETS__KEY=paste-the-key-from-step-3
+   REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+   REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=paste-the-access-key
+   REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=paste-its-secret
+   ```
+
+   Template đánh dấu khóa bí mật và hai khóa của bucket là secret, và tự đặt các biến còn lại:
+
+   - `REPUTECAST_PUBLIC_URL=${APP_URL}`, địa chỉ của ứng dụng, đi theo tên miền chính của ứng dụng.
+   - `DATABASE_URL=${db.DATABASE_URL}`, dev database. ReputeCast đọc `DATABASE_URL` khi `REPUTECAST_DATABASE__URL` chưa
+     được đặt.
+   - `REPUTECAST_HTTP__TRUSTED_PROXIES=private`: proxy của App Platform kết nối tới ứng dụng qua mạng riêng
+     ([proxy tin cậy](/vi/deploy/overview/#proxy-tin-cậy)).
+   - `REPUTECAST_STORAGE__BACKEND=s3`, cùng `REPUTECAST_STORAGE__S3__REGION=nyc3` và
+     `REPUTECAST_STORAGE__S3__ENDPOINT=https://nyc3.digitaloceanspaces.com`.
+
+6. Với bucket nằm ngoài `nyc3`, hãy đổi `REPUTECAST_STORAGE__S3__REGION` và region trong
+   `REPUTECAST_STORAGE__S3__ENDPOINT` thành region của bucket, ví dụ `fra1` và `https://fra1.digitaloceanspaces.com`.
+
+7. Tạo ứng dụng. App Platform kéo image và khởi động ReputeCast; ReputeCast áp dụng các migration và tạo Chủ sở hữu đầu
+   tiên. Health check gọi `/readyz` mười giây một lần và cho lần khởi động đầu tiên 30 lần kiểm tra thất bại, khoảng năm
+   phút, trước khi bỏ cuộc.
+
+8. Mở tab **Runtime Logs** của ứng dụng, chọn component `reputecast` và tìm `ReputeCast is installed`. Thông báo này
+   chứa mật khẩu tạm thời của Chủ sở hữu đầu tiên:
+
+   ```txt title="Runtime Logs"
+     ReputeCast is installed.
+
+     Sign in at  https://reputecast-abcde.ondigitalocean.app
+     Email       you@company.com
+     Password    SHLn-zHfR-cf6j-NEm5   (temporary: you'll replace it at first sign-in)
+   ```
+
+9. Mở URL của ứng dụng và đăng nhập. [Lần đăng nhập đầu tiên](/vi/self-hosting/first-run/) yêu cầu bạn thay mật khẩu,
+   thêm khóa truy cập hoặc ứng dụng xác thực, lưu mã khôi phục, xác nhận thông tin cơ bản của hệ thống và tạo không gian
+   làm việc.
+
+10. Trước khi dựa vào cơ sở dữ liệu, hãy chuyển đổi nó: trên tab **Settings** của ứng dụng, chọn component `db`, rồi
+    trong **Database Type & Scale** nhấn **Convert to a Managed Database**. App Platform chuyển dữ liệu sang một
+    managed database
+    ([manage databases](https://docs.digitalocean.com/products/app-platform/how-to/manage-databases/), kiểm tra tháng
+    11/2026).
+
+</Steps>
+
+<Aside type="caution">
+  Hãy giữ `REPUTECAST_SECRETS__KEY` bên ngoài DigitalOcean, cùng với các bản sao lưu cơ sở dữ liệu: thiếu nó, thông tin
+  xác thực của nhà cung cấp lưu trong cơ sở dữ liệu không thể giải mã được, và các liên kết trong những email đã gửi sẽ
+  ngừng hoạt động.
+</Aside>
+
+### Dùng tên miền riêng
+
+1. Trên tab **Networking** của ứng dụng, trong **Domains**, nhấn **Add domain**, nhập `news.example.com`, chọn **You
+   manage your domain** và thêm bản ghi `CNAME` mà App Platform hiển thị (kết thúc bằng `ondigitalocean.app`) tại nhà
+   cung cấp DNS của bạn
+   ([manage domains](https://docs.digitalocean.com/products/app-platform/how-to/manage-domains/), kiểm tra tháng
+   11/2026).
+2. Khi tên miền đã là tên miền chính của ứng dụng, `${APP_URL}` đi theo nó ở lần triển khai tiếp theo.
+3. Trong ReputeCast, mở <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, đổi
+   <UiPath path="admin.publicUrl" /> thành `https://news.example.com` rồi lưu. Địa chỉ đã lưu ở lần đăng nhập đầu tiên
+   được ưu tiên hơn biến môi trường, và khi lưu, webhook của nhà cung cấp được chuyển sang địa chỉ mới.
+
+## Kiểm tra kết quả
+
+- Tab **Activity** của ứng dụng cho thấy lần triển khai đang hoạt động: health check `/readyz` đã đạt.
+- `https://news.example.com/readyz` trả về `ready`, hoặc 503 kèm lý do, ví dụ `database unavailable`.
+- <UiPath path="shell.userMenuInstanceAdmin > admin.system" /> hiển thị <UiPath path="admin.system.filesStorageS3" />
+  trong <UiPath path="admin.system.filesTitle" />, cùng bucket và endpoint của bạn.
+
+## Nâng cấp
+
+1. Đọc ghi chú phát hành và [sao lưu](/vi/self-hosting/backups/) cơ sở dữ liệu và bucket Spaces.
+2. Triển khai lại ứng dụng: App Platform kéo image theo tag mà service ghi, trong template là `latest`. Để cố định một bản
+   phát hành, hãy đặt tag image của service thành tag đó trong phần cài đặt của ứng dụng.
+3. ReputeCast áp dụng các migration mới khi khởi động ([nâng cấp ReputeCast](/vi/self-hosting/upgrades/)).
+
+## Khắc phục sự cố
+
+- **Lần triển khai thất bại và log hiện `secrets.key: key must be base64-encoded`** hoặc `key must be 32 bytes`:
+  `REPUTECAST_SECRETS__KEY` không phải là khóa tạo ở bước 3. Hãy dán lại, không kèm khoảng trắng.
+- **Log hiện `storage.s3.bucket is required with storage.backend s3`**: `REPUTECAST_STORAGE__S3__BUCKET` đang trống.
+- **Tải tệp lên thất bại với lỗi truy cập**: access key thiếu quyền Read/Write/Delete trên bucket, hoặc region trong
+  `REPUTECAST_STORAGE__S3__ENDPOINT` không phải region của bucket
+  ([khắc phục sự cố lưu trữ đối tượng](/vi/self-hosting/object-storage/#khắc-phục-sự-cố)).
+- **Liên kết trong email vẫn dùng địa chỉ `ondigitalocean.app`**: URL công khai đã lưu trong Quản trị hệ thống vẫn là
+  địa chỉ đó. Hãy đổi nó ở đó (bước 3 của [dùng tên miền riêng](#dùng-tên-miền-riêng)).
+- **Lần triển khai không bao giờ được đưa vào hoạt động**: `/readyz` không trả về `ready` trong 30 lần thử của health check. Hãy đọc
+  runtime log: các migration có thể vẫn đang chạy, hoặc không kết nối được cơ sở dữ liệu.
+
+Tài liệu của nền tảng (kiểm tra tháng 11/2026):
+[Deploy to DigitalOcean button](https://docs.digitalocean.com/products/app-platform/how-to/add-deploy-do-button/),
+[Manage databases](https://docs.digitalocean.com/products/app-platform/how-to/manage-databases/),
+[Environment variables](https://docs.digitalocean.com/products/app-platform/how-to/use-environment-variables/),
+[Manage domains](https://docs.digitalocean.com/products/app-platform/how-to/manage-domains/),
+[View logs](https://docs.digitalocean.com/products/app-platform/how-to/view-logs/),
+[Spaces access keys](https://docs.digitalocean.com/products/spaces/how-to/manage-access/).

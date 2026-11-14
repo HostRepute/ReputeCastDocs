@@ -1,0 +1,261 @@
+---
+title: Lưu tệp trong lưu trữ đối tượng tương thích S3
+description: Lưu các tệp được tải lên của ReputeCast trong lưu trữ đối tượng tương thích S3 như AWS S3, MinIO, Cloudflare R2 hoặc Spaces, và chuyển thư mục tệp sang bucket.
+type: how-to
+audience: [operator]
+primaryKeyword: lưu trữ đối tượng tương thích S3
+uiPath: 'shell.userMenuInstanceAdmin > admin.system'
+sources:
+  - internal/blobstore
+  - internal/config/config.go
+  - internal/cli/storage.go
+  - internal/cli/doctor.go
+  - internal/instance/system.go
+  - web/src/features/admin/system
+  - deploy/helm/reputecast/values.yaml
+  - docs/deploy/configuration.md
+  - docs/deploy/backup-restore.md
+sidebar:
+  order: 9
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+ReputeCast có thể giữ các tệp nó lưu ngoài cơ sở dữ liệu trong lưu trữ đối tượng tương thích S3 thay cho thư mục tệp
+cục bộ, để nhiều tiến trình web và worker dùng chung các tệp đó mà không cần một volume dùng chung. Có từ bản phát hành
+tiếp theo sau 1.6.0.
+
+Các tệp này là tệp của sản phẩm số, quà tặng đăng ký, các lượt tải lên đang dở (tệp sản phẩm được gửi lên theo từng
+phần) và bản xuất danh sách người đăng ký. Với `storage.backend: local`, giá trị mặc định, chúng nằm trong thư mục tệp
+(`files.dir`, là `/var/lib/reputecast/files` trong Docker image). Với `storage.backend: s3`, chúng nằm trong một bucket:
+AWS S3, MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, Wasabi hoặc bất kỳ dịch vụ nào khác hỗ trợ API S3. Cả
+hai backend đặt tên tệp theo cùng các khóa, nên chuyển từ backend này sang backend kia chỉ là một lần sao chép.
+
+Bạn cần một bucket khi:
+
+- bạn chạy nhiều tiến trình web hoặc worker trên các máy khác nhau
+  ([mở rộng với các vai trò](/vi/self-hosting/scaling/)) và không có volume ReadWriteMany để dùng chung giữa chúng;
+- bạn cài [trên Kubernetes bằng Helm](/vi/deploy/kubernetes/) ở chế độ split, chế độ này từ chối lưu trữ cục bộ;
+- nền tảng của bạn không có disk lưu trữ lâu dài, như [DigitalOcean App Platform](/vi/deploy/digitalocean/).
+
+Một tiến trình có volume, như bản cài [Docker Compose](/vi/self-hosting/docker/), chỉ cần thư mục của nó.
+
+## Trước khi bắt đầu
+
+- Tạo bucket ở nhà cung cấp của bạn. ReputeCast không tạo bucket.
+- Tạo thông tin xác thực được phép dùng bucket: một access key và secret của nó, hoặc, trên AWS, một role mà chuỗi
+  thông tin xác thực mặc định tìm thấy (biến môi trường, tệp thông tin xác thực dùng chung, role của EC2 hoặc ECS, IRSA
+  hoặc EKS Pod Identity). Thông tin xác thực cần `s3:ListBucket` trên bucket và `s3:GetObject`, `s3:PutObject`,
+  `s3:DeleteObject` và `s3:AbortMultipartUpload` trên các đối tượng của nó (dưới tiền tố, nếu bạn đặt). Với mã hóa
+  `aws:kms`, thông tin xác thực còn cần `kms:GenerateDataKey` và `kms:Decrypt` trên khóa. Chính sách AWS này cấp các
+  quyền đó cho bucket `reputecast-files`:
+
+  ```json title="IAM policy"
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": "arn:aws:s3:::reputecast-files"
+      },
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+        "Resource": "arn:aws:s3:::reputecast-files/*"
+      }
+    ]
+  }
+  ```
+
+- Thêm một lifecycle rule hủy các lượt tải lên nhiều phần chưa hoàn tất sau một ngày. Tệp trên 16 MB được tải lên theo
+  các phần 8 MB, và quy tắc này dọn các phần của một tiến trình bị dừng giữa chừng khi đang tải lên.
+- Tạo một [bản sao lưu](/vi/self-hosting/backups/) của cơ sở dữ liệu, khóa bí mật và thư mục tệp.
+
+## Đặt bucket
+
+Đặt các khóa `storage.s3` trên mọi tiến trình ReputeCast, với cùng giá trị. Tạm thời giữ `storage.backend` là `local`:
+thư mục tệp vẫn được dùng cho đến khi bạn [chuyển nó](#chuyển-thư-mục-tệp-sang-bucket).
+[Tham chiếu cấu hình](/vi/reference/configuration/#storage) mô tả từng khóa.
+
+<Tabs syncKey="s3">
+<TabItem label="AWS S3">
+
+Không cần endpoint: `storage.s3.endpoint` để trống nghĩa là AWS. Không có access key, chuỗi thông tin xác thực mặc định
+của AWS được dùng.
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=eu-central-1
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=AKIA…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+# Optional: SSE-KMS with your own key instead of the bucket's default encryption.
+# REPUTECAST_STORAGE__S3__SSE=aws:kms
+# REPUTECAST_STORAGE__S3__KMS_KEY_ID=arn:aws:kms:eu-central-1:111122223333:key/…
+```
+
+</TabItem>
+<TabItem label="MinIO">
+
+MinIO và phần lớn các dịch vụ tự lưu trữ đặt tên bucket trong đường dẫn, nên hãy đặt `storage.s3.path_style`. `http://`
+thuần dùng được cho một máy chủ MinIO trong mạng của chính bạn.
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__ENDPOINT=http://minio:9000
+REPUTECAST_STORAGE__S3__PATH_STYLE=true
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+<TabItem label="Cloudflare R2">
+
+Endpoint là `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`, và region của bucket R2 là `auto`; region để trống và
+`us-east-1` đều được hiểu là `auto` ([R2 S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/), kiểm
+tra tháng 11/2026).
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=auto
+REPUTECAST_STORAGE__S3__ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+<TabItem label="DigitalOcean Spaces">
+
+Endpoint là `https://<region>.digitaloceanspaces.com`, với region trung tâm dữ liệu nơi bucket nằm, ví dụ `nyc3`
+([Spaces with AWS SDKs](https://docs.digitalocean.com/products/spaces/how-to/use-aws-sdks/), kiểm tra tháng 11/2026).
+Tạo khóa trong **Spaces Object Storage** › **Access Keys** với quyền Read/Write/Delete trên bucket; secret của nó chỉ
+hiện một lần ([manage access](https://docs.digitalocean.com/products/spaces/how-to/manage-access/), kiểm tra tháng
+11/2026).
+
+```sh title=".env"
+REPUTECAST_STORAGE__S3__BUCKET=reputecast-files
+REPUTECAST_STORAGE__S3__REGION=nyc3
+REPUTECAST_STORAGE__S3__ENDPOINT=https://nyc3.digitaloceanspaces.com
+REPUTECAST_STORAGE__S3__ACCESS_KEY_ID=…
+REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY=…
+```
+
+</TabItem>
+</Tabs>
+
+- `storage.s3.prefix` (`REPUTECAST_STORAGE__S3__PREFIX`) đặt mọi khóa dưới một tiền tố như `reputecast/`, để dùng chung
+  bucket với thứ khác. Tiền tố không được bắt đầu bằng `/`.
+- Khi có endpoint, ReputeCast chỉ gửi checksum của yêu cầu ở những nơi S3 bắt buộc, vì một số dịch vụ tương thích S3
+  không nhận các checksum mà AWS SDK gửi theo mặc định.
+- Với Docker Compose, một biến chỉ đến được container khi tệp Compose có nhắc tới nó: hãy thêm các biến này vào
+  `docker-compose.override.yml`
+  ([các thiết lập khác](/vi/self-hosting/docker/#các-thiết-lập-khác-trong-docker-composeoverrideyml)).
+- Trên Kubernetes với Helm, hãy đặt `storage.backend`, `storage.s3.*` và `storage.s3.existingSecret` trong các giá trị
+  của chart ([Kubernetes](/vi/deploy/kubernetes/#chế-độ-split-và-bucket)).
+
+## Chuyển thư mục tệp sang bucket
+
+<Steps>
+
+1. Khi đã đặt các khóa `storage.s3` và `storage.backend` vẫn là `local`, hãy đếm những gì lần sao chép sẽ làm:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast storage migrate --to s3 --dry-run
+   ```
+
+   ```txt title="Kết quả"
+   30 files, 4.1 MiB in /var/lib/reputecast/files.
+   Dry run: 30 files (4.1 MiB) would be copied to the bucket reputecast-files; 0 are there already at the same size; 0 couldn't be checked.
+   ```
+
+   Lệnh dừng lại và cho biết cần đặt gì khi các khóa chưa nêu tên bucket, và kiểm tra bucket có trả lời hay không trước
+   khi đếm.
+
+2. Sao chép các tệp:
+
+   ```sh
+   docker compose exec app /usr/local/bin/reputecast storage migrate --to s3
+   ```
+
+   Lệnh sao chép mọi tệp với cùng khóa, mỗi lần tám tệp, đọc lại từng bản sao để kiểm tra SHA-256 và bỏ qua những tệp mà
+   bucket đã có với cùng kích thước. Lệnh không bao giờ xóa tệp cục bộ, chạy an toàn trong khi ReputeCast đang chạy và
+   chạy lại cũng an toàn. Tệp sao chép thất bại được nêu tên trên standard error, lệnh thoát với mã 1, và lần chạy tiếp
+   theo sẽ sao chép tệp đó. Lần sao chép được ghi vào nhật ký kiểm tra của hệ thống.
+
+3. Đặt `REPUTECAST_STORAGE__BACKEND=s3` trên mọi tiến trình.
+
+4. Chạy `reputecast storage migrate --to s3` thêm một lần, cho các tệp được tải lên trong lúc đó, rồi khởi động lại mọi
+   tiến trình (`docker compose up -d`). Một lượt tải lên hoặc bản xuất đang chạy trong lúc chuyển sẽ bắt đầu lại.
+
+5. Giữ thư mục tệp cho đến khi việc tải xuống từ bucket hoạt động.
+
+</Steps>
+
+<Aside type="caution">
+  Mọi tiến trình web và worker phải dùng cùng một backend. Một tiến trình vẫn dùng `local` sẽ đọc và ghi thư mục trong
+  khi các tiến trình khác dùng bucket, và một tệp sản phẩm được tải lên qua một bên sẽ không có ở bên kia.
+</Aside>
+
+## Tệp đi qua bucket như thế nào
+
+- **Tệp sản phẩm được tải lên** theo từng phần: mỗi phần là một đối tượng riêng, và khi hoàn tất lượt tải lên, các phần
+  được ghép liên tiếp vào khóa cuối cùng của tệp và kết quả được kiểm tra với SHA-256 của tệp.
+- **Bản xuất danh sách người đăng ký** ghi một phần cho mỗi lô và nối các phần thành tệp mà mọi người tải về.
+- **Tải xuống** vẫn đi qua ReputeCast, không bao giờ trực tiếp từ bucket, nên giới hạn tải xuống, thời hạn, việc đếm và
+  tải xuống tiếp tục (yêu cầu `Range`) hoạt động như với thư mục.
+- **Mã hóa**: `storage.s3.sse` đặt mã hóa phía máy chủ cho những gì ReputeCast ghi, `AES256` (SSE-S3) hoặc `aws:kms`
+  (SSE-KMS, với `storage.s3.kms_key_id` hoặc khóa mặc định của tài khoản cho S3). Để trống sẽ giữ mã hóa mặc định của
+  bucket.
+
+## Kiểm tra kết quả
+
+- `reputecast doctor` in dòng lưu trữ tệp là `ok`: bucket đã trả lời, và một đối tượng thử dưới `.doctor/` đã được ghi,
+  đọc lại và xóa.
+
+  ```txt title="reputecast doctor"
+  [ok  ] File storage       s3 bucket reputecast-files at https://nyc3.digitaloceanspaces.com: 30 objects, 4.1 MiB; a test object was written and deleted
+  ```
+
+- <UiPath path="shell.userMenuInstanceAdmin > admin.system" /> hiển thị backend trong
+  <UiPath path="admin.system.filesTitle" />: <UiPath path="admin.system.filesStorage" /> ghi
+  <UiPath path="admin.system.filesStorageS3" />, kèm <UiPath path="admin.system.filesBucket" />,
+  <UiPath path="admin.system.filesPrefix" /> khi bạn đặt, <UiPath path="admin.system.filesEndpoint" /> (hoặc AWS S3 và
+  region của nó) và những gì bucket đang chứa, được đếm 5 phút một lần. Các access key không bao giờ được hiển thị.
+
+  <Screenshot
+    id="instance-file-storage"
+    alt="Thẻ Nơi lưu tệp của Quản trị hệ thống, Hệ thống, với bộ lưu trữ cục bộ của bản demo: Nơi lưu là Thư mục cục bộ, thư mục data/files, 3 tệp 225 B, đếm lại mỗi 5 phút, và ghi chú rằng mọi tiến trình web và worker cần dùng chung một thư mục."
+  />
+
+  Với bucket, cùng thẻ này ghi Bucket tương thích S3, nêu tên bucket và endpoint của nó, và cho biết mọi tiến trình web
+  và worker đọc chung một bucket.
+
+- Tệp của một sản phẩm số tải xuống được từ [trang sản phẩm](/vi/earn/digital-products/), và một bản xuất danh sách
+  người đăng ký mở được.
+
+## Khắc phục sự cố
+
+- **ReputeCast không khởi động: `storage.s3.bucket is required with storage.backend s3`**: đặt
+  `REPUTECAST_STORAGE__S3__BUCKET`. Các lỗi khởi động khác nêu tên khóa cần sửa: endpoint không phải URL `http://` hay
+  `https://`, chỉ có một trong hai access key, tiền tố bắt đầu bằng `/`, `storage.s3.sse` khác `AES256` và `aws:kms`,
+  hoặc có `storage.s3.kms_key_id` mà không có `aws:kms`.
+- **`reputecast doctor`: `the bucket … doesn't exist`**: tên hoặc region bị sai, hoặc, ngoài AWS, endpoint bị sai.
+  MinIO và phần lớn các dịch vụ tự lưu trữ cũng cần `REPUTECAST_STORAGE__S3__PATH_STYLE=true`.
+- **`reputecast doctor`: `the credentials may not use the bucket …`**, hoặc `… answers but a test object can't be
+  written`: khóa thiếu một quyền nêu trong [trước khi bắt đầu](#trước-khi-bắt-đầu).
+- **Một tệp không tồn tại hiện lỗi "access denied" thay vì "not found"**: thông tin xác thực thiếu `s3:ListBucket`;
+  thiếu quyền này, S3 trả lời mọi khóa không tồn tại bằng lỗi access denied.
+- **`storage migrate` thoát với mã 1 và nêu tên các tệp**: hãy chạy lại; lệnh chỉ sao chép những gì còn thiếu hoặc đã
+  thất bại.
+- **Tải xuống thất bại ở một số tiến trình sau khi chuyển**: một tiến trình vẫn chạy với `storage.backend` là `local`.
+  Hãy đặt cùng các khóa lưu trữ ở mọi nơi rồi khởi động lại.
+
+## Liên quan
+
+- [Sao lưu và khôi phục](/vi/self-hosting/backups/): bucket thuộc về bản sao lưu cùng với cơ sở dữ liệu và khóa.
+- [Mở rộng với các vai trò web, ingest và worker](/vi/self-hosting/scaling/)
+- [Triển khai ReputeCast trên Kubernetes bằng Helm](/vi/deploy/kubernetes/)
+- [Tham chiếu CLI](/vi/reference/cli/#storage-migrate): `storage migrate` và `doctor`.
+- [Tham chiếu cấu hình](/vi/reference/configuration/#storage): mọi khóa `storage`.

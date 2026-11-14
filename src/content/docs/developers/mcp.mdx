@@ -16,11 +16,14 @@ sources:
   - internal/mcpserver/resources.go
   - internal/app/wire_mcpserver.go
   - internal/authz/permissions.go
+  - internal/apikeys/apikeys.go
+  - internal/server/prefix.go
   - internal/campaigns/agent.go
   - web/src/features/keys/McpPage.tsx
   - web/src/features/keys/CreateKeyDialog.tsx
+  - web/src/features/keys/AllowedIpsDialog.tsx
 sidebar:
-  order: 9
+  order: 10
 ---
 
 import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
@@ -55,9 +58,12 @@ of running.
 
 3. Pick its permissions. Start with read access, such as `reports:view` and `deliverability:view`, and add more
    later. A permission you don't hold is locked. Agents can never hold `subscribers:verify`, `placement:run`,
-   `placement:manage`, `integrations:manage`, `ai:use` or the agency permissions.
+   `placement:manage`, `coupons:manage`, `comments:moderate`, `replies:view` and `replies:manage` (API keys can),
+   nor `integrations:manage`, `ai:use` or the agency permissions (people only). Replies, website comments and discount
+   code pools stay with people. Available from the next release after 1.6.0.
 
-4. Optionally limit the agent to some lists and set an expiry, then create it.
+4. Optionally limit the agent to some lists, set an expiry and fill <UiPath path="keys.allowedIpsLabel" />
+   ([limit an agent to allowed IPs](#limit-an-agent-to-allowed-ips)), then create it.
 
 5. Copy the token, `rc_agent_…`. It is shown once; ReputeCast keeps only its SHA-256 hash.
 
@@ -65,7 +71,7 @@ of running.
 
 <Screenshot
   id="settings-mcp"
-  alt="Settings, Keys & MCP: the MCP card with the endpoint and a client configuration snippet, and the agents matrix. One agent can read reports and contacts; an ops agent reads provider health and may pause sends but never start them."
+  alt="Settings, Keys & MCP: the MCP card with the endpoint and a client configuration snippet, and the agents matrix. One agent can read reports and contacts; an ops agent, limited to one allowed IP, reads provider health and may pause sends but never start them. Each row has Allowed IPs… and Edit."
 />
 
 The agents matrix shows what each agent can do, derived from its permissions:
@@ -227,6 +233,37 @@ content test) and the A/B decision with its confidence. An agent answers from th
 An agent's permissions are checked again on every call against its creator's current role. When the creator loses a
 permission, the agent loses it too; when the creator leaves the workspace or is deactivated, the agent can do nothing.
 
+Its lists follow the same rule (since 1.5.0): on every call they are cut down to the lists and sender domains its
+creator reaches at that moment. An agent limited to some lists finds only the contacts on them with
+`search_contacts` and `get_contact`, and `resume_campaign` resumes only a campaign within its lists and sender
+domains, as a person limited the same way can in ReputeCast.
+
+## Limit an agent to allowed IPs
+
+An agent can be limited to the addresses its client calls from: up to 50 IPv4 or IPv6 addresses and networks, such
+as `203.0.113.7` or `203.0.113.0/24` (since 1.6.0). An empty list, the default, allows any address.
+
+<Steps>
+
+1. In the agents matrix, select <UiPath path="keys.allowedIpsButton" /> on the agent's row.
+
+2. Enter one address or network per line. The field shows where the token was last used and your own address as
+   ReputeCast sees it, each with a link to add it.
+
+3. Save. A list that leaves out the address the token was last used from asks first; choose
+   <UiPath path="keys.saveAnyway" /> only if that client should be refused.
+
+</Steps>
+
+The check runs after the token is verified. A call from another address, or from one ReputeCast can't tell, answers
+`401` with `this agent can't be used from <address>; add the address to its allowed IPs in Settings › Keys & MCP`,
+and is counted. Behind a reverse proxy, list the proxy in `http.trusted_proxies` first, or every call seems to come
+from the proxy; the dialog warns when it may. Letting the agent be called from more places needs every permission
+the agent holds and its lists within your own scope, as rotating it does. A signed-in person sets the list, here or
+with `PUT /api/v1/workspaces/<workspace>/mcp-agents/<keyId>/allowed-ips`; the change is in the audit log as
+`agent.updated`. The rules are the same as for
+[API keys](/developers/api-authentication/#limit-a-key-to-allowed-ips).
+
 ## Proposals for anything that sends
 
 Agents don't start sends.
@@ -269,8 +306,13 @@ turns the MCP server off. While it is off, every agent token is refused. An agen
 - **401 "this agent was revoked" or "… expired"**: create a new agent or rotate its token in
   <UiPath path="nav.settings > settings.keys" />.
 - **401 "the MCP server is off"**: turn it on under <UiPath path="keys.changeLimits" />.
+- **401 "this agent can't be used from …"**: the client calls from outside the agent's allowed IPs. Add the address
+  the error names with <UiPath path="keys.allowedIpsButton" />, or list your reverse proxy in `http.trusted_proxies`
+  when the address is the proxy's.
 - **The client connects but every tool is denied**: the agent lacks the permission, or its creator no longer holds it.
   The error names the permission.
+- **The agent finds no contacts, or fewer than expected**: the agent, or the member who created it, is limited to
+  some lists.
 - **Claude Code skips the server**: the `.mcp.json` entry has a `url` but no `"type": "http"`.
 - **Calls hang or time out behind a proxy**: the proxy buffers `/mcp` responses. Turn off buffering for that path.
 - **429 errors**: the agent made more calls than the workspace allows per minute. Raise the limit or slow the agent.

@@ -8,6 +8,7 @@ uiPath: 'nav.settings > settings.webhooks'
 primaryKeyword: Webhook-Signatur prüfen
 sources:
   - internal/webhooks/webhooks.go
+  - internal/webhooks/access.go
   - internal/webhooks/batch.go
   - internal/webhooks/email.go
   - internal/webhooks/jobs.go
@@ -15,8 +16,11 @@ sources:
   - internal/store/queries/webhooks.sql
   - internal/netguard/netguard.go
   - web/src/features/webhooks
+  - sdk/client-ts/src/webhooks.ts
+  - sdk/client-python/src/reputecast/webhooks.py
+  - sdk/client-go/webhooks
 sidebar:
-  order: 8
+  order: 9
 ---
 
 import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
@@ -31,7 +35,9 @@ damit Ihr Code nur auf Anfragen reagiert, die wirklich von Ihrer ReputeCast-Inst
 
 ## Bevor Sie beginnen
 
-- Sie brauchen `webhooks:manage` im Arbeitsbereich.
+- Sie brauchen `webhooks:manage` im Arbeitsbereich, seit Version 1.5.0 eine
+  [sensible Berechtigung](/de/reference/glossary/#sensitive-permission), und die Ansichtsberechtigung für das, was
+  jedes gewählte Ereignis enthält ([für wen ein Endpunkt sendet](#für-wen-ein-endpunkt-sendet)).
 - Ihr Endpunkt braucht eine URL, die Ihr ReputeCast-Server erreichen kann, etwa
   `https://api.example.com/webhooks/reputecast`. Adressen in privaten und internen Netzwerken (`10.0.0.0/8`,
   `localhost`, `*.internal` und Ähnliches) werden abgewiesen, sofern ein Instanz-Admin nicht
@@ -65,7 +71,7 @@ damit Ihr Code nur auf Anfragen reagiert, die wirklich von Ihrer ReputeCast-Inst
 
 <Screenshot
   id="settings-webhooks"
-  alt="Einstellungen, Tab Webhooks: vier ausgehende Webhook-Endpunkte mit ihren Ereignissen, der Erfolgsquote der letzten 24 Stunden und ihrem Status. Ein Endpunkt für ein Data Warehouse, der email.* abonniert, schlägt mit HTTP 502 fehl, und ein Endpunkt von n8n ist als von n8n verwaltet markiert. Darunter die Karte Signatur prüfen."
+  alt="Einstellungen, Tab Webhooks: ein Hinweis, dass API-Schlüssel und MCP-Agenten nach Schlüssel & MCP umgezogen sind, dann vier ausgehende Webhook-Endpunkte mit ihren Ereignissen, der Erfolgsquote der letzten 24 Stunden und ihrem Status. Ein Endpunkt für ein Data Warehouse, der email.* abonniert, schlägt mit HTTP 502 fehl, und ein Endpunkt von n8n ist als von n8n verwaltet markiert. Darunter die Karte Signatur prüfen."
 />
 
 Dieselben Endpunkte lassen sich über die API verwalten: `create-webhook`, `update-webhook`, `pause-webhook`,
@@ -80,6 +86,51 @@ gesendet: Ereignisse `email.*` melden E-Mails aus Kampagnen und Automationen, un
 Ereignisse `message.*`.
 
 `webhook.test` steht nicht im Katalog: Nur der Test-Button und die Operation `test-webhook` senden es.
+
+`email.replied` (ein Kontakt hat auf eine E-Mail geantwortet, Abwesenheitsnotizen eingeschlossen) und `email.received`
+(andere E-Mails, die an der Empfangsdomain angekommen sind) stammen vom [E-Mail-Empfang](/de/providers/receiving-mail/)
+und aus dem [Posteingang für Antworten](/de/audience/replies/). Sie beginnen mit `email.`, daher schließt `email.*` sie
+ein, samt ihrem Bedarf an `replies:view`. `subscription.paused` und `subscription.resumed` melden, dass die Zahlungen
+eines zahlenden Mitglieds bis zu einem Datum pausieren und wieder beginnen. Verfügbar ab der nächsten Version nach
+1.6.0.
+
+## Für wen ein Endpunkt sendet
+
+Ein Endpunkt sendet seine Ereignisse im Namen der Person, die zuletzt seine Ereignisse festgelegt oder ihn fortgesetzt
+hat: bei einem Endpunkt, den ein API-Schlüssel erstellt hat, im Namen der Person, die den Schlüssel erstellt hat. Was
+ein Ereignis enthält, entscheidet, wer es irgendwohin senden lassen darf:
+
+| Ereignisse                                                                                      | Die Person braucht                                                   |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `contact.*`, `email.*`, `form.*`, `sms.*`, `push.*` und `whatsapp.*`, außer den Zeilen unten     | `subscribers:view` und Zugriff auf jede Liste                        |
+| `email.replied`, `email.received`                                                               | `replies:view` und Zugriff auf jede Liste                            |
+| `referral.*`                                                                                    | `grow:view` und `subscribers:view` sowie Zugriff auf jede Liste      |
+| `subscription.*`, `access.*`, `gift.*`, `conversion.*`                                          | `earn:view` und `subscribers:view` sowie Zugriff auf jede Liste      |
+| `order.*`                                                                                       | `products:view` und `subscribers:view` sowie Zugriff auf jede Liste  |
+| `message.*`                                                                                     | `transactional:view`                                                 |
+| `campaign.*`, `approval.*`                                                                      | `campaigns:view`                                                     |
+| `automation.*`                                                                                  | `automations:view`                                                   |
+| `provider.*`, `whatsapp.template_status`                                                        | `providers:view`                                                     |
+| `post.*`                                                                                        | `website:view`                                                       |
+
+Ereignisse mit Kontakten enthalten Kontakte aus jeder Liste, daher kann eine Person oder ein Schlüssel mit Beschränkung
+auf bestimmte Listen sie nicht abonnieren. Eine Gruppe, die noch niemand beschrieben hat, gilt als Gruppe mit
+Kontakten.
+
+- **Das Speichern prüft es.** Wer ein Ereignis, eine Gruppe oder `*` wählt, das ein Ereignis einschließt, das er nicht
+  sehen kann, erhält `403` mit dem Code `permission_denied`; das Detail nennt das Ereignis und wer helfen kann, und
+  `permission` enthält den fehlenden Schlüssel.
+- **Jede Zustellung prüft es erneut**, gegen diese Person, wie sie in diesem Moment ist. Ist sie kein aktives Mitglied
+  mehr, hat sie die Berechtigung verloren oder ist sie jetzt auf bestimmte Listen beschränkt, pausiert ReputeCast den
+  Endpunkt, behält seine Ereignisse und zeigt den Grund unter dem Endpunkt in
+  <UiPath path="nav.settings > settings.webhooks" />. Das Audit-Protokoll erfasst `webhook.paused` durch System, mit
+  dem Grund.
+- **Fortsetzen sendet in Ihrem Namen**: Sie brauchen, was seine Ereignisse brauchen, wie beim Festlegen. Die behaltenen
+  Ereignisse gehen dann der Reihe nach hinaus.
+- **Das Zustellprotokoll verbirgt Payloads, die Sie nicht sehen können.** Sein Detail nennt dann die Berechtigung, die
+  die Zustellung braucht, statt das JSON und die Antwort des Endpunkts zu zeigen.
+- Endpunkte, die vor 1.5.0 ohne erfasste Person gespeichert wurden, laufen weiter wie bisher. Übernimmt jemand den
+  Schlüssel einer Integration, senden ihre Endpunkte ab dann für diese Person.
 
 ## Wie eine Zustellung aussieht
 
@@ -141,6 +192,8 @@ aus lassen.
 - Der Batch ist eine Zustellung mit eigener `id`, eigener Signatur und `X-ReputeCast-Event: email.batch` und wird als
   Ganzes wiederholt und erneut ausgeführt.
 - Solange der Endpunkt pausiert ist, werden seine Batches wie jede andere Zustellung zurückgehalten.
+- Jedes Ereignis `email.*` kommt in Batches, `email.replied` und `email.received` eingeschlossen. Verfügbar ab der
+  nächsten Version nach 1.6.0.
 
 ## Signatur prüfen
 
@@ -158,8 +211,10 @@ So prüfen Sie eine Zustellung:
    getrennten Wert von `X-ReputeCast-Signature`: Nach einer Rotation trägt der Header einen Tag lang zwei Signaturen.
    Akzeptieren Sie die Anfrage, wenn eine passt; antworten Sie mit `401`, wenn keine passt.
 
-Jedes Beispiel unten ist ein vollständiger Empfänger auf Port 3000 unter `/webhooks/reputecast`, der den
-Signaturschlüssel aus `REPUTECAST_WEBHOOK_SECRET` liest:
+Die [Client-SDKs](/de/developers/sdks/#webhook-signaturen-prüfen) erledigen all das mit einem Aufruf: `verifyWebhook` in
+TypeScript, `webhooks.verify` in Python und `webhooks.Verify` in Go. Sie sind gegen Zustellungen getestet, die der
+Server signiert hat. Ohne SDK ist jedes Beispiel unten ein vollständiger Empfänger auf Port 3000 unter
+`/webhooks/reputecast`, der den Signaturschlüssel aus `REPUTECAST_WEBHOOK_SECRET` liest:
 
 <Tabs syncKey="lang">
 <TabItem label="Node.js">
@@ -402,7 +457,9 @@ dann Anfragen ab, die mit dem nach außen gelangten signiert sind.
 
 <UiPath path="webhooks.pauseEndpoint" /> hält neue Ereignisse für den Endpunkt zurück, statt sie zu senden, zum
 Beispiel während einer Wartung. <UiPath path="webhooks.resumeEndpoint" /> stellt alles Zurückgehaltene der Reihe nach
-zu.
+zu, ab dann in Ihrem Namen. ReputeCast pausiert einen Endpunkt auch selbst, wenn die Person, für die er sendet, nicht
+mehr sehen kann, was seine Ereignisse enthalten ([für wen ein Endpunkt sendet](#für-wen-ein-endpunkt-sendet)); der
+Grund steht unter dem Endpunkt.
 
 ## Signaturschlüssel rotieren
 
@@ -441,6 +498,12 @@ ihn. Siehe [Integration entwickeln](/de/developers/integration-api/).
   und verarbeiten Sie dann.
 - **Das Testereignis funktioniert, aber echte Ereignisse kommen nie an**: Prüfen Sie, ob der Endpunkt diese Ereignisse
   abonniert und ob er nicht pausiert ist.
+- **Der Endpunkt hat sich selbst pausiert**: Die Person, für die er sendet, ist gegangen, hat eine Berechtigung
+  verloren, die seine Ereignisse brauchen, oder ist jetzt auf bestimmte Listen beschränkt. Lesen Sie den Grund unter
+  dem Endpunkt und setzen Sie ihn dann als jemand fort, der diese Ereignisse sehen kann.
+- **403 `permission_denied` beim Speichern der Ereignisse**: Eines davon, oder eines, das eine Gruppe oder `*`
+  einschließt, enthält Daten, die Sie nicht sehen können. Das Detail nennt es; wählen Sie engere Ereignisse oder bitten
+  Sie jemanden, der die Berechtigung hat.
 - **Ereignisse kommen doppelt an**: Eine Wiederholung folgte auf eine Antwort, die zu spät kam oder kein `2xx` war.
   Ignorieren Sie eine `id`, die Sie bereits verarbeitet haben.
 

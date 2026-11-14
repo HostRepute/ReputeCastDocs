@@ -1,6 +1,6 @@
 ---
 title: Hacer copias de seguridad y restaurar
-description: Haz una copia de seguridad de ReputeCast con pg_dump, la clave secreta y la carpeta de archivos, y restaura las tres en el orden correcto y pruébalo.
+description: Haz una copia de seguridad de ReputeCast con pg_dump, la clave secreta y la carpeta o el bucket de archivos, y restaura las tres en el orden correcto.
 type: how-to
 audience: [operator]
 primaryKeyword: copia de seguridad de ReputeCast con pg_dump
@@ -18,15 +18,16 @@ sources:
   - migrations/00300_composer.sql
   - web/src/features/admin/instance/InstancePage.tsx
   - docs/deploy/backup-restore.md
+  - internal/blobstore
 sidebar:
-  order: 9
+  order: 11
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 import UiPath from '~/components/UiPath.astro'
 
-Haz la copia de seguridad de ReputeCast con pg_dump, la clave secreta y la carpeta de archivos: una restauración
-necesita las tres cosas, y la base de datos sola no basta.
+Haz la copia de seguridad de ReputeCast con pg_dump, la clave secreta y los archivos subidos (la carpeta de archivos, o
+el bucket que los contiene): una restauración necesita las tres cosas, y la base de datos sola no basta.
 
 ## Qué contiene una copia de seguridad
 
@@ -34,7 +35,7 @@ necesita las tres cosas, y la base de datos sola no basta.
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Base de datos PostgreSQL | Todo lo demás: espacios de trabajo, contactos, campañas, imágenes subidas, la cola de tareas, el [registro de auditoría](/es/reference/glossary/#audit-log) y cada credencial guardada, cifrada. | La base de datos de `database.url`.                                                                                                                       |
 | Clave secreta            | La clave AES-256-GCM que cifra en la base de datos las credenciales de los proveedores, los client secrets de OIDC, los tokens de HostRepute y las semillas de las aplicaciones de autenticación (TOTP). | `REPUTECAST_SECRETS__KEY` si la defines; si no, el archivo de clave `secrets.key_file`: `/var/lib/reputecast/secret.key` en Docker, `data/secret.key` para el binario (relativo al directorio en el que arranca ReputeCast). |
-| Carpeta de archivos      | Los archivos de los productos digitales y los regalos de suscripción, demasiado grandes para la base de datos.                                                                               | `files.dir`; por defecto, una carpeta `files` junto al archivo de clave (`/var/lib/reputecast/files` en Docker). Aparece cuando alguien sube un archivo.   |
+| Archivos                 | Los archivos de los productos digitales, los regalos de suscripción, las subidas en curso y las exportaciones de la audiencia, demasiado grandes para la base de datos.                      | `files.dir`; por defecto, una carpeta `files` junto al archivo de clave (`/var/lib/reputecast/files` en Docker). Aparece cuando alguien sube un archivo. Con `storage.backend: s3`, el [bucket](/es/self-hosting/object-storage/) en su lugar. |
 
 Guarda también tu configuración: el archivo `.env` o las variables de shell con las que arrancas Docker Compose, o tu
 archivo de configuración YAML y el archivo de entorno del binario. La
@@ -130,6 +131,14 @@ El archivo Compose incluido llama al proyecto `reputecast`, así que sus volúme
 </TabItem>
 </Tabs>
 
+### Hacer la copia de seguridad del bucket
+
+Con los archivos en un bucket compatible con S3, haz la copia de seguridad del bucket en lugar de la carpeta: activa su
+control de versiones, replícalo en un bucket de otra cuenta o región, o cópialo con las herramientas de tu proveedor,
+como `aws s3 sync s3://reputecast-files ./files`, `rclone sync` o `mc mirror`. Una copia hecha así se restaura igual en
+una carpeta que en un bucket, porque los dos usan las mismas claves. Disponible a partir de la próxima versión después
+de la 1.6.0.
+
 ## Restaurar
 
 Restaura la base de datos antes de que arranque ReputeCast. La imagen de Docker se ejecuta con `--auto-install`: si
@@ -224,7 +233,8 @@ arranca con una base de datos vacía, crea un primer Propietario nuevo, y eso no
    ```
 
 5. Vuelve a poner el archivo de clave y la carpeta de archivos donde apuntan `secrets.key_file` y `files.dir`, de modo
-   que solo pueda leerlos el usuario con el que se ejecuta ReputeCast:
+   que solo pueda leerlos el usuario con el que se ejecuta ReputeCast (con un bucket, vuelve a copiar sus objetos en el
+   bucket que indican las claves `storage.s3`):
 
    ```sh
    tar xzf reputecast-data-2026-10-22.tar.gz -C /path/to/reputecast
@@ -241,16 +251,20 @@ arranca con una base de datos vacía, crea un primer Propietario nuevo, y eso no
 
 ## Comprobar que funciona
 
-- `reputecast doctor` muestra `ok` para la base de datos, el esquema, la clave secreta, la carpeta de archivos y el rol
-  de los segmentos SQL. Abre con la clave algunos valores guardados de cada tipo, así que una clave equivocada falla
+- `reputecast doctor` muestra `ok` para la base de datos, el esquema, la clave secreta, el almacenamiento de archivos y
+  el rol de los segmentos SQL. El almacenamiento de archivos es la carpeta de archivos, en la que se debe poder
+  escribir, o el bucket, que debe responder y aceptar, devolver y eliminar un objeto de prueba. Abre con la clave algunos valores guardados de cada tipo, así que una clave equivocada falla
   aquí y no en una llamada a un proveedor, y termina con `1` cuando una comprobación falla:
   - **SQL segments role** avisa en un servidor nuevo: crea el rol (paso 3), ejecuta `reputecast migrate segments-role`
     y reinicia ReputeCast.
   - **Previous keys** avisa mientras haya valores guardados que todavía usan una clave de `secrets.previous_keys`
     ([rotar la clave secreta](/es/self-hosting/security/#rotar-la-clave)).
-  - **Public URL** avisa cuando no es `https://`. Si cambió la dirección del servidor, define
-    `REPUTECAST_PUBLIC_URL`; guardarla en <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> también
-    traslada los webhooks de los proveedores.
+  - **Public URL** avisa cuando no es `https://`, o cuando `http.public_url_locked` fija una dirección a la que solo
+    llega el servidor. Si cambió la dirección del servidor, define `REPUTECAST_PUBLIC_URL`; guardarla en
+    <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> también traslada los webhooks de los proveedores.
+  - **GeoIP** muestra el tipo y la fecha de compilación del archivo de base de datos, `off` si no hay ninguno, y avisa
+    cuando `geoip.database` nombra un archivo que no puede leer
+    ([añadir una base de datos GeoIP](/es/self-hosting/geoip/)).
 - `curl -s http://localhost:8080/readyz` responde `ready`. Consulta
   [comprobaciones de estado, métricas y logs](/es/self-hosting/monitoring/).
 - Los logs de la aplicación no contienen `generated a new secret key`. Si lo contienen, ReputeCast no encontró la clave

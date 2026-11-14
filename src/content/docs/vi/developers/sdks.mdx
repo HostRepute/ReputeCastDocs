@@ -1,0 +1,466 @@
+---
+title: Dùng các SDK máy khách
+description: Cài SDK ReputeCast cho TypeScript, Python hoặc Go, tạo client, gửi email giao dịch, phân trang danh sách liên hệ và xác minh chữ ký webhook.
+type: how-to
+audience: [developer]
+permissions: ['apikeys:manage', 'transactional:send', 'subscribers:view']
+uiPath: 'nav.settings > settings.keys'
+primaryKeyword: SDK ReputeCast
+sources:
+  - sdk/client-ts
+  - sdk/client-python
+  - sdk/client-go
+  - sdk/openapi
+  - sdk/scripts/set-version.mjs
+  - docs/api/README.md
+  - internal/app/openapi_public.go
+  - internal/cli/openapi.go
+  - internal/integrations/calls.go
+  - .github/workflows/release.yml
+  - Makefile
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import UiPath from '~/components/UiPath.astro'
+
+SDK ReputeCast có ba ngôn ngữ, TypeScript, Python và Go, được tạo từ tài liệu OpenAPI công khai: mọi thao tác mà một
+[khóa API](/vi/reference/glossary/#api-key) được phép gọi, kèm sẵn xác thực, thử lại, lỗi dưới dạng exception và xác
+minh chữ ký webhook. Trang này cài một SDK, tạo client, gửi một email giao dịch, phân trang danh sách liên hệ và xác
+minh một webhook. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+## Trước khi bắt đầu
+
+- Một khóa API từ <UiPath path="nav.settings > settings.keys" /> có các quyền mà lệnh gọi của bạn cần: các ví dụ dùng
+  `transactional:send` và `subscribers:view` (xem [xác thực và khóa API](/vi/developers/api-authentication/)). SDK
+  cũng nhận token của tác tử MCP (`rc_agent_…`).
+- URL công khai của hệ thống, ví dụ `https://reputecast.example.com`, và slug của không gian làm việc, ví dụ
+  `acme-newsletter`.
+- Một trong các môi trường chạy sau:
+
+| Ngôn ngữ                 | Gói                                              | Cần                                                                      |
+| ------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------ |
+| TypeScript và JavaScript | `@reputecast/client`                             | Node.js 20 trở lên, dưới dạng ES module. Một phụ thuộc: `openapi-fetch`. |
+| Python                   | `reputecast`                                     | Python 3.11 trở lên, cùng `httpx` và `attrs`.                            |
+| Go                       | `github.com/hostrepute/reputecast/sdk/client-go` | Go 1.27.3 trở lên.                                                       |
+
+Các ví dụ đọc khóa từ biến môi trường `REPUTECAST_KEY`. Hãy giữ khóa trên máy chủ của bạn: khóa API không bao giờ được
+nằm trong mã chạy trên trình duyệt hay ứng dụng di động.
+
+## Cài SDK
+
+Mỗi bản phát hành dự kiến xuất bản ba SDK theo phiên bản của máy chủ, ví dụ `@reputecast/client` và `reputecast` 1.7.0
+cho ReputeCast 1.7.0, và module Go dưới tag `sdk/client-go/v1.7.0`. Bản phát hành tự gắn tag cho module Go; các gói npm
+và PyPI chỉ xuất hiện khi tài khoản của dự án trên đó được thiết lập. Tính đến tháng 11/2026, chưa gói nào có trên npm
+hay PyPI, nên hãy cài SDK từ kho mã:
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+Build gói từ một bản clone, rồi cài tệp tạo ra vào dự án của bạn. Việc build dùng pnpm workspace trong `sdk/` (pnpm 12
+và Node.js 24.11 trở lên):
+
+```sh title="Terminal"
+git clone https://github.com/hostrepute/reputecast.git
+cd reputecast/sdk
+pnpm install --frozen-lockfile
+pnpm --filter @reputecast/client build
+cd client-ts && pnpm pack
+# In your project:
+npm install /path/to/reputecast/sdk/client-ts/reputecast-client-0.0.0-dev.tgz
+```
+
+Khi gói đã có trên npm: `npm install @reputecast/client`.
+
+</TabItem>
+<TabItem label="Python">
+
+```sh title="Terminal"
+pip install "reputecast @ git+https://github.com/hostrepute/reputecast.git#subdirectory=sdk/client-python"
+```
+
+Khi gói đã có trên PyPI: `pip install reputecast`.
+
+</TabItem>
+<TabItem label="Go">
+
+```sh title="Terminal"
+go get github.com/hostrepute/reputecast/sdk/client-go@main
+```
+
+Khi một bản phát hành đã gắn tag cho module: `go get github.com/hostrepute/reputecast/sdk/client-go@v1.7.0`, với phiên
+bản của máy chủ bạn.
+
+</TabItem>
+</Tabs>
+
+Hãy dùng SDK cùng phiên bản với máy chủ hoặc một bản cũ hơn. SDK build từ `main` biết mọi thao tác mà `main` có; gọi
+một thao tác máy chủ của bạn chưa có sẽ nhận `404` với mã `not_found`.
+
+## Tạo client
+
+Base URL là URL công khai của hệ thống, không kèm `/api/v1`: đường dẫn của SDK bắt đầu bằng phần đó.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="client.ts"
+import { createClient, unwrap } from '@reputecast/client'
+
+const rc = createClient({ baseUrl: 'https://reputecast.example.com', apiKey: process.env.REPUTECAST_KEY! })
+
+const lists = unwrap(
+  await rc.GET('/api/v1/workspaces/{workspace}/lists', { params: { path: { workspace: 'acme-newsletter' } } }),
+)
+```
+
+Client là [openapi-fetch](https://openapi-ts.dev/openapi-fetch/) có kiểu theo các đường dẫn của API (kiểm tra tháng
+11/2026): `rc.GET`, `rc.POST`, `rc.PUT`, `rc.PATCH` và `rc.DELETE` nhận đường dẫn đúng như tài liệu OpenAPI viết.
+`unwrap` trả về dữ liệu của câu trả lời hoặc ném lỗi. Tùy chọn: `fetch` (của riêng bạn) và `maxRetries` (0 là tắt thử
+lại).
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="client.py"
+import os
+
+from reputecast import ReputeCast, unwrap
+from reputecast.api.audience import list_lists
+
+rc = ReputeCast(api_key=os.environ["REPUTECAST_KEY"], base_url="https://reputecast.example.com")
+
+lists = unwrap(list_lists.sync_detailed(client=rc, workspace="acme-newsletter"))
+```
+
+Mỗi thao tác là một module của `reputecast.api`, nhóm theo các tag của tài liệu tham chiếu API, với các hàm `sync`,
+`sync_detailed`, `asyncio` và `asyncio_detailed`; phần thân và câu trả lời là các class của `reputecast.models`.
+`unwrap` nhận kết quả `*_detailed` và trả về dữ liệu hoặc raise lỗi. `ReputeCast` cũng nhận `timeout` (tính bằng giây,
+mặc định 30) và `max_retries`.
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="client.go"
+rc, err := reputecast.New("https://reputecast.example.com", os.Getenv("REPUTECAST_KEY"))
+if err != nil {
+	return err
+}
+res, err := rc.ListListsWithResponse(ctx, "acme-newsletter")
+if err != nil {
+	return err // an error answer is a *reputecast.Error
+}
+for _, l := range res.JSON200.Items {
+	fmt.Println(l.Name)
+}
+```
+
+Import gói dưới dạng `reputecast "github.com/hostrepute/reputecast/sdk/client-go"`. Mỗi thao tác là một method
+`<Operation>WithResponse`; khi lỗi trả về là nil, trường thành công (`JSON200`, `JSON202`, v.v.) có giá trị. Tùy chọn:
+`reputecast.WithMaxRetries`, `reputecast.WithTimeout` (cho mỗi lần thử, mặc định 30 giây; deadline của context giới hạn
+toàn bộ lệnh gọi), `reputecast.WithTransport` và `reputecast.WithClientOptions`.
+
+</TabItem>
+</Tabs>
+
+Mọi yêu cầu đều mang khóa dưới dạng `Authorization: Bearer <key>` và `User-Agent` riêng của SDK:
+`ReputeCast-SDK-TS/<version>`, `ReputeCast-SDK-Python/<version>` hoặc `ReputeCast-SDK-Go/<version>`. Khi khóa thuộc về
+một tích hợp, <UiPath path="nav.settings > settings.integrations" /> gọi tên bên gọi theo đó, ví dụ "ReputeCast SDK for
+Python 1.7.0".
+
+## Gửi email giao dịch
+
+Ví dụ này gửi mẫu đã xuất bản `password-reset` (xem [gửi email giao dịch bằng API](/vi/developers/transactional-api/)
+để biết mọi trường). Với `Idempotency-Key`, một lần thử lại trong vòng 24 giờ, do SDK hay do bạn, không bao giờ gửi hai
+lần.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="send.ts"
+const msg = unwrap(
+  await rc.POST('/api/v1/workspaces/{workspace}/transactional/messages', {
+    params: {
+      path: { workspace: 'acme-newsletter' },
+      header: { 'Idempotency-Key': `pwreset-${user.id}-${token.id}` },
+    },
+    body: {
+      template: 'password-reset',
+      to: { email: user.email, name: user.name },
+      data: { first_name: user.firstName, reset_url: resetUrl },
+    },
+  }),
+)
+console.log(msg.id, msg.status) // status: queued
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="send.py"
+from reputecast.api.transactional_messages import send_transactional_message
+from reputecast.models import TransactionalSend
+
+msg = unwrap(send_transactional_message.sync_detailed(
+    client=rc,
+    workspace="acme-newsletter",
+    idempotency_key=f"pwreset-{user.id}-{token.id}",
+    body=TransactionalSend.from_dict({
+        "template": "password-reset",
+        "to": {"email": user.email, "name": user.name},
+        "data": {"first_name": user.first_name, "reset_url": reset_url},
+    }),
+))
+print(msg.id, msg.status)  # status: queued
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="send.go"
+key := fmt.Sprintf("pwreset-%s-%s", user.ID, token.ID)
+data := map[string]any{"first_name": user.FirstName, "reset_url": resetURL}
+res, err := rc.SendTransactionalMessageWithResponse(ctx, "acme-newsletter",
+	&reputecast.SendTransactionalMessageParams{IdempotencyKey: &key},
+	reputecast.TransactionalSend{
+		Template: "password-reset",
+		To:       reputecast.TransactionalAddress{Email: user.Email, Name: &user.Name},
+		Data:     &data,
+	})
+if err != nil {
+	return err
+}
+fmt.Println(res.JSON202.Id, res.JSON202.Status) // status: queued
+```
+
+</TabItem>
+</Tabs>
+
+Mã mẫu trong <UiPath path="nav.transactional > transactional.common.tabSetup" /> và trong
+[hướng dẫn gửi lần đầu](/vi/transactional/first-send/) là đúng các lệnh gọi này, điền sẵn biến của mẫu bạn; nút chuyển
+<UiPath path="transactional.codeStyleSdk" /> · <UiPath path="transactional.codeStyleHttp" /> của chúng hiển thị yêu cầu
+HTTP thuần thay thế.
+
+## Liệt kê liên hệ
+
+Các danh sách phân trang bằng con trỏ, như liên hệ, danh sách chặn gửi và nhật ký kiểm tra, trả về `items` và
+`nextCursor`; hãy truyền `nextCursor` lại dưới dạng `cursor` cho đến khi nó trống
+([phân trang](/vi/developers/api-pagination/)).
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+`paginate` tải từng trang khi vòng lặp đi tới trang đó:
+
+```ts title="contacts.ts"
+import { paginate } from '@reputecast/client'
+
+for await (const contact of paginate(rc, '/api/v1/workspaces/{workspace}/contacts', {
+  params: { path: { workspace: 'acme-newsletter' }, query: { pageSize: 100 } },
+})) {
+  console.log(contact.email)
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="contacts.py"
+from reputecast import UNSET
+from reputecast.api.audience import list_contacts
+
+cursor = UNSET
+while True:
+    page = unwrap(list_contacts.sync_detailed(client=rc, workspace="acme-newsletter", page_size=100, cursor=cursor))
+    for contact in page.items:
+        print(contact.email)
+    if not page.next_cursor:
+        break
+    cursor = page.next_cursor
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="contacts.go"
+size := int64(100)
+params := &reputecast.ListContactsParams{PageSize: &size}
+for {
+	page, err := rc.ListContactsWithResponse(ctx, "acme-newsletter", params)
+	if err != nil {
+		return err
+	}
+	for _, c := range page.JSON200.Items {
+		fmt.Println(c.Email)
+	}
+	if page.JSON200.NextCursor == nil || *page.JSON200.NextCursor == "" {
+		break
+	}
+	params.Cursor = page.JSON200.NextCursor
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Thử lại
+
+SDK gửi lại một yêu cầu sau câu trả lời `429`, `502`, `503` hoặc `504`, mặc định hai lần:
+
+- Chỉ những yêu cầu lặp lại an toàn: `GET`, `HEAD`, `PUT` và `DELETE`, và `POST` có header `Idempotency-Key`, mà máy
+  chủ trả lời bằng kết quả đầu tiên thay vì thực hiện hai lần. `POST` không có header này không bao giờ được thử lại.
+  Python và Go cũng bỏ qua yêu cầu có phần thân không gửi lại được, như một lượt tải lên dạng stream.
+- Mỗi lần chờ theo header `Retry-After` của câu trả lời (số giây hoặc một ngày HTTP), tối đa 30 giây. Không có header
+  này, thời gian chờ tăng theo cấp số nhân từ nửa giây, có thêm jitter, cũng tối đa 30 giây.
+- `maxRetries: 0` (TypeScript), `max_retries=0` (Python) hoặc `reputecast.WithMaxRetries(0)` (Go) tắt việc thử lại.
+
+Những câu trả lời gây ra thử lại được mô tả trong [giới hạn tốc độ](/vi/developers/api-rate-limits/).
+
+## Xử lý lỗi
+
+Một câu trả lời lỗi, tức một [problem RFC 9457](/vi/developers/api-errors/), trở thành `ReputeCastError` trong
+TypeScript (do `unwrap` và `paginate` ném ra) và Python (do `unwrap` raise), và `*reputecast.Error` trong Go (lỗi của
+lệnh gọi). Mỗi lỗi có các trường của problem: `status`, `code` ổn định (`permission_denied`, `validation_failed`,
+`not_found`…), `title`, `detail` (câu để hiển thị), `errors` (các trường có lỗi), `meta`, và với quyền bị thiếu thì có
+`permission` và `helpers`, những thành viên có quyền đó. Một trang lỗi không phải problem, như trang lỗi của proxy, giữ
+mã trạng thái của nó và văn bản của nó trở thành detail.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="errors.ts"
+import { ReputeCastError, unwrap } from '@reputecast/client'
+
+try {
+  unwrap(await rc.GET('/api/v1/workspaces/{workspace}/members', { params: { path: { workspace: 'acme-newsletter' } } }))
+} catch (err) {
+  if (err instanceof ReputeCastError && err.code === 'permission_denied') console.log(err.detail, err.helpers)
+  else throw err
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="errors.py"
+from reputecast import ReputeCastError
+from reputecast.api.team import list_members
+
+try:
+    unwrap(list_members.sync_detailed(client=rc, workspace="acme-newsletter"))
+except ReputeCastError as err:
+    print(err.status, err.code, err.detail)
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="errors.go"
+_, err := rc.ListMembersWithResponse(ctx, "acme-newsletter", nil)
+var apiErr *reputecast.Error
+if errors.As(err, &apiErr) && apiErr.Code == "permission_denied" {
+	log.Print(apiErr.Detail, apiErr.Helpers)
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Xác minh chữ ký webhook
+
+Mỗi SDK kiểm tra giúp bạn một lần gửi [webhook](/vi/developers/webhooks/). Hãy truyền phần thân thô, đúng như đã nhận,
+các header của yêu cầu và khóa bí mật để ký của endpoint (`whsec_…`), hoặc nhiều khóa trong lúc bạn xoay vòng khóa của
+mình. Bước kiểm tra từ chối timestamp lệch quá 5 phút so với đồng hồ của bạn, chấp nhận cả hai chữ ký trong một ngày sau
+khi xoay vòng khóa, và so sánh trong thời gian không đổi. Một lần gửi không đạt sẽ ném lỗi (trả về lỗi trong Go); hãy
+trả lời nó bằng `400` hoặc `401`.
+
+<Tabs syncKey="lang">
+<TabItem label="Node.js">
+
+```ts title="webhook.ts"
+import { verifyWebhook, WebhookVerificationError } from '@reputecast/client'
+
+try {
+  await verifyWebhook({ secrets: process.env.REPUTECAST_WEBHOOK_SECRET!, body: rawBody, headers: req.headers })
+} catch (err) {
+  if (err instanceof WebhookVerificationError) return res.writeHead(401).end() // err.reason: missing_header, timestamp or signature
+  throw err
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python title="webhook.py"
+from reputecast import webhooks
+
+try:
+    webhooks.verify(os.environ["REPUTECAST_WEBHOOK_SECRET"], request.get_data(), request.headers)
+except webhooks.WebhookVerificationError:
+    abort(401)
+```
+
+</TabItem>
+<TabItem label="Go">
+
+```go title="webhook.go"
+import "github.com/hostrepute/reputecast/sdk/client-go/webhooks"
+
+if err := webhooks.Verify([]string{os.Getenv("REPUTECAST_WEBHOOK_SECRET")}, body, r.Header, time.Now()); err != nil {
+	http.Error(w, "invalid signature", http.StatusUnauthorized) // ErrMissingHeader, ErrTimestamp or ErrSignature
+	return
+}
+```
+
+</TabItem>
+</Tabs>
+
+Cả ba được kiểm thử với cùng những lần gửi do máy chủ ký, nên chúng chấp nhận đúng những gì ReputeCast gửi và không gì
+khác.
+
+## Tạo client bằng ngôn ngữ khác
+
+Các SDK được tạo từ tài liệu OpenAPI công khai: chỉ gồm những thao tác mà khóa API được phép gọi. Tệp nhị phân của hệ
+thống in ra tài liệu này, không cần cơ sở dữ liệu hay tệp cấu hình:
+
+```sh title="Terminal"
+reputecast openapi --public > reputecast-public.json
+reputecast openapi --public --openapi 3.0 > reputecast-public-3.0.json
+```
+
+`--openapi 3.0` dành cho các trình tạo mã không đọc được OpenAPI 3.1, còn `--yaml` in ra YAML. Kho mã giữ hai tài liệu
+giống hệt trong `sdk/openapi/public.json` và `sdk/openapi/public-3.0.json`. Tài liệu đầy đủ, gồm cả những thao tác chỉ
+ứng dụng web gọi, được mô tả trong [xây dựng trên ReputeCast](/vi/developers/overview/#lấy-tài-liệu-openapi).
+
+## Kiểm tra kết quả
+
+- Lệnh gọi `unwrap` (hoặc lỗi nil trong Go) của ví dụ danh sách trả về các danh sách của không gian làm việc.
+- Dòng của khóa trong <UiPath path="nav.settings > settings.keys" /> cho biết lần cuối khóa được dùng và từ địa chỉ nào.
+- Thư bạn đã gửi xuất hiện trong <UiPath path="nav.transactional > transactional.common.tabMessages" /> cùng dòng thời
+  gian gửi thư của nó.
+
+## Khắc phục sự cố
+
+- **`TypeError: createClient: apiKey is empty`, `ValueError: api_key is empty` hoặc lỗi "the API key is empty" của
+  Go**: `REPUTECAST_KEY` chưa được đặt trong tiến trình chạy mã của bạn.
+- **`401` với mã `unauthenticated`**: khóa không tồn tại, đã bị thu hồi hoặc đã hết hạn. Hãy kiểm tra khóa trong
+  <UiPath path="nav.settings > settings.keys" />.
+- **`403` với mã `ip_not_allowed`**: khóa bị giới hạn trong các IP được phép và máy chủ của bạn gọi từ một địa chỉ
+  khác; detail nêu địa chỉ đó
+  ([IP được phép](/vi/developers/api-authentication/#giới-hạn-khóa-trong-các-ip-được-phép)).
+- **`404` với mã `not_found` trên một đường dẫn có trong SDK**: SDK mới hơn máy chủ của bạn. Hãy dùng SDK cùng phiên
+  bản với máy chủ.
+- **Thư bị gửi trùng sau khi hết thời gian chờ**: hãy gửi `Idempotency-Key` với mọi lần gửi email giao dịch, và dùng
+  lại khóa đó khi bạn tự thử lại.
+- **Xác minh webhook thất bại với mọi lần gửi**: framework của bạn đã phân tích phần thân trước khi bạn đọc nó. Hãy
+  truyền các byte thô.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Thực hiện lệnh gọi API đầu tiên" href="/vi/developers/api-quickstart/" description="Tạo khóa và gọi API bằng curl." />
+  <LinkCard title="Xác thực và khóa API" href="/vi/developers/api-authentication/" description="Loại khóa, quyền, phạm vi, IP được phép và các lần từ chối." />
+  <LinkCard title="Nhận webhook" href="/vi/developers/webhooks/" description="Endpoint, sự kiện, thử lại và xác minh chữ ký." />
+  <LinkCard title="Tham chiếu API" href="/api/" description="Mọi thao tác mà khóa API gọi được, kèm tham số và câu trả lời." />
+</CardGrid>

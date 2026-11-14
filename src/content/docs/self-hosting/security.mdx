@@ -24,8 +24,15 @@ sources:
   - internal/proxycheck
   - internal/app/wire_proxycheck.go
   - web/src/features/composer/inert.ts
+  - internal/liquid/budget.go
+  - internal/segments/sqlmode.go
+  - internal/csvexport
+  - internal/customhost
+  - internal/accounts/external.go
+  - internal/accounts/account.go
+  - internal/webhooks
 sidebar:
-  order: 12
+  order: 14
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -47,37 +54,73 @@ must plan yourself: keeping and rotating the secret key.
    database stores only their SHA-256 hashes; a key is shown once, when it is created.
 3. **Sign-in is hard to attack.** Sign-in asks for the email first and answers with generic errors, so nobody learns
    which addresses have accounts. Failed passwords lock the email for a while (10 attempts lock it for 15 minutes by
-   default), and `/api/v1/auth/*` accepts 30 requests a minute per IP address. Two-factor authentication with an
+   default), and `/api/v1/auth/*` accepts 30 requests a minute per IP address. Wrong authenticator and recovery codes
+   count toward the same lockout, and each authenticator code works once. Two-factor authentication with an
    authenticator app, passkeys and one-time [recovery codes](/reference/glossary/#recovery-code) is required by default
    for everyone who holds a [sensitive permission](/reference/glossary/#sensitive-permission).
-4. **Session cookies stay in the browser.** The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` when
+4. **Invitations can't take over an account.** Accepting an invitation with Google, Microsoft, GitHub or SSO links the
+   identity only as sign-in would: an account that already uses the invited email accepts only with an identity it
+   already signs in with, and otherwise signs in first. An invitation lasts only as long as its inviter could still
+   send it. An account that signs in only through SSO adds a first password, or moves its email to another domain, only
+   from a sign-in in the last 15 minutes, and never where its provider enforces the domain
+   ([single sign-on](/self-hosting/sso/#invitations-and-accounts-managed-by-sso)).
+5. **Session cookies stay in the browser.** The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` when
    `http.public_url` starts with `https://` (or, outside development, while `auth.cookie_secure` is `true`, the default).
-5. **Every action passes one permission check.** People, API keys and MCP agents go through the same check; keys and
-   agents never hold more than the person who created them, and act as themselves, never as that person. A refused
-   action tells people who can help instead of naming a permission key; API clients read the key in the error's
-   `permission` field. See [roles and permissions](/team/roles-and-permissions/).
-6. **The audit log can't be edited.** Every change and every denied attempt is recorded with actor, IP address, user
+6. **Every action passes one permission check.** People, API keys and MCP agents go through the same check; keys and
+   agents never hold more than the person who created them, follow that person's current list and sender-domain
+   scope, and act as themselves, never as that person. A member limited to some lists or sender domains stays within
+   them in flows, MCP, poll and survey exports, automation previews and every kind of send. A refused action tells
+   people who can help instead of naming a permission key; API clients read the key in the error's `permission` field.
+   See [roles and permissions](/team/roles-and-permissions/).
+7. **Keys and agents can be held to addresses.** Since 1.6.0, an API key or an MCP agent can be limited to IP addresses
+   and networks: the REST API answers `403` with the code `ip_not_allowed`, MCP `401` and the SMTP relay `535`. The
+   check uses the client address ReputeCast resolves, so behind a proxy, set `http.trusted_proxies` first.
+8. **Webhooks carry only what their creator can see.** An outgoing webhook takes only events whose data the person it
+   sends for may view, and pauses, with the reason, when they no longer can; `webhooks:manage` is a sensitive
+   permission. Incoming SNS messages are trusted only from `sns.<region>.amazonaws.com` and the provider's own topic,
+   and Mailgun's signature tokens are recorded in PostgreSQL, so no process accepts one twice.
+9. **The audit log can't be edited.** Every change and every denied attempt is recorded with actor, IP address, user
    agent and request ID. A database trigger rejects updates to audit entries; only the retention cleanup removes old
    ones.
-7. **Outbound requests can't reach your network.** Addresses people type into the app (provider URLs, webhook
-   endpoints, importers, feeds, AI model servers, seed mailboxes, the brand kit's import from a website and others) are
-   checked before ReputeCast connects, and again at connect time, after DNS. Redirects are not followed.
-8. **Browsers get strict headers.** Every response carries a Content Security Policy, `X-Frame-Options: DENY`,
-   `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
-   `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
-   is added when `http.public_url` is `https://`. Cross-site browser requests that change something are rejected,
-   except provider webhooks (`POST /hooks/…`) and public form posts (`POST /p/…`), which are verified in other ways.
-   The `/api` routes send no CORS headers.
-9. **SQL segments can only read.** User-written SQL runs in a read-only transaction with a statement timeout, as a role
-   that can read only one workspace's contacts. See [PostgreSQL](/self-hosting/postgres/#sql-segments).
-10. **Images are decoded within a memory budget.** A few hundred bytes of image header can claim gigabytes of memory.
+10. **Outbound requests can't reach your network.** Addresses people type into the app (provider URLs, webhook
+    endpoints, importers, feeds, AI model servers, seed mailboxes, the brand kit's import from a website and others)
+    are checked before ReputeCast connects, and again at connect time, after DNS. Redirects are not followed.
+11. **A saved secret goes only where it was entered for.** An SMTP password, an API provider's key, a bounce mailbox's
+    password, an AI model's key or an SSO client secret is sent only to the address it was saved with. Changing the
+    host or the issuer asks for the secret again.
+12. **Browsers get strict headers.** Every response carries a Content Security Policy, `X-Frame-Options: DENY`,
+    `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+    `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy`. HSTS (`max-age=31536000; includeSubDomains`)
+    is added when `http.public_url` is `https://`. Cross-site browser requests that change something are rejected,
+    except provider webhooks (`POST /hooks/…`) and public form posts (`POST /p/…`), which are verified in other ways.
+    The `/api` routes send no CORS headers.
+13. **SQL segments can only read.** User-written SQL runs in a read-only transaction with a statement timeout, as a
+    role that can read only one workspace's contacts. It can't call advisory-lock functions or the functions that run
+    SQL given as a string (`query_to_xml`, `ts_stat`, `dblink` and their kin), and its connection releases every
+    session lock before it goes back to the pool. See [PostgreSQL](/self-hosting/postgres/#sql-segments).
+14. **Templates render on a budget.** Anyone who can preview an email makes the server render Liquid, so every render
+    stops with an error past 200,000 steps (tags, outputs and loop passes), 64 MB of work by filters and captures, a
+    value of 4 MB, a list of 10,000 items or 2 seconds. Only people who can edit a campaign preview its unsaved
+    content.
+15. **Images are decoded within a memory budget.** A few hundred bytes of image header can claim gigabytes of memory.
     Before ReputeCast decodes an upload, an AI-generated image, a digest's image or an avatar, it works out from the
     header what decoding takes, a progressive JPEG's included, and decodes one image at a time across the instance. An
     avatar, AI or digest image over the budget is refused; an upload over it is stored as it is, only stripped of its
     metadata.
-11. **HTML the composer didn't write can't run.** Pasted HTML and HTML edited in Write mode are read in an inert
+16. **HTML the composer didn't write can't run.** Pasted HTML and HTML edited in Write mode are read in an inert
     document, and scripts, frames, event handlers and `javascript:` links are removed before the HTML is shown in the
     app. The server compiles the MJML itself and keeps its own HTML when the HTML it is sent doesn't match.
+17. **Exports can't run formulas.** Every CSV export puts a single quote in front of a cell that starts with `=`, `+`,
+    `-`, `@`, a tab or a carriage return, so a subscriber's name can't become a working formula in a spreadsheet.
+18. **Request logs leave out tokens.** SMS webhook tokens, WhatsApp callback tokens and short-link codes never reach
+    the request log.
+19. **Each workspace's domains carry only its own links.** A host a workspace holds (its custom domain, short-link
+    domain, link tracking domain or website) serves only that workspace's tracked links, short links and pages, and a
+    domain another workspace verified first needs this workspace's TXT record
+    ([custom domains](/self-hosting/reverse-proxy/#custom-domains)).
+
+The rules on second-factor codes, invitations, scope, webhooks, saved secrets, SQL segments, templates, exports,
+request logs and domains hold since 1.5.0, which fixed what a security review of the whole project found.
 
 The Content Security Policy of the app:
 
@@ -170,7 +213,9 @@ Two settings allow them, for services that run on your own network:
 | `webhooks.allow_private_networks`  | Outgoing webhooks, integration hooks (n8n, Zapier, Make) and the audit stream.                                                                  |
 
 Link-local and cloud metadata addresses (`169.254.0.0/16`, `fe80::/10`, `100.100.100.200`, `fd00:ec2::254`),
-multicast and `0.0.0.0/8` stay refused with either setting.
+multicast and `0.0.0.0/8` stay refused with either setting. So do IPv6 addresses that lead to an IPv4 host the check
+can't see past: 6to4 (`2002::/16`), Teredo (`2001::/32`), NAT64's local-use prefix (`64:ff9b:1::/48`) and the old
+IPv4-compatible form (`::/96`, except `::1`).
 
 ## Defaults and limits
 
@@ -186,8 +231,8 @@ lives in <UiPath path="shell.userMenuInstanceAdmin > admin.authentication" />; s
   is off by default. When on, ReputeCast sends the first 5 characters of a new password's SHA-1 hash to
   `api.pwnedpasswords.com` (k-anonymity); if that service doesn't answer, the password is accepted.
 - **Set `http.trusted_proxies`** to your reverse proxy's address. Without it, ReputeCast ignores `X-Forwarded-For`,
-  and every client behind the proxy shares one IP address in rate limits, the audit log and the bot filter, so opens
-  and clicks can't be told apart. ReputeCast notices a private address that forwards nearly all of its requests with
+  and every client behind the proxy shares one IP address in rate limits, the audit log, allowed IPs and the bot
+  filter, so opens and clicks can't be told apart. ReputeCast notices a private address that forwards nearly all of its requests with
   forwarding headers for 10 one-minute windows, and tells instance admins to add it. A public address that sends most
   of the traffic for an hour is reported too, but never as one to add as it is: if it is your CDN or load balancer, add
   the address ranges its provider publishes. Every `X-Forwarded-For` line counts, in order.
