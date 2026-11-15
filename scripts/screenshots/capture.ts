@@ -66,6 +66,12 @@ type Session = {
 const root = resolve(import.meta.dirname, '../..')
 const outDir = resolve(root, 'src/assets/screenshots')
 const WARN_BYTES = 400 * 1024
+/**
+ * True once the app has drawn a screen (its #root holds a main or h1, as the boot screen's CSS asks) and its boot
+ * screen, skeleton blocks (.sk) and aria-busy loading regions are all hidden. Pages outside the app have no #root.
+ */
+const STILL_LOADING_GONE = `(!document.getElementById('root') || !!document.querySelector('#root :is(main, h1)')) &&
+  ![...document.querySelectorAll('.boot, .sk, [aria-busy="true"]')].some((e) => e.checkVisibility())`
 const OWNER = { email: 'owner@example.com', name: 'Alex Morgan' }
 const emails: Record<Exclude<User, 'anon'>, string> = {
   linh: 'linh@acme.io',
@@ -221,6 +227,10 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
     // A draft's first open re-runs Send Readiness in the background, which can take most of a minute in development.
     if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 60_000 })
     for (const step of s.before ?? []) await runStep(page, step, locale)
+    // The screen must be drawn: a slow dev server otherwise leaves the boot screen or skeletons in the capture.
+    await page.waitForFunction(STILL_LOADING_GONE, null, { timeout: 60_000, polling: 250 }).catch(() => {
+      throw new Error('still loading after 60 s (boot screen, skeleton or aria-busy region visible)')
+    })
     // A font first used by what the steps opened (IBM Plex Mono in a detail pane) loads only then.
     await page.evaluate('document.fonts.ready')
     await page.waitForTimeout(400)
@@ -261,6 +271,8 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
       : await page.screenshot({ ...shotOptions, fullPage: s.fullPage })
     const image = sharp(png)
     const { width, height } = await image.metadata()
+    const { channels } = await image.stats()
+    if (Math.max(...channels.slice(0, 3).map((c) => c.stdev)) < 2) throw new Error('the capture is one flat colour')
     const webp = await image.webp({ quality: 88, effort: 6 }).toBuffer()
 
     const dir = resolve(outDir, locale)
