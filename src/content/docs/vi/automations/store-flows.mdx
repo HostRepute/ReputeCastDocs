@@ -1,0 +1,280 @@
+---
+title: Quy trình browse abandonment và báo có hàng trở lại
+description: Gửi email browse abandonment từ ReputeCast khi liên hệ xem hoặc thêm sản phẩm vào giỏ mà không mua, rồi báo họ khi sản phẩm có hàng lại hoặc rẻ hơn.
+type: how-to
+audience: [publisher]
+permissions: ['automations:edit', 'automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: email browse abandonment
+sources:
+  - internal/automations/{storeflows.go,stores.go,engine.go,graph.go}
+  - internal/tracker/{flows.go,writer.go,static/rc.js}
+  - internal/commerce/{stock.go,recommend.go,blocks.go,jobs.go,webhooks.go,api.go}
+  - internal/store/queries/{tracker_flows.sql,commerce.sql}
+  - web/src/features/commerce/{automation.tsx,composer.tsx,flows.messages.ts}
+  - web/src/features/automations/{panels.tsx,graph.ts}
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Gửi email browse abandonment khi một liên hệ xem một sản phẩm trong cửa hàng của bạn rồi rời đi mà không mua, hoặc thêm
+sản phẩm vào giỏ mà không thanh toán, và gửi email cho những người muốn có một sản phẩm khi sản phẩm đó có hàng trở lại
+hoặc giảm giá. Các [quy trình cửa hàng](/vi/reference/glossary/#store-flow) này bắt đầu từ những gì trang web của cửa hàng
+báo về qua tính năng theo dõi website. Có từ bản phát hành tiếp theo sau 1.6.0.
+
+## Trước khi bắt đầu
+
+- Bạn cần quyền `automations:edit` để dựng quy trình và `automations:publish` để xuất bản nó; các vai trò Chủ sở hữu,
+  Quản trị viên và Biên tập viên có cả hai quyền. [Xây dựng tự động hóa email](/vi/automations/overview/) giải thích trình
+  chỉnh sửa.
+- Kết nối cửa hàng Shopify hoặc WooCommerce, để ReputeCast biết sản phẩm, bộ sưu tập, đơn hàng và lượt thanh toán của cửa
+  hàng (xem [kết nối Shopify hoặc WooCommerce](/vi/integrations/shopify-woocommerce/)).
+- Thêm trang web của cửa hàng vào tính năng theo dõi website và liên kết trang đó với cửa hàng, để lượt xem sản phẩm và
+  lượt thêm vào giỏ trên trang nêu đúng sản phẩm của cửa hàng (xem
+  [theo dõi lượt truy cập trên trang web của bạn](/vi/integrations/website-tracking/)). Chỉ quy trình có hàng trở lại dành
+  cho những người yêu cầu qua API, không gồm người đã xem, mới hoạt động mà không cần bước này.
+- Chỉ liên hệ mới vào được quy trình. Một khách truy cập trở thành liên hệ đã biết khi họ nhấp một liên kết trong một email
+  của bạn, đăng ký qua một biểu mẫu ReputeCast trên cùng trang, hoặc trang web của bạn nhận diện họ bằng một lệnh gọi có
+  chữ ký; khi đó 30 ngày gần nhất của họ trên trang được tính. Khách truy cập ẩn danh không bao giờ vào quy trình.
+
+## Cách quy trình cửa hàng hoạt động
+
+Bốn trình kích hoạt nằm trong nhóm <UiPath path="commerce.flows.storeGroup" /> của bảng công cụ, sau
+<UiPath path="automations.graph.kindAbandonedCheckout" />:
+
+<Screenshot
+  id="automation-palette"
+  alt="Trình chỉnh sửa quy trình Browse abandonment của bản demo với toàn bộ bảng công cụ: nhóm Cửa hàng với Đặt hàng, Đơn hàng đầu tiên, Bỏ dở thanh toán, Xem một sản phẩm, Thêm vào giỏ, Có hàng trở lại và Giảm giá, tiếp theo là nhóm Hội viên trả phí và nhóm Quảng cáo khách hàng tiềm năng."
+>
+  1. Cửa hàng, với bốn trình kích hoạt của quy trình cửa hàng sau các trình kích hoạt đơn hàng và thanh toán của cửa hàng.
+  2. Hội viên trả phí.
+  3. Quảng cáo khách hàng tiềm năng.
+</Screenshot>
+
+| Trình kích hoạt                                    | Bắt đầu khi                                                                                                                                     | Ai được đưa vào                                                                                                                                                       |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="commerce.flows.kindViewedProduct" /> | Đã qua số giờ đặt sẵn kể từ lần cuối liên hệ xem một sản phẩm của cửa hàng, và từ đó không có đơn hàng hay lượt thanh toán nào trong cửa hàng. | Các liên hệ đã xem một trong các sản phẩm ít nhất số lần đặt sẵn, có thể chỉ tính sản phẩm thuộc một số bộ sưu tập.                                                  |
+| <UiPath path="commerce.flows.kindAddedToCart" />   | Tương tự, tính từ lần thêm vào giỏ gần nhất.                                                                                                    | Các liên hệ đã thêm một trong các sản phẩm vào giỏ ít nhất số lần đặt sẵn.                                                                                            |
+| <UiPath path="commerce.flows.kindBackInStock" />   | Một sản phẩm đã hết hàng của cửa hàng có hàng trở lại.                                                                                          | Các liên hệ đã yêu cầu được báo và chưa được báo, và khi có <UiPath path="commerce.flows.viewersTooLabel" />, cả những người đã xem sản phẩm trong số ngày gần nhất. |
+| <UiPath path="commerce.flows.kindPriceDrop" />     | Giá của một sản phẩm giảm ít nhất tỷ lệ đặt sẵn, trong cùng loại tiền tệ.                                                                       | Các liên hệ đã xem sản phẩm hoặc thêm nó vào giỏ trong số ngày gần nhất.                                                                                              |
+
+Trong danh sách tự động hóa và phần so sánh khi xuất bản, hai trình kích hoạt đầu hiện là
+<UiPath path="commerce.flows.startsViewed" /> và <UiPath path="commerce.flows.startsCarted" />, ví dụ "Xem một sản phẩm và
+không mua · Acme Merch · sau 4 giờ".
+
+Quy tắc mà mọi quy trình cửa hàng tuân theo:
+
+- ReputeCast chỉ tìm liên hệ khi có một quy trình đang chạy bắt đầu bằng trình kích hoạt đó. Quy trình xem sản phẩm và
+  giỏ hàng được kiểm tra mỗi phút; quy trình tồn kho và giá chạy khi cửa hàng báo có thay đổi.
+- Chỉ liên hệ đang hoạt động mới được đưa vào: liên hệ đã hủy đăng ký, bị trả thư, đã khiếu nại, bị chặn gửi hoặc đã xóa
+  vĩnh viễn thì không bao giờ.
+- Một quy trình chỉ nhận lại cùng một liên hệ sau 7 ngày. Trình kích hoạt không có lựa chọn
+  <UiPath path="automations.panels.reentry" />.
+- Trình kích hoạt của quy trình cửa hàng chỉ có thể là trình kích hoạt đầu tiên của một quy trình, không bao giờ là trình
+  kích hoạt thêm vào (xem [nhiều hơn một trình kích hoạt](/vi/automations/triggers-and-steps/#nhiều-hơn-một-trình-kích-hoạt)).
+
+## Thiết lập quy trình bỏ dở khi xem sản phẩm hoặc giỏ hàng
+
+<Steps>
+
+1. Mở <UiPath path="nav.automations" />, chọn <UiPath path="automations.newAutomation" /> rồi chọn
+   <UiPath path="automations.blankCanvas" />.
+
+2. Từ nhóm <UiPath path="commerce.flows.storeGroup" /> của bảng công cụ, kéo
+   <UiPath path="commerce.flows.kindViewedProduct" /> vào khung thiết kế, hoặc
+   <UiPath path="commerce.flows.kindAddedToCart" /> để nhắc về giỏ hàng, rồi chọn nó.
+
+3. Trong <UiPath path="commerce.flows.store" />, chọn cửa hàng. Khi chỉ có một cửa hàng được kết nối, cửa hàng đó đã được
+   chọn sẵn. Ghi chú bên dưới phần cài đặt cho biết trang web được theo dõi nào gửi lượt xem sản phẩm của cửa hàng, hoặc
+   cho biết chưa có trang nào được liên kết, kèm <UiPath path="commerce.flows.setUpTracking" />.
+
+4. Đặt trình kích hoạt:
+   - <UiPath path="commerce.flows.wait" />: bao nhiêu giờ sau lượt xem cuối cùng, mà không có đơn hàng hay lượt thanh toán,
+     thì quy trình bắt đầu: từ 1 đến 24, mặc định là 4.
+   - <UiPath path="commerce.flows.only" />: <UiPath path="commerce.flows.addCollection" /> chỉ giữ lại sản phẩm thuộc tối
+     đa 20 bộ sưu tập của cửa hàng. Khi không chọn bộ sưu tập nào, mọi sản phẩm trong cửa hàng đều được tính.
+   - <UiPath path="commerce.flows.after" />: liên hệ đã xem một trong các sản phẩm, hoặc thêm nó vào giỏ, bao nhiêu lần:
+     từ 1 đến 5, mặc định là 1.
+
+   <Screenshot
+     id="store-flow-browse"
+     alt="Quy trình Browse abandonment của bản demo với trình kích hoạt đang được chọn: Xem một sản phẩm trên Acme Merch sau 4 giờ trên khung thiết kế, tiếp theo là hai email cách nhau 2 ngày và một bước thoát, còn ở bảng bên phải là cửa hàng, Chờ 4 giờ, không có bộ sưu tập, sau 1 lượt xem và ghi chú rằng shop.acme.io gửi lượt xem sản phẩm của Acme Merch."
+   >
+     1. Trình kích hoạt trên khung thiết kế: cửa hàng và thời gian chờ.
+     2. Số giờ không có đơn hàng hay lượt thanh toán.
+     3. Các bộ sưu tập mà sản phẩm phải thuộc về.
+     4. Số lượt xem một sản phẩm trước khi quy trình bắt đầu.
+     5. Trang web được theo dõi gửi lượt xem sản phẩm của cửa hàng.
+   </Screenshot>
+
+5. Thêm các email. Kéo <UiPath path="automations.graph.typeEmail" /> xuống dưới trình kích hoạt và viết một email hiện các
+   sản phẩm mà liên hệ đã xem (xem [hiện sản phẩm trong email](#hiện-sản-phẩm-trong-email)). Quy trình của bản demo gửi
+   email thứ hai hai ngày sau đó qua một bước <UiPath path="automations.graph.typeDelay" />.
+
+6. Xuất bản quy trình (xem [xuất bản thay đổi tự động hóa an toàn](/vi/automations/publish-and-versions/)). Từ đó trở đi,
+   ReputeCast kiểm tra mỗi phút.
+
+</Steps>
+
+Mỗi phút, một liên hệ được đưa vào khi tất cả các điều sau đều đúng:
+
+- Lượt xem (hoặc lượt thêm vào giỏ) cuối cùng của họ với một sản phẩm phù hợp diễn ra trong khoảng một giờ kết thúc cách
+  đây đúng số giờ đặt sẵn, nên một phút bị trễ hoặc bị bỏ qua không làm sót ai.
+- Từ đó họ không xem hay thêm vào giỏ sản phẩm nào của cửa hàng: liên hệ vẫn đang xem hàng thì phải chờ.
+- Từ lượt xem đó họ không đặt đơn hàng nào và không bắt đầu thanh toán trong cửa hàng. Liên hệ đã bắt đầu thanh toán thuộc
+  về trình kích hoạt <UiPath path="automations.graph.kindAbandonedCheckout" />.
+- Quy trình chưa nhận họ trong 7 ngày gần nhất.
+
+Sự kiện nêu các sản phẩm họ đã xem (hoặc thêm vào giỏ) trong 24 giờ trước đó, mới nhất trước, tối đa 6 sản phẩm.
+
+## Thiết lập quy trình có hàng trở lại hoặc giảm giá
+
+<Steps>
+
+1. Mở <UiPath path="nav.automations" />, chọn <UiPath path="automations.newAutomation" /> rồi chọn
+   <UiPath path="automations.blankCanvas" />.
+
+2. Từ nhóm <UiPath path="commerce.flows.storeGroup" /> của bảng công cụ, kéo
+   <UiPath path="commerce.flows.kindBackInStock" /> hoặc <UiPath path="commerce.flows.kindPriceDrop" /> vào khung thiết
+   kế, chọn nó và chọn <UiPath path="commerce.flows.store" />.
+
+3. Đặt những ai sẽ được báo:
+   - <UiPath path="commerce.flows.kindBackInStock" />: những người đã yêu cầu được báo khi sản phẩm đã hết hàng có lại
+     (xem [cho người đọc yêu cầu sản phẩm đã hết hàng](#cho-người-đọc-yêu-cầu-sản-phẩm-đã-hết-hàng)). Mỗi người chỉ được
+     báo một lần. Bật <UiPath path="commerce.flows.viewersTooLabel" /> để thêm những người đã xem sản phẩm trong 1 đến 60
+     ngày gần nhất (mặc định 14); lựa chọn này mặc định tắt.
+   - <UiPath path="commerce.flows.kindPriceDrop" />: <UiPath path="commerce.flows.dropDays" /> từ 1 đến 60 ngày (mặc định
+     14), và <UiPath path="commerce.flows.dropPercent" /> từ 1% đến 90% (10%).
+
+   <Screenshot
+     id="store-flow-stock"
+     alt="Phần cài đặt trình kích hoạt của quy trình Back in stock trong bản demo: Có hàng trở lại trên Acme Merch, với công tắc thêm những người đã xem sản phẩm trong 14 ngày qua đang tắt, và ghi chú rằng những người yêu cầu từ nút Báo cho tôi trên trang hoặc từ API mỗi người chỉ nhận một lần."
+   >
+     1. Thêm cả những người đã xem sản phẩm trong 14 ngày qua.
+     2. Ai được báo theo mặc định: những người đã yêu cầu.
+   </Screenshot>
+
+4. Thêm email. Ghi tên sản phẩm bằng `{{ stock.product.title }}` và dẫn liên kết tới nó bằng `{{ stock.product.url }}` (xem
+   [hiện sản phẩm trong email](#hiện-sản-phẩm-trong-email)).
+
+5. Xuất bản quy trình.
+
+</Steps>
+
+ReputeCast nhận ra thay đổi khi lưu sản phẩm: một sản phẩm đã hết hàng nay có hàng trở lại, hoặc có giá thấp hơn trước.
+Thay đổi này khởi động mọi quy trình đang chạy của không gian làm việc trên cửa hàng đó; một lần giảm giá chỉ khởi động các
+quy trình có tỷ lệ mà mức giảm đạt tới. Sản phẩm bị gỡ khỏi cửa hàng hoặc không còn hoạt động thì không khởi động gì.
+
+Việc này nhanh đến đâu tùy vào cửa hàng:
+
+- WooCommerce báo các sản phẩm thay đổi bằng webhook sản phẩm của nó.
+- Shopify báo thay đổi tồn kho bằng `inventory_levels/update` khi cửa hàng đã cấp `read_inventory`. Nếu thiếu scope đó,
+  ReputeCast đọc các sản phẩm thay đổi kể từ lần kiểm tra gần nhất, mỗi 15 phút, trong lúc có quy trình có hàng trở lại
+  hoặc giảm giá theo dõi cửa hàng. Thay đổi giá luôn đến cùng webhook sản phẩm.
+
+### Cho người đọc yêu cầu sản phẩm đã hết hàng
+
+Quy trình có hàng trở lại nhận những người đã yêu cầu được báo. Có hai cách để yêu cầu:
+
+- **Trên trang web được theo dõi**, gọi trình theo dõi từ nút "Báo cho tôi" của bạn với id của sản phẩm theo cửa hàng. Yêu
+  cầu được tính cho khách truy cập mà ReputeCast biết là một liên hệ, trên trang web đã liên kết với cửa hàng:
+
+  ```js title="Nút Báo cho tôi"
+  reputecast('notifyWhenAvailable', { id: '8237401' })
+  ```
+
+- **Từ máy chủ của bạn**, [tạo yêu cầu cho một liên hệ](/api/operations/create-stock-request/) bằng
+  `POST /api/v1/workspaces/{workspace}/commerce/stock-requests` và một khóa API có quyền `subscribers:create`. Gửi `email`
+  của liên hệ và `productId` (id của ReputeCast hoặc id của cửa hàng); thêm `storeId` khi hai cửa hàng đã kết nối có sản
+  phẩm trùng id. Liên hệ phải tồn tại, và nhật ký kiểm tra ghi mỗi yêu cầu là `store_stock_request.created`.
+
+Khi quy trình đã nhận họ, yêu cầu được xem là đã đáp ứng. Yêu cầu lại sẽ chờ lần sản phẩm có hàng trở lại tiếp theo.
+
+## Hiện sản phẩm trong email
+
+Các email của quy trình nhận dữ liệu của trình kích hoạt dưới dạng Liquid (xem
+[cá nhân hóa email bằng Liquid](/vi/campaigns/personalization/)):
+
+| Biến                                                                                                             | Trong quy trình                                                                                      | Chứa                                                                                                         |
+| ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `{{ browse.products }}`                                                                                          | <UiPath path="commerce.flows.kindViewedProduct" />, <UiPath path="commerce.flows.kindAddedToCart" /> | Các sản phẩm mà sự kiện nêu, mới nhất trước, tối đa 6: mỗi sản phẩm có `title`, `url`, `image` và `price`. |
+| `{{ stock.product.title }}`, `{{ stock.product.url }}`, `{{ stock.product.image }}`, `{{ stock.product.price }}` | <UiPath path="commerce.flows.kindBackInStock" />, <UiPath path="commerce.flows.kindPriceDrop" />     | Sản phẩm có hàng trở lại hoặc rẻ hơn, kèm giá hiện tại.                                                      |
+| `{{ stock.previous_price }}`, `{{ stock.drop_percent }}`                                                         | <UiPath path="commerce.flows.kindPriceDrop" />                                                       | Giá trước khi giảm, và mức giảm, tính bằng phần trăm nguyên.                                                 |
+
+```liquid title="Email browse abandonment: các sản phẩm họ đã xem"
+{% for product in browse.products %}
+  <a href="{{ product.url }}"><img src="{{ product.image }}" alt="{{ product.title }}" width="160"></a>
+  <p>{{ product.title }} · {{ product.price }}</p>
+{% endfor %}
+```
+
+Phần cài đặt của trình kích hoạt cũng gợi ý một khối cho các sản phẩm này: lưới sản phẩm với
+<UiPath path="commerce.flows.products" /> đặt là <UiPath path="commerce.flows.viewed" />, khối này điền các vị trí bằng
+chính những sản phẩm đó khi email được gửi đi. Trình soạn thảo liệt kê lựa chọn này trong
+<UiPath path="commerce.flows.eachReader" />, ở dạng mờ, vì chỉ email của các quy trình xem sản phẩm, giỏ hàng và tồn kho
+mới điền được nó; các email Browse abandonment của bản demo có dùng khối này.
+
+Mọi email cũng có thể đề xuất sản phẩm từ một cửa hàng đã kết nối. Các lựa chọn <UiPath path="commerce.flows.products" />
+của lưới sản phẩm là:
+
+- <UiPath path="commerce.flows.sameForEveryone" />: <UiPath path="commerce.flows.chosen" />,
+  <UiPath path="commerce.flows.newest" />, hoặc <UiPath path="commerce.flows.bestSellers" />, tức những sản phẩm bán được
+  nhiều nhất trong 30 ngày qua, có thể chỉ trong một bộ sưu tập.
+- <UiPath path="commerce.flows.eachReader" />: <UiPath path="commerce.flows.recentlyViewed" />, những gì người đọc đã xem
+  hoặc thêm vào giỏ trên trang web của cửa hàng, mới nhất trước, trừ những gì họ đã mua; và
+  <UiPath path="commerce.flows.boughtTogether" />, những gì thường được mua cùng với thứ người đọc đã mua hoặc xem, dựa
+  trên đơn hàng của 180 ngày, được tính lại mỗi đêm. Người đọc chưa có lịch sử nào nhận sản phẩm bán chạy nhất.
+
+Một lưới hiện 2, 3, 4 hoặc 6 sản phẩm, và danh sách của mỗi người đọc được đọc khi thư của họ vào hàng chờ, nên các liên
+kết trong email giữ nguyên vị trí. [Thiết kế email trong trình soạn thảo](/vi/campaigns/composer/#khối) mô tả các khối sản
+phẩm.
+
+## Kiểm tra kết quả
+
+- Hàng của quy trình trong <UiPath path="nav.automations" /> hiện <UiPath path="automations.statusLive" />, trình kích
+  hoạt kèm cửa hàng, ví dụ "Có hàng trở lại · Acme Merch", và số liên hệ đã vào trong 30 ngày qua.
+- Trên khung thiết kế, bước trình kích hoạt đếm số liên hệ đã vào, và mỗi bước email đếm lượt gửi, lượt mở và lượt nhấp
+  của nó.
+- Hồ sơ của một liên hệ hiện một dòng cho mỗi ngày họ có mặt trên trang web được theo dõi, ví dụ "Đã xem 3 sản phẩm trên
+  shop.acme.io", cùng các quy trình họ đang tham gia (xem [xem hồ sơ liên hệ](/vi/audience/contacts/#xem-hồ-sơ-liên-hệ)).
+
+## Khắc phục sự cố
+
+- **Trình kích hoạt yêu cầu kết nối một cửa hàng Shopify hoặc WooCommerce trước.** Không gian làm việc chưa có cửa hàng
+  nào được kết nối. Kết nối một cửa hàng trong <UiPath path="nav.settings > settings.integrations" />.
+- **Trình kích hoạt báo chưa có trang web theo dõi nào liên kết với cửa hàng.** Thêm trang web của cửa hàng vào tính năng
+  theo dõi website, hoặc liên kết trang bạn đã thêm với cửa hàng, rồi xem lại ghi chú.
+- **Khi xuất bản, ứng dụng yêu cầu chọn cửa hàng, hoặc báo cửa hàng của trình kích hoạt không còn được kết nối.** Chọn
+  một cửa hàng đã kết nối, hoặc kết nối lại cửa hàng trong <UiPath path="nav.settings > settings.integrations" />.
+- **Không ai vào quy trình xem sản phẩm hoặc giỏ hàng.** Khách truy cập chưa phải là liên hệ đã biết, trang web chờ sự đồng
+  ý của họ mà banner của bạn không bao giờ gọi `reputecast('consent', true)`, hoặc trình duyệt của họ gửi Global Privacy
+  Control, điều mà trình theo dõi luôn tôn trọng. Liên hệ đã đặt hàng, đã bắt đầu thanh toán hoặc vẫn tiếp tục xem hàng
+  cũng không được đưa vào.
+- **Một liên hệ vào một lần rồi không vào lại.** Quy trình cửa hàng chỉ nhận lại cùng một liên hệ sau 7 ngày.
+- **Quy trình có hàng trở lại bắt đầu chậm với cửa hàng Shopify.** Ứng dụng của cửa hàng chưa cấp `read_inventory`, nên
+  thay đổi tồn kho được đọc mỗi 15 phút. [Kết nối Shopify hoặc WooCommerce](/vi/integrations/shopify-woocommerce/) liệt kê
+  các scope mà ứng dụng yêu cầu.
+- **Một lần giảm giá không khởi động ai.** Giá giảm ít hơn tỷ lệ của trình kích hoạt, loại tiền tệ đã thay đổi, hoặc không
+  ai xem hay thêm sản phẩm vào giỏ trong số ngày đặt sẵn.
+
+<Aside type="note">
+  Quy trình cửa hàng gửi qua tuyến Tự động hóa như mọi quy trình khác: email của chúng tuân theo quy tắc gửi của bước và
+  [giới hạn email marketing](/vi/reference/glossary/#marketing-cap) của không gian làm việc, và các liên hệ thuộc nhóm đối
+  chứng đi qua mà không nhận email (xem
+  [trình kích hoạt và các bước](/vi/automations/triggers-and-steps/#liên-hệ-bị-giữ-ngoài)).
+</Aside>
+
+## Liên quan
+
+- [Trình kích hoạt và các bước](/vi/automations/triggers-and-steps/) liệt kê mọi trình kích hoạt, kể cả các trình kích
+  hoạt đơn hàng và thanh toán của cửa hàng.
+- [Theo dõi lượt truy cập trên trang web của bạn](/vi/integrations/website-tracking/) thêm trình theo dõi vào trang web của
+  cửa hàng.
+- [Kết nối Shopify hoặc WooCommerce](/vi/integrations/shopify-woocommerce/) kết nối cửa hàng và webhook của nó.
+- [Thiết kế email trong trình soạn thảo](/vi/campaigns/composer/) mô tả các khối thẻ sản phẩm, lưới sản phẩm và sản phẩm
+  trong giỏ thanh toán.
+- [Xuất bản thay đổi tự động hóa an toàn](/vi/automations/publish-and-versions/) giải thích hộp thoại xuất bản.

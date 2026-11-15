@@ -1,6 +1,6 @@
 ---
 title: Authentication and API keys
-description: API key authentication for the ReputeCast REST API. Key prefixes, the Bearer header, permissions and list scope, expiry, rotation and the 401 answers.
+description: API key authentication for the ReputeCast REST API. Key prefixes, the Bearer header, permissions, list scope, allowed IPs, expiry, rotation and refusals.
 type: reference
 audience: [developer, admin]
 permissions: ['apikeys:manage']
@@ -10,6 +10,8 @@ sources:
   - internal/api/auth.go
   - internal/api/api.go
   - internal/apikeys
+  - internal/server/prefix.go
+  - internal/transactional/raw.go
   - internal/authn/tokens.go
   - internal/authz/authz.go
   - internal/app/app.go
@@ -18,16 +20,18 @@ sources:
   - internal/readiness/types.go
   - internal/campaigns/presence.go
 sidebar:
-  order: 3
+  order: 4
 ---
 
+import { Steps } from '@astrojs/starlight/components'
 import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import UiPath from '~/components/UiPath.astro'
 
 This page covers API key authentication for the ReputeCast REST API: the credentials it accepts, what a key may do,
-and how keys are created, rotated, revoked and refused. For a first call, follow [make your first API
-call](/developers/api-quickstart/).
+where it may be called from, and how keys are created, rotated, revoked and refused. For a first call, follow [make
+your first API call](/developers/api-quickstart/); the [client SDKs](/developers/sdks/) send the key for you.
 
 ## Send the key
 
@@ -72,7 +76,8 @@ The web app signs people in with the `rc_session` cookie. Scripts and services u
   workspace, the key keeps authenticating but every operation that needs a permission answers `403`; an integration
   key answers `owner_deactivated` instead, and someone with `integrations:manage` can take it over.
 - **List scope.** A key can be limited to lists (up to 100; none means all lists). It can't reach lists outside its
-  creator's own scope.
+  creator's own scope, at creation or later: on every call its lists and sender domains are cut down to what its
+  creator reaches at that moment, so narrowing a member's scope narrows their keys at once (since 1.5.0).
 - **Integration keys** work only for the operations of the triggers and actions turned on for their integration;
   any other call answers `403` with the code `integration_operation_denied`. Twelve operations accept only an
   integration's (or a WordPress site's) key.
@@ -100,7 +105,7 @@ app, signed in.
 | Action                                | What happens                                                                                                                                                                                                                                                           |
 | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Create                                | The secret is shown once. The audit log records `apikey.created` with the permissions and scope, never the secret.                                                                                                                                                    |
-| <UiPath path="keys.rotate" />         | A new secret with the same name, permissions and scope is shown once. **The old secret stops working at once.** A key with an expiry gets the same lifetime again, counted from today. Rotating an expired key replaces it.                                            |
+| <UiPath path="keys.rotate" />         | A new secret with the same name, permissions, scope and allowed IPs is shown once. **The old secret stops working at once.** A key with an expiry gets the same lifetime again, counted from today. Rotating an expired key replaces it.                                            |
 | Rotate an integration key             | Use <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: the old key keeps working for 24 hours. Rotating it in Keys & MCP answers `409` with the code `managed_by_integration`.                                       |
 | <UiPath path="keys.revoke" />         | The key stops working at once; calls get `401`. You can create a replacement with the same permissions and scope in the same dialog.                                                                                                                                  |
 | Expiry                                | After its expiry date the key answers `401`. Expired keys stay listed with the number of calls that still try to use them, so you can find what to update.                                                                                                             |
@@ -110,6 +115,59 @@ app, signed in.
 
 The keys list shows when each key was last used and from which IP address. Actions a key takes appear in the
 [audit log](/team/audit-log/) with the key as the actor.
+
+## Limit a key to allowed IPs
+
+A key can be limited to the addresses it is called from: up to 50 IPv4 or IPv6 addresses and networks, such as
+`203.0.113.7`, `203.0.113.0/24` or `2001:db8::/48` (since 1.6.0). An empty list, the default, allows any address.
+The same applies to send-only keys, SMTP credentials and [MCP agents](/developers/mcp/#limit-an-agent-to-allowed-ips).
+
+<Steps>
+
+1. In <UiPath path="nav.settings > settings.keys" />, select <UiPath path="keys.allowedIpsButton" /> on the key's
+   row, or fill <UiPath path="keys.allowedIpsLabel" /> when you create the key.
+
+2. Enter one address or network per line. The field shows where the key was last used and your own address as
+   ReputeCast sees it, each with a link to add it.
+
+3. Save. A list that leaves out the address the key was last used from asks first: calls from there stop at once.
+   Choose <UiPath path="keys.saveAnyway" /> only if that caller should be refused.
+
+</Steps>
+
+<Screenshot
+  id="settings-keys-allowed-ips"
+  alt="The Allowed IPs dialog of the Data warehouse sync key: two networks, 10.0.4.0/24 and 10.0.5.0/24, the key's last use from 10.0.4.22 inside them, and the address ReputeCast sees for the person editing, with a link to add it."
+>
+
+1. <UiPath path="keys.allowedIpsLabel" />: one address or network per line.
+2. Where the key was last used.
+3. Your own address as ReputeCast sees it, with a link to add it.
+
+</Screenshot>
+
+How allowed IPs work:
+
+- **The check comes after the token.** A known, valid key called from another address, or from an address ReputeCast
+  can't tell, answers `403` with the code `ip_not_allowed`, and the detail names the address ReputeCast saw. An
+  unknown key still answers `401`, so the check never tells anyone which keys exist. ReputeCast counts the refused
+  calls with their address and client.
+- **Behind a reverse proxy**, ReputeCast sees your callers' addresses only when the proxy is listed in
+  `http.trusted_proxies` ([reverse proxy and TLS](/self-hosting/reverse-proxy/)); otherwise every call seems to come
+  from the proxy. The dialog warns when requests arrive through a proxy that setting doesn't list.
+- **Narrowing needs only `apikeys:manage`.** Letting the key be called from more places, by emptying the list or
+  adding a network the old list doesn't cover, needs what rotating it needs: you hold every permission of the key,
+  and its lists are within your own scope. Otherwise the answer is `403` with the code `escalation_denied`.
+- **Integration keys never get a list**: Zapier, Make, n8n and WordPress call from their platforms' servers. Setting
+  one answers `409` with the code `managed_by_integration`. A revoked key keeps its list.
+- **Rotating keeps the list**, and every change is in the [audit log](/team/audit-log/) as `apikey.updated` with the
+  list before and after.
+- **SMTP credentials** outside their list are refused at login: the [SMTP relay](/transactional/smtp-relay/) answers
+  `535 5.7.8` and names the address.
+
+A signed-in person sets the list; the operation, `PUT /api/v1/workspaces/<workspace>/api-keys/<keyId>/allowed-ips`
+with `{ "allowedIps": [ … ] }`, is not callable with an API key. The create call takes the same field as
+`allowedIps`.
 
 ## Limits
 
@@ -128,12 +186,14 @@ The `detail` says why:
 | An expired key                                   | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
 
 Integration keys answer `401` with the codes `key_revoked` and `key_expired` instead, and their detail names the
-integration to reconnect. When the database can't confirm who is calling, the answer is `503` with the code
+integration to reconnect. A valid key called from outside its [allowed IPs](#limit-a-key-to-allowed-ips) answers
+`403` with the code `ip_not_allowed`. When the database can't confirm who is calling, the answer is `503` with the code
 `unavailable`: retry, the key stays valid. Every code is listed in [errors](/developers/api-errors/).
 
 ## Related
 
 - [Make your first API call](/developers/api-quickstart/)
+- [Use the client SDKs](/developers/sdks/)
 - [Rate limits](/developers/api-rate-limits/)
 - [Roles and permissions](/team/roles-and-permissions/)
 - [Security and hardening](/self-hosting/security/)

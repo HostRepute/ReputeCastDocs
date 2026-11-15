@@ -14,6 +14,9 @@ sources:
   - internal/providers/smtp
   - internal/providers/manage/review_health.go
   - internal/providers/provider.go
+  - internal/providers/ses/sns.go
+  - internal/providers/webhookauth/replay.go
+  - internal/providers/mailgun/webhook.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
   - internal/app/wire_sending.go
@@ -46,6 +49,13 @@ model, keeps the provider's original code next to it, and shares every bounce an
 2. **ReputeCast checks the signature.** Each adapter verifies the request the way its provider signs it (an SNS
    signature for Amazon SES, an HMAC for Mailgun, an ECDSA signature for SendGrid, a shared secret for providers that
    don't sign). A request that fails is answered `401` and never processed; the first 2 KB of it are kept for diagnosis.
+   Since 1.5.0, two signatures are held to more than a valid signature:
+   - **SNS** signs every AWS account's topics alike, so ReputeCast accepts a message only from the connection's own
+     topic, signed with a certificate from a regional SNS endpoint, `sns.<region>.amazonaws.com`. It saves the topic
+     before it subscribes the webhook, and trusts no topic while none is saved.
+   - **Mailgun** signs a one-time token rather than the event. ReputeCast ties each token to the event it first came
+     with in its database, so no ReputeCast process accepts that token with another event, also after a restart. A
+     redelivery of the same event passes and is counted once.
 3. **It stores the raw payload and answers at once.** A verified payload is saved as it arrived and the provider gets
    `200` straight away, so slow processing never makes a provider retry or give up. If ReputeCast can't store it, it
    answers `429` with `Retry-After: 30` rather than a `5xx`, because some providers drop events after a server error.
@@ -69,6 +79,9 @@ Events that don't come through a webhook take the same path from step 4:
   reach the suppression list until it can be read again.
 - **Polling**: ReputeCast polls the events API of Mailgun or SparkPost every minute when you chose polling in the
   connect wizard.
+- **Feedback loop reports by email**: while ReputeCast [receives mail](/providers/receiving-mail/), a complaint report
+  in ARF that arrives at the `fbl@` address of the receiving domain becomes a `complaint` event of the sending
+  provider that sent the message. Available from the next release after 1.6.0.
 
 A provider whose events stop arriving while mail goes out is flagged as having silent webhooks, and one that never
 reported an event is flagged once mail is 30 minutes overdue; [Provider health and outages](/providers/health-and-outages/)
@@ -118,8 +131,12 @@ ID.
 
 <Screenshot
   id="providers-events"
-  alt="The event log: raw events from Postmark, Amazon SES and Postal next to their normalized types (delivered, hard bounce, deferred, complaint, soft bounce, rejected), each with its original SMTP code and diagnostic."
+  alt="The event log of all sending providers and events: each raw event, such as Amazon SES Delivery or Bounce/Permanent/General, beside its normalized type, delivered or hard bounce, with the original code and diagnostic, the masked recipient and the automation step it came from."
 />
+
+Received mail, such as replies, is not an event of a sending provider, and the inbound address it arrives at,
+`/hooks/inbound/<token>`, is separate from the event webhooks. Read [set up receiving mail](/providers/receiving-mail/).
+Available from the next release after 1.6.0.
 
 <UiPath path="providers.events.exportCsv" /> downloads the filtered events. Recipients stay masked unless you have the
 `subscribers:export` permission, and every export is recorded in the [audit log](/team/audit-log/).

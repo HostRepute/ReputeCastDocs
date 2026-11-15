@@ -17,11 +17,13 @@ sources:
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
+  - internal/blobstore
   - deploy/docker-compose.yml
+  - deploy/helm/reputecast
   - docs/deploy/performance.md
   - README.md
 sidebar:
-  order: 8
+  order: 10
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -68,8 +70,10 @@ e-mails.
    qu’un fichier de clé ; avec Docker, copiez la clé existante avec
    `docker compose cp app:/var/lib/reputecast/secret.key .` et utilisez son contenu.
 
-2. Donnez aux processus web et worker le même `files.dir` (fichiers des produits et cadeaux d’inscription), sur un
-   volume partagé ou un système de fichiers réseau.
+2. Donnez aux processus web et worker le même `files.dir` (fichiers des produits, cadeaux d’inscription, importations
+   en cours et exports), sur un volume partagé ou un système de fichiers réseau. À défaut, gardez les fichiers dans un
+   [bucket compatible S3](/fr/self-hosting/object-storage/) avec `storage.backend: s3` sur chaque processus. Disponible
+   à partir de la prochaine version après la 1.6.0.
 
 3. Exécutez un ou plusieurs processus `serve --role=web,ingest` derrière votre
    [reverse proxy](/fr/self-hosting/reverse-proxy/), et au moins un `worker`. Plusieurs workers se partagent la file
@@ -115,6 +119,15 @@ services:
 
 Le worker démarre dès que `app` est opérationnel, si bien que la clé secrète et les migrations sont en place.
 
+## Répartir les rôles sur Kubernetes
+
+Sur Kubernetes, le chart que vous installez avec Helm ([Kubernetes](/fr/deploy/kubernetes/)) applique la même
+répartition sous forme de Deployments avec `mode: split` : des pods web (2 par défaut, avec un autoscaler facultatif),
+des pods worker (1) et, avec `ingest.separate`, des pods d’ingestion des webhooks vers lesquels l’Ingress route
+`/hooks/`. Les pods ne partagent pas de dossier : le mode split nécessite donc `storage.backend: s3` et arrête
+l’installation sans lui ; les migrations s’exécutent dans un Job avant chaque installation et chaque mise à niveau.
+Disponible à partir de la prochaine version après la 1.6.0.
+
 <Aside type="caution">
   Répartissez une instance après son premier démarrage, une fois que le fichier de clé secrète existe. Un worker qui
   démarre sur un volume vide avant l’application pourrait créer une clé différente.
@@ -127,7 +140,7 @@ Le worker démarre dès que `app` est opérationnel, si bien que la clé secrèt
   qu’un worker exécute à la fois.
 - **Les paramètres enregistrés dans l’application** : chaque processus relit toutes les 30 secondes l’URL publique
   enregistrée dans Administration de l’instance, et toutes les 15 secondes les adaptateurs communautaires installés.
-- **Les fichiers** : `files.dir`, comme ci-dessus.
+- **Les fichiers** : `files.dir`, ou le bucket, comme ci-dessus. Chaque processus doit utiliser le même stockage.
 - **Pas les limites de débit** : chaque processus web compte les requêtes de son côté, si bien que derrière un
   répartiteur de charge avec trois processus web, un appelant peut atteindre trois fois les
   [limites](/fr/self-hosting/security/#valeurs-par-défaut-et-limites).
@@ -167,7 +180,8 @@ liste des contacts, les décomptes de segments, l’API d’envoi et l’ingesti
 - **Rien n’est envoyé et les imports ne se terminent jamais** : aucun processus n’exécute le rôle `worker`.
 - **Les identifiants enregistrés des fournisseurs ne peuvent pas être déchiffrés dans un processus** : sa clé secrète
   est différente ; donnez à chaque processus le même `secrets.key` ou le même fichier de clé.
-- **Les téléchargements de produits échouent depuis certains processus** : `files.dir` n’est pas partagé.
+- **Les téléchargements de produits échouent depuis certains processus** : `files.dir` n’est pas partagé, ou les
+  processus n’utilisent pas tous le même `storage.backend`.
 - **`FATAL: sorry, too many clients already`** : réduisez `database.max_conns` par processus.
 - **Un processus journalise `metrics listener not started`** : un autre processus de l’hôte occupe déjà le port 9464.
   Donnez à chaque processus d’un même hôte son propre `metrics.addr`.

@@ -8,6 +8,7 @@ uiPath: 'nav.settings > settings.webhooks'
 primaryKeyword: webhook signature verification
 sources:
   - internal/webhooks/webhooks.go
+  - internal/webhooks/access.go
   - internal/webhooks/batch.go
   - internal/webhooks/email.go
   - internal/webhooks/jobs.go
@@ -15,8 +16,11 @@ sources:
   - internal/store/queries/webhooks.sql
   - internal/netguard/netguard.go
   - web/src/features/webhooks
+  - sdk/client-ts/src/webhooks.ts
+  - sdk/client-python/src/reputecast/webhooks.py
+  - sdk/client-go/webhooks
 sidebar:
-  order: 8
+  order: 9
 ---
 
 import { Aside, Steps, Tabs, TabItem, LinkCard, CardGrid } from '@astrojs/starlight/components'
@@ -31,7 +35,9 @@ came from your ReputeCast instance.
 
 ## Before you begin
 
-- You need `webhooks:manage` in the workspace.
+- You need `webhooks:manage` in the workspace, a [sensitive permission](/reference/glossary/#sensitive-permission)
+  since 1.5.0, and the view permission of what each event you pick carries
+  ([who an endpoint sends for](#who-an-endpoint-sends-for)).
 - Your endpoint needs a URL your ReputeCast server can reach, such as `https://api.example.com/webhooks/reputecast`.
   Addresses on private and internal networks (`10.0.0.0/8`, `localhost`, `*.internal` and the like) are refused
   unless an instance admin turns on `webhooks.allow_private_networks`
@@ -63,7 +69,7 @@ came from your ReputeCast instance.
 
 <Screenshot
   id="settings-webhooks"
-  alt="Settings, Webhooks tab: four outgoing webhook endpoints with their events, 24-hour success rate and status. A data warehouse endpoint subscribed to email.* is failing with HTTP 502, and an n8n endpoint is marked Managed by n8n. Below, the Verify a signature card."
+  alt="Settings, Webhooks tab: a note that API keys and MCP agents moved to Keys & MCP, then four outgoing webhook endpoints with their events, 24-hour success rate and status. A data warehouse endpoint subscribed to email.* is failing with HTTP 502, and an n8n endpoint is marked Managed by n8n. Below, the Verify a signature card."
 />
 
 The same endpoints can be managed through the API: `create-webhook`, `update-webhook`, `pause-webhook`,
@@ -77,6 +83,46 @@ or `*` for every event. The full catalog, with what each event means and a sampl
 automation email, and transactional messages have their own `message.*` events.
 
 `webhook.test` isn't in the catalog: only the test button and the `test-webhook` operation send it.
+
+`email.replied` (a contact replied to an email, auto-replies included) and `email.received` (other mail that
+arrived at the receiving domain) come from [receiving mail](/providers/receiving-mail/) and the
+[replies inbox](/audience/replies/). They start with `email.`, so `email.*` includes them, along with their need for
+`replies:view`. `subscription.paused` and `subscription.resumed` report a paid member's payments pausing until a date
+and starting again. Available from the next release after 1.6.0.
+
+## Who an endpoint sends for
+
+An endpoint sends its events on behalf of the person who last set its events or resumed it: for an endpoint an API
+key created, the key's creator. What an event carries decides who may have it sent somewhere:
+
+| Events                                                                                          | The person needs                                                     |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `contact.*`, `email.*`, `form.*`, `sms.*`, `push.*` and `whatsapp.*`, except the rows below      | `subscribers:view`, and access to every list                         |
+| `email.replied`, `email.received`                                                               | `replies:view`, and access to every list                             |
+| `referral.*`                                                                                    | `grow:view` and `subscribers:view`, and access to every list         |
+| `subscription.*`, `access.*`, `gift.*`, `conversion.*`                                          | `earn:view` and `subscribers:view`, and access to every list         |
+| `order.*`                                                                                       | `products:view` and `subscribers:view`, and access to every list     |
+| `message.*`                                                                                     | `transactional:view`                                                 |
+| `campaign.*`, `approval.*`                                                                      | `campaigns:view`                                                     |
+| `automation.*`                                                                                  | `automations:view`                                                   |
+| `provider.*`, `whatsapp.template_status`                                                        | `providers:view`                                                     |
+| `post.*`                                                                                        | `website:view`                                                       |
+
+Events that carry contacts carry them from every list, so a person or key limited to some lists can't subscribe to
+them. A group no one has described yet counts as carrying contacts.
+
+- **Saving checks it.** Picking an event, a group or `*` that includes one you can't see answers `403` with the code
+  `permission_denied`; the detail names the event and who can help, and `permission` holds the missing key.
+- **Every delivery checks it again**, against that person as they are at that moment. When they are no longer an
+  active member, have lost the permission or are now limited to some lists, ReputeCast pauses the endpoint, keeps its
+  events and shows why under the endpoint in <UiPath path="nav.settings > settings.webhooks" />. The audit log records
+  `webhook.paused` by System, with the reason.
+- **Resuming sends on your behalf**: you need what its events need, as when setting them. The kept events then go
+  out in order.
+- **The delivery log hides payloads you can't see.** Its detail says which permission the delivery needs instead of
+  showing the JSON and the endpoint's answer.
+- Endpoints saved before 1.5.0 without a person recorded go on as before. When someone takes over an integration's
+  key, its endpoints send for them from then on.
 
 ## What a delivery looks like
 
@@ -136,6 +182,8 @@ default and changes nothing for endpoints that leave it off.
 - The batch is one delivery with its own `id`, signature and `X-ReputeCast-Event: email.batch`, retried and replayed
   as a whole.
 - While the endpoint is paused, its batches are held like any other delivery.
+- Every `email.*` event is batched, `email.replied` and `email.received` included.
+  Available from the next release after 1.6.0.
 
 ## Verify the signature
 
@@ -151,8 +199,10 @@ To check a delivery:
    `X-ReputeCast-Signature`: after a rotation the header carries two signatures for a day. Accept the request when one
    matches; answer `401` when none does.
 
-Each example below is a complete receiver on port 3000 at `/webhooks/reputecast` that reads the secret from
-`REPUTECAST_WEBHOOK_SECRET`:
+The [client SDKs](/developers/sdks/#verify-webhook-signatures) do all of this in one call: `verifyWebhook` in
+TypeScript, `webhooks.verify` in Python and `webhooks.Verify` in Go. They are tested against deliveries the server
+signed. Without an SDK, each example below is a complete receiver on port 3000 at `/webhooks/reputecast` that reads
+the secret from `REPUTECAST_WEBHOOK_SECRET`:
 
 <Tabs syncKey="lang">
 <TabItem label="Node.js">
@@ -386,7 +436,9 @@ your receiver the new secret at once: it then rejects requests signed with the l
 ## Pause an endpoint
 
 <UiPath path="webhooks.pauseEndpoint" /> holds new events for the endpoint instead of sending them, for example
-during maintenance. <UiPath path="webhooks.resumeEndpoint" /> delivers everything held, in order.
+during maintenance. <UiPath path="webhooks.resumeEndpoint" /> delivers everything held, in order, on your behalf
+from then on. ReputeCast also pauses an endpoint itself when the person it sends for can no longer see what its
+events carry ([who an endpoint sends for](#who-an-endpoint-sends-for)); the reason shows under the endpoint.
 
 ## Rotate the signing secret
 
@@ -421,6 +473,10 @@ don't see them. When such an endpoint answers `410 Gone`, ReputeCast removes it.
 - **Deliveries time out**: your handler takes more than 10 seconds. Answer first, then process.
 - **The test event works but real events never arrive**: check that the endpoint subscribes to those events, and that
   the endpoint isn't paused.
+- **The endpoint paused itself**: the person it sends for left, lost a permission its events need, or is now limited
+  to some lists. Read the reason under the endpoint, then resume it as someone who can see those events.
+- **403 `permission_denied` when saving the events**: one of them, or one that a group or `*` includes, carries data
+  you can't see. The detail names it; pick narrower events or ask someone who holds the permission.
 - **Events arrive twice**: a retry followed an answer that came too late or wasn't `2xx`. Ignore an `id` you already
   processed.
 

@@ -1,0 +1,291 @@
+---
+title: Configurer l’abandon de navigation et le retour en stock
+description: 'Envoyez un e-mail d’abandon de navigation depuis ReputeCast quand un contact voit ou met au panier un produit sans l’acheter, et quand il revient en stock.'
+type: how-to
+audience: [publisher]
+permissions: ['automations:edit', 'automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: e-mail d’abandon de navigation
+sources:
+  - internal/automations/{storeflows.go,stores.go,engine.go,graph.go}
+  - internal/tracker/{flows.go,writer.go,static/rc.js}
+  - internal/commerce/{stock.go,recommend.go,blocks.go,jobs.go,webhooks.go,api.go}
+  - internal/store/queries/{tracker_flows.sql,commerce.sql}
+  - web/src/features/commerce/{automation.tsx,composer.tsx,flows.messages.ts}
+  - web/src/features/automations/{panels.tsx,graph.ts}
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Envoyez un e-mail d’abandon de navigation quand un contact regarde un produit de votre boutique et repart sans
+l’acheter, ou l’ajoute à son panier sans passer commande, et écrivez aux personnes qui voulaient un produit quand il est
+de retour en stock ou que son prix baisse. Ces [scénarios de boutique](/fr/reference/glossary/#store-flow) démarrent sur
+ce que le site de votre boutique signale via le suivi du site web. Disponible à partir de la prochaine version après la
+1.6.0.
+
+## Avant de commencer
+
+- Il vous faut `automations:edit` pour construire le scénario et `automations:publish` pour le publier ; les rôles
+  Propriétaire, Admin et Éditeur disposent des deux. [Créer des automatisations](/fr/automations/overview/) présente
+  l’éditeur.
+- Connectez la boutique Shopify ou WooCommerce, pour que ReputeCast connaisse ses produits, ses collections, ses
+  commandes et ses paiements (voir [connecter Shopify ou WooCommerce](/fr/integrations/shopify-woocommerce/)).
+- Ajoutez le site de la boutique dans le suivi du site web et liez ce site à la boutique, pour que ses vues de produits
+  et ses ajouts au panier désignent les produits de la boutique (voir
+  [suivre les visites sur votre site web](/fr/integrations/website-tracking/)). Seul un scénario de retour en stock pour
+  les personnes qui le demandent via l’API, sans les personnes qui ont vu le produit, fonctionne sans.
+- Seuls des contacts entrent. Un visiteur devient un contact connu quand il clique sur un lien de l’un de vos e-mails,
+  s’inscrit via un formulaire ReputeCast sur la même page, ou quand votre site l’identifie par un appel signé ; ses 30
+  derniers jours sur le site comptent alors. Les visiteurs anonymes n’entrent jamais dans un scénario.
+
+## Fonctionnement des scénarios de boutique
+
+Les quatre déclencheurs se trouvent dans le groupe <UiPath path="commerce.flows.storeGroup" /> de la palette, après
+<UiPath path="automations.graph.kindAbandonedCheckout" /> :
+
+<Screenshot
+  id="automation-palette"
+  alt="L’éditeur du scénario Browse abandonment de la démo avec toute la palette : le groupe Boutique avec Commande passée, Première commande, Paiement abandonné, A vu un produit, A ajouté au panier, De retour en stock et Baisse de prix, puis les groupes Abonnés payants et Publicités à formulaire."
+>
+  1. Boutique, avec les quatre déclencheurs de scénarios de boutique après les déclencheurs de commande et de paiement de la boutique.
+  2. Abonnés payants.
+  3. Publicités à formulaire.
+</Screenshot>
+
+| Déclencheur                                        | Démarre quand                                                                                                                        | Qui entre                                                                                                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="commerce.flows.kindViewedProduct" /> | Le nombre d’heures défini s’est écoulé depuis que le contact a vu pour la dernière fois l’un des produits de la boutique, sans commande ni paiement dans la boutique depuis. | Les contacts qui ont vu l’un des produits au moins le nombre de fois défini, éventuellement seulement des produits de certaines collections.                               |
+| <UiPath path="commerce.flows.kindAddedToCart" />   | La même chose, comptée à partir du dernier ajout au panier.                                                                          | Les contacts qui ont ajouté l’un des produits à leur panier au moins le nombre de fois défini.                                                                             |
+| <UiPath path="commerce.flows.kindBackInStock" />   | Un produit épuisé de la boutique est de nouveau disponible.                                                                          | Les contacts qui ont demandé à en être prévenus et ne l’ont pas encore été, et avec <UiPath path="commerce.flows.viewersTooLabel" />, ceux qui l’ont vu ces derniers jours. |
+| <UiPath path="commerce.flows.kindPriceDrop" />     | Le prix d’un produit baisse d’au moins la part définie, dans la même devise.                                                         | Les contacts qui l’ont vu ou ajouté à leur panier ces derniers jours.                                                                                                      |
+
+Dans la liste des automatisations et dans le diff de publication, les deux premiers s’affichent
+<UiPath path="commerce.flows.startsViewed" /> et <UiPath path="commerce.flows.startsCarted" />, par exemple « A vu un
+produit sans l’acheter · Acme Merch · après 4 heures ».
+
+Règles que suit chaque scénario de boutique :
+
+- ReputeCast ne cherche des contacts que tant qu’un scénario en ligne démarre sur le déclencheur. Les scénarios de
+  navigation et de panier sont vérifiés toutes les minutes ; les scénarios de stock et de prix tournent quand la
+  boutique signale le changement.
+- Seuls les contacts actifs entrent : les contacts désabonnés, en rebond, en plainte, exclus et effacés n’entrent jamais.
+- Un scénario ne reprend le même contact qu’au bout de 7 jours. Le déclencheur n’a pas de choix
+  <UiPath path="automations.panels.reentry" />.
+- Un déclencheur de scénario de boutique ne peut être que le premier déclencheur d’un scénario, jamais un déclencheur
+  ajouté (voir [plusieurs déclencheurs](/fr/automations/triggers-and-steps/#plusieurs-déclencheurs)).
+
+## Configurer un scénario d’abandon de navigation ou de panier
+
+<Steps>
+
+1. Allez dans <UiPath path="nav.automations" />, sélectionnez <UiPath path="automations.newAutomation" /> et choisissez
+   <UiPath path="automations.blankCanvas" />.
+
+2. Depuis le groupe <UiPath path="commerce.flows.storeGroup" /> de la palette, faites glisser
+   <UiPath path="commerce.flows.kindViewedProduct" /> sur le canevas, ou <UiPath path="commerce.flows.kindAddedToCart" />
+   pour relancer les paniers, et sélectionnez-le.
+
+3. Sous <UiPath path="commerce.flows.store" />, choisissez la boutique. Avec une seule boutique connectée, elle est déjà
+   choisie. La note sous les réglages indique quel site suivi envoie les vues de produits de la boutique, ou qu’aucun
+   n’est encore lié, avec <UiPath path="commerce.flows.setUpTracking" />.
+
+4. Réglez le déclencheur :
+   - <UiPath path="commerce.flows.wait" /> : combien d’heures après la dernière vue, sans commande ni paiement, le
+     scénario démarre : de 1 à 24, 4 au départ.
+   - <UiPath path="commerce.flows.only" /> : <UiPath path="commerce.flows.addCollection" /> ne garde que les produits de
+     20 collections de la boutique au plus. Sans collection, n’importe quel produit de la boutique compte.
+   - <UiPath path="commerce.flows.after" /> : combien de fois le contact a vu l’un des produits, ou l’a ajouté à son
+     panier : de 1 à 5, 1 au départ.
+
+   <Screenshot
+     id="store-flow-browse"
+     alt="Le scénario Browse abandonment de la démo avec son déclencheur sélectionné : A vu un produit sur Acme Merch après 4 heures sur le canevas, puis deux e-mails à 2 jours d’intervalle et une sortie, et dans le panneau de droite la boutique, Attendre 4 heures, aucune collection, après 1 vue et la note indiquant que shop.acme.io envoie les produits vus d’Acme Merch."
+   >
+     1. Le déclencheur sur le canevas : la boutique et l’attente.
+     2. Les heures sans commande ni paiement.
+     3. Les collections auxquelles les produits doivent appartenir.
+     4. Les vues d’un produit avant que le scénario démarre.
+     5. Le site suivi qui envoie les vues de produits de la boutique.
+   </Screenshot>
+
+5. Ajoutez les e-mails. Faites glisser <UiPath path="automations.graph.typeEmail" /> sous le déclencheur et rédigez un
+   e-mail qui montre les produits que le contact a regardés (voir
+   [afficher les produits dans les e-mails](#afficher-les-produits-dans-les-e-mails)). Le scénario de la démo envoie un
+   second e-mail deux jours plus tard via un <UiPath path="automations.graph.typeDelay" />.
+
+6. Publiez le scénario (voir [publier les modifications d’automatisation sans risque](/fr/automations/publish-and-versions/)).
+   À partir de là, ReputeCast vérifie toutes les minutes.
+
+</Steps>
+
+Chaque minute, un contact entre quand toutes ces conditions sont réunies :
+
+- Sa dernière vue (ou son dernier ajout au panier) d’un produit correspondant a eu lieu dans l’heure qui s’est terminée il
+  y a le nombre d’heures défini : une minute en retard ou sautée ne fait donc manquer personne.
+- Il n’a vu ni mis au panier aucun produit de la boutique depuis : un contact qui navigue encore attend.
+- Il n’a passé aucune commande ni commencé aucun paiement dans la boutique depuis cette vue. Un contact qui a commencé
+  un paiement relève plutôt du déclencheur <UiPath path="automations.graph.kindAbandonedCheckout" />.
+- Le scénario ne l’a pas pris ces 7 derniers jours.
+
+L’événement désigne les produits qu’il a vus (ou mis au panier) dans les 24 heures précédentes, du plus récent au plus
+ancien, 6 au plus.
+
+## Configurer un scénario de retour en stock ou de baisse de prix
+
+<Steps>
+
+1. Allez dans <UiPath path="nav.automations" />, sélectionnez <UiPath path="automations.newAutomation" /> et choisissez
+   <UiPath path="automations.blankCanvas" />.
+
+2. Depuis le groupe <UiPath path="commerce.flows.storeGroup" /> de la palette, faites glisser
+   <UiPath path="commerce.flows.kindBackInStock" /> ou <UiPath path="commerce.flows.kindPriceDrop" /> sur le canevas,
+   sélectionnez-le et choisissez la <UiPath path="commerce.flows.store" />.
+
+3. Définissez qui est prévenu :
+   - <UiPath path="commerce.flows.kindBackInStock" /> : les personnes qui ont demandé à être prévenues du retour du produit
+     épuisé (voir [permettre aux lecteurs de demander un produit épuisé](#permettre-aux-lecteurs-de-demander-un-produit-épuisé)).
+     Chacune est prévenue une fois. Activez <UiPath path="commerce.flows.viewersTooLabel" /> pour ajouter celles qui l’ont
+     vu ces 1 à 60 derniers jours (14 au départ) ; l’option est désactivée au départ.
+   - <UiPath path="commerce.flows.kindPriceDrop" /> : <UiPath path="commerce.flows.dropDays" /> 1 à 60 jours (14 au
+     départ), et <UiPath path="commerce.flows.dropPercent" /> 1 % à 90 % (10 %).
+
+   <Screenshot
+     id="store-flow-stock"
+     alt="Les réglages du déclencheur du scénario Back in stock de la démo : De retour en stock sur Acme Merch, avec l’interrupteur qui ajoute les personnes l’ayant vu ces 14 derniers jours désactivé, et la note indiquant que les personnes qui l’ont demandé via le bouton « Me prévenir » du site ou l’API sont prévenues une fois chacune."
+   >
+     1. Prendre aussi les personnes qui ont vu le produit ces 14 derniers jours.
+     2. Qui est prévenu par défaut : les personnes qui l’ont demandé.
+   </Screenshot>
+
+4. Ajoutez l’e-mail. Nommez le produit avec `{{ stock.product.title }}` et liez-le avec `{{ stock.product.url }}` (voir
+   [afficher les produits dans les e-mails](#afficher-les-produits-dans-les-e-mails)).
+
+5. Publiez le scénario.
+
+</Steps>
+
+ReputeCast remarque le changement quand il enregistre le produit : un produit qui était épuisé et de nouveau
+disponible, ou dont le prix est plus bas qu’avant. Le changement démarre chaque scénario en ligne de l’espace de travail
+sur cette boutique ; une baisse de prix ne démarre que les scénarios dont elle atteint la part. Un produit retiré de la
+boutique ou inactif ne démarre rien.
+
+Le délai dépend de la boutique :
+
+- WooCommerce signale les produits modifiés avec ses webhooks de produits.
+- Shopify signale les changements de stock avec `inventory_levels/update` quand la boutique a accordé `read_inventory`.
+  Sans cette portée, ReputeCast lit les produits modifiés depuis sa dernière vérification toutes les 15 minutes tant
+  qu’un scénario de retour en stock ou de baisse de prix surveille la boutique. Les changements de prix arrivent dans
+  tous les cas avec les webhooks de produits.
+
+### Permettre aux lecteurs de demander un produit épuisé
+
+Un scénario de retour en stock prend les personnes qui ont demandé à être prévenues. Il existe deux façons de le
+demander :
+
+- **Sur le site suivi**, appelez le tracker depuis votre bouton « Me prévenir » avec l’id du produit propre à la
+  boutique. La demande compte pour un visiteur que ReputeCast connaît comme contact, sur un site lié à la boutique :
+
+  ```js title="Notify me button"
+  reputecast('notifyWhenAvailable', { id: '8237401' })
+  ```
+
+- **Depuis votre serveur**, [faites la demande pour un contact](/api/operations/create-stock-request/) avec
+  `POST /api/v1/workspaces/{workspace}/commerce/stock-requests` et une clé API disposant de `subscribers:create`.
+  Envoyez l’`email` du contact et le `productId` (l’id ReputeCast ou celui de la boutique) ; ajoutez `storeId` quand
+  deux boutiques connectées ont un produit avec le même id. Le contact doit exister, et le journal d’audit enregistre
+  chaque demande sous `store_stock_request.created`.
+
+Une fois que le scénario prend la personne, sa demande est satisfaite. Une nouvelle demande attend le prochain retour
+du produit.
+
+## Afficher les produits dans les e-mails
+
+Les e-mails du scénario reçoivent les données du déclencheur en Liquid (voir
+[personnaliser les e-mails avec Liquid](/fr/campaigns/personalization/)) :
+
+| Variable                                                                                                         | Dans les scénarios                                                                                   | Contient                                                                                                                  |
+| ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `{{ browse.products }}`                                                                                          | <UiPath path="commerce.flows.kindViewedProduct" />, <UiPath path="commerce.flows.kindAddedToCart" /> | Les produits que désigne l’événement, du plus récent au plus ancien, 6 au plus : chacun avec `title`, `url`, `image` et `price`. |
+| `{{ stock.product.title }}`, `{{ stock.product.url }}`, `{{ stock.product.image }}`, `{{ stock.product.price }}` | <UiPath path="commerce.flows.kindBackInStock" />, <UiPath path="commerce.flows.kindPriceDrop" />     | Le produit revenu en stock ou devenu moins cher, avec son prix actuel.                                                    |
+| `{{ stock.previous_price }}`, `{{ stock.drop_percent }}`                                                         | <UiPath path="commerce.flows.kindPriceDrop" />                                                       | Le prix avant la baisse, et de combien il a baissé, en pourcentage entier.                                                |
+
+```liquid title="Browse abandonment email: the products they looked at"
+{% for product in browse.products %}
+  <a href="{{ product.url }}"><img src="{{ product.image }}" alt="{{ product.title }}" width="160"></a>
+  <p>{{ product.title }} · {{ product.price }}</p>
+{% endfor %}
+```
+
+Les réglages du déclencheur indiquent aussi un bloc pour eux : la grille de produits avec ses
+<UiPath path="commerce.flows.products" /> réglés sur <UiPath path="commerce.flows.viewed" />, qui remplit ses
+emplacements avec les mêmes produits au moment où l’e-mail part. L’éditeur liste ce choix sous
+<UiPath path="commerce.flows.eachReader" />, grisé, car seuls les e-mails des scénarios de navigation, de panier et de
+stock peuvent le remplir ; les e-mails Browse abandonment de la démo le montrent.
+
+Chaque e-mail peut aussi recommander des produits d’une boutique connectée. Les choix de
+<UiPath path="commerce.flows.products" /> de la grille de produits sont :
+
+- <UiPath path="commerce.flows.sameForEveryone" /> : <UiPath path="commerce.flows.chosen" />,
+  <UiPath path="commerce.flows.newest" />, ou <UiPath path="commerce.flows.bestSellers" />, le plus d’unités vendues ces
+  30 derniers jours, éventuellement dans une seule collection.
+- <UiPath path="commerce.flows.eachReader" /> : <UiPath path="commerce.flows.recentlyViewed" />, ce que le lecteur a vu
+  ou ajouté à son panier sur le site de la boutique, du plus récent au plus ancien, sans ce qu’il a acheté ; et
+  <UiPath path="commerce.flows.boughtTogether" />, ce qui est souvent acheté avec ce que le lecteur a acheté ou vu,
+  d’après 180 jours de commandes, recalculé chaque nuit. Les lecteurs sans historique reçoivent les meilleures ventes.
+
+Une grille affiche 2, 3, 4 ou 6 produits, et la liste de chaque lecteur est lue quand son message est mis en file
+d’attente : les liens de l’e-mail gardent ainsi leurs emplacements.
+[Concevoir des e-mails dans l’éditeur](/fr/campaigns/composer/#blocs) présente les blocs de produits.
+
+## Vérifier le résultat
+
+- La ligne du scénario dans <UiPath path="nav.automations" /> affiche <UiPath path="automations.statusLive" />, son
+  déclencheur avec la boutique, comme « De retour en stock · Acme Merch », et le nombre de contacts entrés ces 30
+  derniers jours.
+- Sur le canevas, l’étape du déclencheur compte les contacts entrés, et chaque étape e-mail ses envois, ouvertures et
+  clics.
+- La fiche d’un contact affiche une ligne pour chaque jour passé sur le site suivi, comme « A consulté 3 produits sur
+  shop.acme.io », et les scénarios dans lesquels il se trouve (voir
+  [lire la fiche d’un contact](/fr/audience/contacts/#lire-la-fiche-dun-contact)).
+
+## Dépannage
+
+- **Le déclencheur demande de connecter d’abord une boutique Shopify ou WooCommerce.** L’espace de travail n’a aucune
+  boutique connectée. Connectez-en une dans <UiPath path="nav.settings > settings.integrations" />.
+- **Le déclencheur indique qu’aucun site suivi n’est encore lié à la boutique.** Ajoutez le site de la boutique dans le
+  suivi du site web, ou liez à la boutique le site que vous avez ajouté, puis relisez la note.
+- **La publication demande de choisir la boutique, ou indique que la boutique du déclencheur n’est plus connectée.**
+  Choisissez une boutique connectée, ou reconnectez la boutique dans <UiPath path="nav.settings > settings.integrations" />.
+- **Personne n’entre dans un scénario de navigation ou de panier.** Les visiteurs ne sont pas encore des contacts connus,
+  le site attend leur consentement et votre bandeau n’appelle jamais `reputecast('consent', true)`, ou leur navigateur
+  envoie le signal Global Privacy Control, que le tracker respecte toujours. Les contacts qui ont commandé, commencé un
+  paiement ou continué à naviguer n’entrent pas non plus.
+- **Un contact est entré une fois et plus jamais.** Un scénario de boutique ne reprend le même contact qu’au bout de 7
+  jours.
+- **Un scénario de retour en stock démarre en retard pour une boutique Shopify.** L’application de la boutique n’a pas
+  accordé `read_inventory` : les changements de stock sont donc lus toutes les 15 minutes.
+  [Connecter Shopify ou WooCommerce](/fr/integrations/shopify-woocommerce/) liste les portées que demande l’application.
+- **Une baisse de prix n’a fait entrer personne.** Le prix a baissé de moins que la part du déclencheur, la devise a
+  changé, ou personne n’a vu ni mis au panier le produit pendant les jours définis.
+
+<Aside type="note">
+  Les scénarios de boutique envoient sur la route Automatisations comme tout autre scénario : leurs e-mails suivent les
+  règles d’envoi de l’étape et le [plafond marketing](/fr/reference/glossary/#marketing-cap) de l’espace de travail, et
+  les contacts du groupe témoin les passent sans e-mail (voir
+  [déclencheurs et étapes](/fr/automations/triggers-and-steps/#contacts-tenus-à-lécart)).
+</Aside>
+
+## Voir aussi
+
+- [Déclencheurs et étapes](/fr/automations/triggers-and-steps/) liste chaque déclencheur, y compris les déclencheurs de
+  commande et de paiement de la boutique.
+- [Suivre les visites sur votre site web](/fr/integrations/website-tracking/) ajoute le tracker au site de la boutique.
+- [Connecter Shopify ou WooCommerce](/fr/integrations/shopify-woocommerce/) connecte la boutique et ses webhooks.
+- [Concevoir des e-mails dans l’éditeur](/fr/campaigns/composer/) présente les blocs Carte produit, Grille de produits et
+  Articles du panier.
+- [Publier les modifications d’automatisation sans risque](/fr/automations/publish-and-versions/) explique la boîte de
+  dialogue de publication.

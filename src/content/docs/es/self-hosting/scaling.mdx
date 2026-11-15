@@ -17,11 +17,13 @@ sources:
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
+  - internal/blobstore
   - deploy/docker-compose.yml
+  - deploy/helm/reputecast
   - docs/deploy/performance.md
   - README.md
 sidebar:
-  order: 8
+  order: 10
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -67,8 +69,10 @@ segundo plano; PostgreSQL guarda los datos y la cola de tareas, y los proveedore
    de clave; con Docker, copia la clave existente con `docker compose cp app:/var/lib/reputecast/secret.key .` y usa su
    contenido.
 
-2. Da a los procesos web y worker el mismo `files.dir` (archivos de productos y regalos de suscripción), en un volumen
-   compartido o en un sistema de archivos en red.
+2. Da a los procesos web y worker el mismo `files.dir` (archivos de productos, regalos de suscripción, subidas en curso
+   y exportaciones), en un volumen compartido o en un sistema de archivos en red. Si no tienes ninguno, guarda los
+   archivos en un [bucket compatible con S3](/es/self-hosting/object-storage/) con `storage.backend: s3` en todos los
+   procesos. Disponible a partir de la próxima versión después de la 1.6.0.
 
 3. Ejecuta uno o varios procesos `serve --role=web,ingest` detrás de tu [proxy inverso](/es/self-hosting/reverse-proxy/),
    y al menos un `worker`. Varios workers comparten la cola a través de PostgreSQL. Para ampliar por separado la
@@ -113,6 +117,15 @@ services:
 
 El worker arranca en cuanto `app` está en buen estado, así que la clave secreta y las migraciones ya están en su sitio.
 
+## Repartir los roles en Kubernetes
+
+En Kubernetes, el chart que instalas con Helm ([Kubernetes](/es/deploy/kubernetes/)) ejecuta el mismo reparto como
+Deployments con `mode: split`: pods web (2 por defecto, con un autoescalador opcional), pods worker (1) y, con
+`ingest.separate`, pods de ingesta de webhooks a los que el Ingress enruta `/hooks/`. Los pods no comparten una
+carpeta, así que el modo split necesita `storage.backend: s3` y detiene la instalación si no lo tiene; las migraciones
+se ejecutan en un Job antes de cada instalación y cada actualización. Disponible a partir de la próxima versión después
+de la 1.6.0.
+
 <Aside type="caution">
   Reparte una instancia después de su primer arranque, cuando ya existe el archivo de la clave secreta. Un worker que
   arranca con un volumen vacío antes que la aplicación podría crear una clave distinta.
@@ -125,7 +138,7 @@ El worker arranca en cuanto `app` está en buen estado, así que la clave secret
   ejecuta un worker a la vez.
 - **La configuración guardada en la aplicación**: cada proceso vuelve a leer cada 30 segundos la URL pública guardada
   en la administración de la instancia, y cada 15 segundos los adaptadores de la comunidad instalados.
-- **Los archivos**: `files.dir`, como se indica arriba.
+- **Los archivos**: `files.dir`, o el bucket, como se indica arriba. Todos los procesos deben usar el mismo backend.
 - **Los límites de frecuencia no**: cada proceso web cuenta las solicitudes por su cuenta, así que detrás de un
   balanceador de carga con tres procesos web un cliente puede llegar al triple de los
   [límites](/es/self-hosting/security/#valores-predeterminados-y-límites).
@@ -165,7 +178,8 @@ la lista de contactos, los recuentos de segmentos, la API de envío y la ingesta
 - **No se envía nada y las importaciones no terminan nunca**: ningún proceso ejecuta el rol `worker`.
 - **Un proceso no puede descifrar las credenciales guardadas de los proveedores**: su clave secreta es distinta; da a
   todos los procesos la misma `secrets.key` o el mismo archivo de clave.
-- **Las descargas de productos fallan desde algunos procesos**: `files.dir` no está compartido.
+- **Las descargas de productos fallan desde algunos procesos**: `files.dir` no está compartido, o no todos los procesos
+  usan el mismo `storage.backend`.
 - **`FATAL: sorry, too many clients already`**: reduce `database.max_conns` por proceso.
 - **Un proceso registra `metrics listener not started`**: otro proceso del host ya ocupa el puerto 9464. Da a cada
   proceso de un host su propio `metrics.addr`.

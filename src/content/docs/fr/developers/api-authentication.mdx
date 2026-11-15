@@ -1,6 +1,6 @@
 ---
 title: Authentification et clés API
-description: "Authentification par clé API dans l’API REST de ReputeCast : préfixes, en-tête Bearer, autorisations, portée, expiration, renouvellement et réponses 401."
+description: "Authentification par clé API pour l’API REST ReputeCast : préfixes, en-tête Bearer, autorisations, portée, IP autorisées, expiration, renouvellement et refus."
 type: reference
 audience: [developer, admin]
 permissions: ['apikeys:manage']
@@ -10,6 +10,8 @@ sources:
   - internal/api/auth.go
   - internal/api/api.go
   - internal/apikeys
+  - internal/server/prefix.go
+  - internal/transactional/raw.go
   - internal/authn/tokens.go
   - internal/authz/authz.go
   - internal/app/app.go
@@ -18,16 +20,19 @@ sources:
   - internal/readiness/types.go
   - internal/campaigns/presence.go
 sidebar:
-  order: 3
+  order: 4
 ---
 
+import { Steps } from '@astrojs/starlight/components'
 import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import UiPath from '~/components/UiPath.astro'
 
 Cette page décrit l’authentification par clé API dans l’API REST de ReputeCast : les identifiants acceptés, ce
-qu’une clé peut faire, et comment les clés sont créées, renouvelées, révoquées et refusées. Pour un premier appel,
-suivez [faire votre premier appel d’API](/fr/developers/api-quickstart/).
+qu’une clé peut faire, d’où elle peut être appelée, et comment les clés sont créées, renouvelées, révoquées et refusées.
+Pour un premier appel, suivez [faire votre premier appel d’API](/fr/developers/api-quickstart/) ; les
+[SDK clients](/fr/developers/sdks/) envoient la clé pour vous.
 
 ## Envoyer la clé
 
@@ -74,7 +79,9 @@ L’application web connecte les personnes avec le cookie `rc_session`. Les scri
   autorisation répond `403` ; une clé d’intégration répond `owner_deactivated` à la place, et une personne qui
   dispose de `integrations:manage` peut la reprendre.
 - **Portée des listes.** Une clé peut être limitée à des listes (jusqu’à 100 ; aucune signifie toutes les listes).
-  Elle ne peut pas atteindre de listes en dehors de la portée de son créateur.
+  Elle ne peut pas atteindre de listes en dehors de la portée de son créateur, ni à sa création ni plus tard : à chaque
+  appel, ses listes et ses domaines d’expéditeur sont réduits à ce que son créateur atteint à ce moment-là, si bien que
+  réduire la portée d’un membre réduit aussitôt celle de ses clés (depuis la version 1.5.0).
 - **Les clés d’intégration** ne fonctionnent que pour les opérations des déclencheurs et des actions activés pour leur
   intégration ; tout autre appel répond `403` avec le code `integration_operation_denied`. Douze opérations
   n’acceptent que la clé d’une intégration (ou d’un site WordPress).
@@ -105,7 +112,7 @@ renouvellement se font dans l’application, une fois connecté.
 | Action                                | Ce qui se passe                                                                                                                                                                                                                                                                         |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Créer                                 | Le secret est affiché une fois. Le journal d’audit enregistre `apikey.created` avec les autorisations et la portée, jamais le secret.                                                                                                                                                   |
-| <UiPath path="keys.rotate" />         | Un nouveau secret avec le même nom, les mêmes autorisations et la même portée est affiché une fois. **L’ancien secret cesse de fonctionner immédiatement.** Une clé qui a une expiration reçoit de nouveau la même durée de vie, comptée à partir d’aujourd’hui. Renouveler une clé expirée la remplace. |
+| <UiPath path="keys.rotate" />         | Un nouveau secret avec le même nom, les mêmes autorisations, la même portée et les mêmes IP autorisées est affiché une fois. **L’ancien secret cesse de fonctionner immédiatement.** Une clé qui a une expiration reçoit de nouveau la même durée de vie, comptée à partir d’aujourd’hui. Renouveler une clé expirée la remplace. |
 | Renouveler une clé d’intégration      | Utilisez <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" /> : l’ancienne clé continue de fonctionner pendant 24 heures. La renouveler dans Clés et MCP répond `409` avec le code `managed_by_integration`.                              |
 | <UiPath path="keys.revoke" />         | La clé cesse de fonctionner immédiatement ; les appels reçoivent `401`. Vous pouvez créer une remplaçante avec les mêmes autorisations et la même portée dans la même boîte de dialogue.                                                                                               |
 | Expiration                            | Après sa date d’expiration, la clé répond `401`. Les clés expirées restent listées avec le nombre d’appels qui tentent encore de les utiliser, pour que vous trouviez ce qu’il faut mettre à jour.                                                                                     |
@@ -115,6 +122,62 @@ renouvellement se font dans l’application, une fois connecté.
 
 La liste des clés indique quand chaque clé a été utilisée pour la dernière fois et depuis quelle adresse IP. Les
 actions d’une clé apparaissent dans le [journal d’audit](/fr/team/audit-log/) avec la clé comme acteur.
+
+## Limiter une clé à des IP autorisées
+
+Une clé peut être limitée aux adresses depuis lesquelles elle est appelée : jusqu’à 50 adresses et réseaux IPv4 ou IPv6,
+comme `203.0.113.7`, `203.0.113.0/24` ou `2001:db8::/48` (depuis la version 1.6.0). Une liste vide, la valeur par
+défaut, autorise toutes les adresses. Il en va de même pour les clés d’envoi uniquement, les identifiants SMTP et les
+[agents MCP](/fr/developers/mcp/#limiter-un-agent-à-des-ip-autorisées).
+
+<Steps>
+
+1. Dans <UiPath path="nav.settings > settings.keys" />, sélectionnez <UiPath path="keys.allowedIpsButton" /> sur la
+   ligne de la clé, ou remplissez <UiPath path="keys.allowedIpsLabel" /> à la création de la clé.
+
+2. Saisissez une adresse ou un réseau par ligne. Le champ indique d’où la clé a été utilisée pour la dernière fois et
+   votre propre adresse telle que ReputeCast la voit, chacune avec un lien pour l’ajouter.
+
+3. Enregistrez. Une liste qui omet l’adresse depuis laquelle la clé a été utilisée pour la dernière fois demande d’abord
+   confirmation : les appels venant de là s’arrêtent aussitôt. Ne choisissez <UiPath path="keys.saveAnyway" /> que si
+   cet appelant doit être refusé.
+
+</Steps>
+
+<Screenshot
+  id="settings-keys-allowed-ips"
+  alt="La boîte de dialogue IP autorisées de la clé Data warehouse sync : deux réseaux, 10.0.4.0/24 et 10.0.5.0/24, la dernière utilisation de la clé depuis 10.0.4.22, comprise dans ces réseaux, et l’adresse que ReputeCast voit pour la personne qui modifie la liste, avec un lien pour l’ajouter."
+>
+
+1. <UiPath path="keys.allowedIpsLabel" /> : une adresse ou un réseau par ligne.
+2. L’endroit d’où la clé a été utilisée pour la dernière fois.
+3. Votre propre adresse telle que ReputeCast la voit, avec un lien pour l’ajouter.
+
+</Screenshot>
+
+Fonctionnement des IP autorisées :
+
+- **Le contrôle vient après le jeton.** Une clé connue et valide appelée depuis une autre adresse, ou depuis une adresse
+  que ReputeCast ne peut pas déterminer, répond `403` avec le code `ip_not_allowed`, et le détail nomme l’adresse que
+  ReputeCast a vue. Une clé inconnue répond toujours `401` : le contrôle ne révèle donc jamais à personne quelles clés
+  existent. ReputeCast compte les appels refusés avec leur adresse et leur client.
+- **Derrière un reverse proxy**, ReputeCast ne voit les adresses de vos appelants que si le proxy figure dans
+  `http.trusted_proxies` ([reverse proxy et TLS](/fr/self-hosting/reverse-proxy/)) ; sinon, chaque appel semble venir
+  du proxy. La boîte de dialogue avertit quand des requêtes arrivent par un proxy que ce paramètre ne liste pas.
+- **Restreindre ne nécessite que `apikeys:manage`.** Permettre d’appeler la clé depuis davantage d’endroits, en vidant
+  la liste ou en ajoutant un réseau que l’ancienne liste ne couvre pas, nécessite ce que nécessite son renouvellement :
+  vous détenez toutes les autorisations de la clé, et ses listes sont dans votre propre portée. Sinon, la réponse est
+  `403` avec le code `escalation_denied`.
+- **Les clés d’intégration n’ont jamais de liste** : Zapier, Make, n8n et WordPress appellent depuis les serveurs de leur
+  plateforme. En définir une répond `409` avec le code `managed_by_integration`. Une clé révoquée garde sa liste.
+- **Le renouvellement garde la liste**, et chaque changement figure dans le [journal d’audit](/fr/team/audit-log/) sous
+  `apikey.updated`, avec la liste avant et après.
+- **Les identifiants SMTP** utilisés en dehors de leur liste sont refusés à la connexion : le
+  [SMTP relay](/fr/transactional/smtp-relay/) répond `535 5.7.8` et nomme l’adresse.
+
+C’est une personne connectée qui définit la liste ; l’opération,
+`PUT /api/v1/workspaces/<workspace>/api-keys/<keyId>/allowed-ips` avec `{ "allowedIps": [ … ] }`, ne peut pas être
+appelée avec une clé API. L’appel de création accepte le même champ, `allowedIps`.
 
 ## Limites
 
@@ -133,13 +196,15 @@ Une clé refusée répond `401` avec le code `unauthenticated` et l’en-tête
 | Une clé expirée                                  | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
 
 Les clés d’intégration répondent `401` avec les codes `key_revoked` et `key_expired` à la place, et leur détail nomme
-l’intégration à reconnecter. Quand la base de données ne peut pas confirmer qui appelle, la réponse est `503` avec le
-code `unavailable` : réessayez, la clé reste valide. Tous les codes sont listés dans
+l’intégration à reconnecter. Une clé valide appelée en dehors de ses [IP autorisées](#limiter-une-clé-à-des-ip-autorisées)
+répond `403` avec le code `ip_not_allowed`. Quand la base de données ne peut pas confirmer qui appelle, la réponse est
+`503` avec le code `unavailable` : réessayez, la clé reste valide. Tous les codes sont listés dans
 [erreurs de l’API](/fr/developers/api-errors/).
 
 ## Voir aussi
 
 - [Faire votre premier appel d’API](/fr/developers/api-quickstart/)
+- [Utiliser les SDK clients](/fr/developers/sdks/)
 - [Limites de débit](/fr/developers/api-rate-limits/)
 - [Rôles et autorisations](/fr/team/roles-and-permissions/)
 - [Sécurité et durcissement](/fr/self-hosting/security/)

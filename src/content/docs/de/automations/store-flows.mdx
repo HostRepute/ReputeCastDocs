@@ -1,0 +1,295 @@
+---
+title: Browse-Abandonment- und Wieder-vorrätig-Abläufe einrichten
+description: Eine Browse-Abandonment-E-Mail aus ReputeCast senden, wenn ein Kontakt ein Produkt ansieht oder in den Warenkorb legt, und eine, wenn es wieder da ist.
+type: how-to
+audience: [publisher]
+permissions: ['automations:edit', 'automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: Browse-Abandonment-E-Mail
+sources:
+  - internal/automations/{storeflows.go,stores.go,engine.go,graph.go}
+  - internal/tracker/{flows.go,writer.go,static/rc.js}
+  - internal/commerce/{stock.go,recommend.go,blocks.go,jobs.go,webhooks.go,api.go}
+  - internal/store/queries/{tracker_flows.sql,commerce.sql}
+  - web/src/features/commerce/{automation.tsx,composer.tsx,flows.messages.ts}
+  - web/src/features/automations/{panels.tsx,graph.ts}
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Senden Sie eine Browse-Abandonment-E-Mail, wenn ein Kontakt sich in Ihrem Shop ein Produkt ansieht und ohne Kauf geht
+oder es in den Warenkorb legt und nicht bestellt, und schreiben Sie den Personen, die ein Produkt wollten, wenn es
+wieder vorrätig ist oder sein Preis sinkt. Diese [Shop-Abläufe](/de/reference/glossary/#store-flow) starten mit dem,
+was die Website Ihres Shops über das Website-Tracking meldet. Verfügbar ab der nächsten Version nach 1.6.0.
+
+## Bevor Sie beginnen
+
+- Um den Ablauf zu erstellen, brauchen Sie `automations:edit`, um ihn zu veröffentlichen, `automations:publish`; die
+  Rollen Inhaber, Admin und Bearbeiter haben beide. [Automationen erstellen](/de/automations/overview/) erklärt den
+  Editor.
+- Verbinden Sie den Shopify- oder WooCommerce-Shop, damit ReputeCast seine Produkte, Kollektionen, Bestellungen und
+  Checkouts kennt (siehe [Shopify oder WooCommerce verbinden](/de/integrations/shopify-woocommerce/)).
+- Fügen Sie die Website des Shops im Website-Tracking hinzu und verknüpfen Sie sie mit dem Shop, damit ihre
+  Produktaufrufe und Warenkorb-Aktionen die Produkte des Shops nennen (siehe
+  [Besuche auf Ihrer Website erfassen](/de/integrations/website-tracking/)). Ohne das funktioniert nur ein
+  Wieder-vorrätig-Ablauf für Personen, die über die API fragen, ohne die Personen, die das Produkt angesehen haben.
+- Nur Kontakte steigen ein. Ein Besucher wird zum bekannten Kontakt, wenn er auf einen Link in einer Ihrer E-Mails
+  klickt, sich auf derselben Seite über ein ReputeCast-Formular anmeldet oder Ihre Website ihn mit einem signierten
+  Aufruf identifiziert; dann zählen seine letzten 30 Tage auf der Website. Anonyme Besucher steigen nie in einen Ablauf
+  ein.
+
+## So funktionieren Shop-Abläufe
+
+Die vier Auslöser stehen in der Gruppe <UiPath path="commerce.flows.storeGroup" /> der Palette, nach
+<UiPath path="automations.graph.kindAbandonedCheckout" />:
+
+<Screenshot
+  id="automation-palette"
+  alt="Der Ablauf-Editor des Demo-Ablaufs Browse abandonment mit der ganzen Palette: die Gruppe Shop mit Bestellung aufgegeben, Erste Bestellung, Abgebrochener Checkout, Produkt angesehen, In den Warenkorb gelegt, Wieder vorrätig und Preissenkung, dann die Gruppen Zahlende Mitglieder und Lead-Anzeigen."
+>
+  1. Shop, mit den vier Auslösern für Shop-Abläufe nach den Auslösern für Bestellungen und Checkouts des Shops.
+  2. Zahlende Mitglieder.
+  3. Lead-Anzeigen.
+</Screenshot>
+
+| Auslöser                                           | Startet, wenn                                                                                                                            | Wer einsteigt                                                                                                                                                       |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="commerce.flows.kindViewedProduct" /> | Die eingestellten Stunden seit dem letzten Aufruf eines Produkts des Shops durch den Kontakt vergangen sind, ohne Bestellung und ohne Checkout im Shop seitdem. | Kontakte, die eines der Produkte mindestens so oft wie eingestellt angesehen haben, optional nur Produkte aus bestimmten Kollektionen.                       |
+| <UiPath path="commerce.flows.kindAddedToCart" />   | Dasselbe, gezählt ab dem letzten Hinzufügen zum Warenkorb.                                                                               | Kontakte, die eines der Produkte mindestens so oft wie eingestellt in den Warenkorb gelegt haben.                                                                   |
+| <UiPath path="commerce.flows.kindBackInStock" />   | Ein ausverkauftes Produkt des Shops wieder verfügbar ist.                                                                                | Kontakte, die benachrichtigt werden wollten und noch keine Nachricht erhalten haben, und mit <UiPath path="commerce.flows.viewersTooLabel" /> alle, die es in den letzten Tagen angesehen haben. |
+| <UiPath path="commerce.flows.kindPriceDrop" />     | Der Preis eines Produkts um mindestens den eingestellten Anteil fällt, in derselben Währung.                                              | Kontakte, die es in den letzten Tagen angesehen oder in den Warenkorb gelegt haben.                                                                                 |
+
+In der Liste der Automationen und im Versionsvergleich beim Veröffentlichen heißen die ersten beiden
+<UiPath path="commerce.flows.startsViewed" /> und <UiPath path="commerce.flows.startsCarted" />, etwa „Produkt angesehen
+und nicht gekauft · Acme Merch · nach 4 Stunden“.
+
+Regeln, die für jeden Shop-Ablauf gelten:
+
+- ReputeCast sucht nur nach Kontakten, solange ein Live-Ablauf mit dem Auslöser startet. Abläufe für Produktaufrufe und
+  Warenkörbe werden jede Minute geprüft; Abläufe für Bestand und Preis laufen, wenn der Shop die Änderung meldet.
+- Nur aktive Kontakte steigen ein: Abgemeldete, unzustellbare, gesperrte, endgültig gelöschte Kontakte und Kontakte mit
+  Beschwerde nie.
+- Ein Ablauf nimmt denselben Kontakt erst nach 7 Tagen wieder auf. Der Auslöser hat keine Wahl für
+  <UiPath path="automations.panels.reentry" />.
+- Ein Auslöser für Shop-Abläufe kann nur der erste Auslöser eines Ablaufs sein, nie ein zusätzlicher (siehe
+  [mehr als ein Auslöser](/de/automations/triggers-and-steps/#mehr-als-ein-auslöser)).
+
+## Ablauf für abgebrochene Produktaufrufe oder Warenkörbe einrichten
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.automations" />, wählen Sie <UiPath path="automations.newAutomation" /> und dann
+   <UiPath path="automations.blankCanvas" />.
+
+2. Ziehen Sie <UiPath path="commerce.flows.kindViewedProduct" /> aus der Gruppe
+   <UiPath path="commerce.flows.storeGroup" /> der Palette auf die Arbeitsfläche, oder
+   <UiPath path="commerce.flows.kindAddedToCart" />, um Warenkörbe nachzufassen, und wählen Sie den Auslöser aus.
+
+3. Wählen Sie unter <UiPath path="commerce.flows.store" /> den Shop. Bei nur einem verbundenen Shop ist er bereits
+   ausgewählt. Der Hinweis unter den Einstellungen nennt die erfasste Website, die die Produktaufrufe des Shops sendet,
+   oder sagt, dass noch keine verknüpft ist, mit <UiPath path="commerce.flows.setUpTracking" />.
+
+4. Stellen Sie den Auslöser ein:
+   - <UiPath path="commerce.flows.wait" />: wie viele Stunden nach dem letzten Aufruf, ohne Bestellung oder Checkout,
+     der Ablauf startet: 1 bis 24, zu Beginn 4.
+   - <UiPath path="commerce.flows.only" />: <UiPath path="commerce.flows.addCollection" /> beschränkt auf Produkte aus
+     bis zu 20 Kollektionen des Shops. Ohne Kollektion zählt jedes Produkt im Shop.
+   - <UiPath path="commerce.flows.after" />: wie oft der Kontakt eines der Produkte angesehen oder in den Warenkorb
+     gelegt hat: 1 bis 5, zu Beginn 1.
+
+   <Screenshot
+     id="store-flow-browse"
+     alt="Der Demo-Ablauf Browse abandonment mit ausgewähltem Auslöser: Produkt angesehen bei Acme Merch nach 4 Stunden auf der Arbeitsfläche, dann zwei E-Mails im Abstand von 2 Tagen und ein Ausstieg, und rechts der Shop, Warten 4 Stunden, keine Kollektionen, nach 1 Aufruf und der Hinweis, dass shop.acme.io die Produktaufrufe von Acme Merch sendet."
+   >
+     1. Der Auslöser auf der Arbeitsfläche: der Shop und die Wartezeit.
+     2. Stunden ohne Bestellung oder Checkout.
+     3. Kollektionen, in denen die Produkte sein müssen.
+     4. Aufrufe eines Produkts, bevor der Ablauf startet.
+     5. Die erfasste Website, die die Produktaufrufe des Shops sendet.
+   </Screenshot>
+
+5. Fügen Sie die E-Mails hinzu. Ziehen Sie <UiPath path="automations.graph.typeEmail" /> unter den Auslöser und
+   schreiben Sie eine E-Mail, die die angesehenen Produkte zeigt (siehe
+   [Produkte in den E-Mails zeigen](#produkte-in-den-e-mails-zeigen)). Der Demo-Ablauf sendet zwei Tage später über eine
+   <UiPath path="automations.graph.typeDelay" /> eine zweite E-Mail.
+
+6. Veröffentlichen Sie den Ablauf (siehe
+   [Änderungen an Automationen sicher veröffentlichen](/de/automations/publish-and-versions/)). Ab dann prüft
+   ReputeCast jede Minute.
+
+</Steps>
+
+Jede Minute steigt ein Kontakt ein, wenn all das zutrifft:
+
+- Sein letzter Aufruf (oder das letzte Hinzufügen zum Warenkorb) eines passenden Produkts fiel in die Stunde, die vor
+  den eingestellten Stunden endete, sodass eine verspätete oder ausgelassene Minute niemanden verpasst.
+- Er hat seitdem keines der Produkte des Shops angesehen oder in den Warenkorb gelegt: Wer noch stöbert, wartet.
+- Er hat seit diesem Aufruf im Shop weder bestellt noch einen Checkout begonnen. Ein Kontakt, der einen Checkout
+  begonnen hat, gehört stattdessen zum Auslöser <UiPath path="automations.graph.kindAbandonedCheckout" />.
+- Der Ablauf hat ihn in den letzten 7 Tagen nicht aufgenommen.
+
+Das Ereignis nennt die Produkte, die er in den 24 Stunden davor angesehen (oder in den Warenkorb gelegt) hat, die
+neuesten zuerst, höchstens 6.
+
+## Ablauf für Wieder vorrätig oder Preissenkung einrichten
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.automations" />, wählen Sie <UiPath path="automations.newAutomation" /> und dann
+   <UiPath path="automations.blankCanvas" />.
+
+2. Ziehen Sie <UiPath path="commerce.flows.kindBackInStock" /> oder <UiPath path="commerce.flows.kindPriceDrop" />
+   aus der Gruppe <UiPath path="commerce.flows.storeGroup" /> der Palette auf die Arbeitsfläche, wählen Sie den Auslöser aus und wählen Sie den <UiPath path="commerce.flows.store" />.
+
+3. Legen Sie fest, wer benachrichtigt wird:
+   - <UiPath path="commerce.flows.kindBackInStock" />: die Personen, die benachrichtigt werden wollten, wenn das
+     ausverkaufte Produkt wieder da ist (siehe
+     [Leser nach einem ausverkauften Produkt fragen lassen](#leser-nach-einem-ausverkauften-produkt-fragen-lassen)).
+     Jede von ihnen erhält die Nachricht einmal. Schalten Sie <UiPath path="commerce.flows.viewersTooLabel" /> ein, um
+     alle hinzuzunehmen, die es in den letzten 1 bis 60 Tagen angesehen haben (zu Beginn 14); standardmäßig ist es aus.
+   - <UiPath path="commerce.flows.kindPriceDrop" />: <UiPath path="commerce.flows.dropDays" /> 1 bis 60 Tagen (zu
+     Beginn 14) und <UiPath path="commerce.flows.dropPercent" />: 1 % bis 90 % (zu Beginn 10 %).
+
+   <Screenshot
+     id="store-flow-stock"
+     alt="Die Einstellungen des Auslösers im Demo-Ablauf Back in stock: Wieder vorrätig bei Acme Merch, mit ausgeschaltetem Schalter für Personen, die das Produkt in den letzten 14 Tagen angesehen haben, und dem Hinweis, dass Personen, die über den Button „Benachrichtigen“ der Website oder die API gefragt haben, die Nachricht jeweils einmal erhalten."
+   >
+     1. Auch Personen aufnehmen, die das Produkt in den letzten 14 Tagen angesehen haben.
+     2. Wer standardmäßig benachrichtigt wird: die Personen, die gefragt haben.
+   </Screenshot>
+
+4. Fügen Sie die E-Mail hinzu. Nennen Sie das Produkt mit `{{ stock.product.title }}` und verlinken Sie es mit
+   `{{ stock.product.url }}` (siehe [Produkte in den E-Mails zeigen](#produkte-in-den-e-mails-zeigen)).
+
+5. Veröffentlichen Sie den Ablauf.
+
+</Steps>
+
+ReputeCast bemerkt die Änderung, wenn es das Produkt speichert: ein Produkt, das ausverkauft war und wieder verfügbar
+ist, oder dessen Preis niedriger ist als vorher. Die Änderung startet jeden Live-Ablauf des Arbeitsbereichs für diesen
+Shop; eine Preissenkung startet nur die Abläufe, deren Anteil sie erreicht. Ein Produkt, das aus dem Shop entfernt
+wurde oder nicht aktiv ist, startet nichts.
+
+Wie schnell das geschieht, hängt vom Shop ab:
+
+- WooCommerce meldet geänderte Produkte über seine Produkt-Webhooks.
+- Shopify meldet Bestandsänderungen mit `inventory_levels/update`, wenn der Shop `read_inventory` gewährt hat. Ohne
+  diesen Scope liest ReputeCast alle 15 Minuten die seit der letzten Prüfung geänderten Produkte, solange ein
+  Wieder-vorrätig- oder Preissenkungs-Ablauf den Shop beobachtet. Preisänderungen kommen in jedem Fall mit den
+  Produkt-Webhooks.
+
+### Leser nach einem ausverkauften Produkt fragen lassen
+
+Ein Wieder-vorrätig-Ablauf nimmt die Personen auf, die benachrichtigt werden wollten. Fragen lässt sich auf zwei Wegen:
+
+- **Auf der erfassten Website** rufen Sie den Tracker aus Ihrem Button „Benachrichtigen“ mit der eigenen ID des
+  Produkts im Shop auf. Das zählt für einen Besucher, den ReputeCast als Kontakt kennt, auf einer mit dem Shop
+  verknüpften Website:
+
+  ```js title="Button „Benachrichtigen“"
+  reputecast('notifyWhenAvailable', { id: '8237401' })
+  ```
+
+- **Von Ihrem Server** [fragen Sie für einen Kontakt](/api/operations/create-stock-request/) mit
+  `POST /api/v1/workspaces/{workspace}/commerce/stock-requests` und einem API-Schlüssel mit `subscribers:create`.
+  Senden Sie die `email` des Kontakts und die `productId` (die ID in ReputeCast oder die eigene des Shops); fügen Sie
+  `storeId` hinzu, wenn zwei verbundene Shops ein Produkt mit derselben ID haben. Der Kontakt muss existieren, und das
+  Audit-Protokoll vermerkt jede Anfrage als `store_stock_request.created`.
+
+Sobald der Ablauf die Person aufnimmt, ist die Anfrage beantwortet. Eine erneute Anfrage wartet auf die nächste Rückkehr
+des Produkts.
+
+## Produkte in den E-Mails zeigen
+
+Die E-Mails des Ablaufs erhalten die Daten des Auslösers als Liquid (siehe
+[E-Mails mit Liquid personalisieren](/de/campaigns/personalization/)):
+
+| Variable                                                                                                         | In Abläufen                                                                                          | Enthält                                                                                                       |
+| ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `{{ browse.products }}`                                                                                          | <UiPath path="commerce.flows.kindViewedProduct" />, <UiPath path="commerce.flows.kindAddedToCart" /> | Die Produkte, die das Ereignis nennt, die neuesten zuerst, höchstens 6: jeweils mit `title`, `url`, `image` und `price`. |
+| `{{ stock.product.title }}`, `{{ stock.product.url }}`, `{{ stock.product.image }}`, `{{ stock.product.price }}` | <UiPath path="commerce.flows.kindBackInStock" />, <UiPath path="commerce.flows.kindPriceDrop" />     | Das Produkt, das wieder da oder günstiger ist, mit seinem aktuellen Preis.                                    |
+| `{{ stock.previous_price }}`, `{{ stock.drop_percent }}`                                                         | <UiPath path="commerce.flows.kindPriceDrop" />                                                       | Der Preis vor der Senkung und um wie viel er fiel, in ganzen Prozent.                                         |
+
+```liquid title="Browse-Abandonment-E-Mail: die angesehenen Produkte"
+{% for product in browse.products %}
+  <a href="{{ product.url }}"><img src="{{ product.image }}" alt="{{ product.title }}" width="160"></a>
+  <p>{{ product.title }} · {{ product.price }}</p>
+{% endfor %}
+```
+
+Die Einstellungen des Auslösers verweisen auch auf einen Block dafür: das Produktraster mit
+<UiPath path="commerce.flows.products" /> auf <UiPath path="commerce.flows.viewed" />, das seine Plätze beim Versand der
+E-Mail mit denselben Produkten füllt. Der Editor führt diese Wahl unter <UiPath path="commerce.flows.eachReader" />,
+ausgegraut, weil nur die E-Mails von Abläufen für Produktaufrufe, Warenkörbe und Bestand sie füllen können; die E-Mails
+des Demo-Ablaufs Browse abandonment zeigen sie.
+
+Jede E-Mail kann außerdem Produkte aus einem verbundenen Shop empfehlen. Die Wahlmöglichkeiten für
+<UiPath path="commerce.flows.products" /> im Produktraster sind:
+
+- <UiPath path="commerce.flows.sameForEveryone" />: <UiPath path="commerce.flows.chosen" />,
+  <UiPath path="commerce.flows.newest" /> oder <UiPath path="commerce.flows.bestSellers" />, die meistverkauften Stück
+  der letzten 30 Tage, optional aus einer Kollektion.
+- <UiPath path="commerce.flows.eachReader" />: <UiPath path="commerce.flows.recentlyViewed" />, was der Leser auf der
+  Website des Shops angesehen oder in den Warenkorb gelegt hat, die neuesten zuerst, ohne bereits Gekauftes; und
+  <UiPath path="commerce.flows.boughtTogether" />, was oft zusammen mit dem gekauft wird, was der Leser gekauft oder
+  angesehen hat, aus 180 Tagen Bestellungen, jede Nacht neu berechnet. Leser ohne solchen Verlauf erhalten die
+  Bestseller.
+
+Ein Raster zeigt 2, 3, 4 oder 6 Produkte, und die Liste jedes Lesers wird gelesen, wenn seine Nachricht in die
+Warteschlange kommt, sodass die Links der E-Mail ihre Plätze behalten.
+[E-Mails im Editor gestalten](/de/campaigns/composer/#blöcke) behandelt die Produktblöcke.
+
+## Prüfen, ob es funktioniert hat
+
+- Die Zeile des Ablaufs unter <UiPath path="nav.automations" /> zeigt <UiPath path="automations.statusLive" />, seinen
+  Auslöser mit dem Shop, etwa „Wieder vorrätig · Acme Merch“, und wie viele Kontakte in den letzten 30 Tagen
+  eingestiegen sind.
+- Auf der Arbeitsfläche zählt der Auslöserschritt die eingestiegenen Kontakte und jeder E-Mail-Schritt seine Versände,
+  Öffnungen und Klicks.
+- Das Profil eines Kontakts zeigt eine Zeile für jeden Tag, an dem er auf der erfassten Website war, etwa „3 Produkte
+  auf shop.acme.io angesehen“, und die Abläufe, in denen er ist (siehe
+  [das Profil eines Kontakts lesen](/de/audience/contacts/#das-profil-eines-kontakts-lesen)).
+
+## Fehlerbehebung
+
+- **Der Auslöser verlangt, zuerst einen Shopify- oder WooCommerce-Shop zu verbinden.** Der Arbeitsbereich hat keinen
+  verbundenen Shop. Verbinden Sie einen unter <UiPath path="nav.settings > settings.integrations" />.
+- **Der Auslöser sagt, dass noch keine erfasste Website mit dem Shop verknüpft ist.** Fügen Sie die Website des Shops im
+  Website-Tracking hinzu oder verknüpfen Sie die hinzugefügte Website mit dem Shop, und prüfen Sie dann den Hinweis
+  erneut.
+- **Beim Veröffentlichen heißt es, Sie sollen den Shop wählen, oder der Shop des Auslösers sei nicht mehr verbunden.**
+  Wählen Sie einen verbundenen Shop, oder verbinden Sie den Shop unter
+  <UiPath path="nav.settings > settings.integrations" /> erneut.
+- **Niemand steigt in einen Ablauf für Produktaufrufe oder Warenkörbe ein.** Die Besucher sind noch keine bekannten
+  Kontakte, die Website wartet auf ihre Einwilligung und Ihr Banner ruft nie `reputecast('consent', true)` auf, oder
+  ihr Browser sendet Global Privacy Control, das der Tracker immer respektiert. Kontakte, die bestellt, einen Checkout
+  begonnen oder weiter gestöbert haben, steigen ebenfalls nicht ein.
+- **Ein Kontakt ist einmal eingestiegen und nicht wieder.** Ein Shop-Ablauf nimmt denselben Kontakt erst nach 7 Tagen
+  wieder auf.
+- **Ein Wieder-vorrätig-Ablauf startet bei einem Shopify-Shop spät.** Die App des Shops hat `read_inventory` nicht
+  gewährt, daher werden Bestandsänderungen alle 15 Minuten gelesen.
+  [Shopify oder WooCommerce verbinden](/de/integrations/shopify-woocommerce/) listet die Scopes, die die App anfragt.
+- **Eine Preissenkung hat niemanden gestartet.** Der Preis fiel um weniger als den Anteil des Auslösers, die Währung
+  hat sich geändert, oder niemand hat das Produkt in den eingestellten Tagen angesehen oder in den Warenkorb gelegt.
+
+<Aside type="note">
+  Shop-Abläufe senden wie jeder andere Ablauf über die Route Automationen: Ihre E-Mails folgen den Versandregeln des
+  Schritts und dem [Marketing-Limit](/de/reference/glossary/#marketing-cap) des Arbeitsbereichs, und Kontakte in der
+  Kontrollgruppe passieren sie ohne E-Mail (siehe
+  [Auslöser und Schritte](/de/automations/triggers-and-steps/#ausgenommene-kontakte)).
+</Aside>
+
+## Verwandte Themen
+
+- [Auslöser und Schritte](/de/automations/triggers-and-steps/) listet jeden Auslöser, auch die Auslöser für
+  Bestellungen und Checkouts des Shops.
+- [Besuche auf Ihrer Website erfassen](/de/integrations/website-tracking/) fügt den Tracker zur Website des Shops hinzu.
+- [Shopify oder WooCommerce verbinden](/de/integrations/shopify-woocommerce/) verbindet den Shop und seine Webhooks.
+- [E-Mails im Editor gestalten](/de/campaigns/composer/) behandelt die Blöcke Produktkarte, Produktraster und
+  Checkout-Artikel.
+- [Änderungen an Automationen sicher veröffentlichen](/de/automations/publish-and-versions/) erklärt den Dialog zum
+  Veröffentlichen.

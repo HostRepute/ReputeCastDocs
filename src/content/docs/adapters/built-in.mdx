@@ -15,6 +15,8 @@ sources:
   - internal/providers/apiclient
   - internal/providers/webhookauth
   - internal/providers/bounce
+  - internal/providers/received
+  - internal/inbound/hook.go
   - internal/providers/resend
   - internal/sms
   - internal/app/wire_adapters.go
@@ -50,7 +52,7 @@ This guide shows how to contribute email adapter Go code to ReputeCast: a built-
    | Method                                        | Does                                                                                                     |
    | --------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
    | `Adapter() string`                            | The registry key, like `"mailgun"`.                                                                      |
-   | `Capabilities() Capabilities`                 | The badges: bulk policy, webhooks, domain API, suppression sync, batch size, dedicated IPs, sandbox, quota and rate discovery, pricing, tracking. |
+   | `Capabilities() Capabilities`                 | The badges: bulk policy, webhooks, domain API, suppression sync, batch size, dedicated IPs, sandbox, quota and rate discovery, pricing, tracking, receiving mail (`Inbound`). |
    | `Send(ctx, msgs) ([]SendResult, error)`       | Sends at most `BatchSize` messages and returns one result per message, in input order.                  |
    | `ParseWebhook(ctx, r, body) ([]Event, error)` | Verifies the request and maps its payload to normalized events.                                          |
 
@@ -76,6 +78,9 @@ This guide shows how to contribute email adapter Go code to ReputeCast: a built-
    | `StatusPage`, `StatusReporter`                           | The status button and incident text during an outage.                                                                      |
    | `BroadcastStreamCreator`                                 | Providers whose terms want a separate stream for bulk mail (Postmark).                                                     |
    | `ExtrasSender`                                           | Sending copies and attachments; a message with extras only goes to a provider that has it.                                 |
+   | `InboundReceiver`                                        | Receiving mail (<UiPath path="nav.settings > settings.senders > senders.receiving.title" />): `InboundSetup` (the MX records, steps and settings the setup dialog shows), `VerifyInbound` at the inbound hook, `ParseInbound` in the job. Set `Capabilities.Inbound` with it. See [receive mail](#receive-mail). |
+   | `InboundRegistrar`                                       | Pointing the provider's receiving for the route's domain at the inbound hook, and removing it. Only with `Capabilities.Inbound` `"automatic"`. |
+   | `InboundHandshaker`                                      | Answering a subscription handshake on the inbound hook (an SNS `SubscriptionConfirmation`), checked against the route's settings. |
 
    </TableScroll>
 
@@ -166,6 +171,12 @@ This guide shows how to contribute email adapter Go code to ReputeCast: a built-
 
 5. Handle settings and credentials. `providers.Config.Settings` holds the non-secret fields; `Config.Credentials` holds the decrypted secrets as a flat JSON object keyed by the `Secret` fields' keys. Credentials are write-only: sealed at rest, never returned by the API, replaced one key at a time. Mark every field whose key looks secret (`password`, `token`, `secret`, or ending in `api_key`) as `Secret`, or the contract suite fails.
 
+   Mark a setting that says where the adapter's requests go, such as a server URL, an API endpoint or a host, with
+   `Endpoint: true`. A saved secret is sent only to the address it was entered for, so when a form changes an
+   `Endpoint` setting, ReputeCast asks for the secrets again. The contract suite fails a field whose key contains
+   `url`, `endpoint`, `host` or `server` and isn't an `Endpoint` (`providers.AddressKey`), and one that is both an
+   `Endpoint` and a `Secret`.
+
    `New` must not do network I/O and must not fail because an optional value is missing; report missing credentials from the first call. The factory builds an adapter per request, so keep anything worth reusing in a package-level cache keyed by the account. Keep signing material read from the provider's API in a `webhookauth.Material`, which reads it again when a signature fails (at most once a minute) and every hour.
 
 6. Implement `Send`:
@@ -181,10 +192,14 @@ This guide shows how to contribute email adapter Go code to ReputeCast: a built-
    - `ParseWebhook` verifies unless `providers.SignatureVerified(ctx)` is set. The normalization job sets it when it re-parses a stored payload, which no longer has the original URL or the `Authorization` header.
    - Use the scheme the provider signs with; `internal/providers/webhookauth` has Standard Webhooks, HMAC helpers and constant-time comparisons. Where the provider doesn't sign, register the webhook with basic auth or a bearer token carrying `Config.WebhookSecret`, which travels in `Authorization` and is never stored.
    - Bound the signed timestamp: five minutes with `webhookauth.Fresh`, or a window that spans the provider's retries with `webhookauth.Within`.
+   - When the signature covers a one-time token but not the event (Mailgun), tie each token to the payload it first came with through `webhookauth.Replay` and `Config.Tokens`, which keeps the tie in Postgres so every process and every restart sees it for as long as the signature can be accepted. A redelivery of the same event passes; ingest drops the duplicate.
+   - When a valid signature only proves who sent the request, not for whom (SNS signs every AWS account's topics alike), also check it comes from what the connection set up: Amazon SES accepts only its own topics, with the signing certificate from a regional SNS endpoint, and saves a topic through `ProvisionInput.Save` before it subscribes the webhook.
    - Map every delivery-relevant event to `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` or `unsubscribe`. Keep the provider's type in `OriginalType`, its code in `OriginalCode` (split it with `bounce.Split`), the rest in `Diagnostic`, and set `BounceClass` with `bounce.Classify`. Lowercase the recipient, keep the raw JSON in `Raw`, and return no event for things that aren't outcomes (sent, processed, auto-replies, test pings).
    - Don't suppress on a guess: a permanent failure caused by the sender (a spam or reputation block, retries running out) is a soft bounce. Only an address problem is a hard bounce, because hard bounces and complaints go on the shared [suppression list](/audience/suppressions/).
 
-8. Test against the contract suite. Every adapter passes `internal/providers/contracttest`, which checks registration, capabilities, a send, a permanent rejection, an outage and rejected credentials against your fake API, and every recorded webhook: verified, normalized, re-parsed with a verified context, and refused once tampered with. Its `Texts` subtest checks the text people read: a built-in adapter of kind `api`, `smtp`, `self_hosted` or `http` keeps a catalog, every text it declares has a message whose English is that text, and every message is translated into each app language. `contracttest.CheckText` checks a text the adapter writes at runtime.
+8. If the provider receives mail and passes it on, add receiving: see [receive mail](#receive-mail) below.
+
+9. Test against the contract suite. Every adapter passes `internal/providers/contracttest`, which checks registration, capabilities, a send, a permanent rejection, an outage and rejected credentials against your fake API, and every recorded webhook: verified, normalized, re-parsed with a verified context, and refused once tampered with. Its `Texts` subtest checks the text people read: a built-in adapter of kind `api`, `smtp`, `self_hosted` or `http` keeps a catalog, every text it declares has a message whose English is that text, and every message is translated into each app language. `contracttest.CheckText` checks a text the adapter writes at runtime.
 
    ```go title="internal/providers/example/example_test.go"
    func TestContract(t *testing.T) {
@@ -208,13 +223,45 @@ This guide shows how to contribute email adapter Go code to ReputeCast: a built-
 
    Tests use no network: run a fake of the provider's API, record webhook payloads from the provider's documentation as fixtures, and sign them in the test with a test key. Where the provider publishes a signature test vector, test against it. Test the optional interfaces, the error mapping and every quirk you code around (ids above 2^53, a field that is a string or an array, a 400 that carries per-message results).
 
-9. Register the adapter in the build:
-   - Add a blank import of the package to `internal/app/wire_adapters.go`. Registering the same key twice panics at startup.
-   - Add the key to `adapterOrder` in `internal/providers/manage/adapters.go` (the Adapters tab order) and to `catalogOrder` in `internal/connect/catalog.go` (the setup catalog order).
-   - Optionally, give the connect wizard its wording in `copyTable` in `internal/connect/copy.go`, with the words as `adapter.<key>.*` messages in `internal/connect/messages/en.json` and `vi.json`; without an entry, the wizard uses the descriptor's name and fields.
-   - Built-in adapters carry the ReputeCast version (`version.Version`) and the maintainer "HostRepute".
+10. Register the adapter in the build:
+    - Add a blank import of the package to `internal/app/wire_adapters.go`. Registering the same key twice panics at startup.
+    - Add the key to `adapterOrder` in `internal/providers/manage/adapters.go` (the Adapters tab order) and to `catalogOrder` in `internal/connect/catalog.go` (the setup catalog order).
+    - Optionally, give the connect wizard its wording in `copyTable` in `internal/connect/copy.go`, with the words as `adapter.<key>.*` messages in `internal/connect/messages/en.json` and `vi.json`; without an entry, the wizard uses the descriptor's name and fields.
+    - Built-in adapters carry the ReputeCast version (`version.Version`) and the maintainer "HostRepute".
 
 </Steps>
+
+## Receive mail
+
+A workspace can receive mail through one inbound route: a provider's receiving, or a mailbox ReputeCast reads. An
+adapter adds the first. Available from the next release after 1.6.0.
+
+The provider posts what it receives to `POST /hooks/inbound/{token}` (and `/hooks/inbound/{token}/*`, for providers
+such as Mailgun that post to `<url>/mime`). The hook calls `HandshakeInbound` when the adapter has it, then
+`VerifyInbound` with the live request, and stores the body and the headers, without `Authorization`, `Cookie` and the
+adapter's `WebhookSecrets`. A job rebuilds the request later and calls `ParseInbound`, which never verifies again and
+may call the provider's API (Resend's event carries only the message's metadata).
+
+- **`Capabilities.Inbound`** is `"automatic"` (the adapter registers the route itself with `InboundRegistrar`; people
+  add the MX record), `"manual"` (people follow `InboundSetup.Steps` in the provider's console) or empty. Set it on the
+  descriptor and in `Capabilities()`; the contract suite holds the value to the interfaces.
+- **`InboundSetup(route)`** returns the MX records, with `Purpose: "inbound"` and the route's domain as `Name`, the
+  steps as kept messages with the route's domain and URL as arguments, and any settings people enter (Amazon SES's
+  `topic_arn`). A manual route must have steps, and each step needs a text in every app language.
+- **Authenticate with the route's own secret** (`InboundRoute.Secret`), never the provider's webhook secret: basic
+  auth with the user `providers.InboundUser` and the secret in the URL the provider posts to (`received.HookURL`), a
+  token header, or the provider's own signature when it signs (Mailgun, Resend, Postal, SNS), checked against what
+  the route names. A request that fails is `providers.ErrBadSignature`.
+- **Return `Raw`** when the provider passes the whole message, and ReputeCast parses it; otherwise fill the parsed
+  fields and attachments. Envelope recipients, the provider's message ID and its spam, SPF, DKIM and DMARC verdicts go
+  in their fields either way; `internal/providers/received` maps verdicts and scores the same way for every adapter.
+- **Test it** with `Suite.Inbound`: cases from the provider's documented sample payload in `testdata/inbound*`, each
+  with the messages it must parse to. The suite checks that a valid request verifies, that it parses without its
+  credentials, and that a tampered one fails; a basic-auth or token adapter's case sets `Tamper` to change the
+  credential. `InboundLifecycle` registers, unregisters and unregisters again an automatic route.
+
+The [receiving mail](/providers/receiving-mail/) guide lists what each built-in adapter does. Community adapters and
+the generic HTTP adapter don't receive mail.
 
 ## Check that it worked
 

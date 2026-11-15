@@ -1,0 +1,291 @@
+---
+title: Configurar recorridos de abandono y de vuelta al stock
+description: Envía un correo de abandono de navegación cuando un contacto ve un producto o lo añade al carrito sin comprar, y avísale si vuelve al stock o baja de precio.
+type: how-to
+audience: [publisher]
+permissions: ['automations:edit', 'automations:publish']
+uiPath: 'nav.automations'
+primaryKeyword: correo de abandono de navegación
+sources:
+  - internal/automations/{storeflows.go,stores.go,engine.go,graph.go}
+  - internal/tracker/{flows.go,writer.go,static/rc.js}
+  - internal/commerce/{stock.go,recommend.go,blocks.go,jobs.go,webhooks.go,api.go}
+  - internal/store/queries/{tracker_flows.sql,commerce.sql}
+  - web/src/features/commerce/{automation.tsx,composer.tsx,flows.messages.ts}
+  - web/src/features/automations/{panels.tsx,graph.ts}
+sidebar:
+  order: 5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+
+Envía un correo de abandono de navegación cuando un contacto mira un producto de tu tienda y se va sin comprar, o lo
+añade al carrito y no paga, y escribe a las personas que querían un producto cuando vuelve a haber stock o baja su
+precio. Estos [recorridos de tienda](/es/reference/glossary/#store-flow) empiezan con lo que el sitio de tu tienda
+informa a través del seguimiento del sitio web. Disponible a partir de la próxima versión después de la 1.6.0.
+
+## Antes de empezar
+
+- Necesitas `automations:edit` para crear el recorrido y `automations:publish` para publicarlo; los roles Propietario,
+  Administrador y Editor tienen los dos. [Crear automatizaciones](/es/automations/overview/) explica el editor.
+- Conecta la tienda Shopify o WooCommerce, para que ReputeCast conozca sus productos, colecciones, pedidos y pagos
+  (consulta [conectar Shopify o WooCommerce](/es/integrations/shopify-woocommerce/)).
+- Añade el sitio de la tienda en el seguimiento del sitio web y vincula el sitio a la tienda, para que sus vistas de
+  producto y sus añadidos al carrito nombren los productos de la tienda (consulta
+  [añadir el seguimiento del sitio web](/es/integrations/website-tracking/)). Solo un recorrido de vuelta al stock para
+  las personas que lo piden a través de la API, sin quienes vieron el producto, funciona sin él.
+- Solo entran contactos. Un visitante pasa a ser un contacto conocido cuando hace clic en un enlace de uno de tus
+  correos, se suscribe con un formulario de ReputeCast en la misma página o tu sitio lo identifica con una llamada
+  firmada; entonces cuentan sus últimos 30 días en el sitio. Los visitantes anónimos nunca entran en un recorrido.
+
+## Cómo funcionan los recorridos de tienda
+
+Los cuatro disparadores están en el grupo <UiPath path="commerce.flows.storeGroup" /> de la paleta, después de
+<UiPath path="automations.graph.kindAbandonedCheckout" />:
+
+<Screenshot
+  id="automation-palette"
+  alt="El editor del recorrido Browse abandonment de la demo con toda la paleta: el grupo Tienda con Pedido realizado, Primer pedido, Pago abandonado, Vio un producto, Añadió al carrito, Vuelve a haber stock y Bajada de precio, y después los grupos Suscriptores de pago y Anuncios de clientes potenciales."
+>
+  1. Tienda, con los cuatro disparadores de los recorridos de tienda después de los disparadores de pedidos y pagos de la tienda.
+  2. Suscriptores de pago.
+  3. Anuncios de clientes potenciales.
+</Screenshot>
+
+| Disparador                                         | Empieza cuando                                                                                                                                                           | Quién entra                                                                                                                                                      |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="commerce.flows.kindViewedProduct" /> | Han pasado las horas definidas desde que el contacto vio por última vez uno de los productos de la tienda, sin ningún pedido ni ningún pago en la tienda desde entonces. | Los contactos que vieron uno de los productos al menos el número de veces definido, opcionalmente solo productos de algunas colecciones.                         |
+| <UiPath path="commerce.flows.kindAddedToCart" />   | Lo mismo, contado desde el último añadido al carrito.                                                                                                                    | Los contactos que añadieron uno de los productos a su carrito al menos el número de veces definido.                                                              |
+| <UiPath path="commerce.flows.kindBackInStock" />   | Un producto agotado de la tienda vuelve a estar disponible.                                                                                                              | Los contactos que pidieron que se les avisara y aún no lo sabían y, con <UiPath path="commerce.flows.viewersTooLabel" />, quienes lo vieron en los últimos días. |
+| <UiPath path="commerce.flows.kindPriceDrop" />     | El precio de un producto baja al menos el porcentaje definido, en la misma moneda.                                                                                       | Los contactos que lo vieron o lo añadieron a su carrito en los últimos días.                                                                                     |
+
+En la lista de automatizaciones y en las diferencias de la publicación, los dos primeros se leen
+<UiPath path="commerce.flows.startsViewed" /> y <UiPath path="commerce.flows.startsCarted" />, como “Vio un producto y
+no compró · Acme Merch · tras 4 horas”.
+
+Reglas que sigue todo recorrido de tienda:
+
+- ReputeCast busca contactos solo mientras un recorrido publicado empieza con el disparador. Los recorridos de
+  navegación y de carrito se comprueban cada minuto; los de stock y de precio se ejecutan cuando la tienda informa del
+  cambio.
+- Solo entran los contactos activos: los dados de baja, rebotados, con queja, suprimidos y borrados definitivamente
+  nunca entran.
+- Un recorrido vuelve a aceptar al mismo contacto solo al cabo de 7 días. El disparador no tiene la opción
+  <UiPath path="automations.panels.reentry" />.
+- Un disparador de recorrido de tienda solo puede ser el primer disparador de un recorrido, nunca uno añadido (consulta
+  [más de un disparador](/es/automations/triggers-and-steps/#más-de-un-disparador)).
+
+## Configurar un recorrido de abandono de navegación o de carrito
+
+<Steps>
+
+1. Ve a <UiPath path="nav.automations" />, selecciona <UiPath path="automations.newAutomation" /> y elige
+   <UiPath path="automations.blankCanvas" />.
+
+2. Desde el grupo <UiPath path="commerce.flows.storeGroup" /> de la paleta, arrastra
+   <UiPath path="commerce.flows.kindViewedProduct" /> al lienzo, o <UiPath path="commerce.flows.kindAddedToCart" /> para
+   hacer seguimiento de los carritos, y selecciónalo.
+
+3. En <UiPath path="commerce.flows.store" />, elige la tienda. Con una sola tienda conectada, ya está elegida. La nota
+   bajo la configuración indica qué sitio con seguimiento envía las vistas de producto de la tienda, o que aún no hay
+   ninguno vinculado, con <UiPath path="commerce.flows.setUpTracking" />.
+
+4. Configura el disparador:
+   - <UiPath path="commerce.flows.wait" />: cuántas horas después de la última vista, sin un pedido ni un pago, empieza
+     el recorrido: de 1 a 24, 4 al principio.
+   - <UiPath path="commerce.flows.only" />: <UiPath path="commerce.flows.addCollection" /> se queda solo con los
+     productos de hasta 20 de las colecciones de la tienda. Sin ninguna, cuenta cualquier producto de la tienda.
+   - <UiPath path="commerce.flows.after" />: cuántas veces vio el contacto uno de los productos, o lo añadió a su
+     carrito: de 1 a 5, 1 al principio.
+
+   <Screenshot
+     id="store-flow-browse"
+     alt="El recorrido Browse abandonment de la demo con su disparador seleccionado: Vio un producto en Acme Merch tras 4 horas en el lienzo, luego dos correos con 2 días de diferencia y una salida, y en el panel derecho la tienda, Esperar 4 horas, ninguna colección, tras 1 vista y la nota de que shop.acme.io envía las vistas de producto de Acme Merch."
+   >
+     1. El disparador en el lienzo: la tienda y la espera.
+     2. Las horas sin un pedido ni un pago.
+     3. Las colecciones a las que deben pertenecer los productos.
+     4. Las vistas de un producto antes de que empiece el recorrido.
+     5. El sitio con seguimiento que envía las vistas de producto de la tienda.
+   </Screenshot>
+
+5. Añade los correos. Arrastra <UiPath path="automations.graph.typeEmail" /> debajo del disparador y escribe un correo
+   que muestre los productos que miró el contacto (consulta
+   [mostrar los productos en los correos](#mostrar-los-productos-en-los-correos)). El recorrido de la demo envía un
+   segundo correo dos días después mediante una <UiPath path="automations.graph.typeDelay" />.
+
+6. Publica el recorrido (consulta
+   [publicar cambios en automatizaciones con seguridad](/es/automations/publish-and-versions/)). A partir de entonces,
+   ReputeCast comprueba cada minuto.
+
+</Steps>
+
+Cada minuto, un contacto entra cuando se cumple todo esto:
+
+- Su última vista (o su último añadido al carrito) de un producto que coincide ocurrió en la hora que terminó hace las
+  horas definidas, así que un minuto que llega tarde o se salta no deja a nadie fuera.
+- Desde entonces no ha visto ni añadido al carrito ninguno de los productos de la tienda: un contacto que sigue
+  navegando espera.
+- No ha hecho ningún pedido ni empezado ningún pago en la tienda desde esa vista. Un contacto que empezó un pago
+  corresponde al disparador <UiPath path="automations.graph.kindAbandonedCheckout" />.
+- El recorrido no lo aceptó en los últimos 7 días.
+
+El evento nombra los productos que vio (o añadió al carrito) en las 24 horas anteriores, los más recientes primero, 6
+como máximo.
+
+## Configurar un recorrido de vuelta al stock o de bajada de precio
+
+<Steps>
+
+1. Ve a <UiPath path="nav.automations" />, selecciona <UiPath path="automations.newAutomation" /> y elige
+   <UiPath path="automations.blankCanvas" />.
+
+2. Desde el grupo <UiPath path="commerce.flows.storeGroup" /> de la paleta, arrastra
+   <UiPath path="commerce.flows.kindBackInStock" /> o <UiPath path="commerce.flows.kindPriceDrop" /> al lienzo,
+   selecciónalo y elige la <UiPath path="commerce.flows.store" />.
+
+3. Define quién se entera:
+   - <UiPath path="commerce.flows.kindBackInStock" />: las personas que pidieron saber cuándo vuelve el producto agotado
+     (consulta [dejar que los lectores pidan un producto agotado](#dejar-que-los-lectores-pidan-un-producto-agotado)).
+     Cada una se entera una vez. Activa <UiPath path="commerce.flows.viewersTooLabel" /> para añadir a quienes lo vieron
+     en los últimos 1 a 60 días (14 al principio); empieza desactivado.
+   - <UiPath path="commerce.flows.kindPriceDrop" />: <UiPath path="commerce.flows.dropDays" /> de 1 a 60 días (14 al
+     principio), y <UiPath path="commerce.flows.dropPercent" /> de un 1 % a un 90 % (10 %).
+
+   <Screenshot
+     id="store-flow-stock"
+     alt="La configuración del disparador del recorrido Back in stock de la demo: Vuelve a haber stock en Acme Merch, con el interruptor para añadir a quienes lo vieron en los últimos 14 días desactivado, y la nota de que las personas que lo pidieron desde el botón Avísame del sitio o la API se enteran una vez cada una."
+   >
+     1. Incluir también a quienes vieron el producto en los últimos 14 días.
+     2. Quién se entera por defecto: las personas que lo pidieron.
+   </Screenshot>
+
+4. Añade el correo. Nombra el producto con `{{ stock.product.title }}` y enlázalo con `{{ stock.product.url }}`
+   (consulta [mostrar los productos en los correos](#mostrar-los-productos-en-los-correos)).
+
+5. Publica el recorrido.
+
+</Steps>
+
+ReputeCast detecta el cambio cuando guarda el producto: un producto que estaba agotado y vuelve a estar disponible, o
+cuyo precio es más bajo que antes. El cambio inicia todos los recorridos publicados del espacio de trabajo en esa
+tienda; una bajada de precio inicia solo los recorridos cuyo porcentaje alcanza. Un producto que se quita de la tienda o
+que no está activo no inicia nada.
+
+Lo pronto que ocurre depende de la tienda:
+
+- WooCommerce informa de los productos cambiados con sus webhooks de productos.
+- Shopify informa de los cambios de stock con `inventory_levels/update` cuando la tienda concedió `read_inventory`. Sin
+  ese ámbito, ReputeCast lee cada 15 minutos los productos cambiados desde su última comprobación mientras un recorrido
+  de vuelta al stock o de bajada de precio vigila la tienda. Los cambios de precio llegan con los webhooks de productos
+  en ambos casos.
+
+### Dejar que los lectores pidan un producto agotado
+
+Un recorrido de vuelta al stock acepta a las personas que pidieron que se les avisara. Hay dos formas de pedirlo:
+
+- **En el sitio con seguimiento**, llama al rastreador desde tu botón “Avísame” con el id del producto en la propia
+  tienda. Cuenta para un visitante que ReputeCast conoce como contacto, en un sitio vinculado a la tienda:
+
+  ```js title="Botón Avísame"
+  reputecast('notifyWhenAvailable', { id: '8237401' })
+  ```
+
+- **Desde tu servidor**, [pide el aviso para un contacto](/api/operations/create-stock-request/) con
+  `POST /api/v1/workspaces/{workspace}/commerce/stock-requests` y una clave de API con `subscribers:create`. Envía el
+  `email` del contacto y el `productId` (el id de ReputeCast o el de la propia tienda); añade `storeId` cuando dos
+  tiendas conectadas tienen un producto con el mismo id. El contacto debe existir, y el registro de auditoría guarda
+  cada solicitud como `store_stock_request.created`.
+
+Cuando el recorrido acepta a la persona, la solicitud queda atendida. Si vuelve a pedirlo, espera a la siguiente vuelta
+del producto.
+
+## Mostrar los productos en los correos
+
+Los correos del recorrido reciben los datos del disparador como Liquid (consulta
+[personalizar correos con Liquid](/es/campaigns/personalization/)):
+
+| Variable                                                                                                         | En los recorridos                                                                                    | Contiene                                                                                                                      |
+| ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `{{ browse.products }}`                                                                                          | <UiPath path="commerce.flows.kindViewedProduct" />, <UiPath path="commerce.flows.kindAddedToCart" /> | Los productos que nombra el evento, los más recientes primero, 6 como máximo: cada uno con `title`, `url`, `image` y `price`. |
+| `{{ stock.product.title }}`, `{{ stock.product.url }}`, `{{ stock.product.image }}`, `{{ stock.product.price }}` | <UiPath path="commerce.flows.kindBackInStock" />, <UiPath path="commerce.flows.kindPriceDrop" />     | El producto que volvió o bajó de precio, con su precio actual.                                                                |
+| `{{ stock.previous_price }}`, `{{ stock.drop_percent }}`                                                         | <UiPath path="commerce.flows.kindPriceDrop" />                                                       | El precio antes de la bajada, y cuánto bajó, en porcentaje entero.                                                            |
+
+```liquid title="Correo de abandono de navegación: los productos que miró"
+{% for product in browse.products %}
+  <a href="{{ product.url }}"><img src="{{ product.image }}" alt="{{ product.title }}" width="160"></a>
+  <p>{{ product.title }} · {{ product.price }}</p>
+{% endfor %}
+```
+
+La configuración del disparador también remite a un bloque para ellos: la cuadrícula de productos con sus
+<UiPath path="commerce.flows.products" /> en <UiPath path="commerce.flows.viewed" />, que rellena sus huecos con los
+mismos productos cuando sale el correo. El editor enumera esa opción en <UiPath path="commerce.flows.eachReader" />,
+atenuada, porque solo los correos de los recorridos de navegación, carrito y stock pueden rellenarla; los correos Browse
+abandonment de la demo la muestran.
+
+Cualquier correo puede además recomendar productos de una tienda conectada. Las opciones de
+<UiPath path="commerce.flows.products" /> de la cuadrícula de productos son:
+
+- <UiPath path="commerce.flows.sameForEveryone" />: <UiPath path="commerce.flows.chosen" />,
+  <UiPath path="commerce.flows.newest" /> o <UiPath path="commerce.flows.bestSellers" />, las unidades más vendidas de
+  los últimos 30 días, opcionalmente en una colección.
+- <UiPath path="commerce.flows.eachReader" />: <UiPath path="commerce.flows.recentlyViewed" />, lo que el lector vio o
+  añadió a su carrito en el sitio de la tienda, lo más reciente primero, sin lo que compró; y
+  <UiPath path="commerce.flows.boughtTogether" />, lo que se suele comprar con lo que el lector compró o vio, a partir
+  de 180 días de pedidos, recalculado cada noche. Los lectores sin ningún historial reciben los más vendidos.
+
+Una cuadrícula muestra 2, 3, 4 o 6 productos, y la lista de cada lector se lee cuando su mensaje entra en la cola, así
+que los enlaces del correo conservan sus posiciones. [Diseñar correos en el editor](/es/campaigns/composer/#bloques)
+cubre los bloques de producto.
+
+## Comprobar que funciona
+
+- La fila del recorrido en <UiPath path="nav.automations" /> muestra <UiPath path="automations.statusLive" />, su
+  disparador con la tienda, como “Vuelve a haber stock · Acme Merch”, y cuántos contactos entraron en los últimos 30
+  días.
+- En el lienzo, el paso del disparador cuenta los contactos que entraron, y cada paso de correo sus envíos, aperturas y
+  clics.
+- El perfil de un contacto muestra una línea por cada día que estuvo en el sitio con seguimiento, como “Vio 3 productos
+  en shop.acme.io”, y los recorridos en los que está (consulta
+  [leer el perfil de un contacto](/es/audience/contacts/#leer-el-perfil-de-un-contacto)).
+
+## Solución de problemas
+
+- **El disparador pide conectar antes una tienda Shopify o WooCommerce.** El espacio de trabajo no tiene ninguna tienda
+  conectada. Conecta una en <UiPath path="nav.settings > settings.integrations" />.
+- **El disparador dice que aún no hay ningún sitio con seguimiento vinculado a la tienda.** Añade el sitio de la tienda
+  en el seguimiento del sitio web, o vincula a la tienda el sitio que añadiste, y vuelve a mirar la nota.
+- **Al publicar se pide elegir la tienda, o se indica que la tienda del disparador ya no está conectada.** Elige una
+  tienda conectada, o vuelve a conectar la tienda en <UiPath path="nav.settings > settings.integrations" />.
+- **Nadie entra en un recorrido de navegación o de carrito.** Los visitantes aún no son contactos conocidos, el sitio
+  espera su consentimiento y tu banner nunca llama a `reputecast('consent', true)`, o su navegador envía Global Privacy
+  Control, que el rastreador siempre respeta. Los contactos que hicieron un pedido, empezaron un pago o siguieron
+  navegando tampoco entran.
+- **Un contacto entró una vez y no más.** Un recorrido de tienda vuelve a aceptar al mismo contacto solo al cabo de 7
+  días.
+- **Un recorrido de vuelta al stock empieza tarde en una tienda Shopify.** La aplicación de la tienda no concedió
+  `read_inventory`, así que los cambios de stock se leen cada 15 minutos.
+  [Conectar Shopify o WooCommerce](/es/integrations/shopify-woocommerce/) enumera los ámbitos que pide la aplicación.
+- **Una bajada de precio no inició a nadie.** El precio bajó menos que el porcentaje del disparador, cambió la moneda o
+  nadie vio ni añadió al carrito el producto en los días definidos.
+
+<Aside type="note">
+  Los recorridos de tienda envían por la ruta Automatizaciones como cualquier otro recorrido: sus correos siguen las
+  reglas de envío del paso y el [límite de marketing](/es/reference/glossary/#marketing-cap) del espacio de trabajo, y
+  los contactos del grupo de control los pasan sin recibir el correo (consulta [disparadores y
+  pasos](/es/automations/triggers-and-steps/#contactos-fuera-por-el-grupo-de-control)).
+</Aside>
+
+## Relacionado
+
+- [Disparadores y pasos](/es/automations/triggers-and-steps/) enumera todos los disparadores, incluidos los de pedidos y
+  pagos de la tienda.
+- [Añadir el seguimiento del sitio web](/es/integrations/website-tracking/) añade el rastreador al sitio de la tienda.
+- [Conectar Shopify o WooCommerce](/es/integrations/shopify-woocommerce/) conecta la tienda y sus webhooks.
+- [Diseñar correos en el editor](/es/campaigns/composer/) cubre los bloques de tarjeta de producto, cuadrícula de
+  productos y artículos del pago.
+- [Publicar cambios en automatizaciones con seguridad](/es/automations/publish-and-versions/) explica el cuadro de
+  diálogo de publicación.

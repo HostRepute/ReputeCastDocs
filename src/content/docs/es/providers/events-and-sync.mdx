@@ -14,6 +14,9 @@ sources:
   - internal/providers/smtp
   - internal/providers/manage/review_health.go
   - internal/providers/provider.go
+  - internal/providers/ses/sns.go
+  - internal/providers/webhookauth/replay.go
+  - internal/providers/mailgun/webhook.go
   - internal/providers/manage/health.go
   - internal/app/wire_providers.go
   - internal/app/wire_sending.go
@@ -46,7 +49,13 @@ original del proveedor y comparte cada rebote y cada queja a través de una sola
 2. **ReputeCast comprueba la firma.** Cada adaptador verifica la solicitud tal como la firma su proveedor (una firma de
    SNS para Amazon SES, un HMAC para Mailgun, una firma ECDSA para SendGrid, un secreto compartido para los proveedores
    que no firman). Una solicitud que no pasa la comprobación recibe `401` y nunca se procesa; se conservan sus primeros
-   2 KB para el diagnóstico.
+   2 KB para el diagnóstico. Desde la versión 1.5.0, a dos firmas se les exige algo más que una firma válida:
+   - **SNS** firma igual los topics de todas las cuentas de AWS, así que ReputeCast solo acepta un mensaje del topic
+     propio de la conexión, firmado con un certificado de un endpoint regional de SNS, `sns.<region>.amazonaws.com`.
+     Guarda el topic antes de suscribir el webhook y no confía en ningún topic mientras no haya uno guardado.
+   - **Mailgun** firma un token de un solo uso en lugar del evento. ReputeCast vincula cada token, en su base de datos,
+     al evento con el que llegó por primera vez, así que ningún proceso de ReputeCast acepta ese token con otro evento,
+     tampoco después de un reinicio. Una nueva entrega del mismo evento pasa y se cuenta una sola vez.
 3. **Guarda el payload sin procesar y responde de inmediato.** Un payload verificado se guarda tal como llegó y el
    proveedor recibe `200` al momento, así que un procesamiento lento nunca hace que un proveedor reintente o se rinda.
    Si ReputeCast no puede guardarlo, responde `429` con `Retry-After: 30` en lugar de un `5xx`, porque algunos
@@ -72,6 +81,10 @@ Los eventos que no llegan por un webhook siguen el mismo camino desde el paso 4:
   ese servidor no llegan a la lista de supresión hasta que se pueda volver a leer.
 - **Consulta periódica**: ReputeCast consulta cada minuto la API de eventos de Mailgun o SparkPost cuando elegiste la
   consulta periódica en el asistente de conexión.
+- **Informes de bucle de retroalimentación por correo**: mientras ReputeCast
+  [recibe correo](/es/providers/receiving-mail/), un informe de queja en ARF que llega a la dirección `fbl@` del dominio
+  de recepción se convierte en un evento `complaint` del proveedor de envío que envió el mensaje. Disponible a partir de
+  la próxima versión después de la 1.6.0.
 
 Un proveedor cuyos eventos dejan de llegar mientras sale correo se señala como proveedor con webhooks silenciosos, y uno
 que nunca informó de un evento se señala cuando el correo lleva 30 minutos de retraso;
@@ -123,8 +136,13 @@ tipo de evento, o busca un destinatario o un ID del mensaje.
 
 <Screenshot
   id="providers-events"
-  alt="El registro de eventos: eventos sin procesar de Postmark, Amazon SES y Postal junto a sus tipos normalizados (entregado, rebote permanente, aplazado, queja, rebote temporal, rechazado), cada uno con su código SMTP original y su diagnóstico."
+  alt="El registro de eventos con todos los proveedores de envío y todos los eventos: cada evento sin procesar, como Delivery o Bounce/Permanent/General de Amazon SES, junto a su tipo normalizado, entregado o rebote permanente, con el código y el diagnóstico originales, el destinatario enmascarado y el paso de automatización del que vino."
 />
+
+El correo recibido, como las respuestas, no es un evento de un proveedor de envío, y la dirección de entrada a la que
+llega, `/hooks/inbound/<token>`, está separada de los webhooks de eventos. Lee
+[configurar la recepción de correo](/es/providers/receiving-mail/). Disponible a partir de la próxima versión después de
+la 1.6.0.
 
 <UiPath path="providers.events.exportCsv" /> descarga los eventos filtrados. Los destinatarios siguen enmascarados
 salvo que tengas el permiso `subscribers:export`, y cada exportación queda en el

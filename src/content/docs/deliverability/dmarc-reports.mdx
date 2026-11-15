@@ -1,6 +1,6 @@
 ---
 title: Read DMARC aggregate reports
-description: Collect DMARC aggregate report files through HostRepute or your own mailbox, upload them to ReputeCast, and find which sending sources pass, fail or align.
+description: Collect DMARC aggregate report files through HostRepute, ReputeCast's receiving domain or your own mailbox, and find which sending sources pass, fail or align.
 type: how-to
 audience: [admin]
 permissions: ['deliverability:view', 'domains:manage']
@@ -10,12 +10,15 @@ sources:
   - internal/deliverability/dmarc.go
   - internal/deliverability/api.go
   - internal/deliverability/deliverability.go
+  - internal/deliverability/types.go
+  - internal/inbound/process.go
   - internal/domains/records.go
   - internal/hostrepute/client.go
   - internal/hostrepute/sync.go
   - internal/readiness/assemble.go
   - web/src/features/deliverability/DmarcCard.tsx
   - web/src/features/deliverability/dmarc.messages.ts
+  - web/src/features/senders/ReceivingCard.tsx
 sidebar:
   order: 4
 ---
@@ -30,10 +33,11 @@ domain and whether that mail passed DMARC. This guide shows how to collect the r
 and read them under <UiPath path="nav.deliverability > placement.health" />, so you can move your
 [DMARC](/reference/glossary/#dmarc) policy from `p=none` to `quarantine` or `reject` without losing real mail.
 
-Mailbox providers that support DMARC send these reports as XML files, by default once a day, to the addresses in the
-`rua` tag of your DMARC record ([RFC 7489, section 6.3](https://www.rfc-editor.org/rfc/rfc7489#section-6.3), checked
-October 2026). ReputeCast has no inbox of its own for them: either [HostRepute](/reference/glossary/#hostrepute)
-collects and parses them for you, or you receive them in your own mailbox and upload them.
+Mailbox providers that support DMARC send these reports as XML files, usually once a day, to the addresses in the
+`rua` tag of your DMARC record ([RFC 9990, section 3](https://www.rfc-editor.org/rfc/rfc9990#section-3), checked
+November 2026). [HostRepute](/reference/glossary/#hostrepute) can collect and parse them for you, ReputeCast can
+receive them at the `dmarc@` address of its [receiving domain](/providers/receiving-mail/), or you receive them in your
+own mailbox and upload them.
 
 ## Before you begin
 
@@ -41,8 +45,8 @@ collects and parses them for you, or you receive them in your own mailbox and up
   [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/).
 - Reading the reports needs `deliverability:view`, which every built-in role has. Uploading a report needs
   `domains:manage` (Owner and Admin).
-- Decide where the reports go: HostRepute, a mailbox you own, or both. `rua` takes several addresses separated by
-  commas.
+- Decide where the reports go: HostRepute, ReputeCast's receiving domain, a mailbox you own, or more than one. `rua`
+  takes several addresses separated by commas.
 
 ## Collect the reports
 
@@ -62,6 +66,39 @@ collects and parses them for you, or you receive them in your own mailbox and up
 
 HostRepute parses the reports, and ReputeCast reads the last 7 days of results with its hourly sync.
 
+### At ReputeCast's receiving domain
+
+When the workspace [receives mail](/providers/receiving-mail/), aggregate reports sent to `dmarc@` its receiving
+domain are stored as they arrive, without an upload. Available from the next release after 1.6.0.
+
+<Steps>
+
+1. Set up <UiPath path="nav.settings > settings.senders > senders.receiving.title" />. The card lists the address under
+   <UiPath path="senders.receiving.dmarcReports" />, such as `dmarc@reply.news.acme.io`. Until the workspace receives
+   mail, the empty DMARC card offers <UiPath path="deliverability.dmarc.collectSetUp" /> under
+   <UiPath path="deliverability.dmarc.collectTitle" />.
+
+2. Add the address to the `rua` tag of your DMARC record. The DMARC record ReputeCast suggests for a domain you add
+   while the route exists lists it already, after HostRepute's address when HostRepute is connected.
+
+   ```txt title="_dmarc.news.acme.io TXT"
+   v=DMARC1; p=none; rua=mailto:dmarc@reply.news.acme.io
+   ```
+
+3. When the receiving domain isn't under the same organizational domain as the sending domain, publish the external
+   destination record described in [In your own mailbox](#in-your-own-mailbox) at the receiving domain.
+
+</Steps>
+
+ReputeCast keeps a report only when it is about one of the workspace's sending domains or their organizational
+domains; it drops others, and the <UiPath path="senders.receiving.title" /> card says it did. The DMARC card shows where
+reports arrive and when the last one did.
+
+<Screenshot
+  id="deliverability-dmarc"
+  alt="The DMARC reports card for the last 7 days at 99.6% pass: aggregate reports go to HostRepute and also arrive at dmarc@reply.news.acme.io, the last one yesterday; Amazon SES, Postal and Postmark are aligned, and an unknown source at 198.51.100.77 failed and was quarantined, with Investigate source."
+/>
+
 ### In your own mailbox
 
 <Steps>
@@ -75,7 +112,7 @@ HostRepute parses the reports, and ReputeCast reads the last 7 days of results w
 2. If the mailbox is on a different organizational domain than the DMARC record, that other domain has to accept
    the reports by publishing a TXT record `v=DMARC1` at `<your domain>._report._dmarc.<its domain>`, for example
    `acme.io._report._dmarc.example.net`. Without it, mailbox providers don't send the reports there
-   ([RFC 7489, section 7.1](https://www.rfc-editor.org/rfc/rfc7489#section-7.1), checked October 2026).
+   ([RFC 9990, section 4](https://www.rfc-editor.org/rfc/rfc9990#section-4), checked November 2026).
 
 3. Save the report attachments as they arrive. They usually come as `.xml.gz` or `.zip` files.
 
@@ -100,6 +137,10 @@ HostRepute parses the reports, and ReputeCast reads the last 7 days of results w
 ReputeCast stores only the report's counts: the policy that was published, and per sending IP the message count,
 what the receiver did, and the SPF and DKIM results. Uploading the same report again (same organization and report ID)
 replaces the earlier copy, so nothing is counted twice.
+
+Since 1.6.0, reports in RFC 9990's format are read as well as the older ones. The stored policy keeps the tags the new
+format reports (`np`, `fo`, `testing` and `discovery_method`, besides `p`, `sp`, `adkim` and `aspf`), and the `pass`
+disposition, which RFC 9990 added for mail that passed DMARC, counts as delivered.
 
 The upload button exists only on the empty card. Once reports from the last 7 days are shown, upload further reports
 with the API operation [Upload a DMARC aggregate report](/api/operations/upload-dmarc-report/), which takes the raw file and needs
@@ -127,7 +168,9 @@ A successful upload returns `201` with the organization, report ID, domain, peri
   3. Blocklist results for the same domains and IPs.
 </Screenshot>
 
-The card is titled **DMARC reports · last 7 days** and summarizes every report whose period ended in the last 7 days.
+The card is titled **DMARC reports · last 7 days** and summarizes every report whose period ended in the last 7 days,
+from every source together. Under the title it says where the reports come from: HostRepute's report address, the
+number of uploaded reports, and, while ReputeCast receives mail, "Reports arrive at …" with the time of the last one.
 Its badge is the pass rate: the share of messages that passed DMARC through SPF or DKIM. It is green from 98%, amber
 from 90%, and red below.
 
@@ -197,8 +240,9 @@ FAQ, checked October 2026).
 
 </Steps>
 
-[BIMI](/deliverability/bimi/) needs `p=quarantine` or `p=reject` applied to all mail, so don't lower `pct` below 100
-if you plan to show your logo.
+[BIMI](/deliverability/bimi/) needs `p=quarantine` or `p=reject`. To try the stricter policy before it applies, publish
+it with `t=y`: receivers apply one level less, and the reports' `testing` field says so
+([RFC 9989, section 4.7](https://www.rfc-editor.org/rfc/rfc9989#section-4.7), checked November 2026).
 
 ## Check that it worked
 
@@ -212,7 +256,8 @@ if you plan to show your logo.
 
 - **No reports arrive.** Check the `rua` address for typos and, for a mailbox on another domain, the
   `_report._dmarc` record from [In your own mailbox](#in-your-own-mailbox). Reports are usually sent once a day, so
-  wait at least a day after publishing.
+  wait at least a day after publishing. For the `dmarc@` address, check that
+  [receiving mail](/providers/receiving-mail/) says <UiPath path="senders.receiving.statusReceiving" />.
 - **"This report is for …, which isn't a sending domain of this workspace."** The report's domain doesn't share an
   organizational domain with any domain of this workspace. Upload it in the workspace that sends as that domain, or
   [add the domain](/providers/senders-and-domains/) first.
@@ -228,5 +273,6 @@ if you plan to show your logo.
 
 - [Set up SPF, DKIM and DMARC](/deliverability/spf-dkim-dmarc/)
 - [Connect HostRepute](/deliverability/hostrepute/)
+- [Set up receiving mail](/providers/receiving-mail/)
 - [Monitor domain and provider health](/deliverability/health/)
 - [Gmail, Yahoo and Microsoft bulk sender requirements](/deliverability/bulk-sender-requirements/)

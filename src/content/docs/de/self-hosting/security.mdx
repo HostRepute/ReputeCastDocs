@@ -24,8 +24,15 @@ sources:
   - internal/proxycheck
   - internal/app/wire_proxycheck.go
   - web/src/features/composer/inert.ts
+  - internal/liquid/budget.go
+  - internal/segments/sqlmode.go
+  - internal/csvexport
+  - internal/customhost
+  - internal/accounts/external.go
+  - internal/accounts/account.go
+  - internal/webhooks
 sidebar:
-  order: 12
+  order: 14
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components'
@@ -51,43 +58,87 @@ geheimen Schlüssel aufzubewahren und zu rotieren.
 3. **Die Anmeldung ist schwer anzugreifen.** Die Anmeldung fragt zuerst nach der E-Mail-Adresse und antwortet mit
    allgemeinen Fehlermeldungen, sodass niemand erfährt, welche Adressen ein Konto haben. Falsche Passwörter sperren die
    E-Mail-Adresse für eine Weile (10 Versuche sperren sie standardmäßig für 15 Minuten), und `/api/v1/auth/*` nimmt
-   30 Anfragen pro Minute und IP-Adresse an. Die Zwei-Faktor-Authentifizierung mit einer Authenticator-App, Passkeys
-   und einmaligen [Wiederherstellungscodes](/de/reference/glossary/#recovery-code) ist standardmäßig für alle
-   erforderlich, die eine [sensible Berechtigung](/de/reference/glossary/#sensitive-permission) haben.
-4. **Sitzungscookies bleiben im Browser.** Das Sitzungscookie ist `HttpOnly` und `SameSite=Lax` und `Secure`, wenn
+   30 Anfragen pro Minute und IP-Adresse an. Falsche Codes der Authenticator-App und falsche Wiederherstellungscodes
+   zählen zur selben Sperre, und jeder Code der Authenticator-App funktioniert nur einmal. Die
+   Zwei-Faktor-Authentifizierung mit einer Authenticator-App, Passkeys und einmaligen
+   [Wiederherstellungscodes](/de/reference/glossary/#recovery-code) ist standardmäßig für alle erforderlich, die eine
+   [sensible Berechtigung](/de/reference/glossary/#sensitive-permission) haben.
+4. **Einladungen können kein Konto übernehmen.** Wer eine Einladung mit Google, Microsoft, GitHub oder SSO annimmt,
+   verknüpft die Identität nur so, wie es die Anmeldung täte: Ein Konto, das die eingeladene E-Mail-Adresse bereits
+   nutzt, nimmt die Einladung nur mit einer Identität an, mit der es sich schon anmeldet, und meldet sich sonst zuerst
+   an. Eine Einladung gilt nur so lange, wie die einladende Person sie noch senden dürfte. Ein Konto, das sich nur über
+   SSO anmeldet, fügt ein erstes Passwort hinzu oder verlegt seine E-Mail-Adresse auf eine andere Domain nur nach einer
+   Anmeldung in den letzten 15 Minuten, und nie dort, wo sein Anbieter die Domain erzwingt
+   ([Single Sign-on](/de/self-hosting/sso/#einladungen-und-von-sso-verwaltete-konten)).
+5. **Sitzungscookies bleiben im Browser.** Das Sitzungscookie ist `HttpOnly` und `SameSite=Lax` und `Secure`, wenn
    `http.public_url` mit `https://` beginnt (oder, außerhalb der Entwicklung, solange `auth.cookie_secure` auf `true`
    steht, dem Standard).
-5. **Jede Aktion durchläuft eine einzige Berechtigungsprüfung.** Personen, API-Schlüssel und MCP-Agenten durchlaufen
-   dieselbe Prüfung; Schlüssel und Agenten haben nie mehr Rechte als die Person, die sie erstellt hat, und handeln als
-   sie selbst, nie als diese Person. Eine abgelehnte Aktion nennt Personen, die helfen können, statt eines
-   Berechtigungsschlüssels; API-Clients lesen den Schlüssel im Feld `permission` des Fehlers. Siehe
-   [Rollen und Berechtigungen](/de/team/roles-and-permissions/).
-6. **Das Audit-Protokoll lässt sich nicht bearbeiten.** Jede Änderung und jeder verweigerte Versuch wird mit Akteur,
+6. **Jede Aktion durchläuft eine einzige Berechtigungsprüfung.** Personen, API-Schlüssel und MCP-Agenten durchlaufen
+   dieselbe Prüfung; Schlüssel und Agenten haben nie mehr Rechte als die Person, die sie erstellt hat, folgen deren
+   aktuellem Bereich an Listen und Absenderdomains und handeln als sie selbst, nie als diese Person. Ein Mitglied, das
+   auf einige Listen oder Absenderdomains beschränkt ist, bleibt in Abläufen, MCP, Exporten von Abstimmungen und
+   Umfragen, Vorschauen von Automationen und jeder Art von Versand innerhalb dieser Grenzen. Eine abgelehnte Aktion
+   nennt Personen, die helfen können, statt eines Berechtigungsschlüssels; API-Clients lesen den Schlüssel im Feld
+   `permission` des Fehlers. Siehe [Rollen und Berechtigungen](/de/team/roles-and-permissions/).
+7. **Schlüssel und Agenten lassen sich an Adressen binden.** Seit Version 1.6.0 lässt sich ein API-Schlüssel oder ein
+   MCP-Agent auf IP-Adressen und Netze beschränken: Die REST-API antwortet `403` mit dem Code `ip_not_allowed`, MCP
+   `401` und das SMTP-Relay `535`. Die Prüfung verwendet die Client-Adresse, die ReputeCast ermittelt, setzen Sie hinter
+   einem Proxy daher zuerst `http.trusted_proxies`.
+8. **Webhooks enthalten nur, was ihr Ersteller sehen darf.** Ein ausgehender Webhook erhält nur Ereignisse, deren Daten
+   die Person sehen darf, für die er sendet, und pausiert mit Angabe des Grundes, wenn sie das nicht mehr darf;
+   `webhooks:manage` ist eine sensible Berechtigung. Eingehenden SNS-Nachrichten wird nur von
+   `sns.<region>.amazonaws.com` und aus dem eigenen Topic des Anbieters vertraut, und die Signatur-Tokens von Mailgun
+   werden in PostgreSQL erfasst, sodass kein Prozess eines zweimal annimmt.
+9. **Das Audit-Protokoll lässt sich nicht bearbeiten.** Jede Änderung und jeder verweigerte Versuch wird mit Akteur,
    IP-Adresse, User-Agent und Anfrage-ID erfasst. Ein Datenbank-Trigger weist Änderungen an Audit-Einträgen ab; nur die
    Bereinigung nach Ablauf der Aufbewahrungsdauer entfernt alte Einträge.
-7. **Ausgehende Anfragen erreichen Ihr Netzwerk nicht.** Adressen, die Personen in die App eingeben (URLs von
-   Anbietern, Webhook-Endpunkte, Importer, Feeds, Server für KI-Modelle, Testpostfächer, der Import des Brand-Kits von
-   einer Website und andere), werden geprüft, bevor ReputeCast sich verbindet, und beim Verbinden nach der
-   DNS-Auflösung erneut. Weiterleitungen werden nicht verfolgt.
-8. **Browser erhalten strenge Header.** Jede Antwort trägt eine Content Security Policy, `X-Frame-Options: DENY`,
-   `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
-   `Cross-Origin-Opener-Policy: same-origin` und eine `Permissions-Policy`. HSTS
-   (`max-age=31536000; includeSubDomains`) wird ergänzt, wenn `http.public_url` mit `https://` beginnt. Websiteübergreifende
-   Browseranfragen, die etwas ändern, werden abgelehnt, außer Webhooks der Anbieter (`POST /hooks/…`) und öffentlichen
-   Formularübermittlungen (`POST /p/…`), die auf andere Weise geprüft werden. Die Routen unter `/api` senden keine
-   CORS-Header.
-9. **SQL-Segmente können nur lesen.** Von Mitgliedern geschriebenes SQL läuft in einer schreibgeschützten Transaktion mit
-   einem Statement-Timeout, unter einer Rolle, die nur die Kontakte eines Arbeitsbereichs lesen kann. Siehe
-   [PostgreSQL](/de/self-hosting/postgres/#sql-segmente).
-10. **Bilder werden innerhalb eines Speicherbudgets dekodiert.** Ein paar hundert Byte Bild-Header können Gigabytes an
+10. **Ausgehende Anfragen erreichen Ihr Netzwerk nicht.** Adressen, die Personen in die App eingeben (URLs von
+    Anbietern, Webhook-Endpunkte, Importer, Feeds, Server für KI-Modelle, Testpostfächer, der Import des Brand-Kits von
+    einer Website und andere), werden geprüft, bevor ReputeCast sich verbindet, und beim Verbinden nach der
+    DNS-Auflösung erneut. Weiterleitungen werden nicht verfolgt.
+11. **Gespeicherte Zugangsdaten gehen nur dorthin, wofür sie eingegeben wurden.** Ein SMTP-Passwort, der Schlüssel
+    eines API-Anbieters, das Passwort eines Bounce-Postfachs, der Schlüssel eines KI-Modells oder ein Client Secret für
+    SSO wird nur an die Adresse gesendet, mit der es gespeichert wurde. Wer den Host oder den Aussteller ändert, wird
+    erneut nach den Zugangsdaten gefragt.
+12. **Browser erhalten strenge Header.** Jede Antwort trägt eine Content Security Policy, `X-Frame-Options: DENY`,
+    `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`,
+    `Cross-Origin-Opener-Policy: same-origin` und eine `Permissions-Policy`. HSTS
+    (`max-age=31536000; includeSubDomains`) wird ergänzt, wenn `http.public_url` mit `https://` beginnt.
+    Websiteübergreifende Browseranfragen, die etwas ändern, werden abgelehnt, außer Webhooks der Anbieter
+    (`POST /hooks/…`) und öffentlichen Formularübermittlungen (`POST /p/…`), die auf andere Weise geprüft werden. Die
+    Routen unter `/api` senden keine CORS-Header.
+13. **SQL-Segmente können nur lesen.** Von Mitgliedern geschriebenes SQL läuft in einer schreibgeschützten Transaktion
+    mit einem Statement-Timeout, unter einer Rolle, die nur die Kontakte eines Arbeitsbereichs lesen kann. Es kann
+    weder Funktionen für Advisory Locks aufrufen noch die Funktionen, die als String übergebenes SQL ausführen
+    (`query_to_xml`, `ts_stat`, `dblink` und verwandte), und seine Verbindung gibt jede Sitzungssperre frei, bevor sie
+    in den Pool zurückkehrt. Siehe [PostgreSQL](/de/self-hosting/postgres/#sql-segmente).
+14. **Vorlagen werden mit einem Budget gerendert.** Wer eine E-Mail in der Vorschau ansehen kann, lässt den Server
+    Liquid rendern, daher bricht jedes Rendering mit einem Fehler ab, sobald es 200.000 Schritte (Tags, Ausgaben und
+    Schleifendurchläufe), 64 MB Arbeit durch Filter und Captures, einen Wert von 4 MB, eine Liste mit 10.000 Einträgen
+    oder 2 Sekunden überschreitet. Nur wer eine Kampagne bearbeiten darf, sieht ihren ungespeicherten Inhalt in der
+    Vorschau.
+15. **Bilder werden innerhalb eines Speicherbudgets dekodiert.** Ein paar hundert Byte Bild-Header können Gigabytes an
     Speicher beanspruchen. Bevor ReputeCast einen Upload, ein KI-generiertes Bild, das Bild einer Zusammenfassung oder
     einen Avatar dekodiert, ermittelt es aus dem Header, was das Dekodieren braucht, auch bei einem progressiven JPEG,
     und dekodiert instanzweit jeweils ein Bild. Ein Avatar, KI-Bild oder Bild einer Zusammenfassung über dem Budget
     wird abgelehnt; ein Upload darüber wird unverändert gespeichert, nur ohne seine Metadaten.
-11. **HTML, das der Editor nicht geschrieben hat, kann nicht ausgeführt werden.** Eingefügtes HTML und im Schreibmodus
+16. **HTML, das der Editor nicht geschrieben hat, kann nicht ausgeführt werden.** Eingefügtes HTML und im Schreibmodus
     bearbeitetes HTML werden in einem inerten Dokument gelesen, und Skripte, Frames, Event-Handler und Links mit
     `javascript:` werden entfernt, bevor das HTML in der App angezeigt wird. Der Server kompiliert das MJML selbst und
     behält sein eigenes HTML, wenn das gesendete HTML nicht dazu passt.
+17. **Exporte können keine Formeln ausführen.** Jeder CSV-Export setzt ein einfaches Anführungszeichen vor eine Zelle,
+    die mit `=`, `+`, `-`, `@`, einem Tabulator oder einem Wagenrücklauf beginnt, sodass der Name eines Abonnenten in
+    einer Tabellenkalkulation nicht zu einer funktionierenden Formel werden kann.
+18. **Anfrageprotokolle lassen Tokens weg.** Die Tokens von SMS-Webhooks, die Tokens von WhatsApp-Callbacks und die
+    Codes von Kurzlinks erreichen nie das Anfrageprotokoll.
+19. **Die Domains jedes Arbeitsbereichs liefern nur seine eigenen Links aus.** Ein Host, den ein Arbeitsbereich hält
+    (seine eigene Domain, Kurzlink-Domain, Tracking-Domain für Links oder Website), liefert nur die getrackten Links,
+    Kurzlinks und Seiten dieses Arbeitsbereichs aus, und eine Domain, die ein anderer Arbeitsbereich zuerst verifiziert
+    hat, braucht den TXT-Eintrag dieses Arbeitsbereichs ([eigene Domains](/de/self-hosting/reverse-proxy/#eigene-domains)).
+
+Die Regeln zu Codes für den zweiten Faktor, Einladungen, Bereichen, Webhooks, gespeicherten Zugangsdaten,
+SQL-Segmenten, Vorlagen, Exporten, Anfrageprotokollen und Domains gelten seit Version 1.5.0, das behoben hat, was eine
+Sicherheitsprüfung des gesamten Projekts gefunden hatte.
 
 Die Content Security Policy der App:
 
@@ -183,7 +234,9 @@ Zwei Einstellungen erlauben sie für Dienste, die in Ihrem eigenen Netzwerk lauf
 | `webhooks.allow_private_networks`  | Ausgehende Webhooks, Integrations-Hooks (n8n, Zapier, Make) und den Audit-Stream. |
 
 Link-Local- und Cloud-Metadatenadressen (`169.254.0.0/16`, `fe80::/10`, `100.100.100.200`, `fd00:ec2::254`), Multicast
-und `0.0.0.0/8` bleiben mit beiden Einstellungen gesperrt.
+und `0.0.0.0/8` bleiben mit beiden Einstellungen gesperrt. Ebenso IPv6-Adressen, die zu einem IPv4-Host führen, hinter
+den die Prüfung nicht sehen kann: 6to4 (`2002::/16`), Teredo (`2001::/32`), das Präfix für lokale Nutzung von NAT64
+(`64:ff9b:1::/48`) und die alte IPv4-kompatible Form (`::/96`, außer `::1`).
 
 ## Standardwerte und Grenzen
 
@@ -201,8 +254,8 @@ Zwei-Faktor-Authentifizierung, Sitzungen und Anmeldesperre) befindet sich unter
   5 Zeichen des SHA-1-Hashs eines neuen Passworts an `api.pwnedpasswords.com` (k-Anonymität); antwortet dieser Dienst
   nicht, wird das Passwort angenommen.
 - **Setzen Sie `http.trusted_proxies`** auf die Adresse Ihres Reverse Proxys. Ohne diese Einstellung ignoriert
-  ReputeCast `X-Forwarded-For`, und alle Clients hinter dem Proxy teilen sich in Ratenlimits, im Audit-Protokoll und im
-  Bot-Filter eine IP-Adresse, sodass sich Öffnungen und Klicks nicht auseinanderhalten lassen. ReputeCast bemerkt eine
+  ReputeCast `X-Forwarded-For`, und alle Clients hinter dem Proxy teilen sich in Ratenlimits, im Audit-Protokoll, in den
+  erlaubten IPs und im Bot-Filter eine IP-Adresse, sodass sich Öffnungen und Klicks nicht auseinanderhalten lassen. ReputeCast bemerkt eine
   private Adresse, die in 10 Zeitfenstern von je einer Minute fast alle ihre Anfragen mit Weiterleitungs-Headern
   weiterleitet, und fordert Instanz-Admins auf, sie einzutragen. Eine öffentliche Adresse, die eine Stunde lang den
   größten Teil des Datenverkehrs sendet, wird ebenfalls gemeldet, aber nie als Adresse, die Sie unverändert eintragen

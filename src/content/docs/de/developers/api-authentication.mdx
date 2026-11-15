@@ -1,6 +1,6 @@
 ---
 title: Authentifizierung und API-Schlüssel
-description: "Authentifizierung mit API-Schlüssel für die REST-API von ReputeCast: Präfixe, Bearer-Header, Berechtigungen, Listenbereich, Ablauf, Rotation und 401-Antworten."
+description: "Authentifizierung mit API-Schlüssel für die REST-API: Präfixe, Bearer-Header, Berechtigungen, Listenbereich, erlaubte IPs, Ablauf, Rotation und Abweisungen."
 type: reference
 audience: [developer, admin]
 permissions: ['apikeys:manage']
@@ -10,6 +10,8 @@ sources:
   - internal/api/auth.go
   - internal/api/api.go
   - internal/apikeys
+  - internal/server/prefix.go
+  - internal/transactional/raw.go
   - internal/authn/tokens.go
   - internal/authz/authz.go
   - internal/app/app.go
@@ -18,16 +20,19 @@ sources:
   - internal/readiness/types.go
   - internal/campaigns/presence.go
 sidebar:
-  order: 3
+  order: 4
 ---
 
+import { Steps } from '@astrojs/starlight/components'
 import LimitsTable from '~/components/LimitsTable.astro'
+import Screenshot from '~/components/Screenshot.astro'
 import TableScroll from '~/components/TableScroll.astro'
 import UiPath from '~/components/UiPath.astro'
 
 Diese Seite beschreibt die Authentifizierung mit API-Schlüssel für die REST-API von ReputeCast: welche Zugangsdaten sie
-akzeptiert, was ein Schlüssel darf und wie Schlüssel erstellt, rotiert, widerrufen und abgewiesen werden. Für einen
-ersten Aufruf folgen Sie [Ihren ersten API-Aufruf machen](/de/developers/api-quickstart/).
+akzeptiert, was ein Schlüssel darf, von wo er aufgerufen werden darf und wie Schlüssel erstellt, rotiert, widerrufen und
+abgewiesen werden. Für einen ersten Aufruf folgen Sie [Ihren ersten API-Aufruf machen](/de/developers/api-quickstart/);
+die [Client-SDKs](/de/developers/sdks/) senden den Schlüssel für Sie.
 
 ## Schlüssel senden
 
@@ -74,7 +79,9 @@ Die Web-App meldet Personen mit dem Cookie `rc_session` an. Skripte und Dienste 
   Operation, die eine Berechtigung braucht, antwortet mit `403`; ein Integrationsschlüssel antwortet stattdessen mit
   `owner_deactivated`, und jemand mit `integrations:manage` kann ihn übernehmen.
 - **Listenbereich.** Ein Schlüssel kann auf Listen beschränkt werden (bis zu 100; keine heißt alle Listen). Er kann
-  keine Listen außerhalb des Bereichs der Person erreichen, die ihn erstellt hat.
+  keine Listen außerhalb des Bereichs der Person erreichen, die ihn erstellt hat, weder beim Erstellen noch später: Bei
+  jedem Aufruf werden seine Listen und Absenderdomains auf das beschränkt, was die Person in diesem Moment erreicht.
+  Wird der Bereich eines Mitglieds eingegrenzt, sind daher sofort auch seine Schlüssel eingegrenzt (seit Version 1.5.0).
 - **Integrationsschlüssel** funktionieren nur für die Operationen der Auslöser und Aktionen, die für ihre Integration
   aktiviert sind; jeder andere Aufruf antwortet mit `403` und dem Code `integration_operation_denied`. Zwölf
   Operationen akzeptieren nur den Schlüssel einer Integration (oder einer WordPress-Website).
@@ -104,7 +111,7 @@ geschehen in der App, angemeldet.
 | Aktion                                | Was passiert                                                                                                                                                                                                                                                           |
 | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Erstellen                             | Der geheime Schlüssel wird einmal angezeigt. Das Audit-Protokoll erfasst `apikey.created` mit den Berechtigungen und dem Bereich, nie mit dem geheimen Schlüssel.                                                                                                      |
-| <UiPath path="keys.rotate" />         | Ein neuer geheimer Schlüssel mit demselben Namen, denselben Berechtigungen und demselben Bereich wird einmal angezeigt. **Der alte geheime Schlüssel funktioniert sofort nicht mehr.** Ein Schlüssel mit Ablaufdatum erhält erneut dieselbe Laufzeit, ab heute gerechnet. Das Rotieren eines abgelaufenen Schlüssels ersetzt ihn. |
+| <UiPath path="keys.rotate" />         | Ein neuer geheimer Schlüssel mit demselben Namen, denselben Berechtigungen, demselben Bereich und denselben erlaubten IPs wird einmal angezeigt. **Der alte geheime Schlüssel funktioniert sofort nicht mehr.** Ein Schlüssel mit Ablaufdatum erhält erneut dieselbe Laufzeit, ab heute gerechnet. Das Rotieren eines abgelaufenen Schlüssels ersetzt ihn. |
 | Integrationsschlüssel rotieren        | Verwenden Sie <UiPath path="nav.settings > settings.integrations" /> › <UiPath path="integrations.rotateKey" />: Der alte Schlüssel funktioniert noch 24 Stunden. Das Rotieren unter Schlüssel & MCP antwortet mit `409` und dem Code `managed_by_integration`.        |
 | <UiPath path="keys.revoke" />         | Der Schlüssel funktioniert sofort nicht mehr; Aufrufe erhalten `401`. Im selben Dialog können Sie einen Ersatz mit denselben Berechtigungen und demselben Bereich erstellen.                                                                                            |
 | Ablauf                                | Nach seinem Ablaufdatum antwortet der Schlüssel mit `401`. Abgelaufene Schlüssel bleiben mit der Zahl der Aufrufe gelistet, die sie noch zu verwenden versuchen, damit Sie finden, was Sie aktualisieren müssen.                                                         |
@@ -114,6 +121,65 @@ geschehen in der App, angemeldet.
 
 Die Liste der Schlüssel zeigt, wann jeder Schlüssel zuletzt verwendet wurde und von welcher IP-Adresse. Aktionen eines
 Schlüssels erscheinen im [Audit-Protokoll](/de/team/audit-log/) mit dem Schlüssel als Akteur.
+
+## Schlüssel auf erlaubte IPs beschränken
+
+Ein Schlüssel lässt sich auf die Adressen beschränken, von denen er aufgerufen wird: bis zu 50 IPv4- oder
+IPv6-Adressen und -Netze, etwa `203.0.113.7`, `203.0.113.0/24` oder `2001:db8::/48` (seit Version 1.6.0). Eine leere
+Liste, der Standard, erlaubt jede Adresse. Dasselbe gilt für Nur-Senden-Schlüssel, SMTP-Zugangsdaten und
+[MCP-Agenten](/de/developers/mcp/#agenten-auf-erlaubte-ips-beschränken).
+
+<Steps>
+
+1. Wählen Sie unter <UiPath path="nav.settings > settings.keys" /> in der Zeile des Schlüssels
+   <UiPath path="keys.allowedIpsButton" />, oder füllen Sie <UiPath path="keys.allowedIpsLabel" /> aus, wenn Sie den
+   Schlüssel erstellen.
+
+2. Geben Sie eine Adresse oder ein Netz pro Zeile ein. Das Feld zeigt, von wo der Schlüssel zuletzt verwendet wurde, und
+   Ihre eigene Adresse, wie ReputeCast sie sieht, jeweils mit einem Link, um sie hinzuzufügen.
+
+3. Speichern Sie. Lässt die Liste die Adresse weg, von der der Schlüssel zuletzt verwendet wurde, fragt ReputeCast
+   zuerst nach: Aufrufe von dort hören sofort auf. Wählen Sie <UiPath path="keys.saveAnyway" /> nur, wenn dieser
+   Aufrufer abgewiesen werden soll.
+
+</Steps>
+
+<Screenshot
+  id="settings-keys-allowed-ips"
+  alt="Der Dialog Erlaubte IPs des Schlüssels Data warehouse sync: zwei Netze, 10.0.4.0/24 und 10.0.5.0/24, die letzte Verwendung des Schlüssels von 10.0.4.22 innerhalb davon und die Adresse, die ReputeCast für die bearbeitende Person sieht, mit einem Link, um sie hinzuzufügen."
+>
+
+1. <UiPath path="keys.allowedIpsLabel" />: eine Adresse oder ein Netz pro Zeile.
+2. Von wo der Schlüssel zuletzt verwendet wurde.
+3. Ihre eigene Adresse, wie ReputeCast sie sieht, mit einem Link, um sie hinzuzufügen.
+
+</Screenshot>
+
+So funktionieren erlaubte IPs:
+
+- **Die Prüfung kommt nach dem Token.** Ein bekannter, gültiger Schlüssel, der von einer anderen Adresse aufgerufen wird
+  oder von einer Adresse, die ReputeCast nicht erkennen kann, antwortet mit `403` und dem Code `ip_not_allowed`, und das
+  Detail nennt die Adresse, die ReputeCast gesehen hat. Ein unbekannter Schlüssel antwortet weiterhin mit `401`, sodass
+  die Prüfung nie verrät, welche Schlüssel existieren. ReputeCast zählt die abgewiesenen Aufrufe mit ihrer Adresse und
+  ihrem Client.
+- **Hinter einem Reverse Proxy** sieht ReputeCast die Adressen Ihrer Aufrufer nur, wenn der Proxy in
+  `http.trusted_proxies` steht ([Reverse Proxy und TLS](/de/self-hosting/reverse-proxy/)); sonst scheint jeder Aufruf
+  vom Proxy zu kommen. Der Dialog warnt, wenn Anfragen über einen Proxy ankommen, den diese Einstellung nicht aufführt.
+- **Zum Eingrenzen genügt `apikeys:manage`.** Damit der Schlüssel von mehr Orten aufgerufen werden darf, indem Sie die
+  Liste leeren oder ein Netz hinzufügen, das die alte Liste nicht abdeckt, brauchen Sie dasselbe wie zum Rotieren: Sie
+  haben jede Berechtigung des Schlüssels, und seine Listen liegen in Ihrem eigenen Bereich. Andernfalls lautet die
+  Antwort `403` mit dem Code `escalation_denied`.
+- **Integrationsschlüssel erhalten nie eine Liste**: Zapier, Make, n8n und WordPress rufen von den Servern ihrer
+  Plattformen auf. Eine Liste festzulegen antwortet mit `409` und dem Code `managed_by_integration`. Ein widerrufener
+  Schlüssel behält seine Liste.
+- **Rotieren behält die Liste**, und jede Änderung steht im [Audit-Protokoll](/de/team/audit-log/) als `apikey.updated`
+  mit der Liste vorher und nachher.
+- **SMTP-Zugangsdaten** außerhalb ihrer Liste werden bei der Anmeldung abgewiesen: Das
+  [SMTP-Relay](/de/transactional/smtp-relay/) antwortet mit `535 5.7.8` und nennt die Adresse.
+
+Die Liste legt eine angemeldete Person fest; die Operation,
+`PUT /api/v1/workspaces/<workspace>/api-keys/<keyId>/allowed-ips` mit `{ "allowedIps": [ … ] }`, lässt sich nicht mit
+einem API-Schlüssel aufrufen. Der Aufruf zum Erstellen nimmt dasselbe Feld als `allowedIps` an.
 
 ## Limits
 
@@ -132,13 +198,16 @@ Ein abgewiesener Schlüssel antwortet mit `401`, dem Code `unauthenticated` und 
 | Ein abgelaufener Schlüssel                       | `This API key expired on <date>. Rotate it in Settings › Keys & MCP.`    |
 
 Integrationsschlüssel antworten stattdessen mit `401` und den Codes `key_revoked` und `key_expired`, und ihr Detail
-nennt die Integration, die neu verbunden werden muss. Kann die Datenbank nicht bestätigen, wer aufruft, lautet die
-Antwort `503` mit dem Code `unavailable`: Versuchen Sie es erneut, der Schlüssel bleibt gültig. Jeder Code steht unter
+nennt die Integration, die neu verbunden werden muss. Ein gültiger Schlüssel, der außerhalb seiner
+[erlaubten IPs](#schlüssel-auf-erlaubte-ips-beschränken) aufgerufen wird, antwortet mit `403` und dem Code
+`ip_not_allowed`. Kann die Datenbank nicht bestätigen, wer aufruft, lautet die Antwort `503` mit dem Code
+`unavailable`: Versuchen Sie es erneut, der Schlüssel bleibt gültig. Jeder Code steht unter
 [API-Fehler](/de/developers/api-errors/).
 
 ## Verwandte Themen
 
 - [Ihren ersten API-Aufruf machen](/de/developers/api-quickstart/)
+- [Client-SDKs nutzen](/de/developers/sdks/)
 - [Rate-Limits](/de/developers/api-rate-limits/)
 - [Rollen und Berechtigungen](/de/team/roles-and-permissions/)
 - [Sicherheit und Härtung](/de/self-hosting/security/)

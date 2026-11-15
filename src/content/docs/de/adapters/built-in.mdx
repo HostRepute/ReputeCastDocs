@@ -15,6 +15,8 @@ sources:
   - internal/providers/apiclient
   - internal/providers/webhookauth
   - internal/providers/bounce
+  - internal/providers/received
+  - internal/inbound/hook.go
   - internal/providers/resend
   - internal/sms
   - internal/app/wire_adapters.go
@@ -50,7 +52,7 @@ Diese Anleitung zeigt, wie Sie einen E-Mail-Adapter in Go zu ReputeCast beitrage
    | Methode                                       | Aufgabe                                                                                                  |
    | --------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
    | `Adapter() string`                            | Der Registry-Schlüssel, etwa `"mailgun"`.                                                                |
-   | `Capabilities() Capabilities`                 | Die Badges: Richtlinie für Massenmarketing, Webhooks, Domain-API, Sperrlisten-Synchronisierung, Batch-Größe, dedizierte IPs, Sandbox, Kontingent- und Raten-Erkennung, Preise, Tracking. |
+   | `Capabilities() Capabilities`                 | Die Badges: Richtlinie für Massenmarketing, Webhooks, Domain-API, Sperrlisten-Synchronisierung, Batch-Größe, dedizierte IPs, Sandbox, Kontingent- und Raten-Erkennung, Preise, Tracking, Empfang von E-Mails (`Inbound`). |
    | `Send(ctx, msgs) ([]SendResult, error)`       | Sendet höchstens `BatchSize` Nachrichten und gibt pro Nachricht ein Ergebnis zurück, in der Reihenfolge der Eingabe. |
    | `ParseWebhook(ctx, r, body) ([]Event, error)` | Verifiziert die Anfrage und ordnet ihre Payload normalisierten Ereignissen zu.                           |
 
@@ -76,6 +78,9 @@ Diese Anleitung zeigt, wie Sie einen E-Mail-Adapter in Go zu ReputeCast beitrage
    | `StatusPage`, `StatusReporter`                           | Den Status-Button und den Störungstext während eines Ausfalls.                                                             |
    | `BroadcastStreamCreator`                                 | Anbieter, deren Bedingungen einen eigenen Stream für Massen-E-Mails verlangen (Postmark).                                  |
    | `ExtrasSender`                                           | Kopien und Anhänge senden; eine Nachricht mit Extras geht nur an einen Anbieter, der dieses Interface hat.                 |
+   | `InboundReceiver`                                        | Den Empfang von E-Mails (<UiPath path="nav.settings > settings.senders > senders.receiving.title" />): `InboundSetup` (die MX-Einträge, Schritte und Einstellungen, die der Einrichtungsdialog zeigt), `VerifyInbound` am Inbound-Hook, `ParseInbound` im Job. Setzen Sie dazu `Capabilities.Inbound`. Siehe [E-Mails empfangen](#e-mails-empfangen). |
+   | `InboundRegistrar`                                       | Den Empfang des Anbieters für die Domain der Route auf den Inbound-Hook richten und wieder entfernen. Nur mit `Capabilities.Inbound` `"automatic"`. |
+   | `InboundHandshaker`                                      | Einen Subscription-Handshake am Inbound-Hook beantworten (eine SNS-`SubscriptionConfirmation`), geprüft gegen die Einstellungen der Route. |
 
    </TableScroll>
 
@@ -166,6 +171,13 @@ Diese Anleitung zeigt, wie Sie einen E-Mail-Adapter in Go zu ReputeCast beitrage
 
 5. Behandeln Sie Einstellungen und Zugangsdaten. `providers.Config.Settings` enthält die nicht geheimen Felder; `Config.Credentials` enthält die entschlüsselten vertraulichen Werte als flaches JSON-Objekt, dessen Schlüssel die Schlüssel der `Secret`-Felder sind. Zugangsdaten sind nicht auslesbar: versiegelt gespeichert, nie von der API zurückgegeben und Schlüssel für Schlüssel ersetzt. Markieren Sie jedes Feld, dessen Schlüssel nach einem Geheimnis aussieht (`password`, `token`, `secret` oder mit der Endung `api_key`), als `Secret`, sonst schlägt die Contract-Suite fehl.
 
+   Markieren Sie eine Einstellung, die angibt, wohin die Anfragen des Adapters gehen, etwa eine Server-URL, einen
+   API-Endpunkt oder einen Host, mit `Endpoint: true`. Ein gespeicherter vertraulicher Wert wird nur an die Adresse
+   gesendet, für die er eingegeben wurde; ändert ein Formular eine `Endpoint`-Einstellung, fragt ReputeCast deshalb
+   erneut nach den vertraulichen Werten. Die Contract-Suite beanstandet ein Feld, dessen Schlüssel `url`, `endpoint`,
+   `host` oder `server` enthält und das kein `Endpoint` ist (`providers.AddressKey`), und ebenso eines, das zugleich
+   `Endpoint` und `Secret` ist.
+
    `New` darf keine Netzwerk-I/O ausführen und nicht fehlschlagen, weil ein optionaler Wert fehlt; melden Sie fehlende Zugangsdaten ab dem ersten Aufruf. Die Factory baut pro Anfrage einen Adapter, legen Sie also alles, was sich wiederverwenden lässt, in einem Cache auf Package-Ebene ab, der nach Konto geschlüsselt ist. Bewahren Sie Signaturmaterial, das Sie über die API des Anbieters lesen, in einem `webhookauth.Material` auf, das es neu liest, wenn eine Signatur fehlschlägt (höchstens einmal pro Minute), und außerdem jede Stunde.
 
 6. Implementieren Sie `Send`:
@@ -181,10 +193,14 @@ Diese Anleitung zeigt, wie Sie einen E-Mail-Adapter in Go zu ReputeCast beitrage
    - `ParseWebhook` verifiziert, sofern `providers.SignatureVerified(ctx)` nicht gesetzt ist. Der Normalisierungsjob setzt es, wenn er eine gespeicherte Payload erneut parst, die die ursprüngliche URL und den Header `Authorization` nicht mehr hat.
    - Verwenden Sie das Verfahren, mit dem der Anbieter signiert; `internal/providers/webhookauth` bietet Standard Webhooks, HMAC-Helfer und Vergleiche in konstanter Zeit. Signiert der Anbieter nicht, registrieren Sie den Webhook mit Basic Auth oder einem Bearer-Token, das `Config.WebhookSecret` trägt; es wird in `Authorization` übertragen und nie gespeichert.
    - Begrenzen Sie den signierten Zeitstempel: fünf Minuten mit `webhookauth.Fresh` oder ein Zeitfenster, das die Wiederholungsversuche des Anbieters abdeckt, mit `webhookauth.Within`.
+   - Deckt die Signatur ein einmaliges Token ab, aber nicht das Ereignis (Mailgun), verknüpfen Sie jedes Token über `webhookauth.Replay` und `Config.Tokens` mit der Payload, mit der es zuerst kam. Die Verknüpfung liegt in Postgres, sodass jeder Prozess und jeder Neustart sie sieht, solange die Signatur akzeptiert werden kann. Eine erneute Zustellung desselben Ereignisses besteht die Prüfung; der Ingest verwirft das Duplikat.
+   - Beweist eine gültige Signatur nur, wer die Anfrage gesendet hat, aber nicht, für wen (SNS signiert die Topics jedes AWS-Kontos gleich), prüfen Sie außerdem, ob sie von dem stammt, was die Verbindung eingerichtet hat: Amazon SES akzeptiert nur seine eigenen Topics, mit dem Signaturzertifikat eines regionalen SNS-Endpunkts, und speichert ein Topic über `ProvisionInput.Save`, bevor es den Webhook abonniert.
    - Ordnen Sie jedes zustellungsrelevante Ereignis `delivered`, `deferred`, `hard_bounce`, `soft_bounce`, `complaint`, `rejected` oder `unsubscribe` zu. Bewahren Sie den Typ des Anbieters in `OriginalType` auf, seinen Code in `OriginalCode` (zerlegen Sie ihn mit `bounce.Split`), den Rest in `Diagnostic`, und setzen Sie `BounceClass` mit `bounce.Classify`. Schreiben Sie den Empfänger klein, legen Sie das rohe JSON in `Raw` ab und geben Sie kein Ereignis für Dinge zurück, die keine Ergebnisse sind (gesendet, verarbeitet, automatische Antworten, Test-Pings).
    - Sperren Sie nicht auf Verdacht: Ein dauerhafter Fehler, den der Absender verursacht hat (eine Blockierung wegen Spam oder Reputation, ausgeschöpfte Wiederholungen), ist ein Soft Bounce. Nur ein Adressproblem ist ein Hard Bounce, denn Hard Bounces und Beschwerden kommen auf die gemeinsame [Sperrliste](/de/audience/suppressions/).
 
-8. Testen Sie gegen die Contract-Suite. Jeder Adapter besteht `internal/providers/contracttest`, das Registrierung, Fähigkeiten, einen Versand, eine dauerhafte Ablehnung, einen Ausfall und abgelehnte Zugangsdaten gegen Ihre Fake-API prüft, dazu jeden aufgezeichneten Webhook: verifiziert, normalisiert, mit verifiziertem Kontext erneut geparst und nach einer Manipulation abgelehnt. Sein Subtest `Texts` prüft die Texte, die Menschen lesen: Ein integrierter Adapter vom Typ `api`, `smtp`, `self_hosted` oder `http` hat einen Katalog, jeder Text, den er deklariert, hat einen Eintrag, dessen Englisch genau dieser Text ist, und jeder Eintrag ist in jede App-Sprache übersetzt. `contracttest.CheckText` prüft einen Text, den der Adapter zur Laufzeit schreibt.
+8. Wenn der Anbieter E-Mails empfängt und weitergibt, ergänzen Sie den Empfang: siehe [E-Mails empfangen](#e-mails-empfangen) weiter unten.
+
+9. Testen Sie gegen die Contract-Suite. Jeder Adapter besteht `internal/providers/contracttest`, das Registrierung, Fähigkeiten, einen Versand, eine dauerhafte Ablehnung, einen Ausfall und abgelehnte Zugangsdaten gegen Ihre Fake-API prüft, dazu jeden aufgezeichneten Webhook: verifiziert, normalisiert, mit verifiziertem Kontext erneut geparst und nach einer Manipulation abgelehnt. Sein Subtest `Texts` prüft die Texte, die Menschen lesen: Ein integrierter Adapter vom Typ `api`, `smtp`, `self_hosted` oder `http` hat einen Katalog, jeder Text, den er deklariert, hat einen Eintrag, dessen Englisch genau dieser Text ist, und jeder Eintrag ist in jede App-Sprache übersetzt. `contracttest.CheckText` prüft einen Text, den der Adapter zur Laufzeit schreibt.
 
    ```go title="internal/providers/example/example_test.go"
    func TestContract(t *testing.T) {
@@ -208,13 +224,50 @@ Diese Anleitung zeigt, wie Sie einen E-Mail-Adapter in Go zu ReputeCast beitrage
 
    Tests nutzen kein Netzwerk: Führen Sie eine Fake-Version der API des Anbieters aus, zeichnen Sie Webhook-Payloads aus der Dokumentation des Anbieters als Fixtures auf und signieren Sie sie im Test mit einem Testschlüssel. Wo der Anbieter einen Testvektor für Signaturen veröffentlicht, testen Sie dagegen. Testen Sie die optionalen Interfaces, die Fehlerzuordnung und jede Eigenheit, die Sie im Code umgehen (IDs über 2^53, ein Feld, das ein String oder ein Array ist, eine 400, die Ergebnisse pro Nachricht enthält).
 
-9. Registrieren Sie den Adapter im Build:
-   - Fügen Sie in `internal/app/wire_adapters.go` einen Blank-Import des Packages hinzu. Wird derselbe Schlüssel zweimal registriert, löst das beim Start einen Panic aus.
-   - Fügen Sie den Schlüssel zu `adapterOrder` in `internal/providers/manage/adapters.go` hinzu (die Reihenfolge im Tab Adapter) und zu `catalogOrder` in `internal/connect/catalog.go` (die Reihenfolge im Einrichtungskatalog).
-   - Optional geben Sie dem Verbindungsassistenten in `copyTable` in `internal/connect/copy.go` eigene Formulierungen, mit den Texten als Einträge `adapter.<key>.*` in `internal/connect/messages/en.json` und `vi.json`; ohne Eintrag verwendet der Assistent den Namen und die Felder des Deskriptors.
-   - Integrierte Adapter tragen die ReputeCast-Version (`version.Version`) und den Maintainer „HostRepute“.
+10. Registrieren Sie den Adapter im Build:
+    - Fügen Sie in `internal/app/wire_adapters.go` einen Blank-Import des Packages hinzu. Wird derselbe Schlüssel zweimal registriert, löst das beim Start einen Panic aus.
+    - Fügen Sie den Schlüssel zu `adapterOrder` in `internal/providers/manage/adapters.go` hinzu (die Reihenfolge im Tab Adapter) und zu `catalogOrder` in `internal/connect/catalog.go` (die Reihenfolge im Einrichtungskatalog).
+    - Optional geben Sie dem Verbindungsassistenten in `copyTable` in `internal/connect/copy.go` eigene Formulierungen, mit den Texten als Einträge `adapter.<key>.*` in `internal/connect/messages/en.json` und `vi.json`; ohne Eintrag verwendet der Assistent den Namen und die Felder des Deskriptors.
+    - Integrierte Adapter tragen die ReputeCast-Version (`version.Version`) und den Maintainer „HostRepute“.
 
 </Steps>
+
+## E-Mails empfangen
+
+Ein Arbeitsbereich kann E-Mails über eine Empfangsroute empfangen: über den Empfang eines Anbieters oder über ein
+Postfach, das ReputeCast liest. Ein Adapter ergänzt die erste Möglichkeit. Verfügbar ab der nächsten Version nach 1.6.0.
+
+Der Anbieter sendet, was er empfängt, an `POST /hooks/inbound/{token}` (und `/hooks/inbound/{token}/*`, für Anbieter
+wie Mailgun, die an `<url>/mime` senden). Der Hook ruft `HandshakeInbound` auf, wenn der Adapter es hat, dann
+`VerifyInbound` mit der Live-Anfrage, und speichert den Body und die Header, ohne `Authorization`, `Cookie` und die
+`WebhookSecrets` des Adapters. Ein Job baut die Anfrage später wieder auf und ruft `ParseInbound` auf, das nie erneut
+verifiziert und die API des Anbieters aufrufen darf (das Ereignis von Resend enthält nur die Metadaten der Nachricht).
+
+- **`Capabilities.Inbound`** ist `"automatic"` (der Adapter registriert die Route selbst mit `InboundRegistrar`;
+  Teammitglieder fügen den MX-Eintrag hinzu), `"manual"` (Teammitglieder folgen `InboundSetup.Steps` in der Konsole des
+  Anbieters) oder leer. Setzen Sie den Wert im Deskriptor und in `Capabilities()`; die Contract-Suite gleicht ihn mit
+  den Interfaces ab.
+- **`InboundSetup(route)`** gibt die MX-Einträge zurück, mit `Purpose: "inbound"` und der Domain der Route als `Name`,
+  die Schritte als aufbewahrte Einträge mit der Domain und der URL der Route als Argumenten und alle Einstellungen, die
+  Teammitglieder eingeben (`topic_arn` bei Amazon SES). Eine manuelle Route muss Schritte haben, und jeder Schritt
+  braucht einen Text in jeder App-Sprache.
+- **Authentifizieren Sie mit dem eigenen Schlüssel der Route** (`InboundRoute.Secret`), nie mit dem Webhook-Schlüssel
+  des Anbieters: Basic Auth mit dem Benutzer `providers.InboundUser` und dem Schlüssel in der URL, an die der Anbieter
+  sendet (`received.HookURL`), ein Token-Header oder die eigene Signatur des Anbieters, wenn er signiert (Mailgun,
+  Resend, Postal, SNS), geprüft gegen das, was die Route angibt. Eine Anfrage, die durchfällt, ist
+  `providers.ErrBadSignature`.
+- **Geben Sie `Raw` zurück**, wenn der Anbieter die ganze Nachricht weitergibt; ReputeCast parst sie dann. Füllen Sie
+  sonst die geparsten Felder und Anhänge. Envelope-Empfänger, die Nachrichten-ID des Anbieters und seine Ergebnisse für
+  Spam, SPF, DKIM und DMARC kommen in beiden Fällen in ihre Felder; `internal/providers/received` ordnet Ergebnisse und
+  Scores für jeden Adapter gleich zu.
+- **Testen Sie es** mit `Suite.Inbound`: Fälle aus der dokumentierten Beispiel-Payload des Anbieters in
+  `testdata/inbound*`, jeder mit den Nachrichten, die daraus geparst werden müssen. Die Suite prüft, dass eine gültige
+  Anfrage verifiziert wird, dass sie sich ohne ihre Zugangsdaten parsen lässt und dass eine manipulierte durchfällt;
+  der Fall eines Adapters mit Basic Auth oder Token setzt `Tamper`, um die Zugangsdaten zu ändern.
+  `InboundLifecycle` registriert eine automatische Route, hebt die Registrierung auf und hebt sie ein zweites Mal auf.
+
+Die Anleitung [E-Mails empfangen](/de/providers/receiving-mail/) führt auf, was jeder integrierte Adapter tut.
+Community-Adapter und der generische HTTP-Adapter empfangen keine E-Mails.
 
 ## Prüfen, ob es funktioniert hat
 

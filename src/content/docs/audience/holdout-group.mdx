@@ -1,0 +1,202 @@
+---
+title: Measure marketing with a holdout group
+description: An email holdout group in ReputeCast keeps a random share of contacts out of marketing, then measures the conversions and revenue your emails add.
+type: explanation
+audience: [publisher, admin]
+permissions: ['reports:view', 'workspace:manage']
+uiPath: 'nav.audience > holdout.tab'
+primaryKeyword: email holdout group
+sources:
+  - internal/holdout
+  - internal/abstats
+  - internal/readiness/holdout.go
+  - internal/readiness/audience.go
+  - internal/sending/engine/audience.go
+  - internal/segments/holdout.go
+  - internal/store/queries/holdout.sql
+  - migrations/03540_m63_holdout.sql
+  - web/src/features/holdout
+  - web/src/features/sending-rules/HoldoutCard.tsx
+  - web/src/features/sending-rules/holdout.messages.ts
+  - web/src/features/audience/AudienceTabs.tsx
+sidebar:
+  order: 12
+---
+
+import { Steps } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import UiPath from '~/components/UiPath.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+An email holdout group is a random share of your [contacts](/reference/glossary/#contact) kept out of your campaigns,
+your automation emails or both, for as long as it runs. Comparing what they bought with what everyone else bought
+shows what your marketing adds: <UiPath path="nav.audience > holdout.tab" /> measures it every night and says, for
+example, "Marketing added 18% more revenue per contact (96% confidence)." Available from the next release after 1.6.0.
+
+## How it works
+
+1. **A bucket per contact.** ReputeCast puts each contact in one of 10,000 buckets, worked out from the contact's id
+   and the group's random seed. While the holdout group is on, the contacts in the buckets under its share are held
+   out: 5% means buckets 0 to 499. New contacts fall into a bucket the same way, so the share holds as your audience
+   grows.
+2. **One rule everywhere.** The sending engine, [Send Readiness](/reference/glossary/#send-readiness), automations,
+   text, push and WhatsApp campaigns, the segment field and the measurement all ask the same database function, so
+   they never disagree about who is held out.
+3. **Periods.** Each set of settings is one period. Changing the share or the scope, or turning the group off, ends the
+   period, and the next one starts with the same seed: raising the share keeps everyone already held out and adds more;
+   lowering it lets some of them go. Turning the group on again later holds out the same people. <UiPath path="sendingRules.holdout.dialogConfirm" /> draws
+   a new seed, so a new random set of people is held out from then on.
+4. **Sends leave the group out.** What each kind of send does is below. Transactional and System mail always reach
+   everyone.
+5. **The measurement.** Every night at 04:00 in the workspace's time zone, ReputeCast counts what each group did in
+   the open period and the last closed one. The results page compares the holdout group with everyone else, the
+   _marketing group_, and tests whether the difference is more than chance.
+
+### What each send does
+
+<TableScroll label="How each kind of send treats the holdout group">
+
+| Send | With the holdout group on |
+| --- | --- |
+| Email campaigns | Held-out contacts are left out right after duplicates, at the same step in Send Readiness's count and the sending engine. The share is taken when the send starts building its audience. <UiPath path="composer.reviewSend" /> shows the line "Holdout group: 617 left out (5%)". |
+| An email campaign with <UiPath path="review.includeHoldout" /> | Goes to the holdout group too. The choice is part of the campaign's audience, so [approvals](/campaigns/approvals/) compare it and the confirmation names it. It can't change while the campaign is scheduled. |
+| Text, push and WhatsApp campaigns | Messages to held-out contacts are logged as skipped, with the reason holdout. |
+| Automation email, text, push and WhatsApp steps | A held-out contact passes the step without a message and goes on through the flow. The step counts them: "67 held out" on the canvas. |
+| Transactional and System mail | Always sent. |
+
+</TableScroll>
+
+Use <UiPath path="review.includeHoldout" /> only for messages everyone must get, such as a change to your terms. A
+campaign that included the group adds nothing to the difference, and the results page counts these campaigns. See
+[schedule and send a campaign](/campaigns/schedule-and-send/).
+
+## Set up the holdout group
+
+The holdout group is set in <UiPath path="nav.settings > settings.sendingRules > sendingRules.holdout.title" />, which
+needs `workspace:manage` (Owner and Admin). [Add workspace sending rules](/campaigns/sending-rules/) describes the card
+in full.
+
+<Steps>
+
+1. Turn on the <UiPath path="sendingRules.holdout.title" /> switch. It saves at once, with 5% of contacts held out of
+   both campaigns and automations the first time.
+
+2. Type the share, from 0.1% to 20% with one decimal, and under <UiPath path="sendingRules.holdout.scope" /> tick
+   <UiPath path="sendingRules.holdout.campaigns" />, <UiPath path="sendingRules.holdout.automations" /> or both.
+   Select <UiPath path="sendingRules.holdout.save" />. A new period starts.
+
+3. To hold out other people, select <UiPath path="sendingRules.holdout.startOver" />, optionally type why (kept in the
+   audit log), and select <UiPath path="sendingRules.holdout.dialogConfirm" />. The current group ends today and its
+   results are kept; the measurement starts again from today.
+
+</Steps>
+
+The card then says how many contacts are held out and since when. Every change is in the audit log. Campaigns pick a
+change up from their next audience count, automations from their next step.
+
+## Read the results
+
+<UiPath path="nav.audience > holdout.tab" /> appears once the workspace has had a holdout group. Reading it and
+recomputing need `reports:view` (every built-in role).
+
+<Screenshot
+  id="holdout"
+  alt="Audience › Holdout for the whole period: Marketing added 18% more revenue per contact (96% confidence), with 2,487 contacts held out (5%) and 46,064 in the marketing group; tiles for conversion rate 8.8% against 6.9%, revenue per contact $2.85 against $2.41, orders per contact and site visitors 3.8% against 3.0%; the two-bar comparison; and the note that 8 campaigns included the holdout."
+>
+
+1. The window: the whole period, or its last 30 or 90 days.
+2. When the results were computed, and <UiPath path="holdout.recompute" />.
+3. The verdict on revenue per contact, and who was compared.
+4. A tile per measure: the marketing group's value, the holdout group's, the lift and its confidence.
+5. Revenue per contact for the two groups.
+
+</Screenshot>
+
+- **The window.** The first button is the whole period, "Since" and the day it started, then
+  <UiPath path="holdout.last30" /> and <UiPath path="holdout.last90" /> of it. A window never reaches back before the
+  period started, because nobody was held out then.
+- **The verdict** comes first, then how many contacts each group had and what the holdout group didn't get.
+- **The tiles**: <UiPath path="holdout.conversionRate" />, <UiPath path="holdout.revenuePerContact" />,
+  <UiPath path="holdout.ordersPerContact" />, and <UiPath path="holdout.siteVisitors" /> when the workspace tracks a
+  site with [website tracking](/integrations/website-tracking/). The large figure is the marketing group's; under it,
+  the holdout group's. The badge gives the lift, the marketing group's difference from the holdout group's in percent,
+  and the confidence, rounded down and never shown above 99%. It is green when marketing is ahead with 95% confidence
+  or more, amber when the holdout group is, and grey when the difference could be chance.
+- **Revenue per contact** shows the two groups as bars. <UiPath path="holdout.table" /> switches to a table with each
+  group's contacts, converters, conversion rate, orders, revenue, revenue per contact and, with a tracked site, site
+  visitors; <UiPath path="holdout.chart" /> switches back. Amounts in other currencies are listed under the chart and
+  never added.
+- **Campaigns that included the holdout** counts the email campaigns of the window sent with
+  <UiPath path="review.includeHoldout" />.
+
+<Screenshot
+  id="holdout-table"
+  alt="The Revenue per contact card as a table: the marketing group with 46,064 contacts, 4,058 converters, 8.8%, 513 orders, $131,061 and $2.85 per contact, and the holdout group with 2,487 contacts, 171 converters, 6.9%, 34 orders, $5,996 and $2.41, with 1,750 and 75 site visitors."
+/>
+
+With the holdout group off, the page shows the last period's results with the dates it ran and a link to turn it on
+again, without the window and <UiPath path="holdout.recompute" />.
+
+### How the numbers are counted
+
+- **Who is counted.** Every contact that wasn't erased, existed before the window ended and wasn't on the
+  [suppression list](/audience/suppressions/) before it started, in the holdout group or the marketing group by their
+  bucket.
+- **A converter** placed a store order (not a test, not cancelled), recorded a
+  [conversion](/developers/events-and-conversions/) or started a paid subscription through Stripe in the window.
+- **Revenue** is orders minus refunds plus conversion values, in the main currency set in Earn's settings (US dollars
+  until one is set).
+- **A site visitor** was seen on one of the workspace's tracked sites in the window.
+- **The tests.** Conversion rate and site visitors use a two-proportion z-test; revenue and orders per contact use
+  Welch's t-test, which doesn't assume both groups vary alike. Confidence is 1 minus the two-sided p-value, and a
+  difference counts at 95%.
+
+### The verdict
+
+<TableScroll label="Holdout verdicts">
+
+| Verdict | When |
+| --- | --- |
+| "Marketing added 18% more revenue per contact (96% confidence)." | Revenue per contact is higher in the marketing group, with 95% confidence or more. |
+| "Contacts in the holdout brought 8% more revenue per contact (95% confidence)." | Revenue per contact is higher in the holdout group, with 95% confidence or more. |
+| "No measurable difference yet." | The difference could be chance. |
+| "Too few contacts in the holdout: 400 of 1,000 needed." | The holdout group has fewer than 1,000 contacts. Raise the share, or wait for the audience to grow. |
+| "Too early to tell: the holdout group started 1 Nov. Give it at least two weeks." | The open period is less than 14 days old. |
+| "No results yet. ReputeCast computes them every night at 04:00, or now with Recompute." | The period hasn't been measured. |
+
+</TableScroll>
+
+## Recompute the results
+
+Select <UiPath path="holdout.recompute" /> to measure now instead of waiting for 04:00. It runs in the background,
+"Computing the results… This takes a minute." shows meanwhile, and the page loads the new results when they are ready.
+You can recompute once every 10 minutes per workspace; sooner, the page says when the results were last computed.
+The nightly run also catches up as soon as it can when the server was off at 04:00.
+
+## Find held-out contacts
+
+Segments have the field **In the holdout group**, _is Yes_ or _is No_, for the open period whatever it holds contacts
+out of; SQL segments read it as the `in_holdout` column of `contacts`. Use it to see who is held out. See
+[build segments](/audience/segments/).
+
+## Defaults and limits
+
+<LimitsTable area="holdout" />
+
+## When to change them
+
+- Keep the share at 5% or more for an audience of 20,000 contacts or fewer, so the holdout group reaches the 1,000
+  contacts a verdict needs. A large audience can hold out less, such as 2%, and lose less revenue.
+- Hold out of campaigns only to measure your newsletters, or of automations only to measure your flows. Measuring both
+  together tells you what all your email adds.
+- Leave a period running for at least two weeks, and longer for products people buy rarely: every change of share or
+  scope starts the results again.
+- Start over when the same people have been held out for months and you want fresh ones.
+
+## Related
+
+- [Add workspace sending rules](/campaigns/sending-rules/)
+- [Schedule and send a campaign](/campaigns/schedule-and-send/)
+- [Record events and conversions](/developers/events-and-conversions/)
+- [Build segments](/audience/segments/)
