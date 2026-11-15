@@ -21,6 +21,13 @@ Hướng dẫn này chạy ReputeCast trên Kubernetes bằng Helm và chart có
 PostgreSQL do bạn cung cấp và đứng sau Ingress controller của bạn. Các migration chạy trong một Job trước mỗi lần cài
 đặt và nâng cấp. Có từ bản phát hành tiếp theo sau 1.6.0.
 
+<Aside type="caution">
+  Cho đến khi bản phát hành đó ra mắt, image có tag `latest` là 1.6.0, bản này bỏ qua các thiết lập `storage` và giá
+  trị `private` của `http.trustedProxies` mà không cảnh báo. Một bản cài đặt split sẽ giữ các tệp được tải lên trong
+  `emptyDir` của từng pod và mất chúng khi pod khởi động lại, và mọi khách truy cập sẽ có địa chỉ của Ingress
+  controller. Hãy chờ bản phát hành, checkout tag của bản đó và đặt `image.tag` thành tag đó.
+</Aside>
+
 Chart có hai kiểu bố trí:
 
 - **`mode: single`** (mặc định): một pod StatefulSet chạy mọi vai trò, gồm ứng dụng web, API, nhận webhook và các
@@ -68,6 +75,11 @@ spec:
     size: 20Gi
 ```
 
+```sh
+kubectl create namespace reputecast
+kubectl apply -f reputecast-db.yaml
+```
+
 Với cơ sở dữ liệu được quản lý (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean hoặc dịch vụ khác),
 hãy tự tạo Secret:
 
@@ -85,10 +97,11 @@ của chúng ([phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql)).
 
 <Steps>
 
-1. Tải chart về:
+1. Tải chart của bản phát hành bạn cài về, trong đó `<tag>` là tag của bản đó (bản phát hành đầu tiên sau 1.6.0 hoặc
+   một bản mới hơn):
 
    ```sh
-   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   git clone --depth 1 --branch <tag> https://github.com/hostrepute/reputecast.git
    ```
 
 2. Viết các giá trị của bạn. Đây là chế độ single đứng sau ingress-nginx:
@@ -114,8 +127,9 @@ của chúng ([phân khúc SQL](/vi/self-hosting/postgres/#phân-khúc-sql)).
      đều được tạo từ giá trị này. Host của Ingress mặc định là tên máy chủ trong đó.
    - `admin.email` tạo Chủ sở hữu đầu tiên sau lần cài đặt đầu tiên. Hãy để trống với một cơ sở dữ liệu đã có người
      dùng, ví dụ khi khôi phục.
-   - Chart cài từ bản checkout chạy image có tag `latest`, bản phát hành mới nhất. Để cố định một bản, hãy đặt
-     `image.tag` thành tag của bản đó hoặc `image.digest` thành digest của nó; digest được ưu tiên hơn tag.
+   - Chart cài từ bản checkout chạy image có tag `latest`, bản phát hành mới nhất, có thể cũ hơn chart. Hãy đặt
+     `image.tag` thành bản phát hành mà chart thuộc về, hoặc `image.digest` thành digest của nó; digest được ưu tiên
+     hơn tag.
    - `values.schema.json` kiểm tra tên và kiểu dữ liệu, nên một giá trị viết sai sẽ dừng việc cài đặt thay vì bị bỏ
      qua.
 
@@ -190,8 +204,6 @@ máy tính của mình; nhà cung cấp vẫn cần URL công khai.
 
    ```yaml title="values.yaml"
    mode: split
-   web:
-     replicas: 3
    worker:
      replicas: 2
    ingest:
@@ -216,12 +228,16 @@ máy tính của mình; nhà cung cấp vẫn cần URL công khai.
 </Steps>
 
 - `pdb.enabled` (bật) cấp cho các pod web, và các pod ingest, một PodDisruptionBudget cho phép một pod không sẵn sàng.
-- `hpa.enabled` co giãn các pod web từ 2 đến 6 replica ở mức 70% CPU.
+- `hpa.enabled` co giãn các pod web từ 2 đến 6 replica ở mức 70% CPU; `web.replicas` chỉ áp dụng khi không bật nó.
 - `ingest.separate` chạy webhook của nhà cung cấp trong các pod riêng, để một đợt webhook dồn dập không làm chậm ứng
   dụng ([mở rộng với các vai trò](/vi/self-hosting/scaling/)).
-- Chuyển một bản cài đặt chế độ single đang có sang chế độ split: trước hết hãy sao chép các tệp của nó vào bucket bằng
-  `reputecast storage migrate --to s3`
-  ([chuyển thư mục tệp](/vi/self-hosting/object-storage/#chuyển-thư-mục-tệp-sang-bucket)).
+- Chuyển một bản cài đặt chế độ single đang có sang chế độ split: hãy sao chép các tệp của nó vào bucket khi nó vẫn còn
+  ở chế độ single, vì các pod split không gắn volume nào. Chart chỉ truyền thiết lập của bucket khi có
+  `storage.backend: s3`, nên hãy cấp cho pod `REPUTECAST_STORAGE__S3__BUCKET`, `REPUTECAST_STORAGE__S3__REGION` và các
+  khóa từ Secret của bạn (`REPUTECAST_STORAGE__S3__ACCESS_KEY_ID`, `REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY`) bằng
+  `extraEnv`, nâng cấp, chạy
+  `kubectl exec --namespace reputecast statefulset/reputecast -- reputecast storage migrate --to s3`, rồi chuyển sang
+  chế độ split ([chuyển thư mục tệp](/vi/self-hosting/object-storage/#chuyển-thư-mục-tệp-sang-bucket)).
 
 ## Khóa bí mật
 
@@ -245,7 +261,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
   `smtpRelay.service.enabled` công bố các cổng của relay qua một LoadBalancer Service, `reputecast-smtp`, với
   `externalTrafficPolicy: Local` để relay thấy địa chỉ của từng client. Hãy giữ `smtpRelay.starttlsPort` và
   `smtpRelay.tlsPort` giống các cổng đặt trong ứng dụng (587 và 465). Chứng chỉ Let's Encrypt cho relay được kiểm tra
-  qua HTTP: hãy thêm tên máy chủ của relay vào `ingress.hosts`.
+  qua HTTP: hãy đặt `ingress.hosts` thành cả host của URL công khai lẫn host của relay, vì một danh sách sẽ thay thế giá
+  trị mặc định chỉ gồm host của URL công khai.
 - **GeoIP**: `geoip.volume` gắn một volume chứa tệp MaxMind DB ở chế độ chỉ đọc tại `/var/lib/geoip`, và `geoip.file`
   nêu tên tệp ([thêm cơ sở dữ liệu GeoIP](/vi/self-hosting/geoip/)).
 - **Prometheus**: mọi pod phục vụ metrics ở cổng 9464; `serviceMonitor.enabled` thêm một ServiceMonitor của Prometheus
@@ -266,7 +283,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
 
 1. Đọc [ghi chú phát hành](/vi/reference/release-notes/) và [sao lưu](/vi/self-hosting/backups/) cơ sở dữ liệu, Secret
    `reputecast-key` và, ở chế độ split, bucket.
-2. Cập nhật bản checkout (`git -C reputecast pull`), và cả `image.tag` nếu bạn cố định tag.
+2. Checkout tag của bản phát hành mới (`git -C reputecast fetch --depth 1 origin tag <tag>`, rồi
+   `git -C reputecast checkout <tag>`), và đặt `image.tag` thành tag đó.
 3. Chạy nâng cấp với các giá trị của bạn và đủ thời gian cho các migration. Một migration lớn có thể chạy lâu hơn mức
    năm phút mặc định của Helm:
 

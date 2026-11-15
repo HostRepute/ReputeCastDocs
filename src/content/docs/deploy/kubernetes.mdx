@@ -21,6 +21,13 @@ This guide runs ReputeCast on Kubernetes with Helm and the chart in the ReputeCa
 database you provide and behind your Ingress controller. Migrations run in a Job before every install and upgrade.
 Available from the next release after 1.6.0.
 
+<Aside type="caution">
+  Until that release is out, the image tagged `latest` is 1.6.0, which ignores the `storage` settings and the `private`
+  value of `http.trustedProxies` without a warning. A split install would keep uploaded files in each pod's
+  `emptyDir` and lose them when the pod restarts, and every visitor would have the Ingress controller's address. Wait
+  for the release, check out its tag and set `image.tag` to it.
+</Aside>
+
 The chart has two layouts:
 
 - **`mode: single`** (the default): one StatefulSet pod runs every role, the web app, the API, webhook ingest and the
@@ -67,6 +74,11 @@ spec:
     size: 20Gi
 ```
 
+```sh
+kubectl create namespace reputecast
+kubectl apply -f reputecast-db.yaml
+```
+
 For a managed database (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean or another), create the
 Secret yourself:
 
@@ -84,10 +96,11 @@ user can't create roles, so SQL segments stay off until a database admin adds th
 
 <Steps>
 
-1. Check out the chart:
+1. Check out the chart of the release you install, where `<tag>` is its tag (the first release after 1.6.0 or a later
+   one):
 
    ```sh
-   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   git clone --depth 1 --branch <tag> https://github.com/hostrepute/reputecast.git
    ```
 
 2. Write your values. This is single mode behind ingress-nginx:
@@ -113,8 +126,8 @@ user can't create roles, so SQL segments stay off until a database admin adds th
      Ingress host defaults to its host name.
    - `admin.email` creates the first Owner after the first install. Leave it empty on a database that already has
      users, such as a restore.
-   - A chart from a checkout runs the image tagged `latest`, the newest release. To pin one, set `image.tag` to its tag
-     or `image.digest` to its digest, which wins over the tag.
+   - A chart from a checkout runs the image tagged `latest`, the newest release, which can be older than the chart.
+     Set `image.tag` to the release the chart comes from, or `image.digest` to its digest, which wins over the tag.
    - `values.schema.json` checks names and types, so a misspelt value stops the install instead of being ignored.
 
 3. Install it:
@@ -188,8 +201,6 @@ computer; providers still need the public URL.
 
    ```yaml title="values.yaml"
    mode: split
-   web:
-     replicas: 3
    worker:
      replicas: 2
    ingest:
@@ -214,11 +225,15 @@ computer; providers still need the public URL.
 </Steps>
 
 - `pdb.enabled` (on) gives the web pods, and the ingest pods, a PodDisruptionBudget of one unavailable pod.
-- `hpa.enabled` scales the web pods between 2 and 6 replicas at 70% CPU.
+- `hpa.enabled` scales the web pods between 2 and 6 replicas at 70% CPU; `web.replicas` applies only without it.
 - `ingest.separate` runs provider webhooks in their own pods, so a burst of webhooks doesn't slow the app
   ([scale with roles](/self-hosting/scaling/)).
-- Moving an existing single-mode install to split mode: copy its files into the bucket first with
-  `reputecast storage migrate --to s3` ([move the files folder](/self-hosting/object-storage/#move-the-files-folder-to-the-bucket)).
+- Moving an existing single-mode install to split mode: copy its files into the bucket while it is still in single
+  mode, since split pods mount no volume. The chart passes the bucket's settings only with `storage.backend: s3`, so
+  give the pod `REPUTECAST_STORAGE__S3__BUCKET`, `REPUTECAST_STORAGE__S3__REGION` and the keys from your Secret
+  (`REPUTECAST_STORAGE__S3__ACCESS_KEY_ID`, `REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY`) with `extraEnv`, upgrade,
+  run `kubectl exec --namespace reputecast statefulset/reputecast -- reputecast storage migrate --to s3`, then switch
+  to split mode ([move the files folder](/self-hosting/object-storage/#move-the-files-folder-to-the-bucket)).
 
 ## The secret key
 
@@ -242,7 +257,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
   `smtpRelay.service.enabled` publishes its ports through a LoadBalancer Service, `reputecast-smtp`, with
   `externalTrafficPolicy: Local` so the relay sees each client's address. Keep `smtpRelay.starttlsPort` and
   `smtpRelay.tlsPort` the same as the ports set in the app (587 and 465). A Let's Encrypt certificate for the relay is
-  checked over HTTP: add its host name to `ingress.hosts`.
+  checked over HTTP: set `ingress.hosts` to both the public URL's host and the relay's host, since a list replaces the
+  default of the public URL's host alone.
 - **GeoIP**: `geoip.volume` mounts a volume that holds a MaxMind DB file read-only at `/var/lib/geoip`, and
   `geoip.file` names the file ([add a GeoIP database](/self-hosting/geoip/)).
 - **Prometheus**: every pod serves metrics on port 9464; `serviceMonitor.enabled` adds a Prometheus Operator
@@ -262,7 +278,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
 
 1. Read the [release notes](/reference/release-notes/) and [back up](/self-hosting/backups/) the database, the
    `reputecast-key` Secret and, in split mode, the bucket.
-2. Update the checkout (`git -C reputecast pull`), and `image.tag` if you pin one.
+2. Check out the new release's tag (`git -C reputecast fetch --depth 1 origin tag <tag>`, then
+   `git -C reputecast checkout <tag>`), and set `image.tag` to it.
 3. Run the upgrade with your values and time for the migrations. A large one can take longer than Helm's five-minute
    default:
 

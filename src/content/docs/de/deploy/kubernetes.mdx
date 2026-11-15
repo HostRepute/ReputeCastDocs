@@ -21,6 +21,14 @@ Diese Anleitung betreibt ReputeCast auf Kubernetes mit Helm und dem Chart aus de
 PostgreSQL-Datenbank, die Sie bereitstellen, und hinter Ihrem Ingress-Controller. Migrationen laufen vor jeder
 Installation und jedem Upgrade in einem Job. Verfügbar ab der nächsten Version nach 1.6.0.
 
+<Aside type="caution">
+  Bis diese Version erscheint, ist das Image mit dem Tag `latest` 1.6.0. Es ignoriert die Einstellungen unter `storage`
+  und den Wert `private` von `http.trustedProxies` ohne Warnung. Eine Installation im Split-Modus würde hochgeladene
+  Dateien im `emptyDir` jedes Pods ablegen und sie verlieren, wenn der Pod neu startet, und jeder Besucher hätte die
+  Adresse des Ingress-Controllers. Warten Sie auf die Version, checken Sie ihr Tag aus und setzen Sie `image.tag`
+  darauf.
+</Aside>
+
 Das Chart kennt zwei Aufteilungen:
 
 - **`mode: single`** (der Standard): Ein StatefulSet-Pod führt alle Rollen aus, die Web-App, die API, den Empfang der
@@ -68,6 +76,11 @@ spec:
     size: 20Gi
 ```
 
+```sh
+kubectl create namespace reputecast
+kubectl apply -f reputecast-db.yaml
+```
+
 Für eine verwaltete Datenbank (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean oder eine andere)
 legen Sie das Secret selbst an:
 
@@ -85,10 +98,11 @@ Datenbank-Admin ihre Rolle hinzufügt ([SQL-Segmente](/de/self-hosting/postgres/
 
 <Steps>
 
-1. Checken Sie das Chart aus:
+1. Checken Sie das Chart der Version aus, die Sie installieren; `<tag>` ist ihr Tag (die erste Version nach 1.6.0 oder
+   eine spätere):
 
    ```sh
-   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   git clone --depth 1 --branch <tag> https://github.com/hostrepute/reputecast.git
    ```
 
 2. Schreiben Sie Ihre Values. Dies ist der Single-Modus hinter ingress-nginx:
@@ -114,8 +128,9 @@ Datenbank-Admin ihre Rolle hinzufügt ([SQL-Segmente](/de/self-hosting/postgres/
      Anmeldung werden daraus gebildet. Der Host des Ingress ist standardmäßig ihr Hostname.
    - `admin.email` legt nach der ersten Installation den ersten Inhaber an. Lassen Sie den Wert bei einer Datenbank leer,
      die schon Benutzer hat, etwa nach einer Wiederherstellung.
-   - Ein Chart aus einem Checkout führt das Image mit dem Tag `latest` aus, die neueste Version. Um eine festzulegen,
-     setzen Sie `image.tag` auf ihr Tag oder `image.digest` auf ihren Digest, der Vorrang vor dem Tag hat.
+   - Ein Chart aus einem Checkout führt das Image mit dem Tag `latest` aus, die neueste Version, die älter sein kann als
+     das Chart. Setzen Sie `image.tag` auf die Version, aus der das Chart stammt, oder `image.digest` auf ihren Digest,
+     der Vorrang vor dem Tag hat.
    - `values.schema.json` prüft Namen und Typen, sodass ein falsch geschriebener Wert die Installation stoppt, statt
      ignoriert zu werden.
 
@@ -193,8 +208,6 @@ Computer aus; Anbieter brauchen trotzdem die öffentliche URL.
 
    ```yaml title="values.yaml"
    mode: split
-   web:
-     replicas: 3
    worker:
      replicas: 2
    ingest:
@@ -219,11 +232,17 @@ Computer aus; Anbieter brauchen trotzdem die öffentliche URL.
 </Steps>
 
 - `pdb.enabled` (an) gibt den Web-Pods und den Ingest-Pods ein PodDisruptionBudget von einem nicht verfügbaren Pod.
-- `hpa.enabled` skaliert die Web-Pods bei 70 % CPU zwischen 2 und 6 Replikaten.
+- `hpa.enabled` skaliert die Web-Pods bei 70 % CPU zwischen 2 und 6 Replikaten; `web.replicas` gilt nur ohne diese
+  Option.
 - `ingest.separate` führt Webhooks der Anbieter in eigenen Pods aus, damit eine Welle von Webhooks die App nicht
   verlangsamt ([mit Rollen skalieren](/de/self-hosting/scaling/)).
-- Eine bestehende Installation im Single-Modus auf den Split-Modus umstellen: Kopieren Sie ihre Dateien zuerst mit
-  `reputecast storage migrate --to s3` in den Bucket
+- Eine bestehende Installation im Single-Modus auf den Split-Modus umstellen: Kopieren Sie ihre Dateien in den Bucket,
+  solange sie noch im Single-Modus läuft, denn Pods im Split-Modus hängen kein Volume ein. Das Chart übergibt die
+  Einstellungen des Buckets nur mit `storage.backend: s3`. Geben Sie dem Pod daher `REPUTECAST_STORAGE__S3__BUCKET`,
+  `REPUTECAST_STORAGE__S3__REGION` und die Schlüssel aus Ihrem Secret (`REPUTECAST_STORAGE__S3__ACCESS_KEY_ID`,
+  `REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY`) über `extraEnv`, führen Sie ein Upgrade aus, führen Sie dann
+  `kubectl exec --namespace reputecast statefulset/reputecast -- reputecast storage migrate --to s3` aus und stellen
+  Sie danach auf den Split-Modus um
   ([Dateiordner verschieben](/de/self-hosting/object-storage/#dateiordner-in-den-bucket-verschieben)).
 
 ## Der geheime Schlüssel
@@ -249,7 +268,9 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
   einschaltet. `smtpRelay.service.enabled` veröffentlicht seine Ports über einen LoadBalancer-Service,
   `reputecast-smtp`, mit `externalTrafficPolicy: Local`, damit das Relay die Adresse jedes Clients sieht. Halten Sie
   `smtpRelay.starttlsPort` und `smtpRelay.tlsPort` gleich den in der App gesetzten Ports (587 und 465). Ein
-  Let's-Encrypt-Zertifikat für das Relay wird über HTTP geprüft: Fügen Sie seinen Hostnamen zu `ingress.hosts` hinzu.
+  Let's-Encrypt-Zertifikat für das Relay wird über HTTP geprüft: Setzen Sie `ingress.hosts` auf den Host der
+  öffentlichen URL und den Host des Relays, denn eine Liste ersetzt den Standardwert, der nur den Host der öffentlichen
+  URL enthält.
 - **GeoIP**: `geoip.volume` hängt ein Volume mit einer MaxMind-DB-Datei schreibgeschützt unter `/var/lib/geoip` ein,
   und `geoip.file` nennt die Datei ([GeoIP-Datenbank hinzufügen](/de/self-hosting/geoip/)).
 - **Prometheus**: Jeder Pod liefert Metriken auf Port 9464; `serviceMonitor.enabled` fügt einen ServiceMonitor für den
@@ -270,7 +291,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
 
 1. Lesen Sie die [Versionshinweise](/de/reference/release-notes/) und [sichern](/de/self-hosting/backups/) Sie die
    Datenbank, das Secret `reputecast-key` und im Split-Modus den Bucket.
-2. Aktualisieren Sie den Checkout (`git -C reputecast pull`) und `image.tag`, falls Sie eines festlegen.
+2. Checken Sie das Tag der neuen Version aus (`git -C reputecast fetch --depth 1 origin tag <tag>`, dann
+   `git -C reputecast checkout <tag>`), und setzen Sie `image.tag` darauf.
 3. Führen Sie das Upgrade mit Ihren Values und genug Zeit für die Migrationen aus. Eine große kann länger dauern als
    der Standard von Helm, fünf Minuten:
 

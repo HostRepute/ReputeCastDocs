@@ -21,6 +21,13 @@ Ce guide fait tourner ReputeCast sur Kubernetes avec Helm et le chart du dépôt
 PostgreSQL que vous fournissez et derrière votre contrôleur Ingress. Les migrations s’exécutent dans un Job avant chaque
 installation et chaque mise à niveau. Disponible à partir de la prochaine version après la 1.6.0.
 
+<Aside type="caution">
+  Tant que cette version n’est pas sortie, l’image taguée `latest` est la 1.6.0, qui ignore sans avertissement les
+  réglages `storage` et la valeur `private` de `http.trustedProxies`. Une installation en mode split garderait les
+  fichiers importés dans l’`emptyDir` de chaque pod et les perdrait au redémarrage du pod, et chaque visiteur aurait
+  l’adresse du contrôleur Ingress. Attendez cette version, récupérez son tag et réglez `image.tag` sur celui-ci.
+</Aside>
+
 Le chart propose deux modes :
 
 - **`mode: single`** (par défaut) : un seul pod de StatefulSet exécute tous les rôles (l’application web, l’API, la
@@ -69,6 +76,11 @@ spec:
     size: 20Gi
 ```
 
+```sh
+kubectl create namespace reputecast
+kubectl apply -f reputecast-db.yaml
+```
+
 Pour une base de données managée (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL, DigitalOcean ou autre), créez
 le Secret vous-même :
 
@@ -87,10 +99,11 @@ qu’un administrateur de la base de données n’a pas ajouté leur rôle
 
 <Steps>
 
-1. Récupérez le chart :
+1. Récupérez le chart de la version que vous installez, où `<tag>` est son tag (la première version après la 1.6.0 ou
+   une version ultérieure) :
 
    ```sh
-   git clone --depth 1 https://github.com/hostrepute/reputecast.git
+   git clone --depth 1 --branch <tag> https://github.com/hostrepute/reputecast.git
    ```
 
 2. Écrivez vos valeurs. Voici le mode single derrière ingress-nginx :
@@ -117,8 +130,9 @@ qu’un administrateur de la base de données n’a pas ajouté leur rôle
      d’hôte.
    - `admin.email` crée le premier Propriétaire après la première installation. Laissez-le vide sur une base de
      données qui a déjà des utilisateurs, comme après une restauration.
-   - Un chart issu d’un clone exécute l’image taguée `latest`, la dernière version. Pour en figer une, réglez
-     `image.tag` sur son tag ou `image.digest` sur son digest, qui l’emporte sur le tag.
+   - Un chart issu d’un clone exécute l’image taguée `latest`, la dernière version, qui peut être plus ancienne que le
+     chart. Réglez `image.tag` sur la version dont vient le chart, ou `image.digest` sur son digest, qui l’emporte sur
+     le tag.
    - `values.schema.json` vérifie les noms et les types : une valeur mal orthographiée arrête l’installation au lieu
      d’être ignorée.
 
@@ -196,8 +210,6 @@ l’application depuis votre ordinateur ; les fournisseurs ont tout de même b
 
    ```yaml title="values.yaml"
    mode: split
-   web:
-     replicas: 3
    worker:
      replicas: 2
    ingest:
@@ -222,11 +234,16 @@ l’application depuis votre ordinateur ; les fournisseurs ont tout de même b
 </Steps>
 
 - `pdb.enabled` (activé) donne aux pods web, et aux pods ingest, un PodDisruptionBudget d’un pod indisponible.
-- `hpa.enabled` fait varier le nombre de pods web entre 2 et 6 réplicas à 70 % de CPU.
+- `hpa.enabled` fait varier le nombre de pods web entre 2 et 6 réplicas à 70 % de CPU ; `web.replicas` ne s’applique que sans lui.
 - `ingest.separate` exécute les webhooks des fournisseurs dans leurs propres pods : un afflux de webhooks ne ralentit
   donc pas l’application ([passer à l’échelle avec les rôles](/fr/self-hosting/scaling/)).
-- Passer une installation existante du mode single au mode split : copiez d’abord ses fichiers dans le bucket avec
-  `reputecast storage migrate --to s3`
+- Passer une installation existante du mode single au mode split : copiez ses fichiers dans le bucket tant qu’elle est encore en
+  mode single, car les pods du mode split ne montent aucun volume. Le chart ne transmet les réglages du bucket qu’avec
+  `storage.backend: s3` : donnez donc au pod `REPUTECAST_STORAGE__S3__BUCKET`, `REPUTECAST_STORAGE__S3__REGION` et les
+  clés de votre Secret (`REPUTECAST_STORAGE__S3__ACCESS_KEY_ID`, `REPUTECAST_STORAGE__S3__SECRET_ACCESS_KEY`) avec
+  `extraEnv`, mettez à niveau, exécutez
+  `kubectl exec --namespace reputecast statefulset/reputecast -- reputecast storage migrate --to s3`, puis passez au
+  mode split
   ([déplacer le dossier des fichiers](/fr/self-hosting/object-storage/#déplacer-le-dossier-des-fichiers-vers-le-bucket)).
 
 ## La clé secrète
@@ -252,7 +269,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
   l’instance l’a activé. `smtpRelay.service.enabled` publie ses ports via un Service LoadBalancer, `reputecast-smtp`,
   avec `externalTrafficPolicy: Local` pour que le relay voie l’adresse de chaque client. Gardez `smtpRelay.starttlsPort`
   et `smtpRelay.tlsPort` identiques aux ports définis dans l’application (587 et 465). Un certificat Let’s Encrypt pour
-  le relay est vérifié en HTTP : ajoutez son nom d’hôte à `ingress.hosts`.
+  le relay est vérifié en HTTP : réglez `ingress.hosts` sur l’hôte de l’URL publique et sur celui du relay, car une
+  liste remplace la valeur par défaut, qui ne contient que l’hôte de l’URL publique.
 - **GeoIP** : `geoip.volume` monte en lecture seule sur `/var/lib/geoip` un volume qui contient un fichier MaxMind DB,
   et `geoip.file` nomme le fichier ([ajouter une base de données GeoIP](/fr/self-hosting/geoip/)).
 - **Prometheus** : chaque pod sert ses métriques sur le port 9464 ; `serviceMonitor.enabled` ajoute un ServiceMonitor
@@ -273,7 +291,8 @@ kubectl get secret --namespace reputecast reputecast-key -o jsonpath='{.data.sec
 
 1. Lisez les [notes de version](/fr/reference/release-notes/) et [sauvegardez](/fr/self-hosting/backups/) la base de
    données, le Secret `reputecast-key` et, en mode split, le bucket.
-2. Mettez à jour le clone (`git -C reputecast pull`), et `image.tag` si vous en figez un.
+2. Récupérez le tag de la nouvelle version (`git -C reputecast fetch --depth 1 origin tag <tag>`, puis
+   `git -C reputecast checkout <tag>`), et réglez `image.tag` sur celui-ci.
 3. Lancez la mise à niveau avec vos valeurs et laissez du temps aux migrations. Une grosse migration peut durer plus
    longtemps que les cinq minutes par défaut de Helm :
 
