@@ -6,6 +6,7 @@
  * looked up by name after each seed.
  */
 import type { APIRequestContext } from '@playwright/test'
+import { startAuthorization } from './prepare.ts'
 
 export type Placeholder = { token: string; kind: string; value: string }
 
@@ -63,10 +64,17 @@ const lists: Record<string, ListLookup> = {
   leadConnection: (name) => ['lead-ads/connections', 'items', (c) => c.name === name],
   // A post import by its status ({postImport:ready}): the demo's Substack export waiting for review.
   postImport: (status) => ['website/imports', 'items', (i) => i.status === status],
+  // An AI agent run by its state ({agentRun:review}), one of the runs lib/prepare.ts leaves.
+  agentRun: (state) => ['ai/agent/runs', 'items', (r) => r.state === state],
+  // A proposal from an external MCP client by its name ({mcpProposal:Partner webinar: the recording}).
+  mcpProposal: (name) => ['mcp-connect/proposals', 'items', (p) => p.name === name],
 }
 
 /** The placeholder kinds resolvePath understands. */
-export const placeholderKinds = ['campaign', 'sso', 'setup', 'booking', ...Object.keys(lists)]
+export const placeholderKinds = ['campaign', 'sso', 'setup', 'booking', 'consent', ...Object.keys(lists)]
+
+/** Kinds that make something new each time (a consent request is used up and expires): never reuse their ids. */
+export const freshKinds = ['consent']
 
 async function json<T>(request: APIRequestContext, url: string, params?: Record<string, string | number>): Promise<T> {
   const r = await request.get(url, params ? { params } : undefined)
@@ -99,6 +107,13 @@ async function resolveOne(request: APIRequestContext, base: string, p: Placehold
     const body = await json<{ past?: Row[]; upcoming?: Row[] }>(request, `${base}/sponsors/overview`, { range: 'all' })
     return [...(body.past ?? []), ...(body.upcoming ?? [])].find((i) => String(i.number) === value && i.booking)
       ?.booking?.id
+  }
+  if (kind === 'consent') {
+    // A new OAuth authorization request from a client named `value` ({consent:ChatGPT}), started by the signed-in
+    // member: its consent page opens only in that member's session.
+    const origin = base.replace(/\/api\/v1\/workspaces\/[^/]+$/, '')
+    const { consentPath } = await startAuthorization(request, origin, value)
+    return new URL(consentPath, origin).searchParams.get('request') ?? undefined
   }
   const lookup = lists[kind]
   if (!lookup) throw new Error(`no resolver for {${kind}:…}`)
