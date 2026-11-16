@@ -1,0 +1,279 @@
+---
+title: Externe Assistenten mit MCP und OAuth verbinden
+description: 'ChatGPT, Claude oder andere MCP-Clients per MCP-Verbindung mit OAuth in einen Arbeitsbereich lassen: Sie stimmen zu, teilen Quellen und prüfen Vorschläge.'
+type: how-to
+audience: [admin, developer]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys > mcpConnect.managing'
+primaryKeyword: MCP-Verbindung mit OAuth
+sources:
+  - internal/mcpconnect
+  - internal/app/wire_mcpconnect.go
+  - internal/server/spa.go
+  - internal/reports/model.go
+  - internal/editorial
+  - internal/audit/proposal.go
+  - web/src/features/mcpconnect
+  - web/src/features/keys/McpPage.tsx
+  - web/src/routes/mcp-consent.tsx
+  - web/src/routes/w/$workspace/_app/proposals
+  - web/src/routes/w/$workspace/_app/settings/connections.tsx
+  - migrations/{03620_a5_mcp_connect,03621_a5_editorial_proposals,03622_a5_voice_sources,03623_a5_workflow_sources,03624_model_report_snapshots}.sql
+sidebar:
+  order: 10.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Eine MCP-Verbindung mit OAuth lässt einen externen Assistenten wie ChatGPT oder Claude mit einem Arbeitsbereich von
+ReputeCast arbeiten: Er liest die redaktionellen Quellen, die eine Person mit ihm teilt, und Kampagnensummen, und er
+schlägt Entwürfe vor, die eine Person behält oder verwirft. Eine Person stimmt in ReputeCast für einen Arbeitsbereich
+und ausgewählte Befugnisse zu, und die Verbindung nutzt nie das eigene Modell oder KI-Budget des Arbeitsbereichs,
+sendet nie, veröffentlicht nie und liest nie Kontakte. Sie ist getrennt vom
+[MCP-Server für Agenten mit Tokens](/de/developers/mcp/), der bleibt, wie er ist. Verfügbar seit Version 1.7.0.
+
+<Aside type="note">
+  Externe Verbindungen wurden durchgehend mit einem Standard-MCP-Client getestet, noch nicht mit ChatGPT oder Claude
+  selbst. Prüfen Sie die Verbindung in Ihrem Client, bevor Sie sich auf sie verlassen.
+</Aside>
+
+## Bevor Sie beginnen
+
+- Die Instanz braucht eine öffentliche URL, die Ihr Client über HTTPS erreicht. Der Endpunkt ist
+  `<public URL>/mcp/connect`, und die OAuth-Discovery, die Zustimmungsseite und die Token-Anfragen verwenden alle diese
+  öffentliche URL, nie den Host der Anfrage selbst.
+- Der MCP-Server des Arbeitsbereichs muss eingeschaltet sein:
+  <UiPath path="nav.settings > settings.keys > keys.changeLimits" />. Solange er aus ist, wird auch jede externe
+  Verbindung abgelehnt.
+- Die Person, die die Verbindung erlaubt, braucht `mcp:manage` (Inhaber und Admin), eine
+  [sensible Berechtigung](/de/reference/glossary/#sensitive-permission), und die Berechtigungen der Befugnisse, die sie
+  erteilt (siehe unten). Sie meldet sich nach den üblichen Regeln der Instanz für Passwort und
+  [Zwei-Faktor-Authentifizierung](/de/team/account-security/) an.
+
+## Client verbinden
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.settings > settings.keys" /> und wählen Sie <UiPath path="mcpConnect.managing" />.
+   Kopieren Sie den <UiPath path="mcpConnect.endpoint" />, zum Beispiel `https://reputecast.example.com/mcp/connect`.
+
+2. Fügen Sie ihn in Ihrem Client als Remote-MCP-Server hinzu (oft Connector genannt). Der Client findet den
+   OAuth-Server von ReputeCast, registriert sich und öffnet die Zustimmungsseite von ReputeCast in Ihrem Browser.
+   Melden Sie sich an, falls Sie es noch nicht sind.
+
+3. Prüfen Sie auf <UiPath path="mcpConnect.consentTitle" />, wer anfragt: Ein Client, der sich selbst registriert hat,
+   ist ein <UiPath path="mcpConnect.unverified" />, und sein Name ist nur das, was er behauptet; der
+   <UiPath path="mcpConnect.callback" /> zeigt, wohin die Antwort geht.
+
+4. Wählen Sie den <UiPath path="mcpConnect.workspace" /> und haken Sie unter <UiPath path="mcpConnect.capabilities" />
+   an, was Sie erteilen. Eine Befugnis, die Ihre Rolle nicht erteilen kann, ist ausgegraut.
+
+5. Schränken Sie optional den <UiPath path="mcpConnect.resourceScope" /> auf einige Listen oder Absenderdomains ein,
+   und tragen Sie unter <UiPath path="mcpConnect.ips" /> bis zu 20 Adressen oder CIDR-Netze ein. Die IP-Beschränkung
+   gilt für die Aufrufe und Token-Erneuerungen des Clients, nicht für Ihren Browser; ein Client, dessen ausgehende
+   Adresse sich ändert, funktioniert dann nicht mehr.
+
+6. Wählen Sie <UiPath path="mcpConnect.allow" />. Der Browser kehrt zum Client zurück, der jetzt die Tools von
+   ReputeCast aufrufen kann. <UiPath path="mcpConnect.deny" /> erteilt nichts.
+
+</Steps>
+
+<Screenshot
+  id="mcp-consent"
+  alt="Diese externe Verbindung erlauben? ChatGPT, gekennzeichnet als Nicht verifizierter Client, mit dem Callback-Host chatgpt.com; Acme Newsletter als Arbeitsbereich gewählt; „Redaktionellen Kontext lesen“ und „Entwürfe und Änderungen vorschlagen“ angehakt, „Kampagnensummen lesen“ nicht; der Ressourcenbereich mit allen Listen und Absenderdomains; eine leere Liste erlaubter Client-IPs; die Verbindung läuft nach 30 Tagen ab; „Verweigern“ und „Verbindung erlauben“."
+>
+  1. Wer anfragt und wohin die Antwort geht.
+  2. Der Arbeitsbereich, in dem die Verbindung arbeitet.
+  3. Die Befugnisse, die Sie erteilen.
+  4. Optionale Beschränkungen: Listen, Absenderdomains und IP-Adressen des Clients.
+  5. Die Verbindung verweigern oder erlauben.
+</Screenshot>
+
+Die Zustimmungsanfrage läuft nach fünf Minuten ab und funktioniert nur in der Browsersitzung, die sie geöffnet hat.
+
+<TableScroll label="Befugnisse einer externen Verbindung">
+
+| Befugnis | Scope | Braucht | Was der Client tun kann |
+|---|---|---|---|
+| <UiPath path="mcpConnect.editorial" /> | `editorial:read` | `campaigns:view`, `templates:view`, `website:view`, `automations:view` oder `subscribers:view` | Die Quellen lesen, die Sie teilen: redaktionellen Text, Links und Liquid-Tags als Platzhalter, eine Vorlage oder die [Markenstimme](/de/campaigns/brand-voice/), einen Ablauf, die Bedingungen eines Segments aus dem Segment-Editor, deren Werte auf Ihrer Instanz bleiben. Keine Empfängerdaten |
+| <UiPath path="mcpConnect.reports" /> | `reports:read` | `reports:view` und `campaigns:view` | Feste, gerundete Summen einer Kampagne lesen, die Sie teilen: keine Personen, Links, Raten oder Filter |
+| <UiPath path="mcpConnect.drafts" /> | `drafts:propose` | Die Berechtigungen zum Ansehen und Bearbeiten dessen, was er vorschlägt, etwa `campaigns:edit` | Neue Entwürfe für Kampagnen, Beiträge, Segmente und Abläufe sowie Änderungen an Entwürfen vorschlagen, die Sie prüfen |
+
+</TableScroll>
+
+Die Verbindung behält nur die Berechtigungen, die Sie beim Erlauben hatten, beschränkt auf die Befugnisse. Bei jedem
+Aufruf prüft ReputeCast sie erneut gegen Ihre aktuelle Rolle, Ihre Listen und Absenderdomains: Schrumpft Ihr Zugriff,
+schrumpft auch der der Verbindung; wächst er, wächst der der Verbindung nicht mit.
+
+## Quellen mit dem Client teilen
+
+Ein Client liest nichts, bis eine Person es mit ihm teilt. Wählen Sie unter <UiPath path="mcpConnect.title" /> bei der
+Verbindung <UiPath path="mcpConnect.proposals.selected" />.
+
+<Steps>
+
+1. Wählen Sie den <UiPath path="mcpConnect.proposals.sourceKind" />:
+   <UiPath path="mcpConnect.proposals.kindCampaign" />, <UiPath path="mcpConnect.proposals.kindPost" />,
+   <UiPath path="mcpConnect.proposals.kindTemplate" />, <UiPath path="mcpConnect.proposals.kindVoice" />,
+   <UiPath path="mcpConnect.proposals.kindList" />, <UiPath path="mcpConnect.proposals.kindSegment" />,
+   <UiPath path="mcpConnect.proposals.kindAutomation" /> oder <UiPath path="mcpConnect.proposals.kindReport" />. Sie
+   sehen nur Typen, die Ihre Rolle und die Verbindung erlauben.
+
+2. Suchen Sie die Ressource, wählen Sie sie aus und wählen Sie <UiPath path="mcpConnect.proposals.select" />.
+   Bestätigen Sie den Dialog <UiPath path="ai.draft.sharingTitle" /> mit <UiPath path="ai.draft.sharingConfirm" />.
+
+3. Bitten Sie den Client, seine Quellen zu aktualisieren. Die Auswahl gilt bis zu zwei Stunden.
+
+</Steps>
+
+<Screenshot
+  id="mcp-source"
+  alt="Der Dialog Quelle auswählen für ChatGPT: ein Hinweis, dass nur der gefilterte redaktionelle Text und undurchsichtige Referenzen bis zu zwei Stunden lesbar werden, Quellentyp Kampagne, ein Suchfeld, „Feature flags preview“ unter Ressource auswählen gewählt, die bereits geteilte Kampagne mit ihrem Ablauf sowie „Abbrechen“ und „Ausgewählte Quelle teilen“."
+/>
+
+- **Redaktionelle Quellen** erreichen den Client als Text mit Platzhaltern für Links, Bilder und Liquid-Tags; Namen,
+  IDs und Linkziele bleiben in ReputeCast. Eine Quelle mit etwas, das die Filter für personenbezogene Daten oder
+  Zugangsdaten halten, wird abgelehnt; bearbeiten Sie sie zuerst.
+- **Vorlagen und die Markenstimme** sind Referenzen: Ein Client kann aus einer Vorlage eine neue Kopie entwerfen, aber
+  nie die Vorlage oder die Markenstimme ändern.
+- **Listen, Segmente und Abläufe** geben einem Client einen Ausgangspunkt für einen Ablauf, nie Mitglieder. Eine Liste
+  ist ein künftiger Auslöser; ein Segment aus dem Segment-Editor zeigt seine Bedingungen, nie SQL.
+- **Ein Kampagnenbericht** ist ein fester Zahlenstand einer E-Mail-Kampagne, die vor mindestens 72 Stunden gesendet
+  wurde, mit auf Zehner abgerundeten Zahlen. Ein Versand unter 100 und eine Kennzahl oder ihre Gegenmenge unter 20
+  werden ausgeblendet, nicht als null gemeldet. Erneutes Auswählen aktualisiert die Zahlen nie, und der Zahlenstand wird
+  30 Tage nach seiner ersten Erstellung entfernt.
+
+Eine Verbindung hält bis zu 50 ausgewählte Quellen gleichzeitig.
+
+## Vorschläge prüfen
+
+Schlägt ein Client einen Entwurf vor, erhält die Person, die die Verbindung erlaubt hat,
+<UiPath path="notify.event.external_proposal" />. Vorschläge warten unter
+<UiPath path="mcpConnect.proposals.title" />, erreichbar über den Button auf <UiPath path="mcpConnect.title" />; Sie
+sehen die Vorschläge innerhalb Ihres eigenen Zugriffs.
+
+<Screenshot
+  id="mcp-proposal"
+  alt="Ein externer Vorschlag von ChatGPT, „Partner webinar: the recording“: Nicht verifizierter Client, Nicht geprüft, eine Kampagne unter Neue Entwürfe, wer die Verbindung hergestellt hat, wann der Vorschlag kam und wann er abläuft, der Hinweis, dass die Entscheidung nichts senden oder veröffentlichen kann, der vorgeschlagene Betreff und Vorschautext, der genaue MJML-Code, eine Vorschau der E-Mail mit Kopf- und Fußzeile der Marke sowie „Entwurf behalten“ und „Entwurf verwerfen“."
+>
+  1. Der Client und ob ReputeCast ihn verifiziert hat.
+  2. Der Status des Vorschlags und was er erstellen würde.
+  3. Der vorgeschlagene Betreff und Vorschautext und der genaue MJML-Code.
+  4. Behalten oder verwerfen.
+</Screenshot>
+
+- Ein neuer Entwurf bietet <UiPath path="mcpConnect.proposals.keep" /> und
+  <UiPath path="mcpConnect.proposals.discard" />. Das Behalten erstellt einen normalen Entwurf; nichts wird gesendet
+  oder veröffentlicht.
+- Eine Änderung an einem bestehenden Entwurf bietet <UiPath path="mcpConnect.proposals.accept" /> und
+  <UiPath path="mcpConnect.proposals.reject" />. Sie gilt nur für genau die angezeigte Revision; hat sich der Entwurf
+  seitdem geändert, wird nichts übernommen, und Sie bitten den Client um einen neuen Vorschlag.
+- Ein Segment, ein Ablauf und seine E-Mails, die zusammen vorgeschlagen werden, sind eine Entscheidung:
+  <UiPath path="mcpConnect.proposals.keepBundle" /> speichert alle oder keinen davon, und das Behalten nimmt niemanden
+  auf. Ein Ablauf kann nur bei Listenbeitritten oder beim Eintritt in ein Segment und beim Verlassen eines Segments
+  starten, mit Schritten für E-Mails, Verzögerungen, Verzweigungen, Aufteilungen und Ausstiege, höchstens fünf E-Mails.
+- Zum Entscheiden brauchen Sie Ihre Sitzung und die Bearbeitungsberechtigung für das, was der Vorschlag speichert.
+  ReputeCast prüft MJML, Liquid, Bedingungen und Ablauf vorher erneut.
+- Ein Vorschlag läuft nach der Ablaufzeit für Vorschläge des Arbeitsbereichs ab, standardmäßig nach zwei Stunden
+  (1–168 Stunden unter <UiPath path="keys.changeLimits" />). Sein Inhalt bleibt nach dem Abschluss sieben Tage lesbar,
+  aber nie länger als 30 Tage nach seiner Erstellung; <UiPath path="mcpConnect.proposals.copy" /> behält eine Kopie zum
+  Bearbeiten von Hand.
+
+## Verbindungen verwalten und widerrufen
+
+<UiPath path="mcpConnect.title" /> listet Ihre Verbindungen auf; Mitglieder mit `mcp:manage` sehen jede Verbindung im
+Arbeitsbereich. Jede Karte zeigt den Client, wer ihn verbunden hat, die Befugnisse, die Listen, Absenderdomains und
+IP-Adressen und wann die Verbindung abläuft.
+
+<Screenshot
+  id="mcp-connections"
+  alt="Externe Verbindungen: der OAuth-MCP-Endpunkt und eine Verbindung, ChatGPT, Nicht verifizierter Client und Aktiv, verbunden von Linh Nguyen, mit ihren drei Befugnissen, allen Listen und Absenderdomains, ohne IP-Beschränkung, dem Ablauf in 30 Tagen sowie „Quelle auswählen“ und „Verbindung widerrufen“; daneben, was immer unter Ihrer Kontrolle bleibt."
+/>
+
+- Eine Verbindung läuft 30 Tage, nachdem sie erlaubt wurde, ab. Das Erneuern ihrer Tokens verlängert sie nicht;
+  verbinden Sie danach neu.
+- <UiPath path="mcpConnect.revoke" /> stoppt ihre Zugriffs- und Refresh-Tokens sofort. Ihre ausstehenden Vorschläge
+  lassen sich nicht mehr übernehmen, und behaltene Entwürfe bleiben. Was der Client bereits erhalten hat, wird bei ihm
+  nicht gelöscht. Widerrufen können die Person, die die Verbindung hergestellt hat, und Mitglieder mit `mcp:manage`.
+- Legt ein Client ein Refresh-Token vor, das schon verwendet wurde, widerruft ReputeCast die ganze Verbindung, die dann
+  <UiPath path="mcpConnect.reused" /> anzeigt.
+- Verlieren Sie Ihre Mitgliedschaft oder wird der MCP-Server ausgeschaltet, stoppt jeder Aufruf sofort.
+
+## Tools, die der Client aufrufen kann
+
+Der Endpunkt spricht den Transport Streamable HTTP von MCP, mit einer JSON-Antwort pro Anfrage und einem
+Bearer-Zugriffstoken.
+
+<TableScroll label="Tools einer externen Verbindung">
+
+| Tool | Befugnis | Was es tut |
+|---|---|---|
+| `connection_status` | Jede | Die jetzt nutzbaren Befugnisse und wann die Verbindung abläuft |
+| `list_sources` | Jede | Die nicht abgelaufenen Quellen, die eine Person geteilt hat: Handles und Typen, keine Namen |
+| `read_source` | `editorial:read` | Text, Betreff, Vorschautext, Platzhalter für Links, Bilder und Liquid-Tags, Markenstimme, Ablauf oder Segmentbedingungen einer geteilten Quelle |
+| `read_report` | `reports:read` | Den festen Zahlenstand eines geteilten Kampagnenberichts |
+| `propose_email` | `drafts:propose` | Erstellt vorläufig einen Entwurf für eine Kampagne oder einen Beitrag, neu oder als Änderung an genau der Revision eines geteilten Entwurfs |
+| `propose_workflow` | `drafts:propose` | Erstellt vorläufig ein Segment für den Segment-Editor, einen unveröffentlichten Ablauf oder beides als ein Paket |
+| `proposal_status` | `drafts:propose` | Die Entscheidung über einen Vorschlag und wann er abläuft |
+
+</TableScroll>
+
+Ein Tool, das fehlschlägt, antwortet nur mit einem festen Code, etwa `source_changed` (Quelle erneut teilen),
+`insufficient_scope`, `invalid_content`, `idempotency_conflict` oder `proposal_limit`. Vorschläge tragen einen
+Schlüssel: Ein erneuter Versuch mit demselben Schlüssel und Inhalt gibt denselben Vorschlag zurück, derselbe Schlüssel
+mit anderem Inhalt ist ein Konflikt.
+
+## OAuth-Details für Client-Entwickler
+
+- Discovery: `GET /.well-known/oauth-protected-resource/mcp/connect` (RFC 9728) und
+  `GET /.well-known/oauth-authorization-server` (RFC 8414). Ein Aufruf von `/mcp/connect` ohne Authentifizierung
+  antwortet `401` mit `WWW-Authenticate`, das auf die Metadaten der Ressource zeigt.
+- Registrierung: `POST /oauth/mcp/register` (RFC 7591), mit bis zu fünf exakten HTTPS-Callback-URIs oder Loopback-HTTP
+  für eine App auf demselben Computer und mit `none`, `client_secret_basic` oder `client_secret_post`. Ein Client
+  Secret wird einmal angezeigt. Ein registrierter Client, der sieben Tage lang nicht genutzt wird, wird entfernt. Ein
+  Instanz-Admin kann mit `POST /api/v1/admin/mcp-connect/clients` einen vom Betreiber verifizierten Client
+  registrieren; seine Zustimmungsseite zeigt dann <UiPath path="mcpConnect.verified" />.
+- Autorisierung: nur Authorization Code mit PKCE `S256`, unter `/oauth/mcp/authorize`, mit `resource` auf den
+  Endpunkt gesetzt und den Scopes `editorial:read`, `reports:read` und `drafts:propose`. Die Antwort enthält `iss`.
+- Tokens: `POST /oauth/mcp/token`. Zugriffstokens gelten 10 Minuten, Codes 60 Sekunden, und Refresh-Tokens rotieren
+  bei jeder Verwendung. `POST /oauth/mcp/revoke` widerruft ein Token (RFC 7009).
+- Diese Tokens funktionieren nur unter `/mcp/connect`: API-Schlüssel, Tokens von Agenten und Sitzungen werden dort
+  abgelehnt, und die REST-API und `/mcp` lehnen diese Tokens ab.
+
+<LimitsTable area="mcp-connect" />
+
+## Audit
+
+Das [Audit-Protokoll](/de/team/audit-log/) erfasst `mcp_connect.client_registered`, `.granted`, `.denied`,
+`.revoked`, `.source_selected` und `.proposed` und jede Entscheidung als `mcp_connect.kept`, `.discarded`,
+`.accepted` oder `.rejected`. Ein Entwurf, den eine Person behält, wird wie gewohnt als `campaign.create` oder
+`post.created` mit `via: external_mcp` und der ID der Verbindung erfasst, und Akteur ist die Person, die entschieden
+hat. Tokens, Prompts und Inhalte werden nicht protokolliert.
+
+## Fehlerbehebung
+
+- **Der Client meldet, dass der Server eine Autorisierung braucht, aber keine Zustimmungsseite öffnet sich**: Die
+  öffentliche URL der Instanz ist kein HTTPS, oder der Client erreicht sie nicht.
+- **<UiPath path="mcpConnect.invalidTitle" />**: Die Anfrage ist abgelaufen, wurde bereits entschieden oder gehört zu
+  einer anderen Browsersitzung. Beginnen Sie im Client von vorn.
+- **<UiPath path="mcpConnect.optionsFailed" />**: Der MCP-Server des Arbeitsbereichs ist aus, oder Ihnen fehlen
+  `mcp:manage` oder die Berechtigungen für sämtliche Befugnisse.
+- **`list_sources` gibt nichts zurück**: Niemand hat in den letzten zwei Stunden eine Quelle geteilt. Wählen Sie
+  <UiPath path="mcpConnect.proposals.selected" /> und teilen Sie eine.
+- **`429` mit `Retry-After`**: mehr als 120 Aufrufe pro Minute über die Verbindung oder ein Aufruf, während ein anderer
+  läuft.
+- **„Seit diesem Vorschlag geändert“**: Jemand hat den Entwurf bearbeitet, nachdem der Client ihn gelesen hat. Teilen
+  Sie ihn erneut und bitten Sie um einen neuen Vorschlag.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="KI-Agenten mit MCP verbinden" href="/de/developers/mcp/" />
+  <LinkCard title="Kampagnen und Abläufe mit dem KI-Agenten entwerfen" href="/de/integrations/ai-agent/" />
+  <LinkCard title="Rollen und Berechtigungen" href="/de/team/roles-and-permissions/" />
+  <LinkCard title="Reverse Proxy und TLS" href="/de/self-hosting/reverse-proxy/" />
+</CardGrid>

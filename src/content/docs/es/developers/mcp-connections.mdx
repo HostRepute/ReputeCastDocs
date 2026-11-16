@@ -1,0 +1,276 @@
+---
+title: Conectar asistentes externos con MCP y OAuth
+description: "Da a ChatGPT, Claude u otro cliente MCP acceso a un espacio de trabajo con una conexión MCP con OAuth: lo autorizas, eliges qué lee y revisas sus propuestas."
+type: how-to
+audience: [admin, developer]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys > mcpConnect.managing'
+primaryKeyword: conexión MCP con OAuth
+sources:
+  - internal/mcpconnect
+  - internal/app/wire_mcpconnect.go
+  - internal/server/spa.go
+  - internal/reports/model.go
+  - internal/editorial
+  - internal/audit/proposal.go
+  - web/src/features/mcpconnect
+  - web/src/features/keys/McpPage.tsx
+  - web/src/routes/mcp-consent.tsx
+  - web/src/routes/w/$workspace/_app/proposals
+  - web/src/routes/w/$workspace/_app/settings/connections.tsx
+  - migrations/{03620_a5_mcp_connect,03621_a5_editorial_proposals,03622_a5_voice_sources,03623_a5_workflow_sources,03624_model_report_snapshots}.sql
+sidebar:
+  order: 10.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Una conexión MCP con OAuth permite que un asistente externo como ChatGPT o Claude trabaje con un espacio de trabajo de
+ReputeCast: lee las fuentes editoriales que una persona comparte con él y los totales de las campañas, y propone
+borradores que una persona conserva o descarta. Una persona da su consentimiento en ReputeCast para un espacio de
+trabajo y unas capacidades elegidas, y la conexión nunca usa el modelo ni el presupuesto de IA del propio espacio de
+trabajo, y nunca envía, publica ni lee contactos. Es independiente del
+[servidor MCP para agentes con tokens](/es/developers/mcp/), que sigue como está. Disponible desde la versión 1.7.0.
+
+<Aside type="note">
+  Las conexiones externas se probaron de principio a fin con un cliente MCP estándar, todavía no con ChatGPT ni con
+  Claude. Comprueba la conexión en tu cliente antes de depender de ella.
+</Aside>
+
+## Antes de empezar
+
+- La instancia necesita una URL pública a la que tu cliente llegue por HTTPS. El endpoint es `<public URL>/mcp/connect`,
+  y el descubrimiento de OAuth, la página de consentimiento y las solicitudes de tokens usan todos esa URL pública,
+  nunca el host de la propia solicitud.
+- El servidor MCP del espacio de trabajo debe estar activado:
+  <UiPath path="nav.settings > settings.keys > keys.changeLimits" />. Mientras está desactivado, también se rechaza
+  cualquier conexión externa.
+- La persona que permite la conexión necesita `mcp:manage` (Propietario y Administrador), un [permiso
+  delicado](/es/reference/glossary/#sensitive-permission), y los permisos de las capacidades que concede (consulta más
+  abajo). Inicia sesión con las reglas habituales de contraseña y de
+  [verificación en dos pasos](/es/team/account-security/) de la instancia.
+
+## Conectar un cliente
+
+<Steps>
+
+1. Abre <UiPath path="nav.settings > settings.keys" /> y elige <UiPath path="mcpConnect.managing" />. Copia el
+   <UiPath path="mcpConnect.endpoint" />, por ejemplo `https://reputecast.example.com/mcp/connect`.
+
+2. En tu cliente, añádelo como servidor MCP remoto (a menudo se llama conector). El cliente encuentra el servidor OAuth
+   de ReputeCast, se registra y abre la página de consentimiento de ReputeCast en tu navegador. Inicia sesión si no lo
+   has hecho.
+
+3. En <UiPath path="mcpConnect.consentTitle" />, comprueba quién lo pide: un cliente que se registró a sí mismo es un
+   <UiPath path="mcpConnect.unverified" />, y su nombre es solo lo que afirma ser; el
+   <UiPath path="mcpConnect.callback" /> muestra adónde va la respuesta.
+
+4. Elige el <UiPath path="mcpConnect.workspace" /> y marca las <UiPath path="mcpConnect.capabilities" /> que concedes.
+   Una capacidad que tu rol no puede conceder aparece desactivada.
+
+5. Si quieres, limita el <UiPath path="mcpConnect.resourceScope" /> a algunas listas o dominios de remitente, y escribe
+   hasta 20 direcciones o redes CIDR en <UiPath path="mcpConnect.ips" />. El límite de IP se aplica a las llamadas del
+   cliente y a las renovaciones de tokens, no a tu navegador; un cliente cuya dirección de salida cambia deja entonces
+   de funcionar.
+
+6. Elige <UiPath path="mcpConnect.allow" />. El navegador vuelve al cliente, que ya puede llamar a las herramientas de
+   ReputeCast. <UiPath path="mcpConnect.deny" /> no concede nada.
+
+</Steps>
+
+<Screenshot
+  id="mcp-consent"
+  alt="¿Permitir esta conexión externa? ChatGPT, marcado como Cliente sin verificar, con el host de devolución de llamada chatgpt.com; Acme Newsletter elegido como espacio de trabajo; Leer contexto editorial y Proponer borradores y cambios marcados, Leer totales de campañas no; el ámbito de recursos con todas las listas y todos los dominios de remitente; una lista vacía de IP permitidas del cliente; la conexión caduca en 30 días; Denegar y Permitir conexión."
+>
+  1. Quién lo pide y adónde va la respuesta.
+  2. El espacio de trabajo en el que trabaja la conexión.
+  3. Las capacidades que concedes.
+  4. Límites opcionales: listas, dominios de remitente y direcciones IP del cliente.
+  5. Denegar o permitir la conexión.
+</Screenshot>
+
+La solicitud de consentimiento caduca a los cinco minutos y solo funciona en la sesión del navegador que la abrió.
+
+<TableScroll label="Capacidades de una conexión externa">
+
+| Capacidad | Ámbito | Necesita | Qué puede hacer el cliente |
+|---|---|---|---|
+| <UiPath path="mcpConnect.editorial" /> | `editorial:read` | `campaigns:view`, `templates:view`, `website:view`, `automations:view` o `subscribers:view` | Leer las fuentes que compartes: el texto editorial, los enlaces y las variables como marcadores de posición, una plantilla o la [voz de marca](/es/campaigns/brand-voice/), un recorrido, las condiciones de un segmento del generador con sus valores guardados en tu instancia. Sin datos de destinatarios |
+| <UiPath path="mcpConnect.reports" /> | `reports:read` | `reports:view` y `campaigns:view` | Leer los totales fijos y redondeados de una campaña que compartes: sin personas, enlaces, tasas ni filtros |
+| <UiPath path="mcpConnect.drafts" /> | `drafts:propose` | Los permisos de ver y editar lo que propone, como `campaigns:edit` | Proponer borradores nuevos de campañas, artículos, segmentos y recorridos, y cambios en borradores, para que los revises |
+
+</TableScroll>
+
+La conexión solo conserva los permisos que tenías cuando la permitiste, reducidos a las capacidades. En cada llamada,
+ReputeCast los vuelve a comprobar frente a tu rol, tus listas y tus dominios de remitente actuales: cuando tu acceso se
+reduce, el de la conexión también; cuando crece, el de la conexión no.
+
+## Compartir fuentes con el cliente
+
+Un cliente no lee nada hasta que una persona se lo comparte. En <UiPath path="mcpConnect.title" />, elige
+<UiPath path="mcpConnect.proposals.selected" /> en la conexión.
+
+<Steps>
+
+1. Elige el <UiPath path="mcpConnect.proposals.sourceKind" />: <UiPath path="mcpConnect.proposals.kindCampaign" />,
+   <UiPath path="mcpConnect.proposals.kindPost" />, <UiPath path="mcpConnect.proposals.kindTemplate" />,
+   <UiPath path="mcpConnect.proposals.kindVoice" />, <UiPath path="mcpConnect.proposals.kindList" />,
+   <UiPath path="mcpConnect.proposals.kindSegment" />, <UiPath path="mcpConnect.proposals.kindAutomation" /> o
+   <UiPath path="mcpConnect.proposals.kindReport" />. Solo ves los tipos que permiten tu rol y la conexión.
+
+2. Busca el recurso, elígelo y elige <UiPath path="mcpConnect.proposals.select" />. Confirma el diálogo
+   <UiPath path="ai.draft.sharingTitle" /> con <UiPath path="ai.draft.sharingConfirm" />.
+
+3. Pide al cliente que actualice sus fuentes. La selección dura hasta dos horas.
+
+</Steps>
+
+<Screenshot
+  id="mcp-source"
+  alt="El diálogo Seleccionar fuente de ChatGPT: una nota de que solo su texto editorial filtrado y sus referencias opacas serán legibles durante un máximo de dos horas, Tipo de fuente Campaña, un campo de búsqueda, Feature flags preview elegida en Seleccionar recurso, la campaña ya compartida con su caducidad, y Cancelar y Compartir fuente seleccionada."
+/>
+
+- **Las fuentes editoriales** llegan al cliente como texto con marcadores de posición para los enlaces, las imágenes y
+  las variables; los nombres, los ID y los destinos de los enlaces se quedan en ReputeCast. Una fuente que contiene algo
+  que los filtros toman por datos personales o credenciales se rechaza; edítala antes.
+- **Las plantillas y la voz de marca** son referencias: un cliente puede redactar una copia nueva a partir de una
+  plantilla, nunca cambiar la plantilla ni la voz.
+- **Las listas, los segmentos y los recorridos** dan al cliente un punto de partida para un recorrido, nunca miembros.
+  Una lista es un disparador futuro; un segmento del generador muestra sus condiciones, nunca SQL.
+- **Un informe de campaña** es una instantánea fija de una campaña de correo enviada hace al menos 72 horas, con las
+  cifras redondeadas hacia abajo a decenas. Un envío de menos de 100 y una métrica o su complemento por debajo de 20 se
+  ocultan, no son cero. Seleccionarlo de nuevo nunca actualiza las cifras, y la instantánea se elimina 30 días después
+  de tomarse por primera vez.
+
+Una conexión admite hasta 50 fuentes seleccionadas a la vez.
+
+## Revisar las propuestas
+
+Cuando un cliente propone un borrador, la persona que permitió la conexión recibe
+<UiPath path="notify.event.external_proposal" />. Las propuestas esperan en
+<UiPath path="mcpConnect.proposals.title" />, desde el botón de <UiPath path="mcpConnect.title" />; ves las que quedan
+dentro de tu propio acceso.
+
+<Screenshot
+  id="mcp-proposal"
+  alt="Una propuesta externa de ChatGPT, Partner webinar: the recording: Cliente sin verificar, Sin revisar, una campaña en Borradores nuevos, quién la conectó, cuándo se propuso y cuándo caduca, la nota de que la decisión no puede enviar ni publicar, el asunto y el preencabezado propuestos, el MJML exacto, una vista previa del correo con la cabecera y el pie de la marca, y Conservar borrador y Descartar borrador."
+>
+  1. El cliente, y si ReputeCast lo verificó.
+  2. El estado de la propuesta y lo que crearía.
+  3. El asunto y el preencabezado propuestos, y el MJML exacto.
+  4. Conservarla o descartarla.
+</Screenshot>
+
+- Un borrador nuevo ofrece <UiPath path="mcpConnect.proposals.keep" /> y
+  <UiPath path="mcpConnect.proposals.discard" />. Al conservarlo se crea un borrador normal; no se envía ni se publica
+  nada.
+- Un cambio en un borrador existente ofrece <UiPath path="mcpConnect.proposals.accept" /> y
+  <UiPath path="mcpConnect.proposals.reject" />. Solo se aplica a la revisión exacta que se muestra; si el borrador
+  cambió desde entonces, no se aplica nada y pides al cliente una propuesta nueva.
+- Un segmento, un recorrido y sus correos propuestos juntos son una sola decisión:
+  <UiPath path="mcpConnect.proposals.keepBundle" /> los guarda todos o ninguno, y conservarlos no incorpora a nadie. Un
+  recorrido solo puede empezar con altas en una lista o con entradas y salidas de un segmento, con pasos de correo,
+  espera, bifurcación, división y salida, y como máximo cinco correos.
+- Para decidir hace falta tu sesión y el permiso de edición de lo que guarda la propuesta. Antes, ReputeCast vuelve a
+  validar el MJML, el Liquid, las condiciones y el recorrido.
+- Una propuesta caduca cuando vence el plazo de propuestas del espacio de trabajo, dos horas por defecto (de 1 a 168
+  horas en <UiPath path="keys.changeLimits" />). Su contenido sigue legible siete días después de cerrarse, y nunca más
+  de 30 días desde que se hizo; <UiPath path="mcpConnect.proposals.copy" /> guarda una copia para editarla a mano.
+
+## Gestionar y revocar las conexiones
+
+<UiPath path="mcpConnect.title" /> enumera tus conexiones; los miembros con `mcp:manage` ven todas las conexiones del
+espacio de trabajo. Cada tarjeta muestra el cliente, quién lo conectó, las capacidades, las listas, los dominios de
+remitente y las direcciones IP, y cuándo caduca.
+
+<Screenshot
+  id="mcp-connections"
+  alt="Conexiones externas: el endpoint MCP con OAuth y una conexión, ChatGPT, Cliente sin verificar y Activa, creada por Linh Nguyen, con sus tres capacidades, todas las listas y todos los dominios de remitente, sin restricción de IP, la caducidad dentro de 30 días, y Seleccionar fuente y Revocar conexión; al lado, lo que siempre queda bajo tu control."
+/>
+
+- Una conexión caduca 30 días después de que se permitió. Renovar sus tokens no la amplía; después, vuelve a conectar.
+- <UiPath path="mcpConnect.revoke" /> detiene al instante sus tokens de acceso y de renovación. Sus propuestas
+  pendientes ya no se pueden aceptar, y los borradores conservados se quedan. Lo que el cliente ya recibió no se elimina
+  de él. Pueden revocarla la persona que la conectó y los miembros con `mcp:manage`.
+- Cuando un cliente presenta un token de renovación que ya se usó, ReputeCast revoca toda la conexión, que muestra
+  entonces <UiPath path="mcpConnect.reused" />.
+- Perder tu pertenencia al espacio de trabajo, o que se desactive el servidor MCP, detiene al instante todas las
+  llamadas.
+
+## Herramientas que puede llamar el cliente
+
+El endpoint usa el transporte Streamable HTTP de MCP, con una respuesta JSON por solicitud y un token de acceso de tipo
+bearer.
+
+<TableScroll label="Herramientas de una conexión externa">
+
+| Herramienta | Capacidad | Qué hace |
+|---|---|---|
+| `connection_status` | Cualquiera | Las capacidades que se pueden usar ahora y cuándo caduca la conexión |
+| `list_sources` | Cualquiera | Las fuentes sin caducar que compartió una persona: identificadores y tipos, no nombres |
+| `read_source` | `editorial:read` | El texto de una fuente compartida, su asunto, su preencabezado, los marcadores de posición de enlaces, imágenes y variables, la voz, el recorrido o las condiciones del segmento |
+| `read_report` | `reports:read` | La instantánea fija del informe de una campaña compartida |
+| `propose_email` | `drafts:propose` | Prepara un borrador de campaña o de artículo, nuevo o como cambio sobre la revisión exacta de un borrador compartido |
+| `propose_workflow` | `drafts:propose` | Prepara un segmento del generador, un recorrido sin publicar, o ambos como un solo conjunto |
+| `proposal_status` | `drafts:propose` | La decisión de una propuesta y su caducidad |
+
+</TableScroll>
+
+Una herramienta que falla solo responde con un código fijo, como `source_changed` (vuelve a compartir la fuente),
+`insufficient_scope`, `invalid_content`, `idempotency_conflict` o `proposal_limit`. Las propuestas llevan una clave:
+reintentar con la misma clave y el mismo contenido devuelve la misma propuesta, y la misma clave con otro contenido es
+un conflicto.
+
+## Detalles de OAuth para desarrolladores de clientes
+
+- Descubrimiento: `GET /.well-known/oauth-protected-resource/mcp/connect` (RFC 9728) y
+  `GET /.well-known/oauth-authorization-server` (RFC 8414). Una llamada sin autenticar a `/mcp/connect` responde `401`
+  con un `WWW-Authenticate` que apunta a los metadatos del recurso.
+- Registro: `POST /oauth/mcp/register` (RFC 7591), con hasta cinco URI de devolución de llamada HTTPS exactas, o HTTP de
+  loopback para una aplicación en el mismo equipo, y `none`, `client_secret_basic` o `client_secret_post`. Un secreto
+  se muestra una sola vez. Un cliente registrado que no se usa durante siete días se elimina. Quien administra la
+  instancia puede registrar un cliente verificado por el operador con `POST /api/v1/admin/mcp-connect/clients`; su
+  página de consentimiento muestra entonces <UiPath path="mcpConnect.verified" />.
+- Autorización: solo código de autorización con PKCE `S256`, en `/oauth/mcp/authorize`, con `resource` igual al
+  endpoint y los ámbitos `editorial:read`, `reports:read` y `drafts:propose`. La respuesta incluye `iss`.
+- Tokens: `POST /oauth/mcp/token`. Los tokens de acceso duran 10 minutos, los códigos 60 segundos, y los tokens de
+  renovación rotan en cada uso. `POST /oauth/mcp/revoke` revoca un token (RFC 7009).
+- Estos tokens solo funcionan en `/mcp/connect`: allí se rechazan las claves de API, los tokens de agente y las
+  sesiones, y la API REST y `/mcp` rechazan estos tokens.
+
+<LimitsTable area="mcp-connect" />
+
+## Auditoría
+
+El [registro de auditoría](/es/team/audit-log/) anota `mcp_connect.client_registered`, `.granted`, `.denied`,
+`.revoked`, `.source_selected` y `.proposed`, y cada decisión como `mcp_connect.kept`, `.discarded`, `.accepted` o
+`.rejected`. Un borrador que conserva una persona se anota como el `campaign.create` o el `post.created` de siempre, con
+`via: external_mcp` y el ID de la conexión, y la persona que decidió es el actor. No se registran tokens, prompts ni
+contenido.
+
+## Solución de problemas
+
+- **El cliente dice que el servidor necesita autorización, pero no se abre ninguna página de consentimiento**: la URL
+  pública de la instancia no es HTTPS, o el cliente no puede llegar a ella.
+- **<UiPath path="mcpConnect.invalidTitle" />**: la solicitud caducó, ya se decidió o pertenece a otra sesión del
+  navegador. Vuelve a empezar desde el cliente.
+- **<UiPath path="mcpConnect.optionsFailed" />**: el servidor MCP del espacio de trabajo está desactivado, o te falta
+  `mcp:manage` o los permisos de todas las capacidades.
+- **`list_sources` no devuelve nada**: nadie compartió una fuente en las últimas dos horas. Elige
+  <UiPath path="mcpConnect.proposals.selected" /> y comparte una.
+- **`429` con `Retry-After`**: más de 120 llamadas por minuto en la conexión, o una llamada mientras se ejecuta otra.
+- **"Ha cambiado desde esta propuesta"**: alguien editó el borrador después de que el cliente lo leyera. Vuelve a
+  compartirlo y pide una propuesta nueva.
+
+## Relacionado
+
+<CardGrid>
+  <LinkCard title="Conectar agentes de IA con MCP" href="/es/developers/mcp/" />
+  <LinkCard title="Redactar campañas y recorridos con el agente de IA" href="/es/integrations/ai-agent/" />
+  <LinkCard title="Roles y permisos" href="/es/team/roles-and-permissions/" />
+  <LinkCard title="Proxy inverso y TLS" href="/es/self-hosting/reverse-proxy/" />
+</CardGrid>
