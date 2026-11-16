@@ -30,6 +30,7 @@ export type Shot = {
     | { press: string }
     // text to type; a search that matches the screen's words takes one per locale ({ en, de, es, fr, vi })
     | { fill: [string, string | Record<Lang, string>] }
+    | { select: [string, string] } // a <select> and the value of the option to pick
     | { wait: number }
   )[]
   waitFor?: string // selector that must be visible before capture
@@ -38,6 +39,10 @@ export type Shot = {
   // side the number goes on (default: the first side with room, see badgeSide in lib/markers.ts).
   markers?: { n: number; selector: string; badge?: BadgeSide }[]
   locales?: Lang[] // default every docs locale
+  // Runs on a fresh Acme that lib/prepare.ts sets up: the recorded model (lib/model-fixture.ts) as the workspace's
+  // model with the agent on and two runs, a saved and a learned brand voice, and an external MCP client allowed over
+  // OAuth with one proposal.
+  prepare?: true
   // `reputecast demo send`; `canary` defaults to the CLI's (on in the normal scenario, off in the others)
   demoSend?: {
     campaign: string
@@ -87,6 +92,27 @@ const commentRow = (n: number) => `.wc-list > .wc-row:nth-child(${n})`
 // recognised and What's kept in the second column).
 const trackingSites = 'main section.ih-dhead + section.card'
 const trackingGrid = `${trackingSites} + div`
+
+// The AI agent's and Draft from a brief's briefs. The `prepare` runs (lib/prepare.ts) start from the same text, which
+// the recorded model (lib/model-fixture.ts) answers with its fixed plan and drafts.
+export const AGENT_BRIEF =
+  'Announce that feature flags are generally available: an email to the newsletter, a reminder a week later, and a ' +
+  'web post with the full changelog. Link to the feature flags docs.'
+export const AGENT_LINK = 'https://acme.io/docs/feature-flags'
+export const DRAFT_BRIEF =
+  'Tell readers that flag changes can now be scheduled for any time and time zone. Suggest trying it on a small ' +
+  'rollout first, and link to the docs.'
+export const DRAFT_LINK = 'https://acme.io/docs/scheduled-rollouts'
+/** The external proposal lib/prepare.ts has the MCP client make. */
+export const EXTERNAL_PROPOSAL = 'Partner webinar: the recording'
+
+// New campaign › Draft from a brief, opened from the Campaigns header.
+const draftDialog: NonNullable<Shot['before']> = [
+  { click: 'header button.pri' },
+  { click: '[role="dialog"] input[value="ai"]' },
+  { click: '[role="dialog"] button.pri' },
+  { wait: 800 },
+]
 
 export const shots: Shot[] = [
   { id: 'sign-in', path: '/sign-in', feature: 'auth', user: 'anon' },
@@ -1487,4 +1513,183 @@ export const shots: Shot[] = [
   { id: 'overview-dark', path: `${ws}`, feature: 'overview', theme: 'dark' },
   // qa-map: Notifications. The page's last card: the sending summary by email (M57 G-14).
   { id: 'notifications-summary', path: `${ws}/notifications`, feature: 'notifications', clip: '#summary' },
+
+  // AI agent, drafts from a brief, brand voice and external MCP connections (1.7.0), on the prepared Acme (`prepare`).
+  // AI assistant settings › Agent settings: tool calling verified with the recorded model, the agent on.
+  {
+    id: 'agent-settings',
+    path: `${ws}/settings/integrations/ai`,
+    feature: 'ai',
+    prepare: true,
+    clip: 'main section.card:has(input[max="200"])',
+  },
+  // A new brief, filled in as for the prepared runs; nothing is started.
+  {
+    id: 'agent-brief',
+    path: `${ws}/agent/new`,
+    feature: 'ai',
+    prepare: true,
+    fullPage: true,
+    before: [
+      { fill: ['main form textarea[name="brief"]', AGENT_BRIEF] },
+      { fill: ['main form textarea[name="links"]', AGENT_LINK] },
+    ],
+    markers: [
+      { n: 1, selector: 'main form textarea[name="brief"]' },
+      { n: 2, selector: 'main form .grid' },
+      { n: 3, selector: 'main form textarea[name="links"]' },
+      { n: 4, selector: 'aside.agent-aside > section:nth-child(2)' },
+    ],
+  },
+  // The run whose plan is ready to build, on Brief & plan.
+  {
+    id: 'agent-plan',
+    path: `${ws}/agent/{agentRun:ready}?tab=plan`,
+    feature: 'ai',
+    prepare: true,
+    fullPage: true,
+    markers: [
+      { n: 1, selector: '.agent-main [role="tabpanel"] section.card ol' },
+      { n: 2, selector: '.agent-main [role="tabpanel"] section.card > div.border-t' },
+      { n: 3, selector: 'aside.agent-aside > section:first-child' },
+    ],
+  },
+  // The built run, on Review: three bundles of new drafts, none decided.
+  {
+    id: 'agent-review',
+    path: `${ws}/agent/{agentRun:review}?tab=review`,
+    feature: 'ai',
+    prepare: true,
+    markers: [
+      { n: 1, selector: '[role="tabpanel"] [role="status"] .badge' },
+      { n: 2, selector: '[role="tabpanel"] section[aria-label] > section.card:first-of-type details' },
+      {
+        n: 3,
+        selector:
+          '[role="tabpanel"] section[aria-label] > section.card:first-of-type div.flex.flex-wrap.gap-2:has(> button)',
+      },
+    ],
+  },
+  // Campaigns › New campaign, with the two AI options under Regular.
+  {
+    id: 'campaign-new-ai',
+    path: `${ws}/campaigns`,
+    feature: 'digests',
+    prepare: true,
+    before: [{ click: 'header button.pri' }, { wait: 500 }],
+    clip: '[role="dialog"]',
+    markers: [
+      { n: 1, selector: '[role="dialog"] label:has(> input[value="ai"])' },
+      { n: 2, selector: '[role="dialog"] label:has(> input[value="agent"])' },
+    ],
+  },
+  // Draft from a brief, filled in; the prepared proposal waits above the form. Nothing is generated.
+  {
+    id: 'ai-draft-brief',
+    path: `${ws}/campaigns`,
+    feature: 'ai',
+    prepare: true,
+    before: [
+      ...draftDialog,
+      { fill: ['[role="dialog"] textarea[name="brief"]', DRAFT_BRIEF] },
+      { fill: ['[role="dialog"] input[name="name"]', 'Scheduled rollouts: first steps'] },
+      { fill: ['[role="dialog"] textarea[maxlength="41000"]', DRAFT_LINK] },
+    ],
+    markers: [
+      { n: 1, selector: '[role="dialog"] section' },
+      { n: 2, selector: '[role="dialog"] textarea[name="brief"]' },
+      { n: 3, selector: '[role="dialog"] .grid' },
+      { n: 4, selector: '[role="dialog"] textarea[maxlength="41000"]' },
+    ],
+  },
+  // The prepared proposal, reopened with Review proposal: no model request.
+  {
+    id: 'ai-draft-proposal',
+    path: `${ws}/campaigns`,
+    feature: 'ai',
+    prepare: true,
+    before: [...draftDialog, { click: '[role="dialog"] section li button' }, { wait: 1500 }],
+    markers: [
+      { n: 1, selector: '[role="dialog"] [role="status"] + div' },
+      { n: 2, selector: '[role="dialog"] section.border-ok-line' },
+      { n: 3, selector: '[role="dialog"] .df' },
+    ],
+  },
+  // Automations › New automation: With the agent, and Describe the automation first among the templates.
+  {
+    id: 'automation-new-ai',
+    path: `${ws}/automations`,
+    feature: 'automations',
+    prepare: true,
+    before: [{ click: 'header button.pri' }, { wait: 500 }],
+    clip: '[role="dialog"]',
+    markers: [
+      { n: 1, selector: '[role="dialog"] a[href$="/agent/new?kind=automation"]' },
+      { n: 2, selector: '[role="dialog"] .grid > button:first-child' },
+    ],
+  },
+  // Brand kit › Brand voice: revision 2, learned from three sent campaigns and saved.
+  {
+    id: 'brand-voice',
+    path: `${ws}/settings/brand-kit`,
+    feature: 'brandkit',
+    prepare: true,
+    clip: 'main section.mt-5',
+    markers: [
+      { n: 1, selector: 'main section.mt-5 div.grid > section.card' },
+      { n: 2, selector: 'main section.mt-5 div.grid > div > section.card:first-child' },
+      { n: 3, selector: 'main section.mt-5 div.grid > div > section.card:last-child' },
+    ],
+  },
+  // The consent page of a new authorization request from a client named ChatGPT, with Acme Newsletter and two of the
+  // three requested capabilities picked. Nothing is allowed.
+  {
+    id: 'mcp-consent',
+    path: '/mcp-consent?request={consent:ChatGPT}',
+    feature: 'mcpconnect',
+    prepare: true,
+    fullPage: true,
+    before: [
+      { select: ['main select', 'acme-newsletter'] },
+      { click: 'main input[value="editorial:read"]' },
+      { click: 'main input[value="drafts:propose"]' },
+    ],
+    markers: [
+      { n: 1, selector: 'main .mcp-connect-grid > section.card > div:first-child' },
+      { n: 2, selector: 'main .mcp-connect-form > .lbl:has(> select)' },
+      { n: 3, selector: 'main form fieldset:nth-of-type(1)' },
+      { n: 4, selector: 'main form fieldset:nth-of-type(2)' },
+      { n: 5, selector: 'main form > div:last-child' },
+    ],
+  },
+  // Settings › External connections: the prepared connection's Select source dialog, with a second campaign picked
+  // (the one already shared is listed under it). Nothing is shared.
+  {
+    id: 'mcp-source',
+    path: `${ws}/settings/connections`,
+    feature: 'mcpconnect',
+    prepare: true,
+    before: [
+      { click: 'main .mcp-connect-grid > div > section.card button' },
+      { wait: 800 },
+      // The resource list is the dialog's select with an empty first option.
+      { select: ['[role="dialog"] select:has(option[value=""])', 'Feature flags preview'] },
+    ],
+  },
+  // The prepared external proposal: a new campaign draft from ChatGPT, not reviewed. Its preview loads no images.
+  {
+    id: 'mcp-proposal',
+    path: `${ws}/proposals/{mcpProposal:${EXTERNAL_PROPOSAL}}`,
+    feature: 'mcpconnect',
+    prepare: true,
+    fullPage: true,
+    markers: [
+      { n: 1, selector: 'main section.card:has(iframe) > div:first-child' },
+      { n: 2, selector: 'main section.card:has(iframe) > [role="status"]' },
+      { n: 3, selector: 'main section.card:has(iframe) .border-ok-line' },
+      { n: 4, selector: 'main section.card:has(iframe) div.flex.flex-wrap.gap-2:has(> button)' },
+    ],
+  },
+  // Settings › External connections, with the prepared connection.
+  { id: 'mcp-connections', path: `${ws}/settings/connections`, feature: 'mcpconnect', prepare: true },
 ]

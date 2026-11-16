@@ -50,7 +50,9 @@ app itself; the REST API reference is generated from the upstream OpenAPI spec.
   `scripts/screenshots/manifest.ts`, plus `<id>.json` with the numbered markers' boxes. Use `--only id,id`,
   `--locale de,es,fr` (any of `en`, `de`, `es`, `fr`, `vi`), `--no-reseed`. The dev database is left reseeded with
   the Acme demo when the run ends; to keep yours, run a second upstream stack on other ports and point the run at it
-  with `REPUTECAST_SRC`, `PG_PORT` and `--app`.
+  with `REPUTECAST_SRC`, `PG_PORT` and `--app`. The AI agent, brand voice and external connection shots (`prepare`
+  in the manifest) answer with a recorded model on a loopback port, so start the dev server with
+  `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true` for them.
 
 ## Deployment
 

@@ -14,7 +14,9 @@
  *
  * Environment: REPUTECAST_SRC (default ../ReputeCast), PG_PORT (default: the checkout's .env, else 5432).
  * Needs upstream `make dev` running (the Vite dev build: release builds offer English only). The run recreates
- * the dev database for each sample and leaves it re-seeded with Acme.
+ * the dev database for each sample and leaves it re-seeded with Acme. Shots marked `prepare` run on an Acme of their
+ * own (lib/prepare.ts), whose model is a recorded one on a loopback port (lib/model-fixture.ts): the dev server must
+ * run with REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true to reach it.
  *
  * Writes src/assets/screenshots/<locale>/<id>.webp, plus <id>.json with the marker boxes in percent.
  *
@@ -37,7 +39,9 @@ import {
 import sharp from 'sharp'
 import { setLanguage, signIn } from './lib/auth.ts'
 import { toMarker, type Box, type MarkerFile } from './lib/markers.ts'
-import { parsePlaceholders, resolvePath } from './lib/resolve.ts'
+import { startModelFixture } from './lib/model-fixture.ts'
+import { prepare } from './lib/prepare.ts'
+import { freshKinds, parsePlaceholders, resolvePath } from './lib/resolve.ts'
 import {
   buildCli,
   parseTempPassword,
@@ -172,7 +176,8 @@ async function runStep(page: Page, step: NonNullable<Shot['before']>[number], lo
       .locator(selector)
       .first()
       .fill(typeof text === 'string' ? text : text[locale])
-  } else await page.waitForTimeout(step.wait)
+  } else if ('select' in step) await page.locator(step.select[0]).first().selectOption(step.select[1])
+  else await page.waitForTimeout(step.wait)
 }
 
 /** Captures one shot in one locale; returns the WebP size in bytes. Throws with the reason on failure. */
@@ -192,7 +197,7 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
       }
       path = await resolvePath(auth.api, app, s.path)
     }
-    resolvedPaths.set(s.path, path)
+    if (!parsePlaceholders(s.path).some((p) => freshKinds.includes(p.kind))) resolvedPaths.set(s.path, path)
   }
   if (auth && auth.language !== locale) {
     await setLanguage(auth.api, app, locale)
@@ -354,7 +359,8 @@ function printSummary(): void {
 async function main(): Promise<void> {
   const u = upstreamFromEnv(resolve(root, '.shots-tmp'), app)
   const fresh = selected.filter((s) => s.sample === 'fresh')
-  const acme = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && !s.demoSend)
+  const acme = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && !s.demoSend && !s.prepare)
+  const prepared = selected.filter((s) => s.prepare)
   const demo = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && s.demoSend)
   const northwind = selected.filter((s) => s.sample === 'northwind')
   // The developer's database is Acme until the run replaces it.
@@ -387,6 +393,18 @@ async function main(): Promise<void> {
         database = 'acme'
       }
       await captureAll(acme)
+    }
+    if (prepared.length) {
+      console.log('Seeding Acme and preparing the AI agent, brand voice and external connection …')
+      await seed(u, [])
+      database = 'changed'
+      const model = await startModelFixture()
+      try {
+        await prepare((await session('linh'))!.api, app, model.baseUrl)
+        await captureAll(prepared)
+      } finally {
+        model.server.close()
+      }
     }
     const groups = Map.groupBy(demo, (s) => JSON.stringify(s.demoSend))
     for (const [key, list] of groups) {
