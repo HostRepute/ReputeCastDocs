@@ -29,6 +29,55 @@ export const DYNAMIC_CODES: Record<string, string[]> = {
   // internal/audience erase (strict): the first erasure.Refusal's Code; internal/earn's Guard is the only source
   // that refuses, with "paid_members".
   'first.Code': ['paid_members'],
+  // internal/mcpconnect privateAPI.Transform: it rewrites only problems whose code is api.CodeValidation.
+  'p.Code': ['validation_failed'],
+  // internal/mcpconnect DecideProposal: blocked is proposalBlocked's reason.
+  '"mcp_proposal_"+blocked': [
+    'mcp_proposal_changed',
+    'mcp_proposal_expired',
+    'mcp_proposal_permission',
+    'mcp_proposal_purged',
+    'mcp_proposal_revoked',
+  ],
+  // internal/ai agentProblem(ctx, key): the agent.* keys of internal/ai/messages.
+  '"ai_agent_"+key': [
+    'ai_agent_bundle',
+    'ai_agent_changed',
+    'ai_agent_decided',
+    'ai_agent_expired',
+    'ai_agent_input',
+    'ai_agent_manual',
+    'ai_agent_permission',
+    'ai_agent_report_unavailable',
+    'ai_agent_request_reused',
+    'ai_agent_tools_unavailable',
+    'ai_agent_unavailable',
+  ],
+  // internal/ai budgetProblem(ctx, key): the budget.* keys of internal/ai/messages.
+  '"ai_"+key': [
+    'ai_connection_changed',
+    'ai_context_limit',
+    'ai_price_unknown',
+    'ai_reconcile_changed',
+    'ai_reconcile_confirm',
+    'ai_reconcile_wait',
+    'ai_reservation_cap',
+    'ai_run_cap',
+    'ai_usage_unknown',
+  ],
+  // internal/ai draftProblem(ctx, status, key): the draft.* keys of internal/ai/messages (projectSource picks
+  // source, privacy or input).
+  '"ai_draft_"+key': [
+    'ai_draft_changed',
+    'ai_draft_decided',
+    'ai_draft_input',
+    'ai_draft_invalid',
+    'ai_draft_privacy',
+    'ai_draft_refused',
+    'ai_draft_sharing_review',
+    'ai_draft_source',
+    'ai_draft_unavailable',
+  ],
 }
 
 /** A Go source file; `path` is relative to the upstream root, e.g. 'internal/api/errors.go'. */
