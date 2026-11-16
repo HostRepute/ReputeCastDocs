@@ -1,0 +1,343 @@
+---
+title: Kampagnen und Abläufe mit dem KI-Agenten entwerfen
+description: 'Der KI-Agent für E-Mail-Marketing entwirft aus einer Beschreibung Kampagnen, Beiträge, Segmente und Abläufe: Sie bestätigen den Plan und prüfen jeden Entwurf.'
+type: how-to
+audience: [publisher, admin]
+permissions: ['ai:use', 'integrations:manage']
+uiPath: 'ai.agent.runs'
+primaryKeyword: KI-Agent für E-Mail-Marketing
+sources:
+  - internal/ai/agent.go
+  - internal/ai/agent_api.go
+  - internal/ai/agent_runtime.go
+  - internal/ai/agent_decisions.go
+  - internal/ai/agent_tools.go
+  - internal/ai/agent_audience.go
+  - internal/ai/agent_automation.go
+  - internal/ai/agent_pool.go
+  - internal/ai/agent_proposals.go
+  - internal/ai/agent_capability.go
+  - internal/ai/budget.go
+  - internal/ai/messages/en.json
+  - internal/editorial
+  - internal/reports/model.go
+  - internal/audit/proposal.go
+  - web/src/features/ai/{AgentBriefPage,AgentRunPage,AgentRunsPage,AgentReview,AgentSettings,AgentAudience,AgentPool,AgentReport,SharingReview}.tsx
+  - web/src/features/ai/agent.tsx
+  - web/src/features/ai/agent.messages.ts
+  - web/src/routes/w/$workspace/_app/agent
+  - migrations/{03600_a3_agent_runtime,03601_a3_agent_activity,03602_a3_run_metadata,03604_a3_tool_capability,03625_a4_agent_request_keys}.sql
+sidebar:
+  order: 7.2
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Der KI-Agent für E-Mail-Marketing von ReputeCast macht aus einer Beschreibung einen Plan, den Sie bestätigen, und
+erstellt dann die Entwürfe darin: Kampagnen, Beiträge für die Website, Segmente aus dem Segment-Editor und
+unveröffentlichte E-Mail-Abläufe. Er arbeitet mit dem Modell, das Ihr Arbeitsbereich verbunden hat, innerhalb von
+Limits pro Lauf und pro Monat, und nichts, was er erstellt, wird zu Ihrem Entwurf, bevor eine Person es behält. Der
+Agent sendet, plant und veröffentlicht nichts, gibt nichts frei, ändert keine Einstellungen und liest keine Kontakte.
+Verfügbar seit Version 1.7.0.
+
+<Aside type="note">
+  Der Agent wurde mit einem aufgezeichneten Modell getestet, nicht mit den Modellen jedes Anbieters: Wie gut seine
+  Pläne und Entwürfe sind, hängt von dem Modell ab, das Sie verbinden.
+</Aside>
+
+## Bevor Sie beginnen
+
+- Der Arbeitsbereich braucht ein [verbundenes Modell](/de/integrations/ai-assistant/) mit beiden Preisen, Input und
+  Output (0 ist ein gültiger Preis für ein Modell, das Sie selbst betreiben). Ohne bekannte Preise kann ReputeCast die
+  Kosten eines Laufs nicht begrenzen und startet keinen.
+- Jemand mit `integrations:manage` (Inhaber und Admin) schaltet den Agenten ein und prüft, ob das Modell Tools richtig
+  aufruft, wie unten beschrieben.
+- Um einen Lauf zu starten und fortzusetzen, brauchen Sie `ai:use` (Inhaber, Admin und Bearbeiter) und die
+  Berechtigungen für das, was er entwirft: `campaigns:view` und `campaigns:edit` für Kampagnen, `automations:view` und
+  `automations:edit` für Abläufe, `website:view` und `website:edit` für Beiträge. Ein Segment braucht außerdem
+  `subscribers:view` und `segments:edit`, und ein Mitglied, das auf bestimmte Listen beschränkt ist, kann keine
+  Zielgruppenbedingungen auswählen. API-Schlüssel und [MCP-Agenten](/de/developers/mcp/) können `ai:use` nicht haben
+  und daher keine Läufe starten.
+
+## Agenten einschalten
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.settings > settings.integrations > ai.title" /> und gehen Sie zu
+   <UiPath path="ai.agent.settings" />, unter den Funktionen des Assistenten.
+
+2. Wählen Sie <UiPath path="ai.agent.testTools" />. ReputeCast sendet eine feste Anfrage ohne Inhalte aus dem
+   Arbeitsbereich und prüft, ob das Modell ein Test-Tool richtig aufruft. Das Kennzeichen zeigt dann
+   <UiPath path="ai.agent.capabilityVerified" /> oder <UiPath path="ai.agent.capabilityFailed" />. Der Test zählt zum
+   Monatslimit. Eine fehlgeschlagene Prüfung stoppt die Modellarbeit des Agenten, bis ein Test besteht oder sich die
+   Verbindung ändert; gespeicherte Entwürfe bleiben verfügbar.
+
+3. Schalten Sie <UiPath path="ai.agent.enabled" /> ein und prüfen Sie die Werte unter
+   <UiPath path="ai.agent.defaults" />: 40 <UiPath path="ai.agent.calls" />, 300.000
+   <UiPath path="ai.agent.tokens" /> und 2,00 $ für <UiPath path="ai.agent.costLimit" />. Sie gelten für Läufe, die
+   nach dem Speichern starten. Wählen Sie <UiPath path="common.save" />.
+
+</Steps>
+
+<Screenshot
+  id="agent-settings"
+  alt="Die Agenteneinstellungen in den Einstellungen des KI-Assistenten: das Kennzeichen „Werkzeugaufrufe geprüft“, der Button „Werkzeugaufrufe prüfen“, „Agenten aktivieren“ eingeschaltet und die kumulativen Standardlimits von 40 Tool-Aufrufen, 300.000 Tokens und 2 US-Dollar pro Lauf."
+/>
+
+Wenn Sie den Agenten ausschalten, pausiert seine Modellarbeit. Personen können ihre Läufe weiterhin öffnen und die
+Entwürfe darin behalten oder verwerfen.
+
+## Lauf starten
+
+Beginnen Sie unter <UiPath path="nav.campaigns > campaigns.newCampaign > ai.agent.entry" />, unter
+<UiPath path="nav.automations > automations.newAutomation > ai.agent.entry" /> (der Entwurfstyp steht dann auf
+<UiPath path="ai.agent.kindAutomation" />), mit <UiPath path="ai.agent.ask" /> in der
+[Befehlspalette](/de/reference/keyboard-shortcuts/#mit-der-befehlspalette-suchen) oder mit
+<UiPath path="ai.agent.newBrief" /> auf <UiPath path="ai.agent.runs" /> (<kbd>⌘</kbd> <kbd>K</kbd>, dann
+<UiPath path="ai.agent.runs" />).
+
+<Steps>
+
+1. Beschreiben Sie die Aufgabe unter <UiPath path="ai.agent.brief" /> in bis zu 4.000 Zeichen: das Ziel, die Fakten
+   und die Handlungsaufforderung. Lassen Sie Kontaktdaten und Zugangsdaten weg, und tragen Sie Links in ihr eigenes
+   Feld ein.
+
+2. Wählen Sie den <UiPath path="ai.agent.goal" /> (<UiPath path="ai.agent.kindCampaign" />,
+   <UiPath path="ai.agent.kindAutomation" /> oder <UiPath path="ai.agent.kindPost" />), die
+   <UiPath path="ai.agent.language" />, die [Markenstimme](/de/campaigns/brand-voice/) unter
+   <UiPath path="brandkit.voice.voiceSelection" /> und eine <UiPath path="ai.draft.template" /> oder
+   <UiPath path="ai.draft.blank" />.
+
+3. Fügen Sie Kontext hinzu, wenn die Aufgabe ihn braucht. Jeder Teil ist optional:
+
+   - <UiPath path="ai.agent.poolSelect" />: Neue E-Mails behalten den Code und den Einlöse-Link des Pools als
+     [Rabattcode-Platzhalter](/de/campaigns/discount-codes/). Nur der Typ des Pools und die Zahl der freien Codes
+     erreichen das Modell; Codes werden nie gelesen, erstellt oder reserviert.
+   - <UiPath path="ai.agent.report" />: eine E-Mail-Kampagne, deren Versand vor mindestens 72 Stunden abgeschlossen
+     wurde. Nur feste Summen erreichen das Modell, auf Zehner abgerundet. Ein Versand unter 100 und eine Kennzahl oder
+     ihre Gegenmenge unter 20 werden ausgeblendet, nicht als null gemeldet; Namen, Inhalte, Links, Raten und Filter
+     gehen nie mit. Die Zahlen sind ein fester Zahlenstand, der sich nie aktualisiert und 30 Tage nach der ersten
+     Auswahl entfernt wird.
+   - <UiPath path="ai.agent.localAudience" />: Bedingungen aus dem [Segment-Editor](/de/audience/segments/), die auf
+     Ihrer Instanz bleiben. Das Modell sieht Symbole, nicht die Werte, und kein Segment wird gespeichert, bevor Sie sein
+     Paket behalten.
+   - Bei einer Automation der <UiPath path="ai.agent.trigger" />: <UiPath path="ai.agent.triggerJoined" /> (eine Liste
+     mit bestätigter Einwilligung), <UiPath path="ai.agent.triggerEntered" /> oder
+     <UiPath path="ai.agent.triggerLeft" />. Mit ausgewählten Zielgruppenbedingungen macht
+     <UiPath path="ai.agent.fromAudience" /> sie zum neuen Segment, mit dem der Ablauf beginnt. Kontakte treten einmal
+     ein; ein Listenauslöser lässt Importe aus und lässt Personen aus dem Ablauf, wenn sie die Liste verlassen.
+
+4. Tragen Sie unter <UiPath path="ai.draft.links" /> bis zu 10 vollständige HTTP(S)-Adressen ein, eine pro Zeile. Das
+   Modell erhält Platzhalter; die Adressen bleiben auf Ihrer Instanz und kommen in den Entwürfen zurück.
+
+5. Wählen Sie <UiPath path="ai.agent.planStart" />. Der Dialog <UiPath path="ai.draft.sharingTitle" /> nennt, was an
+   das Modell geht, und bittet Sie zu bestätigen, dass Sie es geprüft haben und teilen dürfen; wählen Sie
+   <UiPath path="ai.draft.sharingConfirm" />. Wenn Sie abbrechen, wird nichts gesendet.
+
+</Steps>
+
+<Screenshot
+  id="agent-brief"
+  alt="Neue Beschreibung für den KI-Agenten: Die Beschreibung verlangt eine E-Mail, eine Erinnerung eine Woche später und einen Beitrag für die Website zu Feature Flags; Entwurfstyp Kampagne, Englisch, die neueste gespeicherte Stimme und der Markenauftritt; der optionale Rabattcode-Pool, die Kampagnensummen und die Zielgruppenbedingungen; ein beizubehaltender Link; und daneben, was das Modell sieht, und ein Laufbudget von 0 von 40 Tool-Aufrufen, 300.000 Tokens und 2 US-Dollar."
+>
+  1. Die Beschreibung.
+  2. Was entworfen wird, mit Sprache, Stimme und Vorlage.
+  3. Links, die die Entwürfe behalten.
+  4. Das Budget des Laufs.
+</Screenshot>
+
+Schon das Erstellen des Plans verbraucht Budget, auch wenn Sie ihn nie umsetzen. Der Lauf öffnet sich sofort und
+arbeitet im Hintergrund: Sie können die Seite verlassen.
+
+## Plan bestätigen
+
+Die Seite des Laufs hat drei Tabs, <UiPath path="ai.agent.planTab" />, <UiPath path="ai.agent.steps" /> und
+<UiPath path="ai.agent.review" />, neben dem Budget des Laufs und dem, was das Modell sieht.
+
+- **Der Plan** listet bis zu 10 Entwürfe auf. Jeder nennt seinen Zweck, die Prüfungen, die er bestehen muss, die
+  Berechtigungen, die er braucht, und den Entwurf, von dem er abhängt. Entwürfe, die voneinander abhängen, bilden ein
+  Paket, etwa ein neues Segment und der Ablauf, der mit ihm beginnt.
+- **Fragen.** Lässt die Beschreibung etwas offen, etwa welche Leser oder welches Angebot, zeigt der Lauf
+  <UiPath path="ai.agent.stateNeedsAnswers" /> und stellt bis zu drei Fragen. Beantworten Sie sie unter
+  <UiPath path="ai.agent.questions" /> und wählen Sie <UiPath path="ai.agent.answerSend" />.
+- **<UiPath path="ai.agent.audience" />**: Mit Zielgruppenbedingungen zeigt sie, wie viele Kontakte ungefähr passen, von
+  wie vielen und wann das gezählt wurde. Nur Sie sehen sie, nie das Modell, und Einwilligung, Sperrliste und
+  Mitgliedschaft werden erneut geprüft, wenn jemand sendet oder veröffentlicht.
+- **Die Schätzung der Erstellungskosten** nennt niedrige und hohe Kosten, berechnet aus den konfigurierten Preisen.
+  Sie ist weder ein Angebot noch ein Ausgabenlimit; übersteigt der hohe Wert, was vom Limit des Laufs übrig ist,
+  kündigt der Lauf an, dass er am Limit pausieren wird.
+
+<Screenshot
+  id="agent-plan"
+  alt="Ein Lauf im Status Bereit zum Erstellen: Plan v1 listet „Feature flags are generally available“ und „Reminder: try feature flags“ als Kampagnen und „Changelog: feature flags“ als Beitrag, jeweils mit Zweck, Prüfungen und Berechtigungen; darunter die geschätzten verbleibenden Erstellungskosten von 0,02 bis 0,76 US-Dollar und „Entwürfe erstellen“; daneben das Laufbudget mit 1 von 40 verbrauchten Tool-Aufrufen."
+>
+  1. Die Entwürfe, die der Plan erstellt.
+  2. Die Schätzung der Erstellungskosten und <UiPath path="ai.agent.build" />.
+  3. Was der Lauf bisher verbraucht hat.
+</Screenshot>
+
+Wählen Sie <UiPath path="ai.agent.build" /> und bestätigen Sie. Sie bestätigen diese Version des Plans: Der Agent darf
+nur diese Entwürfe vorläufig erstellen, und alles, was einen bestehenden Entwurf ändert, ist ein eigener Vorschlag, den
+Sie übernehmen oder ablehnen. Der Lauf wechselt zu <UiPath path="ai.agent.stateQueued" /> oder
+<UiPath path="ai.agent.stateBuilding" />. Ein Arbeitsbereich führt zwei Modellanfragen gleichzeitig aus, eine Person
+eine, daher wartet ein weiterer Lauf und zeigt seinen Platz in der Warteschlange.
+
+Der Tab <UiPath path="ai.agent.steps" /> listet jeden Schritt mit seinen Tool-Aufrufen: was der Agent getan hat und mit
+welchem Ergebnis, etwa <UiPath path="ai.agent.outcomeRecorded" /> oder <UiPath path="ai.agent.outcomeOutsideScope" />,
+nie die verborgenen Überlegungen des Modells. Ein Entwurf, der die Prüfung nicht besteht, wird höchstens zweimal
+korrigiert; danach pausiert der Lauf, behält die Entwürfe, die bestanden haben, und bittet Sie, den Rest von Hand
+fertigzustellen.
+
+## Entwürfe behalten oder verwerfen
+
+Sind alle geplanten Entwürfe vorläufig erstellt, steht der Lauf auf <UiPath path="ai.agent.stateReview" />, und Sie
+erhalten eine Benachrichtigung. Der Tab <UiPath path="ai.agent.review" /> zählt die verbleibenden Entscheidungen.
+
+<Screenshot
+  id="agent-review"
+  alt="Der Tab Prüfung eines Laufs im Status Bereit zur Prüfung: noch 3 Entscheidungen, der Hinweis, dass Behalten keine Versandfreigabe ist, und unter Neue Entwürfe die Pakete „Feature flags are generally available“ und „Reminder: try feature flags“, jeweils Nicht geprüft, mit „Inhalte prüfen“, „Paket behalten“ und „Paket verwerfen“."
+>
+  1. Die verbleibenden Entscheidungen.
+  2. Der Entwurf des Pakets mit seinen Inhalten zum Prüfen.
+  3. Das ganze Paket behalten oder verwerfen.
+</Screenshot>
+
+- **<UiPath path="ai.agent.newDrafts" />**: <UiPath path="ai.agent.keep" /> speichert alle Entwürfe eines Pakets auf
+  einmal als normale Entwürfe, oder keinen davon. Nichts wird gesendet, veröffentlicht oder in einen Ablauf
+  aufgenommen: Ein behaltener Ablauf bleibt unveröffentlicht, und ein behaltenes Segment nimmt seine aktuellen
+  Mitglieder in keinen Ablauf auf. <UiPath path="ai.agent.discard" /> entfernt nur diese vorläufigen Entwürfe. Ein
+  Paket, dem ein geplanter Entwurf fehlt, lässt sich nicht behalten.
+- **<UiPath path="ai.agent.existingDrafts" />**: <UiPath path="ai.agent.accept" /> übernimmt die Änderung nur, wenn der
+  Entwurf noch auf der Revision steht, aus der der Vorschlag entstanden ist. Hat ihn seitdem jemand bearbeitet, meldet
+  der Lauf „Die Quelle wurde seit diesem Vorschlag geändert. Nichts wurde überschrieben.“: Lehnen Sie den Vorschlag ab,
+  oder wählen Sie <UiPath path="ai.agent.refresh" /> und bestätigen Sie einen neuen Plan.
+  <UiPath path="ai.agent.reject" /> lässt den Entwurf, wie er ist. Durch das Übernehmen kann eine bestehende
+  [Freigabe](/de/campaigns/approvals/) veralten, wie durch jede Bearbeitung.
+- Jede Entscheidung braucht die Bearbeitungsberechtigung für das, was sie speichert, zum Beispiel `campaigns:edit` für
+  eine Kampagne.
+- Ein behaltener Entwurf öffnet sich mit <UiPath path="ai.agent.composer" />, <UiPath path="ai.agent.flowEditor" />,
+  <UiPath path="ai.agent.segmentEditor" /> oder <UiPath path="ai.agent.postEditor" />. Ab dann gehört er Ihnen:
+  Senden, Veröffentlichen und Freigabeanfragen laufen über die gewohnten Bildschirme, mit der
+  [Versandbereitschaft](/de/campaigns/send-readiness/) und den Prüfungen vor dem Veröffentlichen wie sonst auch.
+  <UiPath path="ai.agent.propose" /> bittet den Agenten um eine Änderung an einem behaltenen Entwurf, die als Vorschlag
+  zurückkommt.
+
+Sind alle Entscheidungen getroffen, steht der Lauf auf <UiPath path="ai.agent.stateCompleted" />. Das heißt, dass alles
+geprüft wurde, nicht, dass etwas gesendet wurde.
+
+## Lauf im Gespräch verfeinern
+
+Fügen Sie unter <UiPath path="ai.agent.conversation" /> eine Anweisung hinzu und wählen Sie mit
+<UiPath path="ai.agent.scope" />, wofür sie gilt:
+
+- Ein nicht behaltener Entwurf, etwa „Die Erinnerung kürzer fassen“: Der Agent überarbeitet diesen Entwurf im Rahmen
+  des bestätigten Plans, und Sie prüfen die neue Revision.
+- <UiPath path="ai.agent.wholePlan" />: Der Agent bereitet eine neue Version des Plans vor. Bestätigen Sie sie,
+  ersetzt sie die nicht behaltenen Entwürfe und Vorschläge, die sie nennt und die die Bestätigung auflistet; behaltene
+  Entwürfe ändern sich nie.
+
+Jede Anweisung, Antwort und Quelle, die der Lauf teilt, durchläuft dieselbe Bestätigung
+<UiPath path="ai.draft.sharingTitle" />.
+
+## Budgets, Pausen und Stoppen
+
+Die Karte <UiPath path="ai.agent.budget" /> zählt <UiPath path="ai.agent.calls" />,
+<UiPath path="ai.agent.tokens" /> und <UiPath path="ai.agent.cost" /> für den ganzen Lauf: Planung, Erstellung,
+Korrekturen, Antworten und Überarbeitungen. Vor jeder Anfrage reserviert ReputeCast ihre höchstmöglichen Kosten
+gegen die Limits des Laufs und das Monatslimit des Arbeitsbereichs und verbucht danach, was der Anbieter meldet. Die
+Rechnung des Anbieters kann von diesen Schätzungen abweichen.
+
+Ist ein Limit erreicht oder braucht etwas anderes eine Person, steht der Lauf auf
+<UiPath path="ai.agent.statePaused" />, mit dem Grund und den Entwürfen, die er fertiggestellt hat:
+
+<TableScroll label="Warum ein Lauf pausiert">
+
+| Grund | Was zu tun ist |
+|---|---|
+| Das Limit des Laufs reicht nicht für die nächste Anfrage | Jemand mit `integrations:manage` wählt <UiPath path="ai.agent.raise" /> und erhöht die Limits. Die Nutzung wird nicht zurückgesetzt, und das Monatslimit gilt weiterhin. Alle anderen sehen <UiPath path="ai.agent.manager" /> |
+| Das Monatslimit reicht nicht für die nächste Anfrage | Erhöhen Sie das Limit in den Einstellungen des KI-Assistenten, oder warten Sie bis zum 1. des Monats |
+| Die Abrechnung einer Anfrage ist unklar | Jemand mit `integrations:manage` gleicht sie unter <UiPath path="ai.holdsTitle" /> ab; siehe [Reservierte Anfragen und unbekannte Nutzung](/de/integrations/ai-assistant/#reservierte-anfragen-und-unbekannte-nutzung) |
+| Der Anbieter hat die Anfrage nicht abgeschlossen, die Verbindung hat sich geändert oder der Preis ist unbekannt | Prüfen Sie die Modellverbindung und ihre Preise |
+| Ihr Zugriff hat sich geändert | Stellen Sie die Mitgliedschaft, die Berechtigungen oder den Listenbereich wieder her, die der Lauf braucht |
+| Der Agent ist aus | Jemand mit `integrations:manage` schaltet ihn wieder ein |
+| Das Modell hat die Aufgabe abgelehnt, oder seine Antwort war unvollständig | Überarbeiten Sie die Beschreibung |
+| Das Modell hat angehalten, bevor der Plan oder alle Entwürfe fertig waren | Setzen Sie die fehlende Arbeit fort, oder überarbeiten Sie den Plan |
+| Die Aufgabe überschreitet den Kontext des Modells | Behalten Sie die gültigen Entwürfe und starten Sie eine kleinere Aufgabe |
+| Der Hintergrundprozess hat seinen Ausführungsplatz verloren, etwa bei einem Neustart | Gespeicherte Arbeit bleibt erhalten; prüfen Sie die Abrechnung und setzen Sie dann fort |
+| Die Ausgabe hat die Prüfung auch nach zwei Korrekturen nicht bestanden | Behalten Sie die gültigen Entwürfe und stellen Sie den Rest im Editor fertig |
+
+</TableScroll>
+
+Wählen Sie dann <UiPath path="ai.agent.continue" />. Das Fortsetzen setzt die Zähler nie zurück und gibt kein neues
+Budget frei.
+
+<UiPath path="ai.agent.cancel" /> beendet einen Lauf: Kein weiterer Schritt startet, aber eine Anfrage, die schon beim
+Anbieter ist, kann trotzdem berechnet werden. Die fertigen Entwürfe bleiben unter <UiPath path="ai.agent.review" />
+zum Behalten oder Verwerfen.
+
+<LimitsTable area="ai-agent" />
+
+## Wer einen Lauf sieht und wie lange
+
+- Einen Lauf sehen die Person, die ihn gestartet hat, und Mitglieder mit `integrations:manage`, jeweils innerhalb ihres
+  eigenen Bereichs an Listen und Absenderdomains. Nur die Person, die ihn gestartet hat, kann ihn fortsetzen, Fragen
+  beantworten oder ihn stoppen. Verlieren Sie `ai:use`, stoppt die Modellarbeit, nicht aber Ihr Zugriff auf Entwürfe,
+  die Sie noch behalten dürfen.
+- Ein Lauf läuft 30 Tage nach seinem Start ab, unabhängig von seinem Status. Seine Beschreibung, sein Plan, seine
+  Schritte und die nicht behaltenen Entwürfe werden dann entfernt; behaltene Entwürfe sind normale Entwürfe und
+  bleiben. Das Gespräch mit dem Modell wird 7 Tage nach dem Ende des Laufs entfernt, falls das früher ist. Für die
+  Speicherung bei Ihrem Modellanbieter und für Ihre Backups gelten deren eigene Regeln.
+- Die Person, die den Lauf gestartet hat, erhält <UiPath path="notify.event.ai_agent_ready" />, wenn ein Plan bereit
+  ist, eine Frage wartet, die Entwürfe bereit sind oder der Lauf pausiert. Die Benachrichtigung verlinkt auf den Lauf
+  und enthält keine Inhalte. Siehe [Benachrichtigungen](/de/team/notifications/).
+- Das [Audit-Protokoll](/de/team/audit-log/) erfasst jeden Schritt eines Laufs als Aktion `ai.agent.*` ohne Inhalte
+  und einen aus einem Lauf behaltenen Entwurf wie gewohnt als `campaign.create` oder `segment.create`, mit
+  `via: ai_agent` und der ID des Laufs. Akteur ist die Person, die entschieden hat. Jede Modellanfrage steht im
+  KI-Aktivitätsprotokoll unter <UiPath path="ai.agent.title" />.
+
+## Was der Agent nicht kann
+
+- Senden, planen, veröffentlichen, freigeben oder eine Freigabe anfordern, Tests senden, Abonnements oder Einträge der
+  Sperrliste ändern, Routing, Anbieter oder Einstellungen ändern.
+- Kontakte, Empfängerlisten, Ereignisse einzelner Personen, Antworten, Bestellungen, Exporte, gerenderte Vorschauen
+  oder Rabattcodes lesen, SQL ausführen oder eine Webseite abrufen.
+- Einen Entwurf ohne Ihre Entscheidung ändern oder ein aktives Segment, einen veröffentlichten Beitrag oder einen
+  aktiven Ablauf ändern. Diese lassen sich nur kopieren.
+- Abläufe anders starten als bei künftigen Listenbeitritten oder beim Eintritt in ein Segment und beim Verlassen eines
+  Segments, oder andere Schritte verwenden als E-Mails, Verzögerungen, Verzweigungen nach Interaktion, Aufteilungen und
+  Ausstiege.
+
+Fragen zu Reputation und Zustellung gehören in die [Zustellbarkeit](/de/deliverability/overview/); der Agent sagt das,
+statt zu raten.
+
+## Prüfen, ob es funktioniert hat
+
+- <UiPath path="ai.agent.runs" /> listet den Lauf mit Status, Modell, Nutzung und Ablaufdatum.
+- Nach <UiPath path="ai.agent.keep" /> steht der Entwurf unter <UiPath path="nav.campaigns" />,
+  <UiPath path="nav.automations" />, in der Liste der Segmente oder unter den Beiträgen der Website, als Entwurf.
+
+## Fehlerbehebung
+
+- **<UiPath path="ai.agent.planStart" /> ist ausgegraut**: Der Agent ist aus, das Modell hat keine Preise, seine
+  Prüfung der Tool-Aufrufe ist fehlgeschlagen, oder Ihnen fehlt `ai:use` oder eine Berechtigung des Entwurfstyps. Der
+  Hinweis unter dem Formular nennt den Grund.
+- **„Dieser Bericht kann nicht ausgewählt werden“**: Wählen Sie eine E-Mail-Kampagne, deren Versand vor mindestens 72
+  Stunden abgeschlossen wurde und deren Zahlenstand nicht abgelaufen ist, oder starten Sie ohne Bericht.
+- **„Die Quelle wurde seit diesem Vorschlag geändert“**: Jemand hat den Entwurf bearbeitet, nachdem der Agent seine
+  Änderung vorgeschlagen hat. Lehnen Sie den Vorschlag ab, oder aktualisieren Sie die Quelle und bestätigen Sie einen
+  neuen Plan.
+- **Der Lauf bleibt in der Warteschlange**: Im Arbeitsbereich arbeiten bereits zwei Läufe, oder einer von Ihnen. Er
+  startet, sobald sie fertig sind.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="KI-Assistenten mit eigenem Modell nutzen" href="/de/integrations/ai-assistant/" />
+  <LinkCard title="E-Mail oder Ablauf aus einer Beschreibung entwerfen" href="/de/integrations/ai-drafts/" />
+  <LinkCard title="Markenstimme für KI-Entwürfe festlegen" href="/de/campaigns/brand-voice/" />
+  <LinkCard title="Externe Assistenten mit MCP und OAuth verbinden" href="/de/developers/mcp-connections/" />
+</CardGrid>

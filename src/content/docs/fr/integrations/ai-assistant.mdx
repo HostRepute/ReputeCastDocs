@@ -12,8 +12,13 @@ sources:
   - internal/campaigns/agent.go
   - internal/netguard/netguard.go
   - internal/ai/settings.go
+  - internal/ai/budget.go
+  - internal/ai/usage.go
+  - internal/store/queries/ai_budget.sql
   - web/src/features/ai
+  - web/src/features/brandkit/VoiceSelection.tsx
   - web/src/features/integrations/messages.ts
+  - migrations/{03600_a3_agent_runtime,03603_a3_connection_test_usage}.sql
 sidebar:
   order: 7
 ---
@@ -29,6 +34,9 @@ L’assistant IA de rédaction d’e-mails de ReputeCast suggère des objets, r�
 modèle que vous connectez vous-même : Anthropic, OpenAI, Google Gemini, Azure OpenAI ou un serveur compatible OpenAI sur
 votre propre réseau. L’assistant est désactivé tant que vous n’avez pas connecté de modèle, le fournisseur facture votre
 propre compte, et rien ne change dans un e-mail tant qu’une personne n’a pas accepté la suggestion.
+Depuis la version 1.7.0, le même modèle suggère aussi une [voix de marque](/fr/campaigns/brand-voice/) à partir de vos
+campagnes envoyées, [rédige un e-mail ou un scénario à partir d’une consigne](/fr/integrations/ai-drafts/) et fait
+fonctionner l’[agent IA](/fr/integrations/ai-agent/).
 
 ## Avant de commencer
 
@@ -41,7 +49,9 @@ propre compte, et rien ne change dans un e-mail tant qu’une personne n’a pas
   [agents MCP](/fr/developers/mcp/) ne peuvent pas détenir `ai:use`. Chaque fonctionnalité exige aussi l’autorisation
   correspondant à ce qu’elle modifie, par exemple `campaigns:edit` dans l’éditeur ou `segments:edit` pour les brouillons
   de segments. Lisez [Autorisations et rôles](/fr/reference/permissions/).
-- Munissez-vous d’une clé API du fournisseur du modèle, ou de l’adresse de votre propre serveur.
+- Munissez-vous d’une clé API du fournisseur du modèle, ou de l’adresse de votre propre serveur. Pour un modèle absent
+  de la grille de prix de ReputeCast, munissez-vous aussi de ses prix d’entrée et de sortie par million de tokens
+  (depuis la version 1.7.0).
 - Un espace de travail a un seul modèle à la fois. Pour changer de fournisseur, déconnectez d’abord le fournisseur
   actuel.
 
@@ -79,14 +89,24 @@ propre compte, et rien ne change dans un e-mail tant qu’une personne n’a pas
    commence avec un plafond de 20 000 000 de tokens par mois. Après la connexion, vous pouvez passer à un plafond en
    dollars, en tokens ou sans plafond.
 
+   Depuis la version 1.7.0, les deux prix doivent être définis avant la connexion, quel que soit le plafond. Un modèle
+   de la grille de prix de ReputeCast les remplit ; pour tout autre modèle, comme un modèle sur un serveur compatible
+   OpenAI, saisissez les deux. Saisissez 0 pour un modèle qui ne coûte rien. Sans les deux prix, ReputeCast ne peut pas
+   borner le coût d’une requête et n’envoie rien, pas même le test.
+
 4. Choisissez **Connecter**. ReputeCast envoie d’abord un prompt de test fixe, sans aucun contenu de l’espace de travail
    (« Reply with the word Ready. »), et n’enregistre rien si le test échoue.
+
+   Depuis la version 1.7.0, chaque test consomme des tokens et compte dans le plafond mensuel : le test de la
+   connexion, celui du remplacement d’une clé, et chaque <UiPath path="ai.testConnection" />. Avant la première
+   connexion, les tests partagent un plafond mensuel qui leur est propre (voir
+   [plafond, consommation et journal d’activité](#plafond-consommation-et-journal-dactivité)).
 
 </Steps>
 
 <Screenshot
   id="ai-settings"
-  alt="Les paramètres de l’assistant IA avec un modèle Anthropic connecté : le modèle, la clé API en écriture seule et le dernier test, la consommation du mois face au plafond mensuel, le coût du mois par fonctionnalité et par membre, qui peut utiliser l’assistant, et les fonctionnalités avec ce que chacune envoie."
+  alt="Les paramètres de l’assistant IA avec un modèle Anthropic connecté : le modèle, la clé API en écriture seule et le dernier test ; les boutons Tester la connexion, Changer de modèle et Toutes les intégrations, avec la note indiquant que chaque test consomme des tokens et compte dans le plafond mensuel, y compris lors de la connexion ou du remplacement d’une clé, que les deux prix passent en premier, avec zéro pour un modèle gratuit, et qu’avant la première connexion les tests partagent un plafond mensuel de 25 $US ; puis la consommation du mois face au plafond mensuel, le coût du mois par fonctionnalité pour les neuf fonctionnalités, d’Idées d’objet à Brouillon à partir d’une consigne, puis Agent IA et Tester la connexion, et le coût par membre avec qui peut utiliser l’assistant."
 />
 
 ### Modèles sur votre propre réseau
@@ -100,27 +120,47 @@ comptent comme privés. Les adresses link-local et les adresses de métadonnées
 
 ## Ce que fait l’assistant
 
-Chaque fonctionnalité a son propre interrupteur sous **Fonctionnalités et ce que chacune envoie** ; les sept sont
-activées au départ.
+Chaque fonctionnalité a son propre interrupteur sous <UiPath path="ai.featuresTitle" /> ; les neuf sont activées au
+départ, y compris les deux ajoutées dans la version 1.7.0.
 
 | Fonctionnalité | Où la trouver | Ce que vous obtenez |
 |---|---|---|
 | Idées d’objet | **Idées** à côté de l’objet dans l’éditeur, ou **Assistant** › **Idées d’objet** | Cinq objets, chacun avec les contrôles d’objet ; **Utiliser** en applique un |
 | Réécrire, raccourcir et changer le ton | La barre d’outils du texte : **Raccourcir**, **Plus chaleureux**, **Plus formel**, **Plus direct**, **Avec une consigne…** | Le texte réécrit, présenté comme une modification de l’original |
-| Traduire une version linguistique | **Traduire en &lt;langue&gt ; avec l’IA** dans le menu des langues de l’éditeur, la boîte de dialogue d’ajout de langue ou la vue de comparaison | Une traduction côte à côte, à accepter bloc par bloc ou en une fois |
+| Traduire une version linguistique | **Traduire en &lt;langue&gt; avec l’IA** dans le menu des langues de l’éditeur, la boîte de dialogue d’ajout de langue ou la vue de comparaison | Une traduction côte à côte, à accepter bloc par bloc ou en une fois |
 | Texte alternatif | **Suggérer un texte alternatif** dans les réglages d’une image et dans le panneau d’accessibilité | Une description avec des contrôles ; « Image décorative » reste votre choix |
 | Corrections d’accessibilité | **Suggérer une correction** dans le panneau d’accessibilité | Un texte de lien plus clair |
 | Décrire le segment | La carte **Décrire le segment** de l’éditeur de segments, puis **Rédiger** | Des conditions marquées comme ajoutées ou retirées, avec le décompte en direct |
 | Résumés de rapports | **Résumer les résultats** sur un rapport de campagne | Un résumé à conserver, modifier ou rejeter |
+| <UiPath path="ai.featureBrandVoice" /> | <UiPath path="brandkit.voice.learn" /> sur la carte <UiPath path="brandkit.voice.title" /> du kit de marque | Une voix suggérée à modifier, puis à enregistrer ou à rejeter : voir [définir la voix de marque](/fr/campaigns/brand-voice/) |
+| <UiPath path="ai.featureDraft" /> | <UiPath path="ai.draft.title" /> dans <UiPath path="campaigns.newCampaign" /> et dans le menu <UiPath path="ai.suggest.assist" /> de l’éditeur ; <UiPath path="ai.automationDraft.title" /> dans <UiPath path="automations.newAutomation" /> | Un e-mail entier, ou un scénario qui démarre quand quelqu’un s’inscrit à une liste, sous forme de proposition à accepter : voir [brouillon à partir d’une consigne](/fr/integrations/ai-drafts/) |
 
 Sur un téléphone, le menu **Assistant** de l’éditeur est l’étincelle de sa barre du haut, et ses cartes s’affichent sous
 l’e-mail. Le texte alternatif et les corrections d’accessibilité y indiquent <UiPath path="ai.suggest.largerScreen" /> :
 ils s’ouvrent dans le panneau Propriétés, dont disposent les écrans plus grands.
 
+L’[agent IA](/fr/integrations/ai-agent/) n’a pas d’interrupteur parmi ces fonctionnalités. Une personne disposant de
+`integrations:manage` l’active dans la section <UiPath path="ai.agent.settings" />, sous les fonctionnalités, où
+<UiPath path="ai.agent.testTools" /> vérifie que le modèle appelle des outils. Un test échoué arrête le travail du
+modèle pour l’agent jusqu’à ce qu’un test réussisse ou que la connexion change. Disponible depuis la version 1.7.0.
+
+Les assistants extérieurs à ReputeCast, comme ChatGPT ou Claude, peuvent
+[proposer des brouillons par une connexion externe](/fr/developers/mcp-connections/). Ils apportent leur propre modèle
+et n’utilisent jamais cette connexion ni son plafond.
+
 <Screenshot
   id="ai-composer"
   alt="Une suggestion Raccourcir dans l’éditeur : le paragraphe montre la modification sur place (mots barrés retirés, mots en vert ajoutés), et le panneau Raccourcir nomme le modèle, confirme que la variable et le lien ont été conservés et que 22 mots sont devenus 19, propose Accepter, Modifier, Refuser et Réessayer, et indique ce qui a été envoyé."
 />
+
+### Choisir la voix de marque
+
+Depuis la version 1.7.0, les idées d’objet, les réécritures et les brouillons à partir d’une consigne suivent la
+[voix de marque](/fr/campaigns/brand-voice/) enregistrée de l’espace de travail comme guide de style. Choisissez la voix
+d’une requête sous <UiPath path="brandkit.voice.voiceSelection" />, en haut du menu <UiPath path="ai.suggest.assist" />
+de l’éditeur et dans les boîtes de dialogue de brouillon : <UiPath path="brandkit.voice.latest" /> (par défaut),
+<UiPath path="brandkit.voice.none" /> ou une révision précédente. Tant que personne n’a enregistré de voix, les requêtes
+n’en transmettent aucune.
 
 ### Rien ne change sans vous
 
@@ -136,6 +176,10 @@ ils s’ouvrent dans le panneau Propriétés, dont disposent les écrans plus gr
   comme relue ou la modifie.
 - Les brouillons qu’un agent IA rédige par le [serveur MCP](/fr/developers/mcp/) sont compilés, contrôlés et versionnés
   comme les enregistrements de l’éditeur, et n’annulent jamais une approbation.
+- Depuis la version 1.7.0, un brouillon à partir d’une consigne, une voix de marque apprise et les brouillons de l’agent
+  IA sont eux aussi des propositions : rien n’est enregistré tant qu’une personne n’a pas accepté la proposition,
+  enregistré la voix ou conservé le brouillon, et conserver un brouillon ne l’envoie, ne le programme ni ne le publie
+  jamais.
 
 L’assistant ne s’occupe pas de la réputation de l’expéditeur. Les questions sur les listes de blocage, DMARC ou la raison
 pour laquelle des e-mails arrivent en spam n’envoient rien au modèle ; ReputeCast vous renvoie plutôt vers la
@@ -147,7 +191,9 @@ Seulement ce sur quoi une personne travaille, seulement quand elle le demande, e
 activées :
 
 - **Idées d’objet et traduction** : le texte de l’e-mail (sans les images), l’objet, le texte d’aperçu et la langue.
-- **Réécriture** : le paragraphe sélectionné et votre consigne.
+  Depuis la version 1.7.0, les idées d’objet envoient aussi la [voix de marque](#choisir-la-voix-de-marque) choisie
+  pour la requête.
+- **Réécriture** : le paragraphe sélectionné et votre consigne, et depuis la version 1.7.0 la voix de marque choisie.
 - **Texte alternatif** : l’image (redimensionnée à 1 024 px de large), son nom de fichier et le texte qui l’entoure. Le
   modèle doit savoir lire les images ; avec un modèle texte uniquement, le texte alternatif reste désactivé.
 - **Corrections d’accessibilité** : le texte du lien, son adresse et la phrase qui l’entoure.
@@ -155,6 +201,20 @@ activées :
   segments (listes, tags, formules) et les conditions actuelles.
 - **Résumés de rapports** : les totaux et les taux, les trois liens principaux, les taux par fournisseur de messagerie
   et les motifs de désabonnement.
+- **Apprentissage de la voix de marque** : le texte source non personnalisé des campagnes envoyées que vous choisissez,
+  avec les variables Liquid telles qu’elles sont écrites.
+- **Brouillons à partir d’une consigne** : votre consigne, le texte éditorial du modèle ou du brouillon dont vous partez,
+  et la voix de marque choisie. Les liens, les images et les variables Liquid voyagent sous forme d’espaces réservés ;
+  les destinations des liens et le pied de page légal restent sur votre instance. Voir
+  [ce que partage un brouillon](/fr/integrations/ai-drafts/#ce-qui-quitte-votre-instance).
+- **L’agent IA** : la consigne et le contexte que vous y ajoutez, tels que les liste sa page de consigne. Voir
+  [rédiger avec l’agent IA](/fr/integrations/ai-agent/).
+
+Depuis la version 1.7.0, avant qu’un apprentissage de la voix de marque, un brouillon à partir d’une consigne ou une
+exécution de l’agent ne partage du contenu de l’espace de travail, <UiPath path="ai.draft.sharingTitle" /> liste ce qui
+part vers le modèle, et rien n’est envoyé tant que vous n’avez pas choisi <UiPath path="ai.draft.sharingConfirm" />.
+ReputeCast refuse la requête, avant d’envoyer quoi que ce soit, quand le contenu semble contenir des données
+personnelles ou des identifiants.
 
 Jamais envoyés : les contacts, adresses, noms, valeurs de champs, listes de destinataires, clés ou identifiants. Les
 variables Liquid partent telles qu’elles sont écrites (un aperçu « en tant que contact » n’est jamais envoyé), et rien
@@ -163,17 +223,60 @@ de l’assistant ne va à HostRepute.
 ## Plafond, consommation et journal d’activité
 
 La consommation correspond au nombre de tokens que signale le fournisseur multiplié par les prix de la page, cumulé à
-partir du 1er du mois dans le fuseau horaire de l’espace de travail.
+partir du 1er du mois dans le fuseau horaire de l’espace de travail. Depuis la version 1.7.0, elle inclut les tests de
+connexion et les requêtes de l’agent IA.
 
 <LimitsTable area="ai" />
 
 - À 80 % du plafond, les membres disposant de `integrations:manage` reçoivent une notification (dans l’application et
   par e-mail). À 100 %, l’assistant se met en pause jusqu’au 1er ; l’édition, les envois et les rapports continuent
   normalement. Relever le plafond le relance.
+- <UiPath path="ai.byFeature" /> liste les neuf fonctionnalités, puis <UiPath path="ai.agent.title" /> pour les
+  requêtes de l’agent et <UiPath path="ai.testConnection" /> pour les tests de connexion et les tests d’appel d’outils.
+  Disponible depuis la version 1.7.0.
 - Le **Journal d’activité de l’IA** conserve pendant 90 jours qui a demandé, quand, quelle fonctionnalité, sur quoi, le
   modèle, les tokens, le coût et le résultat, sans le texte envoyé ni renvoyé.
+- Depuis la version 1.7.0, le journal liste aussi les tests de connexion et les requêtes de l’agent, et affiche
+  <UiPath path="ai.usageUnknown" /> à la place des tokens quand le fournisseur ne les a pas signalés.
 - La connexion, les changements de modèle ou de clé, le plafond, les prix et les interrupteurs des fonctionnalités sont
-  enregistrés dans le [journal d’audit](/fr/team/audit-log/). Les requêtes IA individuelles ne le sont pas.
+  enregistrés dans le [journal d’audit](/fr/team/audit-log/). Les suggestions individuelles ne le sont pas. Depuis la
+  version 1.7.0, les brouillons à partir d’une consigne, les exécutions et les paramètres de l’agent, les vérifications
+  avant partage confirmées et les rapprochements y sont aussi enregistrés, sans leur contenu.
+
+### Requêtes réservées et consommation inconnue
+
+Depuis la version 1.7.0, ReputeCast réserve ce que peut coûter une requête avant de l’envoyer : son entrée et la plus
+longue réponse qu’elle autorise, aux prix configurés. La requête ne part que lorsque ce qui reste du plafond mensuel la
+couvre, en plus des requêtes en cours. Quand le fournisseur répond, la réservation devient la consommation mesurée.
+<UiPath path="ai.usageTitle" /> affiche ce qui est réservé : la jauge du plafond le compte, la consommation mesurée
+non.
+
+Quand le fournisseur ne renvoie pas de nombres de tokens fiables, par exemple après un délai dépassé, une erreur du
+serveur ou une réponse illisible, ou quand une requête est coupée en chemin, ReputeCast garde toute la réservation et
+ne répète jamais la requête de lui-même. Le <UiPath path="ai.logTitle" /> affiche <UiPath path="ai.usageUnknown" />,
+<UiPath path="ai.usageTitle" /> indique combien de requêtes ont une consommation inconnue, et une
+[exécution de l’agent](/fr/integrations/ai-agent/) concernée se met en pause. La réservation reste bloquée, y compris
+après le 1er du mois, jusqu’à ce qu’une personne disposant de `integrations:manage` la rapproche :
+
+<Steps>
+
+1. Sous <UiPath path="ai.holdsTitle" />, sur cette page, trouvez la requête par son modèle, son heure et son ID. Seules
+   les personnes disposant de `integrations:manage` voient la carte, et seulement tant qu’une réservation est bloquée.
+
+2. Relevez les tokens d’entrée et de sortie de la requête dans les relevés de consommation de votre fournisseur de
+   modèles.
+
+3. Choisissez <UiPath path="ai.reconcile" />, saisissez <UiPath path="ai.reconcileInput" /> et
+   <UiPath path="ai.reconcileOutput" />, confirmez que vous les avez vérifiés auprès du fournisseur, puis choisissez de
+   nouveau <UiPath path="ai.reconcile" />. Ne saisissez 0 que lorsque le fournisseur confirme ne pas avoir facturé la
+   requête.
+
+</Steps>
+
+Le rapprochement remplace la réservation par les nombres de tokens que vous saisissez, aux prix avec lesquels la
+requête a été réservée. Il ne répète pas la requête et ne récupère pas sa réponse. Il n’est possible qu’une fois que la
+requête ne peut plus être en cours (voir le tableau ci-dessus) ; d’ici là, la boîte de dialogue indique à partir de
+quand. Chaque rapprochement figure dans le journal d’audit sous `ai.usage_reconciled`.
 
 ## Vérifier le résultat
 
@@ -184,6 +287,9 @@ partir du 1er du mois dans le fuseau horaire de l’espace de travail.
 
 - **« Erreur · clé refusée »** : le fournisseur a refusé la clé. Toutes les fonctionnalités s’arrêtent jusqu’à ce que vous
   choisissiez **Remplacer la clé** ou qu’un **Tester la connexion** réussisse.
+- **La connexion échoue avec une erreur de validation alors que les neuf fonctionnalités sont cochées** : dans la
+  version 1.7.0, le serveur accepte au plus huit fonctionnalités à la connexion. Décochez-en une dans la boîte de
+  dialogue, connectez le modèle, puis activez-la sous <UiPath path="ai.featuresTitle" />.
 - **« Connexion impossible à une adresse privée »** : voir
   [Modèles sur votre propre réseau](#modèles-sur-votre-propre-réseau).
 - **« L’adresse a changé : collez à nouveau la clé API »** : ReputeCast n’envoie pas une clé enregistrée à une nouvelle
@@ -195,6 +301,20 @@ partir du 1er du mois dans le fuseau horaire de l’espace de travail.
   attendez le 1er.
 - **La limite de débit du fournisseur** : la carte affiche un compte à rebours (« Réessayer dans N s ») ; rien ne change
   dans l’e-mail.
+- **« Coût inconnu. Un gestionnaire des intégrations doit configurer les deux tarifs du modèle avant l’envoi d’une autre
+  requête. »** : le modèle n’a pas de prix. Définissez les deux sous <UiPath path="ai.pricesTitle" /> ›
+  <UiPath path="common.edit" />, 0 pour un modèle qui ne coûte rien. Après la mise à niveau vers la version 1.7.0, une
+  connexion dont les deux prix valaient 0 sans venir de la grille de prix de ReputeCast en a besoin une fois.
+- **« Le budget mensuel restant ne couvre pas cette requête et celles en cours. »** : attendez la fin des requêtes en
+  cours, rapprochez les éventuelles [requêtes réservées](#requêtes-réservées-et-consommation-inconnue), ou relevez le
+  plafond.
+- **Une requête affiche <UiPath path="ai.usageUnknown" />** : le fournisseur n’a pas signalé sa consommation.
+  Relevez-la dans les relevés du fournisseur et [rapprochez-la](#requêtes-réservées-et-consommation-inconnue).
+- **« Rapprochement possible après … »** dans la boîte de dialogue, ou `ai_reconcile_wait` depuis l’API : la requête est
+  peut-être encore en cours. Rapprochez-la après l’heure indiquée.
+- **<UiPath path="ai.agent.capabilityFailed" />** : le modèle n’a pas appelé l’outil de test comme demandé, si bien que
+  l’agent ne peut pas l’utiliser. Utilisez un modèle qui prend en charge les appels d’outils, puis choisissez de nouveau
+  <UiPath path="ai.agent.testTools" />.
 
 ## Voir aussi
 
@@ -203,4 +323,8 @@ partir du 1er du mois dans le fuseau horaire de l’espace de travail.
   <LinkCard title="Envoyer à chaque lecteur sa langue" href="/fr/campaigns/languages/" />
   <LinkCard title="Créer des segments" href="/fr/audience/segments/" />
   <LinkCard title="Connecter d’autres outils" href="/fr/integrations/overview/" />
+  <LinkCard title="Définir la voix de marque pour les brouillons IA" href="/fr/campaigns/brand-voice/" />
+  <LinkCard title="Rédiger un e-mail ou un scénario à partir d’une consigne" href="/fr/integrations/ai-drafts/" />
+  <LinkCard title="Rédiger des campagnes et des scénarios avec l’agent IA" href="/fr/integrations/ai-agent/" />
+  <LinkCard title="Connecter des assistants externes avec MCP et OAuth" href="/fr/developers/mcp-connections/" />
 </CardGrid>

@@ -12,8 +12,13 @@ sources:
   - internal/campaigns/agent.go
   - internal/netguard/netguard.go
   - internal/ai/settings.go
+  - internal/ai/budget.go
+  - internal/ai/usage.go
+  - internal/store/queries/ai_budget.sql
   - web/src/features/ai
+  - web/src/features/brandkit/VoiceSelection.tsx
   - web/src/features/integrations/messages.ts
+  - migrations/{03600_a3_agent_runtime,03603_a3_connection_test_usage}.sql
 sidebar:
   order: 7
 ---
@@ -28,7 +33,10 @@ Der KI-Assistent für E-Mails von ReputeCast schlägt Betreffzeilen vor, schreib
 [Sprachversionen](/de/campaigns/languages/), schreibt Alternativtexte und entwirft Segmente, und zwar mit einem Modell,
 das Sie selbst verbinden: Anthropic, OpenAI, Google Gemini, Azure OpenAI oder ein OpenAI-kompatibler Server in Ihrem
 eigenen Netzwerk. Der Assistent ist aus, bis Sie ein Modell verbinden, der Anbieter rechnet über Ihr eigenes Konto ab,
-und in einer E-Mail ändert sich nichts, bis eine Person den Vorschlag übernimmt.
+und in einer E-Mail ändert sich nichts, bis eine Person den Vorschlag übernimmt. Seit Version 1.7.0 schlägt dasselbe
+Modell außerdem eine [Markenstimme](/de/campaigns/brand-voice/) aus Ihren gesendeten Kampagnen vor,
+[entwirft eine E-Mail oder einen Ablauf aus einer Beschreibung](/de/integrations/ai-drafts/) und treibt den
+[KI-Agenten](/de/integrations/ai-agent/) an.
 
 ## Bevor Sie beginnen
 
@@ -41,7 +49,9 @@ und in einer E-Mail ändert sich nichts, bis eine Person den Vorschlag übernimm
   [MCP-Agenten](/de/developers/mcp/) können `ai:use` nicht haben. Jede Funktion braucht außerdem die Berechtigung für
   das, was sie ändert, zum Beispiel `campaigns:edit` im Editor oder `segments:edit` für Segmententwürfe. Lesen Sie
   [Berechtigungen und Rollen](/de/reference/permissions/).
-- Sie brauchen einen API-Schlüssel des Modellanbieters oder die Adresse Ihres eigenen Servers.
+- Sie brauchen einen API-Schlüssel des Modellanbieters oder die Adresse Ihres eigenen Servers. Für ein Modell, das nicht
+  in der Preisliste von ReputeCast steht, brauchen Sie außerdem seine Input- und Output-Preise pro Million Token (seit
+  Version 1.7.0).
 - Ein Arbeitsbereich hat jeweils ein Modell. Um den Anbieter zu wechseln, trennen Sie zuerst den aktuellen.
 
 ## Unterstützte Modellanbieter
@@ -79,14 +89,23 @@ und in einer E-Mail ändert sich nichts, bis eine Person den Vorschlag übernimm
    mit einem Token-Limit von 20.000.000 Token im Monat. Nach dem Verbinden können Sie zu Dollar, Token oder „Kein Limit“
    wechseln.
 
+   Seit Version 1.7.0 müssen beide Preise vor dem Verbinden festgelegt sein, unabhängig vom Limit. Bei einem Modell aus
+   der Preisliste von ReputeCast werden sie eingetragen; für jedes andere Modell, etwa eines auf einem
+   OpenAI-kompatiblen Server, geben Sie beide ein. Geben Sie 0 für ein Modell ein, das nichts kostet. Ohne beide Preise
+   kann ReputeCast nicht begrenzen, was eine Anfrage kostet, und sendet nichts, nicht einmal den Test.
+
 4. Wählen Sie **Verbinden**. ReputeCast sendet zuerst einen festen Test-Prompt ohne Inhalte aus dem Arbeitsbereich
    („Antworten Sie mit dem Wort Ready.“) und speichert nichts, wenn der Test fehlschlägt.
+
+   Seit Version 1.7.0 verbraucht jeder Test Token und zählt zum Monatslimit: der Test beim Verbinden, der beim Ersetzen
+   eines Schlüssels und jeder Klick auf <UiPath path="ai.testConnection" />. Vor der ersten Verbindung teilen sich die
+   Tests ein eigenes Monatslimit (siehe [Limit, Nutzung und Aktivitätsprotokoll](#limit-nutzung-und-aktivitätsprotokoll)).
 
 </Steps>
 
 <Screenshot
   id="ai-settings"
-  alt="Die Einstellungen des KI-Assistenten mit einem verbundenen Anthropic-Modell: das Modell, der nicht auslesbare API-Schlüssel und der letzte Test, die Nutzung in diesem Monat im Verhältnis zum Monatslimit, die Kosten dieses Monats nach Funktion und nach Mitglied, wer den Assistenten nutzen darf und die Funktionen mit dem, was jede sendet."
+  alt="Die Einstellungen des KI-Assistenten mit einem verbundenen Anthropic-Modell: das Modell, der nicht auslesbare API-Schlüssel und der letzte Test; die Buttons Verbindung testen, Modell ändern und Alle Integrationen mit dem Hinweis, dass jeder Test Token verbraucht und zum Monatslimit zählt, auch beim Verbinden oder Ersetzen eines Schlüssels, dass zuerst beide Preise festzulegen sind, null für ein kostenloses Modell, und dass sich die Tests vor der ersten Verbindung ein Monatslimit von 25 USD teilen; dann die Nutzung in diesem Monat im Verhältnis zum Monatslimit, die Kosten dieses Monats nach Funktion für die neun Funktionen von Betreffideen bis Entwurf aus einer Beschreibung, danach KI-Agent und Verbindung testen, und die Kosten nach Mitglied mit der Angabe, wer den Assistenten nutzen darf."
 />
 
 ### Modelle im eigenen Netzwerk
@@ -100,7 +119,8 @@ als privat. Link-Local-Adressen und Metadatenadressen von Cloud-Anbietern werden
 
 ## Was der Assistent kann
 
-Jede Funktion hat unter **Funktionen und was jede sendet** einen eigenen Schalter; alle sieben sind anfangs aktiv.
+Jede Funktion hat unter <UiPath path="ai.featuresTitle" /> einen eigenen Schalter; alle neun sind anfangs aktiv, auch die
+beiden, die in Version 1.7.0 hinzugekommen sind.
 
 | Funktion | Wo Sie sie finden | Was Sie erhalten |
 |---|---|---|
@@ -111,16 +131,35 @@ Jede Funktion hat unter **Funktionen und was jede sendet** einen eigenen Schalte
 | Korrekturen für Barrierefreiheit | **Korrektur vorschlagen** im Bereich Barrierefreiheit | Klareren Linktext |
 | Segment beschreiben | Die Karte **Segment beschreiben** im Segment-Editor, dann **Entwerfen** | Bedingungen, markiert als Hinzugefügt und Entfernt, mit der Live-Zählung |
 | Berichtszusammenfassungen | **Ergebnisse zusammenfassen** in einem Kampagnenbericht | Eine Zusammenfassung zum Behalten, Bearbeiten oder Verwerfen |
+| <UiPath path="ai.featureBrandVoice" /> | <UiPath path="brandkit.voice.learn" /> auf der Karte <UiPath path="brandkit.voice.title" /> des Brand-Kits | Eine vorgeschlagene Markenstimme zum Bearbeiten, dann zum Speichern oder Ablehnen: siehe [Markenstimme für KI-Entwürfe festlegen](/de/campaigns/brand-voice/) |
+| <UiPath path="ai.featureDraft" /> | <UiPath path="ai.draft.title" /> unter <UiPath path="campaigns.newCampaign" /> und im Menü <UiPath path="ai.suggest.assist" /> des Editors; <UiPath path="ai.automationDraft.title" /> unter <UiPath path="automations.newAutomation" /> | Eine ganze E-Mail oder einen Ablauf, der startet, wenn jemand einer Liste beitritt, als Vorschlag zum Annehmen: siehe [E-Mail oder Ablauf aus einer Beschreibung entwerfen](/de/integrations/ai-drafts/) |
 
 Auf dem Smartphone ist das Menü **Assistent** des Editors das Funkeln-Symbol in seiner oberen Leiste, und seine Karten
 erscheinen unter der E-Mail. Alternativtext und Korrekturen für Barrierefreiheit zeigen dort
 <UiPath path="ai.suggest.largerScreen" />: Sie öffnen sich im Eigenschaftenbereich, den es auf größeren Bildschirmen
 gibt.
 
+Der [KI-Agent](/de/integrations/ai-agent/) hat unter diesen keinen Schalter. Jemand mit `integrations:manage` schaltet
+ihn unter <UiPath path="ai.agent.settings" /> ein, unterhalb der Funktionen, wo <UiPath path="ai.agent.testTools" />
+prüft, ob das Modell Tools aufruft. Eine fehlgeschlagene Prüfung stoppt die Modellarbeit des Agenten, bis ein Test
+besteht oder sich die Verbindung ändert. Verfügbar seit Version 1.7.0.
+
+Assistenten außerhalb von ReputeCast, etwa ChatGPT oder Claude, können
+[über eine externe Verbindung Entwürfe vorschlagen](/de/developers/mcp-connections/). Sie bringen ihr eigenes Modell mit
+und nutzen nie diese Verbindung oder ihr Limit.
+
 <Screenshot
   id="ai-composer"
   alt="Ein Kürzungsvorschlag im Editor: Der Absatz zeigt die Änderung direkt im Text (durchgestrichene Wörter entfernt, grüne Wörter neu), und der Bereich „Kürzen“ nennt das Modell, bestätigt, dass Platzhalter und Link erhalten blieben und aus 22 Wörtern 19 wurden, bietet Übernehmen, Bearbeiten, Verwerfen und Erneut versuchen an und zeigt, was gesendet wurde."
 />
+
+### Markenstimme wählen
+
+Seit Version 1.7.0 folgen Betreffideen, Umformulierungen und Entwürfe aus einer Beschreibung der gespeicherten
+[Markenstimme](/de/campaigns/brand-voice/) des Arbeitsbereichs als Stilvorgabe. Wählen Sie die Stimme für eine Anfrage
+unter <UiPath path="brandkit.voice.voiceSelection" />, oben im Menü <UiPath path="ai.suggest.assist" /> des Editors und
+in den Dialogen für Entwürfe: <UiPath path="brandkit.voice.latest" /> (Standard), <UiPath path="brandkit.voice.none" />
+oder eine frühere Version. Solange niemand eine Markenstimme gespeichert hat, enthalten die Anfragen keine.
 
 ### Ohne Sie ändert sich nichts
 
@@ -136,6 +175,9 @@ gibt.
   oder bearbeitet.
 - Entwürfe, die ein KI-Agent über den [MCP-Server](/de/developers/mcp/) schreibt, werden wie Speichervorgänge im Editor
   kompiliert, geprüft und versioniert und machen nie eine Freigabe ungültig.
+- Seit Version 1.7.0 sind auch ein Entwurf aus einer Beschreibung, eine gelernte Markenstimme und die Entwürfe des
+  KI-Agenten Vorschläge: Nichts wird gespeichert, bevor eine Person einen annimmt, speichert oder behält, und das
+  Behalten eines Entwurfs sendet, plant oder veröffentlicht ihn nie.
 
 Der Assistent befasst sich nicht mit der Absenderreputation. Fragen zu Blocklisten, DMARC oder dazu, warum E-Mails im
 Spam landen, senden nichts an das Modell; ReputeCast verweist Sie stattdessen auf die
@@ -145,8 +187,9 @@ Spam landen, senden nichts an das Modell; ReputeCast verweist Sie stattdessen au
 
 Nur das, woran eine Person gerade arbeitet, nur wenn sie darum bittet, und nur für die Funktionen, die aktiv sind:
 
-- **Betreffideen und Übersetzung**: der Text der E-Mail (ohne Bilder), Betreff, Vorschautext und Sprache.
-- **Umschreiben**: der markierte Absatz und Ihre Anweisung.
+- **Betreffideen und Übersetzung**: der Text der E-Mail (ohne Bilder), Betreff, Vorschautext und Sprache. Seit Version
+  1.7.0 senden Betreffideen außerdem die für die Anfrage gewählte [Markenstimme](#markenstimme-wählen).
+- **Umschreiben**: der markierte Absatz und Ihre Anweisung, seit Version 1.7.0 auch die gewählte Markenstimme.
 - **Alternativtext**: das Bild (verkleinert auf 1.024 px Breite), sein Dateiname und der umgebende Text. Das Modell muss
   Bilder lesen können; mit einem reinen Textmodell bleibt der Alternativtext aus.
 - **Korrekturen für Barrierefreiheit**: der Linktext, seine Adresse und der umgebende Satz.
@@ -154,6 +197,19 @@ Nur das, woran eine Person gerade arbeitet, nur wenn sie darum bittet, und nur f
   Tarife) und die aktuellen Bedingungen.
 - **Berichtszusammenfassungen**: Summen und Raten, die drei häufigsten Links, die Raten je Postfachanbieter und die
   Abmeldegründe.
+- **Markenstimme lernen**: der nicht personalisierte Text der gesendeten Kampagnen, die Sie auswählen, mit
+  Liquid-Platzhaltern, wie sie geschrieben sind.
+- **Entwürfe aus einer Beschreibung**: Ihre Beschreibung, der redaktionelle Text der Vorlage oder des Entwurfs, von dem
+  Sie ausgehen, und die gewählte Markenstimme. Links, Bilder und Liquid-Tags gehen als Platzhalter mit; Linkziele und
+  die Fußzeile mit den Pflichtangaben bleiben auf Ihrer Instanz. Siehe
+  [was ein Entwurf teilt](/de/integrations/ai-drafts/#was-ihre-instanz-verlässt).
+- **Der KI-Agent**: die Beschreibung und der Kontext, den Sie ihr hinzufügen, so wie die Seite der Beschreibung sie
+  auflistet. Siehe [Kampagnen und Abläufe mit dem KI-Agenten entwerfen](/de/integrations/ai-agent/).
+
+Seit Version 1.7.0 listet <UiPath path="ai.draft.sharingTitle" /> auf, was an das Modell geht, bevor das Lernen der
+Markenstimme, ein Entwurf aus einer Beschreibung oder ein Lauf des Agenten Inhalte des Arbeitsbereichs teilt, und nichts
+wird gesendet, bevor Sie <UiPath path="ai.draft.sharingConfirm" /> wählen. ReputeCast lehnt die Anfrage ab, bevor
+etwas gesendet wird, wenn der Inhalt allem Anschein nach personenbezogene Daten oder Zugangsdaten enthält.
 
 Nie gesendet werden: Kontakte, Adressen, Namen, Feldwerte, Empfängerlisten, Schlüssel oder Zugangsdaten.
 Liquid-Platzhalter werden so gesendet, wie sie geschrieben sind (eine Vorschau „als Kontakt“ wird nie gesendet), und
@@ -162,17 +218,58 @@ nichts aus dem Assistenten geht an HostRepute.
 ## Limit, Nutzung und Aktivitätsprotokoll
 
 Die Nutzung ist die vom Anbieter gemeldete Tokenzahl mal den Preisen auf der Seite, summiert ab dem 1. des Monats in
-der Zeitzone des Arbeitsbereichs.
+der Zeitzone des Arbeitsbereichs. Seit Version 1.7.0 gehören Verbindungstests und die Anfragen des KI-Agenten dazu.
 
 <LimitsTable area="ai" />
 
 - Bei 80 % des Limits erhalten Mitglieder mit `integrations:manage` eine Benachrichtigung (in der App und per E-Mail).
   Bei 100 % pausiert der Assistent bis zum 1. des Monats; Bearbeiten, Senden und Berichte laufen wie gewohnt weiter.
   Wird das Limit erhöht, arbeitet der Assistent wieder.
+- Die Karte <UiPath path="ai.byFeature" /> listet die neun Funktionen auf, danach <UiPath path="ai.agent.title" /> für
+  die Anfragen des Agenten und <UiPath path="ai.testConnection" /> für Verbindungstests und Prüfungen der
+  Werkzeugaufrufe. Verfügbar seit Version 1.7.0.
 - Das **KI-Aktivitätsprotokoll** bewahrt 90 Tage lang auf, wer wann welche Funktion wofür angefordert hat, mit Modell,
   Token, Kosten und Ergebnis, aber ohne den gesendeten oder zurückgegebenen Text.
+- Seit Version 1.7.0 listet das Protokoll auch Verbindungstests und die Anfragen des Agenten auf und zeigt
+  <UiPath path="ai.usageUnknown" /> statt der Token, wenn der Anbieter sie nicht gemeldet hat.
 - Das Verbinden, Änderungen an Modell oder Schlüssel, am Limit, an den Preisen und an den Schaltern der Funktionen werden
-  im [Audit-Protokoll](/de/team/audit-log/) erfasst. Einzelne KI-Anfragen nicht.
+  im [Audit-Protokoll](/de/team/audit-log/) erfasst. Einzelne Vorschläge nicht. Seit Version 1.7.0 werden auch Entwürfe
+  aus einer Beschreibung, Läufe des Agenten und die Agenteneinstellungen, bestätigte Prüfungen vor dem Teilen und
+  Abgleiche erfasst, ohne ihre Inhalte.
+
+### Reservierte Anfragen und unbekannte Nutzung
+
+Seit Version 1.7.0 reserviert ReputeCast, was eine Anfrage kosten kann, bevor es sie sendet: ihren Input und die
+längste Antwort, die sie zulässt, zu den konfigurierten Preisen. Die Anfrage geht erst hinaus, wenn der Rest des
+Monatslimits sie zusätzlich zu den laufenden Anfragen abdeckt. Antwortet der Anbieter, wird aus der Reservierung die
+gemessene Nutzung. Die Karte <UiPath path="ai.usageTitle" /> zeigt, was reserviert ist: Die Anzeige des Limits zählt
+es mit, die gemessene Nutzung nicht.
+
+Liefert der Anbieter keine verlässlichen Tokenzahlen, etwa nach einer Zeitüberschreitung, einem Serverfehler oder einer
+Antwort, die sich nicht lesen lässt, oder wird eine Anfrage unterwegs abgebrochen, behält ReputeCast die ganze
+Reservierung und wiederholt die Anfrage nie von selbst. Das <UiPath path="ai.logTitle" /> zeigt
+<UiPath path="ai.usageUnknown" />, die Karte <UiPath path="ai.usageTitle" /> nennt, wie viele Anfragen eine unbekannte
+Nutzung haben, und ein [Lauf des Agenten](/de/integrations/ai-agent/) mit einer solchen Anfrage pausiert. Die Reservierung
+bleibt bestehen, auch über den 1. des Monats hinaus, bis jemand mit `integrations:manage` sie abgleicht:
+
+<Steps>
+
+1. Suchen Sie die Anfrage auf dieser Seite unter <UiPath path="ai.holdsTitle" /> anhand von Modell, Zeitpunkt und ID.
+   Nur Personen mit `integrations:manage` sehen die Karte, und nur solange eine Reservierung besteht.
+
+2. Schlagen Sie die Input- und Output-Token der Anfrage in den Nutzungsdaten Ihres Modellanbieters nach.
+
+3. Wählen Sie <UiPath path="ai.reconcile" />, tragen Sie <UiPath path="ai.reconcileInput" /> und
+   <UiPath path="ai.reconcileOutput" /> ein, bestätigen Sie, dass Sie die Zahlen beim Anbieter geprüft haben, und wählen
+   Sie erneut <UiPath path="ai.reconcile" />. Geben Sie 0 nur ein, wenn der Anbieter bestätigt, dass er die Anfrage
+   nicht berechnet hat.
+
+</Steps>
+
+Der Abgleich ersetzt die Reservierung durch die Tokenzahlen, die Sie eingeben, zu den Preisen, mit denen die Anfrage
+reserviert wurde. Er wiederholt die Anfrage nicht und stellt ihre Antwort nicht wieder her. Er ist erst möglich, wenn
+die Anfrage nicht mehr laufen kann (siehe die Tabelle oben); bis dahin nennt der Dialog, ab wann. Jeder Abgleich steht
+im Audit-Protokoll als `ai.usage_reconciled`.
 
 ## Prüfen, ob es funktioniert hat
 
@@ -183,6 +280,9 @@ der Zeitzone des Arbeitsbereichs.
 
 - **„Fehler · Schlüssel abgelehnt“**: Der Anbieter hat den Schlüssel abgelehnt. Alle Funktionen stoppen, bis Sie
   **Schlüssel ersetzen** wählen oder **Verbindung testen** erfolgreich ist.
+- **Das Verbinden schlägt mit einem Validierungsfehler fehl, während alle neun Funktionen angehakt sind**: In Version
+  1.7.0 nimmt der Server beim Verbinden höchstens acht Funktionen an. Entfernen Sie im Dialog den Haken bei einer,
+  verbinden Sie, und schalten Sie sie dann unter <UiPath path="ai.featuresTitle" /> ein.
 - **„Keine Verbindung zu einer privaten Adresse möglich“**: siehe
   [Modelle im eigenen Netzwerk](#modelle-im-eigenen-netzwerk).
 - **„Die Adresse hat sich geändert: Fügen Sie den API-Schlüssel erneut ein.“**: ReputeCast sendet einen gespeicherten
@@ -195,6 +295,21 @@ der Zeitzone des Arbeitsbereichs.
   des Monats.
 - **Das Rate-Limit des Anbieters**: Die Karte zählt herunter („Erneut versuchen in N s“); in der E-Mail ändert sich
   nichts.
+- **„Kosten unbekannt. Eine Person mit Integrationsverwaltung muss beide Modellpreise festlegen, bevor eine weitere
+  Anfrage gesendet werden kann.“**: Das Modell hat keine Preise. Legen Sie beide unter
+  <UiPath path="ai.pricesTitle" /> › <UiPath path="common.edit" /> fest, 0 für ein Modell, das nichts kostet. Nach dem
+  Upgrade auf 1.7.0 ist das einmal nötig für eine Verbindung, deren beide Preise 0 waren und nicht aus der Preisliste
+  von ReputeCast stammten.
+- **„Das verbleibende Monatsbudget reicht für diese und die laufenden Anfragen nicht aus.“**: Warten Sie, bis die
+  laufenden Anfragen fertig sind, gleichen Sie [reservierte Anfragen](#reservierte-anfragen-und-unbekannte-nutzung) ab,
+  oder erhöhen Sie das Limit.
+- **Eine Anfrage zeigt <UiPath path="ai.usageUnknown" />**: Der Anbieter hat ihre Nutzung nicht gemeldet. Schlagen Sie
+  sie in den Daten des Anbieters nach und [gleichen Sie sie ab](#reservierte-anfragen-und-unbekannte-nutzung).
+- **„Abgleich möglich nach …“** im Dialog oder `ai_reconcile_wait` von der API: Die Anfrage läuft möglicherweise noch.
+  Gleichen Sie sie nach der angezeigten Zeit ab.
+- **<UiPath path="ai.agent.capabilityFailed" />**: Das Modell hat das Test-Tool nicht wie verlangt aufgerufen, daher
+  kann der Agent es nicht nutzen. Verwenden Sie ein Modell, das Tool-Aufrufe unterstützt, und wählen Sie dann erneut
+  <UiPath path="ai.agent.testTools" />.
 
 ## Verwandte Themen
 
@@ -203,4 +318,8 @@ der Zeitzone des Arbeitsbereichs.
   <LinkCard title="E-Mails in der Sprache jedes Kontakts senden" href="/de/campaigns/languages/" />
   <LinkCard title="Segmente erstellen" href="/de/audience/segments/" />
   <LinkCard title="Andere Tools verbinden" href="/de/integrations/overview/" />
+  <LinkCard title="Markenstimme für KI-Entwürfe festlegen" href="/de/campaigns/brand-voice/" />
+  <LinkCard title="E-Mail oder Ablauf aus einer Beschreibung entwerfen" href="/de/integrations/ai-drafts/" />
+  <LinkCard title="Kampagnen und Abläufe mit dem KI-Agenten entwerfen" href="/de/integrations/ai-agent/" />
+  <LinkCard title="Externe Assistenten mit MCP und OAuth verbinden" href="/de/developers/mcp-connections/" />
 </CardGrid>

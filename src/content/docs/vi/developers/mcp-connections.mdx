@@ -1,0 +1,273 @@
+---
+title: Kết nối trợ lý bên ngoài qua MCP và OAuth
+description: "Dùng kết nối MCP qua OAuth để cho ChatGPT, Claude hoặc ứng dụng MCP khác vào một không gian làm việc: bạn đồng ý, chọn những gì nó đọc và duyệt đề xuất của nó."
+type: how-to
+audience: [admin, developer]
+permissions: ['mcp:manage']
+uiPath: 'nav.settings > settings.keys > mcpConnect.managing'
+primaryKeyword: kết nối MCP qua OAuth
+sources:
+  - internal/mcpconnect
+  - internal/app/wire_mcpconnect.go
+  - internal/server/spa.go
+  - internal/reports/model.go
+  - internal/editorial
+  - internal/audit/proposal.go
+  - web/src/features/mcpconnect
+  - web/src/features/keys/McpPage.tsx
+  - web/src/routes/mcp-consent.tsx
+  - web/src/routes/w/$workspace/_app/proposals
+  - web/src/routes/w/$workspace/_app/settings/connections.tsx
+  - migrations/{03620_a5_mcp_connect,03621_a5_editorial_proposals,03622_a5_voice_sources,03623_a5_workflow_sources,03624_model_report_snapshots}.sql
+sidebar:
+  order: 10.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Kết nối MCP qua OAuth cho phép một trợ lý bên ngoài như ChatGPT hoặc Claude làm việc với một không gian làm việc
+ReputeCast: trợ lý đọc các nguồn biên tập mà một người chia sẻ với nó cùng số liệu tổng hợp của chiến dịch, và đề xuất
+bản nháp để một người giữ lại hoặc loại bỏ. Một người đồng ý trong ReputeCast cho một không gian làm việc và những khả
+năng được chọn; kết nối không bao giờ dùng mô hình hay ngân sách AI của chính không gian làm việc, không bao giờ gửi thư,
+xuất bản hay đọc liên hệ. Kết nối này tách biệt với [máy chủ MCP cho tác tử dùng token](/vi/developers/mcp/), vốn vẫn
+giữ nguyên. Có từ bản 1.7.0.
+
+<Aside type="note">
+  Kết nối bên ngoài đã được kiểm thử đầu cuối với một MCP client tiêu chuẩn, chưa được kiểm thử với chính ChatGPT hay
+  Claude. Hãy kiểm tra kết nối trong ứng dụng khách của bạn trước khi dựa vào nó.
+</Aside>
+
+## Trước khi bắt đầu
+
+- Hệ thống cần một URL công khai mà ứng dụng khách truy cập được qua HTTPS. Endpoint là `<public URL>/mcp/connect`, và
+  OAuth discovery, trang đồng ý cùng các yêu cầu token đều dùng URL công khai đó, không bao giờ dùng host của chính yêu
+  cầu.
+- Máy chủ MCP của không gian làm việc phải đang bật:
+  <UiPath path="nav.settings > settings.keys > keys.changeLimits" />. Khi máy chủ tắt, mọi kết nối bên ngoài cũng bị từ
+  chối.
+- Người cho phép kết nối cần `mcp:manage` (Chủ sở hữu và Quản trị viên), một
+  [quyền nhạy cảm](/vi/reference/glossary/#sensitive-permission), cùng các quyền ứng với những khả năng họ cấp (xem bên
+  dưới). Họ đăng nhập theo các quy tắc mật khẩu và [xác thực hai lớp](/vi/team/account-security/) thông thường của hệ
+  thống.
+
+## Kết nối một ứng dụng khách
+
+<Steps>
+
+1. Mở <UiPath path="nav.settings > settings.keys" /> và chọn <UiPath path="mcpConnect.managing" />. Sao chép
+   <UiPath path="mcpConnect.endpoint" />, ví dụ `https://reputecast.example.com/mcp/connect`.
+
+2. Trong ứng dụng khách, thêm endpoint này làm máy chủ MCP từ xa (thường gọi là connector). Ứng dụng khách tìm máy chủ
+   OAuth của ReputeCast, tự đăng ký và mở trang đồng ý của ReputeCast trong trình duyệt của bạn. Hãy đăng nhập nếu bạn
+   chưa đăng nhập.
+
+3. Trên trang <UiPath path="mcpConnect.consentTitle" />, kiểm tra ai đang yêu cầu: một ứng dụng khách tự đăng ký được
+   đánh dấu là <UiPath path="mcpConnect.unverified" />, và tên của nó chỉ là tên nó tự khai;
+   <UiPath path="mcpConnect.callback" /> cho biết câu trả lời được gửi đến đâu.
+
+4. Chọn <UiPath path="mcpConnect.workspace" /> và đánh dấu những mục trong <UiPath path="mcpConnect.capabilities" /> mà
+   bạn muốn cấp. Khả năng mà vai trò của bạn không cấp được sẽ bị mờ.
+
+5. Nếu muốn, thu hẹp <UiPath path="mcpConnect.resourceScope" /> trong một số danh sách hoặc tên miền gửi, và liệt kê tối
+   đa 20 địa chỉ hoặc mạng CIDR trong <UiPath path="mcpConnect.ips" />. Giới hạn IP áp dụng cho các lệnh gọi và lần làm
+   mới token của ứng dụng khách, không áp dụng cho trình duyệt của bạn; khi đó, một ứng dụng khách đổi địa chỉ IP đầu ra
+   sẽ ngừng hoạt động.
+
+6. Chọn <UiPath path="mcpConnect.allow" />. Trình duyệt quay lại ứng dụng khách, giờ đã gọi được các công cụ của
+   ReputeCast. <UiPath path="mcpConnect.deny" /> không cấp quyền gì.
+
+</Steps>
+
+<Screenshot
+  id="mcp-consent"
+  alt="Cho phép kết nối bên ngoài này? ChatGPT, được đánh dấu Ứng dụng khách chưa được xác minh, với tên máy chủ callback chatgpt.com; Acme Newsletter được chọn làm không gian làm việc; Đọc ngữ cảnh biên tập và Đề xuất bản nháp và thay đổi được đánh dấu, Đọc số liệu tổng hợp chiến dịch thì không; phạm vi tài nguyên gồm mọi danh sách và tên miền gửi; danh sách IP ứng dụng khách được phép đang trống; kết nối hết hạn sau 30 ngày; các nút Từ chối và Cho phép kết nối."
+>
+  1. Ai đang yêu cầu và câu trả lời được gửi đến đâu.
+  2. Không gian làm việc mà kết nối làm việc trong đó.
+  3. Các khả năng bạn cấp.
+  4. Giới hạn không bắt buộc: danh sách, tên miền gửi và địa chỉ IP của ứng dụng khách.
+  5. Từ chối, hoặc cho phép kết nối.
+</Screenshot>
+
+Yêu cầu đồng ý hết hạn sau năm phút và chỉ dùng được trong phiên trình duyệt đã mở nó.
+
+<TableScroll label="Khả năng của một kết nối bên ngoài">
+
+| Khả năng | Scope | Cần | Ứng dụng khách làm được gì |
+|---|---|---|---|
+| <UiPath path="mcpConnect.editorial" /> | `editorial:read` | `campaigns:view`, `templates:view`, `website:view`, `automations:view` hoặc `subscribers:view` | Đọc các nguồn bạn chia sẻ: văn bản biên tập, liên kết và biến dưới dạng ký hiệu giữ chỗ, một mẫu hoặc [giọng thương hiệu](/vi/campaigns/brand-voice/), một quy trình, điều kiện của một phân khúc tạo bằng trình tạo với giá trị được giữ trên hệ thống của bạn. Không có dữ liệu người nhận |
+| <UiPath path="mcpConnect.reports" /> | `reports:read` | `reports:view` và `campaigns:view` | Đọc các tổng số cố định, đã làm tròn của một chiến dịch bạn chia sẻ: không có người, liên kết, tỷ lệ hay bộ lọc |
+| <UiPath path="mcpConnect.drafts" /> | `drafts:propose` | Quyền xem và sửa đối với thứ nó đề xuất, như `campaigns:edit` | Đề xuất bản nháp chiến dịch, bài viết, phân khúc và quy trình mới, cùng các thay đổi cho bản nháp, để bạn duyệt |
+
+</TableScroll>
+
+Kết nối chỉ giữ những quyền bạn có lúc cho phép nó, thu hẹp theo các khả năng đã cấp. Ở mỗi lệnh gọi, ReputeCast kiểm
+tra lại các quyền đó với vai trò, danh sách và tên miền gửi hiện tại của bạn: khi quyền truy cập của bạn bị thu hẹp,
+quyền của kết nối cũng vậy; khi quyền của bạn được mở rộng, quyền của kết nối thì không.
+
+## Chia sẻ nguồn với ứng dụng khách
+
+Ứng dụng khách không đọc được gì cho đến khi có người chia sẻ nguồn với nó. Trong <UiPath path="mcpConnect.title" />,
+nhấn <UiPath path="mcpConnect.proposals.selected" /> trên kết nối.
+
+<Steps>
+
+1. Chọn <UiPath path="mcpConnect.proposals.sourceKind" />: <UiPath path="mcpConnect.proposals.kindCampaign" />,
+   <UiPath path="mcpConnect.proposals.kindPost" />, <UiPath path="mcpConnect.proposals.kindTemplate" />,
+   <UiPath path="mcpConnect.proposals.kindVoice" />, <UiPath path="mcpConnect.proposals.kindList" />,
+   <UiPath path="mcpConnect.proposals.kindSegment" />, <UiPath path="mcpConnect.proposals.kindAutomation" /> hoặc
+   <UiPath path="mcpConnect.proposals.kindReport" />. Bạn chỉ thấy những loại mà vai trò của bạn và kết nối cho phép.
+
+2. Tìm tài nguyên, chọn nó, rồi chọn <UiPath path="mcpConnect.proposals.select" />. Xác nhận hộp thoại
+   <UiPath path="ai.draft.sharingTitle" /> bằng <UiPath path="ai.draft.sharingConfirm" />.
+
+3. Nhờ ứng dụng khách tải lại các nguồn của nó. Lựa chọn có hiệu lực tối đa hai giờ.
+
+</Steps>
+
+<Screenshot
+  id="mcp-source"
+  alt="Hộp thoại Chọn nguồn cho ChatGPT: ghi chú rằng chỉ văn bản biên tập đã lọc và mã tham chiếu không lộ giá trị được đọc trong tối đa hai giờ, Loại nguồn là Chiến dịch, ô tìm kiếm, Feature flags preview được chọn trong Chọn tài nguyên, chiến dịch đã được chia sẻ kèm thời điểm hết hạn, và các nút Hủy và Chia sẻ nguồn đã chọn."
+/>
+
+- **Nguồn biên tập** đến ứng dụng khách dưới dạng văn bản, với ký hiệu giữ chỗ cho liên kết, hình ảnh và biến; tên, ID
+  và đích của liên kết ở lại trong ReputeCast. Một nguồn chứa thứ mà bộ lọc coi là dữ liệu cá nhân hay thông tin xác
+  thực sẽ bị từ chối; hãy sửa nó trước.
+- **Mẫu và giọng thương hiệu** chỉ để tham khảo: ứng dụng khách có thể soạn một bản mới từ một mẫu, nhưng không bao giờ
+  thay đổi mẫu hay giọng thương hiệu.
+- **Danh sách, phân khúc và quy trình** cho ứng dụng khách một điểm bắt đầu cho quy trình, không bao giờ cho thành viên.
+  Danh sách là trình kích hoạt về sau; phân khúc tạo bằng trình tạo cho thấy các điều kiện của nó, không bao giờ là SQL.
+- **Báo cáo chiến dịch** là bản chụp cố định của một chiến dịch email đã gửi ít nhất 72 giờ trước, với số đếm làm tròn
+  xuống hàng chục. Lượt gửi dưới 100, và chỉ số hoặc phần bù của nó dưới 20, được ẩn đi chứ không phải bằng không. Chọn
+  lại không bao giờ cập nhật số liệu, và bản chụp bị xóa 30 ngày sau lần chụp đầu tiên.
+
+Mỗi kết nối giữ tối đa 50 nguồn đã chọn cùng lúc.
+
+## Duyệt đề xuất
+
+Khi một ứng dụng khách đề xuất bản nháp, người đã cho phép kết nối nhận thông báo
+<UiPath path="notify.event.external_proposal" />. Đề xuất chờ trên trang <UiPath path="mcpConnect.proposals.title" />,
+mở từ nút trên trang <UiPath path="mcpConnect.title" />; bạn thấy những đề xuất nằm trong phạm vi truy cập của chính
+bạn.
+
+<Screenshot
+  id="mcp-proposal"
+  alt="Một đề xuất bên ngoài từ ChatGPT, Partner webinar: the recording: Ứng dụng khách chưa được xác minh, Chưa duyệt, một chiến dịch trong Bản nháp mới, người đã kết nối, thời điểm đề xuất và thời điểm hết hạn, ghi chú rằng quyết định không thể gửi hay xuất bản, tiêu đề và dòng xem trước được đề xuất, mã MJML chính xác, bản xem trước email có đầu thư và chân thư của thương hiệu, và các nút Giữ bản nháp và Loại bỏ bản nháp."
+>
+  1. Ứng dụng khách, và ReputeCast đã xác minh nó hay chưa.
+  2. Trạng thái của đề xuất và thứ nó sẽ tạo ra.
+  3. Tiêu đề và dòng xem trước được đề xuất, cùng mã MJML chính xác.
+  4. Giữ hoặc loại bỏ đề xuất.
+</Screenshot>
+
+- Với một bản nháp mới, bạn có <UiPath path="mcpConnect.proposals.keep" /> và
+  <UiPath path="mcpConnect.proposals.discard" />. Giữ sẽ tạo một bản nháp thông thường; không có gì được gửi hay xuất
+  bản.
+- Với một thay đổi cho bản nháp hiện có, bạn có <UiPath path="mcpConnect.proposals.accept" /> và
+  <UiPath path="mcpConnect.proposals.reject" />. Thay đổi chỉ áp dụng cho đúng phiên bản đang hiện; nếu bản nháp đã thay
+  đổi kể từ đó, không có gì được áp dụng và bạn nhờ ứng dụng khách gửi đề xuất mới.
+- Một phân khúc, một quy trình và các email của nó được đề xuất cùng nhau là một quyết định:
+  <UiPath path="mcpConnect.proposals.keepBundle" /> lưu tất cả hoặc không lưu gì, và việc giữ không đưa ai vào quy trình.
+  Quy trình chỉ có thể bắt đầu khi có người tham gia danh sách, vào hoặc rời phân khúc, với các bước email, trì hoãn, rẽ
+  nhánh, chia A/B và thoát, tối đa năm email.
+- Việc quyết định cần phiên đăng nhập của bạn và quyền sửa đối với thứ mà đề xuất lưu. Trước đó, ReputeCast kiểm tra lại
+  MJML, Liquid, các điều kiện và quy trình.
+- Đề xuất hết hạn theo thời hạn đề xuất của không gian làm việc, mặc định là hai giờ (1–168 giờ trong
+  <UiPath path="keys.changeLimits" />). Nội dung của nó vẫn đọc được trong bảy ngày sau khi đề xuất đóng, và không bao giờ
+  quá 30 ngày kể từ lúc tạo; dùng <UiPath path="mcpConnect.proposals.copy" /> để giữ một bản sao và tự sửa.
+
+## Quản lý và thu hồi kết nối
+
+<UiPath path="mcpConnect.title" /> liệt kê các kết nối của bạn; thành viên có `mcp:manage` thấy mọi kết nối trong không
+gian làm việc. Mỗi thẻ hiện ứng dụng khách, người đã kết nối nó, các khả năng, danh sách, tên miền gửi và địa chỉ IP, và
+thời điểm hết hạn.
+
+<Screenshot
+  id="mcp-connections"
+  alt="Kết nối bên ngoài: Endpoint MCP qua OAuth, và một kết nối, ChatGPT, Ứng dụng khách chưa được xác minh và Đang hoạt động, do Linh Nguyen kết nối, với ba khả năng, mọi danh sách và tên miền gửi, không giới hạn IP, hết hạn sau 30 ngày, và các nút Chọn nguồn và Thu hồi kết nối; bên cạnh là những gì luôn thuộc quyền kiểm soát của bạn."
+/>
+
+- Kết nối hết hạn 30 ngày sau khi được cho phép. Làm mới token không kéo dài thời hạn; sau đó hãy kết nối lại.
+- <UiPath path="mcpConnect.revoke" /> chặn ngay token truy cập và token làm mới của kết nối. Các đề xuất đang chờ của nó
+  không thể được chấp nhận nữa, còn bản nháp đã giữ vẫn còn. Những gì ứng dụng khách đã nhận không bị xóa khỏi nó. Người
+  đã kết nối và thành viên có `mcp:manage` có thể thu hồi kết nối.
+- Khi một ứng dụng khách gửi lại một token làm mới đã được dùng, ReputeCast thu hồi toàn bộ kết nối, và khi đó kết nối
+  hiện <UiPath path="mcpConnect.reused" />.
+- Mất tư cách thành viên, hoặc máy chủ MCP bị tắt, sẽ chặn ngay mọi lệnh gọi.
+
+## Công cụ mà ứng dụng khách có thể gọi
+
+Endpoint dùng transport Streamable HTTP của MCP, mỗi yêu cầu một phản hồi JSON, với token truy cập dạng bearer.
+
+<TableScroll label="Công cụ của kết nối bên ngoài">
+
+| Công cụ | Khả năng | Chức năng |
+|---|---|---|
+| `connection_status` | Bất kỳ | Các khả năng dùng được lúc này và thời điểm kết nối hết hạn |
+| `list_sources` | Bất kỳ | Các nguồn chưa hết hạn mà một người đã chia sẻ: mã tham chiếu và loại, không có tên |
+| `read_source` | `editorial:read` | Văn bản, tiêu đề, dòng xem trước, ký hiệu giữ chỗ cho liên kết, hình ảnh và biến, giọng, quy trình hoặc điều kiện phân khúc của một nguồn đã chia sẻ |
+| `read_report` | `reports:read` | Bản chụp cố định của một báo cáo chiến dịch đã chia sẻ |
+| `propose_email` | `drafts:propose` | Tạo tạm một bản nháp chiến dịch hoặc bài viết, mới hoặc dưới dạng thay đổi cho đúng phiên bản của một bản nháp đã chia sẻ |
+| `propose_workflow` | `drafts:propose` | Tạo tạm một phân khúc tạo bằng trình tạo, một quy trình chưa xuất bản, hoặc cả hai thành một bộ |
+| `proposal_status` | `drafts:propose` | Quyết định và thời điểm hết hạn của một đề xuất |
+
+</TableScroll>
+
+Công cụ thất bại chỉ trả lời bằng một mã cố định, như `source_changed` (hãy chia sẻ lại nguồn), `insufficient_scope`,
+`invalid_content`, `idempotency_conflict` hoặc `proposal_limit`. Mỗi đề xuất mang một khóa: thử lại với cùng khóa và
+cùng nội dung sẽ trả về cùng đề xuất, còn cùng khóa với nội dung khác là xung đột.
+
+## Chi tiết OAuth cho nhà phát triển ứng dụng khách
+
+- Discovery: `GET /.well-known/oauth-protected-resource/mcp/connect` (RFC 9728) và
+  `GET /.well-known/oauth-authorization-server` (RFC 8414). Một lệnh gọi chưa xác thực tới `/mcp/connect` nhận `401`
+  kèm `WWW-Authenticate` trỏ tới metadata của tài nguyên.
+- Đăng ký: `POST /oauth/mcp/register` (RFC 7591), với tối đa năm URI callback HTTPS chính xác, hoặc HTTP loopback cho
+  ứng dụng trên cùng máy tính, và `none`, `client_secret_basic` hoặc `client_secret_post`. Client secret chỉ hiện một
+  lần. Ứng dụng khách đã đăng ký mà không được dùng trong bảy ngày sẽ bị xóa. Quản trị viên hệ thống có thể đăng ký một
+  ứng dụng khách được bên vận hành xác minh bằng `POST /api/v1/admin/mcp-connect/clients`; khi đó trang đồng ý của nó
+  hiện <UiPath path="mcpConnect.verified" />.
+- Ủy quyền: chỉ hỗ trợ authorization code với PKCE `S256`, tại `/oauth/mcp/authorize`, với `resource` đặt thành
+  endpoint và các scope `editorial:read`, `reports:read` và `drafts:propose`. Câu trả lời có `iss`.
+- Token: `POST /oauth/mcp/token`. Token truy cập có hiệu lực 10 phút, mã ủy quyền 60 giây, và token làm mới được xoay
+  vòng ở mỗi lần dùng. `POST /oauth/mcp/revoke` thu hồi một token (RFC 7009).
+- Các token này chỉ dùng được tại `/mcp/connect`: khóa API, token của tác tử và phiên đăng nhập bị từ chối ở đó, còn
+  REST API và `/mcp` từ chối các token này.
+
+<LimitsTable area="mcp-connect" />
+
+## Nhật ký kiểm tra
+
+[Nhật ký kiểm tra](/vi/team/audit-log/) ghi `mcp_connect.client_registered`, `.granted`, `.denied`, `.revoked`,
+`.source_selected` và `.proposed`, và ghi mỗi quyết định thành `mcp_connect.kept`, `.discarded`, `.accepted` hoặc
+`.rejected`. Bản nháp một người giữ lại được ghi thành `campaign.create` hoặc `post.created` như thường lệ, với
+`via: external_mcp` và ID của kết nối, và người quyết định là người thực hiện. Không ghi token, lời nhắc hay nội dung
+nào.
+
+## Khắc phục sự cố
+
+- **Ứng dụng khách báo máy chủ cần ủy quyền nhưng không mở trang đồng ý nào**: URL công khai của hệ thống không dùng
+  HTTPS, hoặc ứng dụng khách không truy cập được URL đó.
+- **<UiPath path="mcpConnect.invalidTitle" />**: yêu cầu đã hết hạn, đã được quyết định hoặc thuộc một phiên trình duyệt
+  khác. Hãy bắt đầu lại từ ứng dụng khách.
+- **<UiPath path="mcpConnect.optionsFailed" />**: máy chủ MCP của không gian làm việc đang tắt, hoặc bạn thiếu
+  `mcp:manage`, hoặc không có quyền cho bất kỳ khả năng nào.
+- **`list_sources` không trả về gì**: chưa ai chia sẻ nguồn nào trong hai giờ qua. Nhấn
+  <UiPath path="mcpConnect.proposals.selected" /> và chia sẻ một nguồn.
+- **`429` kèm `Retry-After`**: kết nối có hơn 120 lệnh gọi mỗi phút, hoặc một lệnh gọi đến trong lúc một lệnh gọi khác
+  đang chạy.
+- **"Đã thay đổi kể từ đề xuất này"**: có người đã sửa bản nháp sau khi ứng dụng khách đọc nó. Hãy chia sẻ lại và yêu
+  cầu đề xuất mới.
+
+## Liên quan
+
+<CardGrid>
+  <LinkCard title="Kết nối tác tử AI qua MCP" href="/vi/developers/mcp/" />
+  <LinkCard title="Soạn nháp chiến dịch và quy trình với tác tử AI" href="/vi/integrations/ai-agent/" />
+  <LinkCard title="Vai trò và quyền" href="/vi/team/roles-and-permissions/" />
+  <LinkCard title="Reverse proxy và TLS" href="/vi/self-hosting/reverse-proxy/" />
+</CardGrid>
