@@ -17,8 +17,10 @@ sources:
   - internal/smtprelay
   - internal/app/wire_smtprelay.go
   - internal/config/config.go
-  - internal/app/metrics.go
+  - internal/ai/assistant/stream.go
+  - internal/mcpclient/oauth.go
   - docs/deploy/reverse-proxy.md
+  - internal/app/metrics.go
   - README.md
 sidebar:
   order: 7
@@ -39,17 +41,23 @@ octubre de 2026.
 - **Reenviar todas las rutas** a ReputeCast: la aplicación y la API, `/hooks/…` (los webhooks de los proveedores de
   envío), `/p/…` (las páginas públicas), `/t/…` (el seguimiento de aperturas y clics), `/mcp` y `/healthz`, que consulta
   la comprobación de la URL pública. Desde la versión 1.7.0, las [conexiones externas](/es/developers/mcp-connections/)
-  también necesitan `/mcp/connect`, `/oauth/mcp/…` y los documentos de descubrimiento de OAuth bajo `/.well-known/`.
+  también necesitan `/mcp/connect`, `/oauth/mcp/…` y los documentos de descubrimiento de OAuth bajo `/.well-known/`. A
+  partir de la próxima versión después de la 1.7.0, los miembros que inician sesión en los
+  [servidores MCP](/es/integrations/mcp-servers/) del asistente de IA vuelven a `/api/v1/ai/mcp/oauth/callback`.
 - **Conservar la cabecera `Host`.** ReputeCast reconoce por ella los dominios personalizados.
 - **Enviar `X-Forwarded-For`.** ReputeCast solo la lee de los
   [proxies de confianza](#configurar-la-url-pública-y-los-proxies-de-confianza), tanto si el proxy amplía la línea del
   cliente como si añade su propia línea de cabecera. No necesita `X-Forwarded-Proto`: sabe que está en HTTPS por
   `http.public_url`.
-- **Transmitir sin búfer** dos tipos de respuesta:
+- **Transmitir sin búfer** estas respuestas:
   - el monitor en tiempo real, Server-Sent Events en
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (un latido cada 15 segundos,
     `retry: 3000`);
-  - el [endpoint MCP](/es/developers/mcp/) `/mcp` (Streamable HTTP), cuyas respuestas son `text/event-stream`.
+  - el [endpoint MCP](/es/developers/mcp/) `/mcp` (Streamable HTTP), cuyas respuestas son `text/event-stream`;
+  - a partir de la próxima versión después de la 1.7.0, las respuestas del
+    [asistente de IA](/es/integrations/ai-assistant/), Server-Sent Events en
+    `GET /api/v1/workspaces/{workspace}/ai/assistant/threads/{thread}/stream` (consulta
+    [los flujos de eventos del asistente](#los-flujos-de-eventos-del-asistente)).
 - **Esperar a las [solicitudes largas de IA](#solicitudes-largas-de-ia).** Un borrador desde una descripción puede tardar
   hasta 10 minutos en responder.
 - **Aceptar cuerpos de solicitud grandes.** ReputeCast define un límite por operación; el mayor es de 105 MiB (la
@@ -131,8 +139,8 @@ Quita el bloque `https://` si ningún espacio de trabajo usa un dominio personal
 
 Esta configuración es para nginx 1.25.1 o posterior (la directiva `http2`; antes de la 1.25.1, escribe
 `listen 443 ssl http2;`) en el propio servidor, con un certificado de Let's Encrypt en la ubicación predeterminada de
-Certbot. nginx usa por defecto un búfer para las respuestas que pasan por el proxy, así que las dos rutas de streaming
-lo desactivan.
+Certbot. nginx usa por defecto un búfer para las respuestas que pasan por el proxy, así que las rutas de streaming lo
+desactivan.
 
 ```nginx title="/etc/nginx/conf.d/reputecast.conf"
 upstream reputecast {
@@ -176,6 +184,14 @@ server {
     }
 
     location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    # The AI assistant's answers (Server-Sent Events), from the next release after 1.7.0.
+    location ~ ^/api/v1/workspaces/[^/]+/ai/assistant/threads/[^/]+/stream$ {
         proxy_pass http://reputecast;
         proxy_buffering off;
         proxy_cache off;
@@ -313,6 +329,29 @@ Un balanceador de carga o una CDN delante del proxy necesitan el mismo tiempo pa
 [agente de IA](/es/integrations/ai-agent/) no: sus llamadas al modelo se ejecutan en segundo plano y la página solo lee
 su progreso. Disponible desde la versión 1.7.0.
 
+## Los flujos de eventos del asistente
+
+A partir de la próxima versión después de la 1.7.0, cada conversación del
+[asistente de IA](/es/integrations/ai-assistant/) abierta en un panel o en una página completa mantiene un flujo de
+Server-Sent Events (`text/event-stream`). El proxy tiene que pasar cada evento en cuanto se escribe:
+
+- **Sin búfer.** nginx usa un búfer por defecto, así que conserva el `location` del flujo con `proxy_buffering off;`
+  como en el ejemplo de arriba (ReputeCast no envía `X-Accel-Buffering`). Caddy y Traefik vacían al instante las
+  respuestas `text/event-stream` sin ajustes adicionales. Si el proxy o una CDN por delante comprime las respuestas,
+  deja fuera `text/event-stream`. Un flujo con búfer muestra las respuestas tarde, todas de golpe, o no las muestra hasta
+  que el navegador se rinde y vuelve a conectarse.
+- **Tiempos de espera.** El flujo envía un latido cada 15 segundos cuando no pasa nada más, y el navegador trata 45
+  segundos de silencio como una conexión cortada. Cualquier tiempo de espera de lectura o de inactividad por encima de
+  15 segundos funciona, incluidos los 60 segundos predeterminados de nginx. Cuando un proxy corta un flujo de todos
+  modos, el navegador vuelve a conectarse con el último evento que tenía, y no se pierde ni se repite nada; la propia
+  respuesta sigue en el servidor.
+- **HTTP/2.** Cada conversación abierta y cada monitor en tiempo real mantienen una conexión. Por HTTP/1.1, un navegador
+  abre como máximo seis conexiones con un mismo host, compartidas por todas sus pestañas, así que unas pocas pestañas
+  abiertas pueden dejar otras solicitudes esperando. Por HTTP/2 comparten una sola conexión.
+
+Un navegador que no lee un evento en 5 segundos se corta, y se reanuda desde su último evento. La conexión de Postgres
+que usan los flujos está en [escalado](/es/self-hosting/scaling/#el-asistente-de-ia).
+
 ## Dominios personalizados
 
 Un espacio de trabajo puede servir su página de suscripción, su centro de preferencias, su archivo y sus demás páginas
@@ -395,6 +434,9 @@ propio certificado, así que los proxies HTTP no lo transportan:
 
 - **El monitor en tiempo real no se mueve, o salta cada pocos segundos**: el proxy usa un búfer para el stream. En
   nginx, añade el `location` del stream en tiempo real con `proxy_buffering off`.
+- **Las respuestas del asistente de IA llegan todas de golpe, o el panel no deja de indicar que se está reconectando**:
+  el proxy usa un búfer o comprime el flujo del asistente. En nginx, añade el `location` del asistente con
+  `proxy_buffering off`; consulta [los flujos de eventos del asistente](#los-flujos-de-eventos-del-asistente).
 - **`413 Request Entity Too Large` en importaciones o subidas**: sube el `client_max_body_size` de nginx.
 - **Las pantallas tardan muchos segundos en aparecer en los móviles**: el proxy habla HTTP/1.1 con los navegadores. En
   nginx, añade `http2 on;` al bloque `server`.

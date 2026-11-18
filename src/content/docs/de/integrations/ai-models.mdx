@@ -1,0 +1,426 @@
+---
+title: KI-Modelle mit eigenem Schlüssel verbinden
+description: 'KI-Modelle mit eigenem API-Schlüssel verbinden: Modellkonten, gehostete Dienste, ein Modell je Funktion, Tool-Prüfung, Monatslimit und persönliche Schlüssel.'
+type: how-to
+audience: [admin]
+permissions: ['integrations:manage']
+uiPath: 'nav.settings > settings.integrations > ai.title'
+primaryKeyword: KI-Modelle mit eigenem API-Schlüssel
+sources:
+  - internal/ai/accounts.go
+  - internal/ai/personal.go
+  - internal/ai/settings.go
+  - internal/ai/assistant_settings.go
+  - internal/ai/agent_capability.go
+  - internal/ai/budget.go
+  - internal/ai/usage.go
+  - internal/ai/status.go
+  - internal/ai/llm/catalog.go
+  - internal/ai/messages/en.json
+  - internal/netguard/netguard.go
+  - internal/store/queries/{ai,ai_budget}.sql
+  - web/src/features/ai/{SettingsPage,ModelSettings,ConnectDialog,AgentSettings,BudgetHolds,catalog}.tsx
+  - web/src/features/ai/{messages,models.messages}.ts
+  - web/src/features/integrations/CatalogPage.tsx
+  - migrations/{03600_a3_agent_runtime,03603_a3_connection_test_usage,03630_b1_ai_registry,03631_b1_personal_keys}.sql
+  - docs/ai/models.md
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import ProviderMatrix from '~/components/ProviderMatrix.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Die KI-Funktionen von ReputeCast nutzen KI-Modelle mit eigenem API-Schlüssel: Sie verbinden Modellkonten bei
+Anthropic, OpenAI, Google Gemini, Azure OpenAI oder einem OpenAI-kompatiblen Dienst, wählen das Modell, das jede
+Funktion nutzt, und begrenzen, was der Arbeitsbereich im Monat ausgibt. Der Anbieter rechnet über Ihr eigenes Konto ab,
+und nichts geht an ein Modell, bevor eine Person darum bittet. Mit diesen Modellen arbeiten die
+[KI-Vorschläge](/de/integrations/ai-suggestions/), die [Entwürfe aus einer Beschreibung](/de/integrations/ai-drafts/),
+der [KI-Agent](/de/integrations/ai-agent/) und der [KI-Assistent](/de/integrations/ai-assistant/). Verfügbar ab der
+nächsten Version nach 1.7.0.
+
+<Aside type="note" title="In Version 1.7.0">
+  Die Seite heißt <UiPath path="ai.formerTitle" />, und ein Arbeitsbereich hat jeweils ein Modell: Um den Anbieter zu
+  wechseln, trennen Sie zuerst den aktuellen. Es gibt keine gehosteten Dienste zur Auswahl, kein Modell je Funktion,
+  keine Tool-Prüfung außerhalb von <UiPath path="ai.agent.settings" /> und keine persönlichen Schlüssel. Monatslimit,
+  Preise, reservierte Anfragen und das Aktivitätsprotokoll funktionieren so, wie diese Seite es beschreibt.
+</Aside>
+
+## Bevor Sie beginnen
+
+- Zum Hinzufügen, Ändern und Entfernen von Modellkonten brauchen Sie `integrations:manage`, eine
+  [sensible Berechtigung](/de/reference/glossary/#sensitive-permission), die nur Menschen haben können (Inhaber und
+  Admin haben sie). Mitglieder mit `integrations:view` sehen die Seite schreibgeschützt, mit den Namen der Personen, die
+  sie ändern können.
+- Zum Nutzen der Modelle brauchen Sie `ai:use`: Inhaber, Admin und Bearbeiter haben diese Berechtigung, ein Betrachter
+  nicht. API-Schlüssel und [MCP-Agenten](/de/developers/mcp/) können sie nicht haben. Lesen Sie
+  [Berechtigungen und Rollen](/de/reference/permissions/).
+- Sie brauchen einen API-Schlüssel des Modellanbieters oder die Adresse Ihres eigenen Servers. Für ein Modell, das nicht
+  in der Preisliste von ReputeCast steht, und das gilt für jeden gehosteten Dienst, brauchen Sie außerdem seine Input-
+  und Output-Preise pro Million Token.
+
+## Unterstützte Modellanbieter
+
+<ProviderMatrix family="ai" />
+
+ReputeCast unterstützt AWS Bedrock nicht.
+
+## Modellkonto hinzufügen
+
+Ein [Modellkonto](/de/reference/glossary/#model-account) ist ein Schlüssel (oder ein Server in Ihrem Netzwerk) mit
+einem oder mehreren Modellen. Ein Arbeitsbereich kann mehrere haben, auch von verschiedenen Anbietern.
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.settings > settings.integrations > ai.title" />. Solange es noch kein Konto gibt,
+   listet die Seite die fünf Anbieter: Wählen Sie bei einem davon <UiPath path="ai.connectModel" />. Sobald ein Konto
+   verbunden ist, wählen Sie <UiPath path="ai.models.addAccount" /> unter <UiPath path="ai.models.accountsTitle" />. In
+   <UiPath path="nav.settings > settings.integrations" /> bietet die Gruppe <UiPath path="integrations.groupAi" /> bei
+   jedem weiteren Anbieter <UiPath path="ai.models.addAccount" /> an, das denselben Dialog öffnet.
+
+2. Wählen Sie den Anbieter und füllen Sie seine Felder aus:
+
+   - **Anthropic, OpenAI, Google Gemini**: der API-Schlüssel und das Modell.
+   - **Azure OpenAI**: der Endpunkt (HTTPS, zum Beispiel `https://acme.openai.azure.com`), der Name der
+     Bereitstellung, der API-Schlüssel, die API-Version (`2024-10-21`, wenn Sie das Feld leer lassen) und das Modell,
+     das die Bereitstellung ausführt, für seine Preise. Ihre Daten bleiben in der Region Ihrer Azure-Ressource.
+   - **OpenAI-kompatibel**: unter <UiPath path="ai.serviceLabel" /> entweder <UiPath path="ai.serviceOwn" /> mit der
+     Serveradresse, die auf `/v1` endet, einem optionalen Namen und, falls der Server einen braucht, einem
+     API-Schlüssel; oder einer der [gehosteten Dienste](#gehostete-openai-kompatible-dienste), deren Adresse schon
+     eingetragen ist und deren API-Schlüssel Pflicht ist.
+
+   Die Liste der Modelle kommt zuerst aus der Preisliste von ReputeCast und dann vom Anbieter, sobald der Schlüssel
+   (oder die Serveradresse) eingetragen ist. Steht Ihr Modell nicht in der Liste, wählen Sie **Modellnamen eingeben…**.
+
+3. Prüfen Sie beide Preise pro Million Input- und Output-Token. Die Preisliste von ReputeCast (1. Oktober 2026) trägt
+   sie für die wichtigsten Modelle von Anthropic, OpenAI und Gemini ein; ändern Sie sie, wenn Ihr Vertrag abweicht. Für
+   gehostete Dienste und eigene Server geben Sie sie von der Preisseite des Anbieters ein, oder 0 für ein Modell, das
+   nichts kostet. Ohne beide Preise kann ReputeCast nicht begrenzen, was eine Anfrage kostet, und sendet nichts, nicht
+   einmal den Test.
+
+   Das erste Konto legt auch das Monatslimit des Arbeitsbereichs fest: Der Dialog beginnt bei gehosteten Anbietern mit
+   25 $ im Monat und bei Ihrem eigenen Server mit 20.000.000 Token. Spätere Konten teilen sich dieses Limit.
+
+4. Testen und verbinden Sie. ReputeCast sendet einen festen Prompt ohne Inhalte aus dem Arbeitsbereich („Antworten Sie
+   mit dem Wort Ready.“), der zum Monatslimit zählt, und speichert nichts, wenn der Test fehlschlägt. Beim ersten Konto
+   führt **… verbinden** mit dem Namen des Anbieters (etwa **Anthropic verbinden**) den Test aus und verbindet, sobald
+   er besteht. Bei einem weiteren Konto wählen Sie <UiPath path="ai.testConnection" /> und dann
+   <UiPath path="ai.models.connect" />, sobald der Test bestanden ist.
+
+</Steps>
+
+<Screenshot
+  id="ai-models-add"
+  alt="Der Dialog Modellkonto hinzufügen mit OpenAI-kompatibel und dem Dienst OpenRouter: der Hinweis, dass gehostete Dienste ihren API-Schlüssel und die Preise von der Preisseite des Dienstes brauchen, die eingetragene Adresse, der Name OpenRouter, der API-Schlüssel, das von Hand eingegebene Modell, Verbindung testen, beide Preise noch leer mit dem Hinweis, dass sie festgelegt werden müssen, was an OpenRouter geht, und Verbinden, das auf einen bestandenen Test wartet."
+/>
+
+Das Modell des ersten Kontos wird zum Standard jeder Funktion, auch für <UiPath path="ai.models.featureAssistant" />
+und <UiPath path="ai.models.featureAgent" />; diese beiden nutzen es aber erst, wenn es seine
+[Tool-Prüfung](#die-tool-prüfung) bestanden hat. Die Modelle späterer Konten werden nur dort genutzt, wo Sie sie
+[auswählen](#modell-für-jede-funktion-wählen).
+
+### Gehostete OpenAI-kompatible Dienste
+
+Die gehosteten Dienste sind OpenAI-kompatible Dienste, deren Adresse schon eingetragen ist. Ihre Modelle kommen aus der
+Modellliste des Dienstes selbst, und ReputeCast hat keine Preise für sie; geben Sie diese daher selbst ein.
+
+| Dienst       | Adresse                                 |
+| ------------ | --------------------------------------- |
+| OpenRouter   | `https://openrouter.ai/api/v1`          |
+| Mistral      | `https://api.mistral.ai/v1`             |
+| Groq         | `https://api.groq.com/openai/v1`        |
+| DeepSeek     | `https://api.deepseek.com/v1`           |
+| xAI          | `https://api.x.ai/v1`                   |
+| Together AI  | `https://api.together.xyz/v1`           |
+| Fireworks AI | `https://api.fireworks.ai/inference/v1` |
+
+### Modelle im eigenen Netzwerk
+
+Ein OpenAI-kompatibler Server unter einer privaten oder Loopback-Adresse (etwa `http://ollama.acme.internal:11434/v1`)
+wird mit „Keine Verbindung zu einer privaten Adresse möglich“ abgelehnt, bis ein Serverbetreiber
+[`providers.allow_private_networks`](/de/reference/configuration/) auf `true` setzt
+(`REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true`). Hostnamen, die auf `.internal` oder `.localhost` enden, gelten
+als privat. Link-Local-Adressen und Metadatenadressen von Cloud-Anbietern werden immer abgelehnt. Das Konto zeigt dann
+„Kein Schlüssel · Host (privates Netzwerk von der Instanz erlaubt)“. Lesen Sie
+[Sicherheit und Härtung](/de/self-hosting/security/).
+
+## Konto und Modelle verwalten
+
+<UiPath path="ai.models.manage" /> bei einem Konto listet seine <UiPath path="ai.models.modelsHeading" />, jedes mit
+seinen Preisen, seiner Tool-Prüfung und den Funktionen, die es nutzen. Von dort aus:
+
+- <UiPath path="ai.models.addModel" /> fügt ein weiteres Modell mit demselben Schlüssel hinzu. Die Preise folgen dem
+  Modell, sofern Sie sie nicht ändern.
+- <UiPath path="ai.models.editPrices" /> ändert die Preise eines Modells, und <UiPath path="ai.models.runToolCheck" />
+  führt seine [Tool-Prüfung](#die-tool-prüfung) aus.
+- <UiPath path="ai.models.removeModel" /> entfernt ein Modell, das keine Funktion nutzt. Das einzige Modell eines Kontos
+  bleibt: Fügen Sie zuerst ein weiteres hinzu oder entfernen Sie das Konto.
+- **Ersetzen** (oder **Schlüssel hinzufügen**) testet einen neuen Schlüssel, bevor er gespeichert wird, und
+  <UiPath path="ai.testConnection" /> testet den aktuellen.
+- <UiPath path="ai.models.removeAccount" /> löscht den Schlüssel und seine Modelle. Funktionen, die sie nutzen,
+  brauchen zuerst das Modell eines anderen Kontos. Das KI-Aktivitätsprotokoll behält ihre Anfragen.
+
+<Screenshot
+  id="ai-models-manage"
+  alt="Das Anthropic-Modellkonto verwalten: der nicht auslesbare API-Schlüssel, hinzugefügt von Marcus Chen, der letzte Test mit Verbindung testen, dann das Modell Claude Sonnet 5.5 mit 2,00 $ Input und 10,00 $ Output pro Million Token, Tool-Prüfung bestanden und alle Funktionen, die es nutzen, mit Preise, Tool-Prüfung starten und Entfernen (nicht verfügbar für das einzige Modell des Kontos); dann Modell hinzufügen und Konto entfernen."
+/>
+
+Schlüssel sind nicht auslesbar. Ein Schlüssel wird nach dem Speichern nie wieder angezeigt; die Seite nennt nur, wann
+und von wem er gesetzt wurde („Schlüssel des Arbeitsbereichs, gesetzt am 2. Nov. von Linh Nguyen“), und das
+[Audit-Protokoll](/de/team/audit-log/) erfasst, dass er hinzugefügt oder ersetzt wurde, nie den Schlüssel selbst.
+Schlüssel werden mit dem geheimen Schlüssel der Instanz verschlüsselt gespeichert; sichern Sie diesen daher zusammen
+mit der Datenbank ([Sichern und wiederherstellen](/de/self-hosting/backups/)). Ein gespeicherter Schlüssel geht nur an
+die Adresse, für die er gespeichert wurde: Für einen neuen Endpunkt oder eine neue Serveradresse fügen Sie den Schlüssel
+erneut ein. Lehnt der Anbieter einen Schlüssel ab, zeigt das Konto das an, seine Modelle stoppen, und die Mitglieder,
+die Integrationen verwalten, werden benachrichtigt; die anderen Konten arbeiten weiter.
+
+## Die Tool-Prüfung
+
+Der KI-Assistent und der KI-Agent rufen Tools auf und nutzen daher nur ein Modell, das die
+[Tool-Prüfung](/de/reference/glossary/#tool-check) bestanden hat. <UiPath path="ai.models.runToolCheck" /> sendet eine
+feste Anfrage, die das Modell bittet, genau einmal ein harmloses Tool aufzurufen. Sie enthält keine Inhalte aus dem
+Arbeitsbereich und zählt zum Monatslimit.
+
+| Das Modell zeigt                                 | Bedeutung                                                                    |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- |
+| **Tool-Prüfung bestanden am …**                  | Der Assistent und der Agent können es nutzen.                                |
+| **Tool-Prüfung nicht bestanden am …**            | Sie können es nicht nutzen. Die einmaligen KI-Vorschläge funktionieren weiterhin. |
+| <UiPath path="ai.models.toolsUntested" />        | Sie können es erst nutzen, wenn es die Prüfung besteht.                       |
+
+Das Ergebnis gehört zum Modell mit seinem Schlüssel, seiner Adresse und seiner Verbindung. Wenn Sie den Schlüssel
+ersetzen oder das Konto neu verbinden, wird es auf <UiPath path="ai.models.toolsUntested" /> zurückgesetzt; führen Sie
+die Prüfung dann erneut aus. Preise, Namen und die Schalter der Funktionen setzen es nicht zurück.
+<UiPath path="ai.agent.testTools" /> unter <UiPath path="ai.agent.settings" /> führt dieselbe Prüfung für das Modell
+von <UiPath path="ai.models.featureAgent" /> aus.
+
+## Modell für jede Funktion wählen
+
+<UiPath path="ai.models.defaultsTitle" /> hat eine Zeile pro Funktion: <UiPath path="ai.models.featureAssistant" />,
+<UiPath path="ai.models.featureAgent" />, dann die neun [KI-Vorschläge](/de/integrations/ai-suggestions/) von
+Betreffideen bis Entwurf aus einer Beschreibung. Wählen Sie im Menü jeder Zeile ein Modell.
+
+<Screenshot
+  id="ai-settings"
+  alt="Einstellungen, Integrationen, KI-Modelle: Modellkonten mit dem Anthropic-Konto der Demo (Claude Sonnet 5.5) und Office Ollama, einem Server unter einer privaten Adresse mit qwen3-32b, beide verbunden und jeweils mit Verwalten, und die Summe des Arbeitsbereichs im Verhältnis zum Monatslimit von 25 $; darunter Standardmodell für jede Funktion, wo Assistent, Agentenläufe und die KI-Vorschläge Claude Sonnet 5.5 nutzen."
+/>
+
+- Ein Modell kann der Standard einer Funktion sein, wenn sein Konto verbunden ist und sein Schlüssel funktioniert.
+  Alternativtext braucht außerdem ein Modell, das Bilder liest, und <UiPath path="ai.models.featureAssistant" /> und
+  <UiPath path="ai.models.featureAgent" /> brauchen eine bestandene Tool-Prüfung. Das Menü nennt, warum sich ein Modell
+  nicht wählen lässt, zum Beispiel „Tool-Prüfung nicht bestanden“, „liest keine Bilder“ oder „Schlüssel abgelehnt“.
+- Eine Funktion, deren Modell sich nicht nutzen lässt, lehnt ihre Anfragen ab; sie weicht nie auf ein anderes Modell
+  aus.
+- Eine Änderung des Standards gilt für neue Anfragen. Eine Unterhaltung mit dem Assistenten behält ihr Modell, bis die
+  Person, der sie gehört, ein anderes wählt, und ein Agentenlauf behält das Modell, mit dem er begonnen hat.
+- Das Modell eines [persönlichen Schlüssels](#persönliche-schlüssel) ist nie ein Standard des Arbeitsbereichs.
+  Mitglieder wählen es für ihre eigenen Anfragen unter <UiPath path="ai.models.yourPicksTitle" />.
+
+## Assistenten einschalten
+
+Die Karte <UiPath path="ai.models.assistantTitle" /> enthält den Schalter und die Limits des
+[KI-Assistenten](/de/integrations/ai-assistant/):
+
+<TableScroll label="Die Zeilen der Karte Assistent">
+
+| Zeile                                       | Standard                                                 | Hinweise                                                                                                                                                                                                                                          |
+| ------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| <UiPath path="ai.models.assistantToggle" /> | Aus                                                      | Aus: Niemand kann eine neue Nachricht senden, und der Bereich des Assistenten zeigt <UiPath path="assistant.offTitle" />. Unterhaltungen bleiben erhalten und laufen weiterhin planmäßig ab; bis er wieder eingeschaltet ist, lassen sie sich nur stoppen oder löschen. |
+| <UiPath path="ai.models.limitPerThread" />  | 40 Tool-Aufrufe · 300.000 Token · 2,00 $                 | Die Summe jeder Unterhaltung. Bis zu 200 Tool-Aufrufe, 2.000.000 Token und 100 $.                                                                                                                                                                 |
+| <UiPath path="ai.models.atOnce" />          | 1 pro Unterhaltung · 2 pro Person · 10 im Arbeitsbereich | Antworten, die gleichzeitig entstehen, ohne Agentenläufe: 1 bis 10 pro Person, 1 bis 100 im Arbeitsbereich.                                                                                                                                       |
+| <UiPath path="ai.models.contentKept" />     | 30 Tage nach der letzten Nachricht                       | Fest.                                                                                                                                                                                                                                             |
+
+</TableScroll>
+
+<Steps>
+
+1. Stellen Sie sicher, dass das Modell von <UiPath path="ai.models.featureAssistant" /> unter
+   <UiPath path="ai.models.defaultsTitle" /> seine [Tool-Prüfung](#die-tool-prüfung) bestanden hat.
+
+2. Schalten Sie <UiPath path="ai.models.assistantToggle" /> ein.
+
+3. Um die Limits zu ändern, wählen Sie <UiPath path="ai.models.editLimits" />. Sie gelten für Unterhaltungen, die danach
+   beginnen: Eine Unterhaltung behält die Limits, mit denen sie begonnen hat.
+
+</Steps>
+
+<Screenshot
+  id="ai-models-assistant"
+  alt="Die eingeschaltete Karte Assistent: ein Limit pro Unterhaltung von 40 Tool-Aufrufen, 300.000 Token und 2,00 $; gleichzeitig 1 pro Unterhaltung, 2 pro Person und 10 im Arbeitsbereich; Inhalte 30 Tage nach der letzten Nachricht aufbewahrt; Limits bearbeiten; was die Instanz verlässt, mit dem Link zu den MCP-Servern und ihren freigegebenen Tools; und der Hinweis, dass Limits für Unterhaltungen gelten, die nach einer Änderung beginnen."
+/>
+
+Mitglieder brauchen außerdem `ai:use`. Wem etwas fehlt, sieht im Bereich des Assistenten eine Karte, die es nennt, etwa
+<UiPath path="assistant.noUsableTitle" />. Der Hinweis <UiPath path="ai.models.leavesTitle" /> auf der Karte verlinkt
+auf die [MCP-Server](/de/integrations/mcp-servers/), deren freigegebene Tools der Assistent aufrufen darf.
+
+## Limit, Nutzung und Aktivitätsprotokoll
+
+Die Nutzung ist die vom Anbieter gemeldete Tokenzahl mal den Preisen des Modells, summiert ab dem 1. des Monats in der
+Zeitzone des Arbeitsbereichs. Das Limit des Arbeitsbereichs umfasst jede Modellanfrage des Arbeitsbereichs: die
+KI-Vorschläge, Entwürfe aus einer Beschreibung, den Agenten, den Assistenten, Verbindungstests und Tool-Prüfungen.
+[Persönliche Schlüssel](#persönliche-schlüssel) haben eigene Limits und zählen hier nie.
+
+<LimitsTable area="ai" />
+
+- Bei 80 % des Limits erhalten Mitglieder mit `integrations:manage` eine Benachrichtigung (in der App und per E-Mail).
+  Bei 100 % pausieren die Modelle des Arbeitsbereichs bis zum 1. des Monats; Bearbeiten, Senden und Berichte laufen
+  wie gewohnt weiter, und Mitglieder mit einem persönlichen Schlüssel können damit weiterarbeiten. Wird das Limit
+  erhöht, arbeiten die Modelle wieder.
+- <UiPath path="ai.byFeature" /> listet die neun KI-Vorschläge auf, danach <UiPath path="ai.agent.title" /> für die
+  Anfragen des Agenten und <UiPath path="ai.testConnection" /> für Verbindungstests und Tool-Prüfungen.
+- Das <UiPath path="ai.logTitle" /> bewahrt 90 Tage lang auf, wer wann welche Funktion wofür angefordert hat, mit
+  Modell, Token, Kosten und Ergebnis, aber ohne den gesendeten oder zurückgegebenen Text. Es listet auch
+  Verbindungstests sowie die Anfragen des Agenten und des Assistenten auf und zeigt <UiPath path="ai.usageUnknown" />
+  statt der Token, wenn der Anbieter sie nicht gemeldet hat.
+- Konten, Modelle, Preise, Standardmodelle, das Limit, die Schalter der Funktionen, die Einstellungen des Assistenten
+  und persönliche Schlüssel werden im [Audit-Protokoll](/de/team/audit-log/) erfasst, ohne Schlüssel. Einzelne
+  Vorschläge nicht.
+
+### Reservierte Anfragen und unbekannte Nutzung
+
+ReputeCast reserviert, was eine Anfrage kosten kann, bevor es sie sendet: ihren Input und die längste Antwort, die sie
+zulässt, zu den Preisen des Modells. Die Anfrage geht erst hinaus, wenn der Rest des Monatslimits sie zusätzlich zu den
+laufenden Anfragen abdeckt. Antwortet der Anbieter, wird aus der Reservierung die gemessene Nutzung.
+<UiPath path="ai.usageTitle" /> zeigt, was reserviert ist: Die Anzeige des Limits zählt es mit, die gemessene Nutzung
+nicht.
+
+Liefert der Anbieter keine verlässlichen Tokenzahlen, etwa nach einer Zeitüberschreitung, einem Serverfehler, einer
+gestoppten Antwort oder einer abgebrochenen Verbindung, behält ReputeCast die ganze Reservierung und wiederholt die
+Anfrage nie von selbst. Das <UiPath path="ai.logTitle" /> zeigt <UiPath path="ai.usageUnknown" />,
+<UiPath path="ai.usageTitle" /> nennt, wie viele Anfragen eine unbekannte Nutzung haben, und ein
+[Agentenlauf](/de/integrations/ai-agent/) mit einer solchen Anfrage pausiert. Eine Unterhaltung mit dem Assistenten
+pausiert nicht: Sie zählt die Anfrage mit ihrem Höchstwert. Die Reservierung bleibt bestehen, auch über den 1. des
+Monats hinaus, bis jemand mit `integrations:manage` sie abgleicht:
+
+<Steps>
+
+1. Suchen Sie die Anfrage auf dieser Seite unter <UiPath path="ai.holdsTitle" /> anhand von Modell, Zeitpunkt und ID.
+   Nur Personen mit `integrations:manage` sehen die Karte, und nur solange eine Reservierung besteht.
+
+2. Schlagen Sie die Input- und Output-Token der Anfrage in den Nutzungsdaten Ihres Modellanbieters nach.
+
+3. Wählen Sie <UiPath path="ai.reconcile" />, tragen Sie <UiPath path="ai.reconcileInput" /> und
+   <UiPath path="ai.reconcileOutput" /> ein, bestätigen Sie, dass Sie die Zahlen beim Anbieter geprüft haben, und wählen
+   Sie erneut <UiPath path="ai.reconcile" />. Geben Sie 0 nur ein, wenn der Anbieter bestätigt, dass er die Anfrage
+   nicht berechnet hat.
+
+</Steps>
+
+Der Abgleich ersetzt die Reservierung durch die Tokenzahlen, die Sie eingeben, zu den Preisen, mit denen die Anfrage
+reserviert wurde. Er wiederholt die Anfrage nicht und stellt ihre Antwort nicht wieder her. Er ist erst möglich, wenn
+die Anfrage nicht mehr laufen kann, 10 Minuten nach ihrem Start; bis dahin nennt der Dialog, ab wann. Jeder Abgleich
+steht im Audit-Protokoll als `ai.usage_reconciled`. Die Anfragen ihres eigenen persönlichen Schlüssels gleichen
+Mitglieder über die API ab (`reconcile-ai-personal-budget`); die Seite listet sie noch nicht.
+
+## Persönliche Schlüssel
+
+Ein [persönlicher Schlüssel](/de/reference/glossary/#personal-key) ist das eigene Modellkonto eines Mitglieds: Nur
+seine Anfragen nutzen ihn, innerhalb eines persönlichen Monatslimits. Das passt zu jemandem, der einen eigenen Vertrag
+mit einem Anbieter hat oder ein Modell nutzen möchte, das der Arbeitsbereich nicht hat.
+
+| Zeile                                      | Standard          | Hinweise                                                                                                                                         |
+| ------------------------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| <UiPath path="ai.models.personalToggle" /> | Aus               | Aus: Persönliche Schlüssel bleiben erhalten, und ihre Anfragen werden abgelehnt, bis Verantwortliche sie wieder erlauben.                      |
+| <UiPath path="ai.models.personalCap" />    | 10,00 $ pro Person | <UiPath path="ai.models.editCap" />: 1 $ bis 100.000 $. Die Anfragen einer Person mit ihren eigenen Schlüsseln stoppen dort, bis der Monat neu beginnt. |
+| <UiPath path="ai.models.managersSee" />    | Nutzung und Kosten | Nie Inhalte: So sagt es die Karte den Mitgliedern.                                                                                             |
+
+Sobald Verantwortliche persönliche Schlüssel erlauben, fügen Mitglieder mit `ai:use` ihren eigenen so hinzu:
+
+<Steps>
+
+1. Öffnen Sie <UiPath path="nav.settings > settings.integrations > ai.title" /> und wählen Sie unter
+   <UiPath path="ai.models.yourTitle" /> die Option <UiPath path="ai.models.addPersonal" />. Es stehen dieselben
+   Anbieter und gehosteten Dienste zur Verfügung.
+
+2. Tragen Sie den Schlüssel, das Modell und seine Preise ein und wählen Sie
+   <UiPath path="ai.models.addPersonalButton" />; das testet den Schlüssel mit einem festen Prompt innerhalb Ihres
+   persönlichen Limits.
+
+3. Führen Sie die Tool-Prüfung dafür aus, wenn der Assistent den Schlüssel nutzen soll.
+
+4. Wählen Sie ihn unter <UiPath path="ai.models.yourPicksTitle" /> für die gewünschten Funktionen: „Für Ihre eigenen
+   Anfragen. Alle anderen nutzen weiter die Modelle des Arbeitsbereichs.“
+
+</Steps>
+
+<UiPath path="ai.models.peopleTitle" /> listet für Verantwortliche die persönlichen Konten jedes Mitglieds nach Anbieter
+und Modell sowie die Kosten und Anfragen dieses Monats. Es zeigt nie einen Schlüssel oder das, was gefragt wurde. Für das
+Offboarding entfernen Sie dort den Schlüssel einer Person: Das löscht den Schlüssel, seine Modelle und die Auswahl
+dieser Modelle durch das Mitglied, und das KI-Aktivitätsprotokoll behält die Anfragen. Verlässt ein Mitglied den
+Arbeitsbereich, wird es daraus entfernt oder deaktiviert, werden seine persönlichen Schlüssel dort gelöscht; das
+Deaktivieren einer Person in der Instanzverwaltung löscht ihre persönlichen Schlüssel in jedem Arbeitsbereich.
+
+## Was Ihre Instanz verlässt
+
+Nur das, woran eine Person gerade arbeitet, nur wenn sie darum bittet, und nur an das Modell der Funktion, die sie
+nutzt:
+
+- Jeder KI-Vorschlag sendet, was seine Funktion braucht;
+  [was die Vorschläge senden](/de/integrations/ai-suggestions/#was-ihre-instanz-verlässt) listet es auf.
+- Der Assistent sendet die Nachrichten der Unterhaltung und das, was die Person angehängt hat; siehe
+  [Datenschutz und Aufbewahrung](/de/integrations/ai-assistant/#datenschutz-und-aufbewahrung). MCP-Server erhalten nur
+  die Argumente der Aufrufe ihrer eigenen Tools ([was Server erhalten](/de/integrations/mcp-servers/#was-server-erhalten)).
+- Verbindungstests und Tool-Prüfungen senden festen Text ohne Inhalte aus dem Arbeitsbereich.
+
+Nie gesendet werden: Kontakte, Empfängerlisten, Exporte, Schlüssel oder Zugangsdaten, und nichts geht an HostRepute.
+Wie der Modellanbieter speichert, was er erhält, regeln seine eigenen Bedingungen.
+
+## Prüfen, ob es funktioniert hat
+
+- <UiPath path="ai.models.accountsTitle" /> zeigt das Konto als verbunden, und <UiPath path="ai.models.manage" /> zeigt
+  **Tool-Prüfung bestanden am …** für sein Modell.
+- <UiPath path="ai.models.defaultsTitle" /> nennt in jeder Zeile ein Modell.
+- Im Editor listet das Menü **Assistent** die eingeschalteten Funktionen auf, und der
+  [KI-Assistent](/de/integrations/ai-assistant/) antwortet mit dem Modell von
+  <UiPath path="ai.models.featureAssistant" />.
+
+## Fehlerbehebung
+
+- **„Fehler · Schlüssel abgelehnt“**: Der Anbieter hat den Schlüssel abgelehnt. Die Modelle dieses Kontos stoppen, bis
+  Sie den Schlüssel ersetzen oder <UiPath path="ai.testConnection" /> erfolgreich ist; andere Konten arbeiten weiter.
+- **Ein Modell lässt sich für Assistent oder Agentenläufe nicht wählen**: Es hat seine Tool-Prüfung nicht bestanden,
+  oder die Prüfung lief noch nicht. Wählen Sie <UiPath path="ai.models.manage" /> ›
+  <UiPath path="ai.models.runToolCheck" />, oder nutzen Sie ein Modell, das Tool-Aufrufe unterstützt.
+- **Ein Modell lässt sich nicht entfernen**: Funktionen nutzen es, oder es ist das einzige Modell des Kontos. Wählen
+  Sie zuerst ein anderes Modell für diese Funktionen, oder entfernen Sie das ganze Konto.
+- **Das Verbinden des ersten Modells schlägt mit einem Validierungsfehler fehl, während alle neun Funktionen angehakt
+  sind**: Der Server nimmt beim Verbinden höchstens acht Funktionen an (HostRepute/ReputeCast#83, offen in 1.7.0 und
+  der nächsten Version). Entfernen Sie im Dialog den Haken bei einer, verbinden Sie, und schalten Sie sie dann unter
+  <UiPath path="ai.featuresTitle" /> ein.
+- **„Keine Verbindung zu einer privaten Adresse möglich“**: siehe
+  [Modelle im eigenen Netzwerk](#modelle-im-eigenen-netzwerk).
+- **„Die Adresse hat sich geändert: Fügen Sie den API-Schlüssel erneut ein.“**: ReputeCast sendet einen gespeicherten
+  Schlüssel nicht an eine neue Adresse. Fügen Sie den Schlüssel zusammen mit dem neuen Endpunkt oder der neuen
+  Serveradresse ein.
+- **Der Alternativtext bleibt aus**: Sein Modell kann keine Bilder lesen. Wählen Sie für Alternativtext ein Modell, das
+  es kann.
+- **„Monatslimit erreicht“**: Erhöhen Sie das Limit unter **Monatslimit** › <UiPath path="common.edit" /> oder warten
+  Sie bis zum 1. des Monats.
+- **„Kosten unbekannt. Eine Person mit Integrationsverwaltung muss beide Modellpreise festlegen, bevor eine weitere
+  Anfrage gesendet werden kann.“**: Das Modell hat keine Preise. Legen Sie beide mit
+  <UiPath path="ai.models.editPrices" /> fest, 0 für ein Modell, das nichts kostet. Nach dem Upgrade auf 1.7.0 ist das
+  einmal nötig für eine Verbindung, deren beide Preise 0 waren und nicht aus der Preisliste von ReputeCast stammten.
+- **„Das verbleibende Monatsbudget reicht für diese und die laufenden Anfragen nicht aus.“**: Warten Sie, bis die
+  laufenden Anfragen fertig sind, gleichen Sie [reservierte Anfragen](#reservierte-anfragen-und-unbekannte-nutzung) ab,
+  oder erhöhen Sie das Limit.
+- **Eine Anfrage zeigt <UiPath path="ai.usageUnknown" />**: Der Anbieter hat ihre Nutzung nicht gemeldet. Schlagen Sie
+  sie in den Daten des Anbieters nach und [gleichen Sie sie ab](#reservierte-anfragen-und-unbekannte-nutzung).
+- **„Abgleich möglich nach …“** im Dialog oder `ai_reconcile_wait` von der API: Die Anfrage läuft möglicherweise noch.
+  Gleichen Sie sie nach der angezeigten Zeit ab.
+- **Der persönliche Schlüssel eines Mitglieds wird abgelehnt**: Persönliche Schlüssel sind ausgeschaltet, oder das
+  Mitglied hat sein persönliches Limit erreicht. Schalten Sie <UiPath path="ai.models.personalToggle" /> ein, erhöhen
+  Sie das Limit oder warten Sie, bis der Monat neu beginnt.
+
+## Verwandte Themen
+
+<CardGrid>
+  <LinkCard title="KI-Vorschläge für E-Mails, Segmente und Berichte erhalten" href="/de/integrations/ai-suggestions/" />
+  <LinkCard title="Den KI-Assistenten fragen" href="/de/integrations/ai-assistant/" />
+  <LinkCard title="Dem Assistenten Tools von MCP-Servern geben" href="/de/integrations/mcp-servers/" />
+  <LinkCard title="Kampagnen und Abläufe mit dem KI-Agenten entwerfen" href="/de/integrations/ai-agent/" />
+  <LinkCard title="E-Mail oder Ablauf aus einer Beschreibung entwerfen" href="/de/integrations/ai-drafts/" />
+  <LinkCard title="Andere Tools verbinden" href="/de/integrations/overview/" />
+</CardGrid>

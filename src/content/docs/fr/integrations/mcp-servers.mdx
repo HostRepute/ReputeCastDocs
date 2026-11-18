@@ -1,0 +1,371 @@
+---
+title: Donner à l’assistant les outils de serveurs MCP
+description: "Reliez des serveurs MCP distants à l’assistant IA de ReputeCast : examinez chaque outil, laissez les membres se connecter en OAuth et confirmez chaque écriture."
+type: how-to
+audience: [admin]
+permissions: ['integrations:manage', 'ai:use']
+uiPath: 'nav.settings > settings.integrations > mcpservers.title'
+primaryKeyword: serveurs MCP distants
+sources:
+  - internal/mcpclient
+  - internal/ai/assistant/mcp.go
+  - internal/app/wire_mcpclient.go
+  - internal/jobs/jobs.go
+  - internal/netguard/netguard.go
+  - web/src/features/mcpservers
+  - web/src/features/assistant/{ServerPicker,Confirmation}.tsx
+  - web/src/features/assistant/mcp.messages.ts
+  - web/src/routes/w/$workspace/_app/settings/integrations/mcp-servers.tsx
+  - migrations/{03650_b5_mcp,03651_b6_mcp}.sql
+  - docs/ai/mcp-servers.md
+sidebar:
+  order: 7.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Les serveurs MCP distants donnent à l’[assistant IA](/fr/integrations/ai-assistant/) de ReputeCast les outils de
+services extérieurs, comme un outil de suivi des tickets, un wiki ou une base de connaissances. Chaque outil attend
+l’examen d’un responsable. Les outils qui ne font que lire s’exécutent une fois approuvés ; les outils qui écrivent
+demandent à la personne à chaque fois, avec les arguments exacts. Les serveurs ne reçoivent jamais les clés de
+ReputeCast, et ce qu’ils renvoient est traité comme des données non fiables. Disponible à partir de la prochaine
+version après la 1.7.0.
+
+<Aside type="caution" title="Pas encore essayé avec des serveurs publics">
+  En amont, les serveurs MCP ont été testés avec les gestionnaires de serveur du SDK Go de MCP et un faux serveur
+  d’autorisation en loopback, y compris les variantes de découverte et la révocation décrites ci-dessous. Aucun serveur
+  MCP public ni aucun serveur d’autorisation public n’a encore été essayé. Lisez
+  [ce que ReputeCast attend d’un serveur OAuth](#ce-que-reputecast-attend-dun-serveur-oauth) avant d’en ajouter un.
+</Aside>
+
+ReputeCast a trois fonctionnalités MCP. Cette page porte sur la première :
+
+| Fonctionnalité | Sens | Où |
+|---|---|---|
+| Serveurs MCP | L’assistant de ReputeCast appelle les outils d’un serveur extérieur | <UiPath path="nav.settings > settings.integrations > mcpservers.title" /> |
+| [Le serveur MCP de ReputeCast](/fr/developers/mcp/) | Un agent extérieur appelle les outils de ReputeCast avec un jeton d’agent | <UiPath path="nav.settings > settings.keys" /> |
+| [Connexions externes](/fr/developers/mcp-connections/) | ChatGPT, Claude ou un autre client MCP se connecte avec OAuth et propose des brouillons | <UiPath path="nav.settings > settings.keys" /> |
+
+## Avant de commencer
+
+- Ajouter, modifier, synchroniser et retirer des serveurs, et examiner les outils, exige `integrations:manage`
+  (Propriétaire et Admin). Les personnes disposant de `integrations:view` voient la page en lecture seule : les
+  serveurs, leurs outils et la façon dont chacun est autorisé. Avec `ai:use`, elles peuvent connecter leur propre compte
+  à un serveur OAuth.
+- Utiliser les outils d’un serveur dans une conversation exige `ai:use` et un serveur autorisé pour le rôle de la
+  personne.
+- Munissez-vous du point de terminaison MCP du serveur (Streamable HTTP, ou HTTP avec SSE) et de son identifiant, s’il
+  en exige un. Seuls les serveurs distants peuvent être ajoutés : les serveurs de processus locaux (stdio) ne sont pas
+  pris en charge.
+- Pour les serveurs qui connectent les membres avec OAuth, l’URL publique de l’instance doit utiliser `https://` et être
+  joignable depuis les navigateurs des personnes ([l’adresse de redirection OAuth](#ladresse-de-redirection-oauth)).
+
+## Ajouter un serveur
+
+<Steps>
+
+1. Ouvrez <UiPath path="nav.settings > settings.integrations > mcpservers.title" />. Le groupe
+   <UiPath path="integrations.groupAi" /> du catalogue des intégrations et la page Modèles d’IA y renvoient.
+   Choisissez <UiPath path="mcpservers.addServer" />.
+
+2. Remplissez <UiPath path="mcpservers.addTitle" /> :
+
+   - <UiPath path="mcpservers.fieldName" /> : la façon dont les conversations et les lignes d’outils le nomment
+     (« Linear · search_issues »). Ses premières lettres préfixent aussi les noms de ses outils pour le modèle, comme
+     `mcp__linear__search_issues`.
+   - <UiPath path="mcpservers.fieldUrl" /> : le point de terminaison MCP du serveur. ReputeCast essaie Streamable HTTP
+     et se replie sur HTTP avec SSE. Utilisez l’adresse exacte : ReputeCast ne suit pas les redirections.
+   - <UiPath path="mcpservers.fieldAuth" /> : <UiPath path="mcpservers.optOAuth" />,
+     <UiPath path="mcpservers.optHeader" /> ou <UiPath path="mcpservers.optNone" />. Voir [la connexion](#connexion).
+   - <UiPath path="mcpservers.fieldWho" /> : <UiPath path="mcpservers.whoAll" /> ou
+     <UiPath path="mcpservers.whoManagers" />. L’API accepte aussi n’importe quelle liste de clés de rôle.
+
+3. Choisissez <UiPath path="mcpservers.addAndSync" />. Un serveur avec un en-tête partagé ou sans connexion est
+   synchronisé aussitôt. Un serveur OAuth vous envoie d’abord vers sa connexion, car une synchronisation liste les
+   outils en votre nom ; de retour sur la page, il se synchronise.
+
+4. [Examinez chaque outil](#examiner-les-outils). Tant que vous ne l’avez pas fait, aucune conversation ne se voit
+   proposer l’un d’eux.
+
+</Steps>
+
+<Screenshot
+  id="mcp-server-add"
+  alt="La boîte de dialogue Ajouter un serveur MCP remplie pour Acme Wiki à https://wiki.acme.io/mcp, avec la note indiquant que l’adresse est le point de terminaison MCP du serveur en Streamable HTTP ou en HTTP avec SSE ; Connexion réglée sur OAuth, chaque membre se connecte, avec Utiliser un client enregistré auprès du serveur replié ; Qui peut l’utiliser réglé sur Toutes les personnes avec « Utiliser l’assistant IA » ; la note indiquant que les adresses privées nécessitent le réglage de l’instance ; et Ajouter et synchroniser les outils."
+/>
+
+Chaque requête que ReputeCast adresse à un serveur ou à son serveur d’autorisation passe par la protection SSRF, qui
+vérifie l’adresse à chaque connexion. Les serveurs sur des adresses privées ou loopback nécessitent le réglage de
+l’instance [`providers.allow_private_networks`](/fr/reference/configuration/) ; les adresses link-local et de
+métadonnées cloud sont toujours refusées. ReputeCast accepte les adresses `http://`, mais le secret d’en-tête ou le
+jeton circule alors en clair : utilisez `https://`.
+
+Après l’ajout, <UiPath path="mcpservers.edit" /> modifie le nom, qui peut l’utiliser, la valeur du secret d’en-tête
+(<UiPath path="mcpservers.replace" />), le client OAuth et <UiPath path="mcpservers.enabled" /> (désactivé : les
+conversations ne proposent plus ses outils ; rien n’est supprimé). L’adresse, le type de connexion et le nom de
+l’en-tête ne peuvent pas changer : retirez le serveur et ajoutez-le de nouveau. <UiPath path="mcpservers.removeServer" />,
+dans Modifier, retire ses outils et la connexion de chaque membre à ce serveur ; leurs jetons d’actualisation sont
+[révoqués](#révoquer-les-connexions-supprimées) là où le serveur d’autorisation le permet, et un appel en attente de
+confirmation ne peut plus être autorisé, seulement refusé.
+
+## Connexion
+
+<TableScroll label="Types de connexion d’un serveur MCP">
+
+| Type | Ce que voit le serveur | Remarques |
+|---|---|---|
+| <UiPath path="mcpservers.optNone" /> | Des requêtes anonymes | Pour les serveurs qui n’exigent aucun identifiant. |
+| <UiPath path="mcpservers.optHeader" /> | L’espace de travail, comme une seule identité | Un <UiPath path="mcpservers.fieldHeaderName" /> (`Authorization` par défaut) et une <UiPath path="mcpservers.fieldHeaderValue" />. La valeur est en écriture seule : « ReputeCast ne l’affiche plus jamais et ne l’envoie qu’à ce serveur. » Toutes les personnes autorisées à utiliser le serveur agissent avec cet unique identifiant. |
+| <UiPath path="mcpservers.optOAuth" /> | Chaque membre, en son propre nom | Chaque membre connecte son propre compte : les autorisations propres au serveur s’appliquent donc personne par personne. |
+
+</TableScroll>
+
+Les secrets d’en-tête, les secrets client et les jetons sont chiffrés au repos avec la clé secrète de l’instance et ne
+sont jamais renvoyés par l’API.
+
+### L’adresse de redirection OAuth
+
+Le serveur d’autorisation renvoie les personnes vers la même adresse pour chaque serveur et chaque espace de travail :
+
+```text title="Adresse de redirection OAuth"
+<public URL>/api/v1/ai/mcp/oauth/callback
+```
+
+Par exemple `https://news.example.com/api/v1/ai/mcp/oauth/callback`. L’URL publique est celle enregistrée dans
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, ou
+[`REPUTECAST_PUBLIC_URL`](/fr/self-hosting/configuration/).
+
+- Quand ReputeCast s’enregistre lui-même auprès du serveur d’autorisation (enregistrement dynamique de client), il
+  enregistre cette adresse. Vous n’avez rien à saisir.
+- Quand le serveur exige un client que vous avez enregistré, ouvrez <UiPath path="mcpservers.clientSummary" />,
+  saisissez l’<UiPath path="mcpservers.fieldClientId" /> et, s’il en a un, le
+  <UiPath path="mcpservers.fieldClientSecret" />, puis enregistrez l’adresse ci-dessus comme adresse de redirection du
+  client. Une fois le serveur ajouté, <UiPath path="mcpservers.edit" /> l’affiche sous la forme « Adresse de
+  redirection à enregistrer : … ».
+
+La spécification d’autorisation de MCP exige que les adresses de redirection utilisent https (ou localhost), et les
+serveurs d’autorisation peuvent refuser les autres
+([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), vérifié en
+novembre 2026). Si l’URL publique change, l’adresse de redirection change avec elle : enregistrez la nouvelle pour un
+client que vous avez saisi. Un client que ReputeCast a enregistré garde l’ancienne adresse : effacez donc son ID client
+dans Modifier, et la connexion suivante enregistre un nouveau client. Attendez-vous à ce que les membres doivent se
+reconnecter.
+
+### Ce que ReputeCast attend d’un serveur OAuth
+
+ReputeCast suit le flux d’autorisation de MCP avec PKCE (S256), l’indicateur de ressource (RFC 8707) et un state lié à
+la session de la personne, utilisable une seule fois et pendant dix minutes. La découverte a lieu à la première
+connexion au serveur, puis de nouveau après l’effacement de son ID client :
+
+1. Il envoie au serveur une requête MCP `initialize` sans identifiants. Si la réponse est un 401, il lit
+   `resource_metadata` et `scope` dans son challenge Bearer `WWW-Authenticate`.
+2. Il lit les métadonnées de la ressource protégée (RFC 9728) depuis, dans l’ordre : l’adresse que nommait le 401 ;
+   `https://<host>/.well-known/oauth-protected-resource<path>`, construite à partir de l’adresse du serveur ; et la
+   racine `https://<host>/.well-known/oauth-protected-resource`. Un document issu des deux premières doit nommer
+   l’adresse du serveur comme sa `resource` ; le document racine doit nommer l’origine du serveur, qui devient alors la
+   ressource pour laquelle ReputeCast demande des jetons. Un document qui nomme une autre ressource est refusé.
+3. Il prend le premier serveur d’autorisation listé et lit ses métadonnées : OAuth (RFC 8414) d’abord, puis la
+   découverte OpenID Connect. Les métadonnées doivent lister `S256` dans `code_challenge_methods_supported`.
+4. Sans client que vous avez saisi, le serveur d’autorisation doit avoir un `registration_endpoint`. Les documents de
+   métadonnées d’ID client (Client ID metadata documents) ne sont pas pris en charge.
+5. Il demande le scope que nommait le 401, sinon tous les scopes de `scopes_supported` de la ressource.
+6. L’authentification du client est soit aucune, soit HTTP basic avec le secret client. `client_secret_post` et
+   `private_key_jwt` ne sont pas pris en charge.
+7. Les adresses de métadonnées doivent être en https (http simple uniquement en loopback).
+8. Il conserve le `revocation_endpoint` du serveur d’autorisation, s’il en a un, pour
+   [révoquer les connexions supprimées](#révoquer-les-connexions-supprimées).
+
+Quand l’une de ces étapes échoue, la connexion indique « La connexion à … n’a pas pu être configurée : son serveur
+d’autorisation n’a pas répondu comme prévu. Vérifiez l’adresse ou saisissez un client enregistré. »
+
+## Examiner les outils
+
+La page affiche les outils d’un seul serveur à la fois : celui que vous choisissez avec
+<UiPath path="mcpservers.showTools" />, sinon le premier dont un outil a changé, sinon le premier.
+<UiPath path="mcpservers.sync" /> les liste de nouveau depuis le serveur, jusqu’à 200 par serveur. Un nouvel outil est
+<UiPath path="mcpservers.statePending" /> et n’est proposé à aucune conversation.
+
+<Screenshot
+  id="mcp-servers"
+  alt="Paramètres, Intégrations, Serveurs MCP : le serveur Acme Tracker sur une adresse loopback, sans connexion, avec le badge 1 outil à examiner ; son tableau d’outils avec add_comment Non décidé et En attente d’examen, create_issue Écrit et Demande à chaque fois, et search_issues Lecture seule et Approuvé, chacun avec Examiner ; et la carte Comment les appels sont autorisés."
+>
+  1. Le serveur, sa connexion et ses badges.
+  2. Le type et l’état de chaque outil.
+  3. Comment les appels sont autorisés.
+</Screenshot>
+
+<Steps>
+
+1. Choisissez <UiPath path="mcpservers.review" /> sur un outil (<UiPath path="mcpservers.view" /> pour les personnes
+   qui ne peuvent pas gérer les intégrations). La boîte de dialogue affiche la description de l’outil, son
+   `inputSchema` et ses annotations en texte brut, tels que le serveur les a envoyés. Lisez-les comme non fiables : ce
+   sont les propres mots du serveur, et ce que le modèle lira. Les annotations comme `readOnlyHint` sont des
+   indications du serveur, pas des preuves.
+
+2. Choisissez son type : <UiPath path="mcpservers.optReadOnly" />, <UiPath path="mcpservers.optWrites" /> ou
+   <UiPath path="mcpservers.optBlocked" />. Un outil en attente d’examen part sur Écrit. Marquez un outil Écrit dès
+   qu’il modifie quoi que ce soit hors de ReputeCast, même s’il semble inoffensif.
+
+3. Enregistrez. « L’approbation fige cette description et ce schéma. Toute modification désactive l’outil. »
+
+</Steps>
+
+<Screenshot
+  id="mcp-tool-review"
+  alt="L’examen de add_comment d’Acme Tracker : la note indiquant que la description est le texte du serveur lui-même et qu’elle n’est pas fiable, la description, le schéma d’entrée et les annotations en texte brut, la version examinée, les types Lecture seule, Écrit (choisi) et Bloqué, la note indiquant que l’approbation fige cette description et ce schéma, et Enregistrer."
+/>
+
+| Type | État | Ce qui se passe |
+|---|---|---|
+| <UiPath path="mcpservers.kindReadOnly" /> | <UiPath path="mcpservers.stateApproved" /> | Le modèle peut l’appeler ; il s’exécute sans demander. |
+| <UiPath path="mcpservers.kindWrites" /> | <UiPath path="mcpservers.stateAsks" /> | Chaque appel attend que la personne choisisse [Autoriser une fois ou Refuser](/fr/integrations/ai-assistant/#confirmer-les-outils-qui-écrivent). |
+| <UiPath path="mcpservers.kindBlocked" /> | <UiPath path="mcpservers.stateBlocked" /> | Jamais proposé au modèle. |
+
+Les arguments d’un outil en lecture seule quittent tout de même l’instance : le modèle les écrit, et ils peuvent
+contenir ce qu’une personne a joint. Les autres états sont <UiPath path="mcpservers.stateChanged" />
+([voir ci-dessous](#quand-un-outil-change)) et <UiPath path="mcpservers.stateRemoved" /> (la dernière liste du serveur
+ne le contenait pas ; il n’est pas proposé). Si l’outil a changé sur le serveur pendant votre examen, la décision n’est
+pas enregistrée et la page affiche la nouvelle version : « Cet outil a changé sur le serveur pendant votre examen. »
+
+## Quand un outil change
+
+Une décision est enregistrée avec l’empreinte de la description, du schéma d’entrée et des annotations de l’outil tels
+que vous les avez examinés. ReputeCast compare les outils d’un serveur avec ce qui a été décidé à trois moments :
+
+- **Avant chaque appel.** Dans la session propre à l’appel, ReputeCast liste d’abord les outils du serveur. Si l’outil
+  n’est plus listé, ou diffère de la version sur laquelle porte la décision, l’appel n’est pas envoyé.
+- **Toutes les heures**, pour les serveurs dont la connexion est <UiPath path="mcpservers.optNone" /> ou un
+  <UiPath path="mcpservers.optHeader" />, qui sont activés et ont déjà été synchronisés (la tâche `mcp.servers_sync`, au
+  plus 20 serveurs par passage). Les serveurs OAuth sont listés au nom d’une personne : seuls la vérification avant
+  chaque appel et le Synchroniser les outils d’un responsable les couvrent.
+- **Quand un responsable choisit <UiPath path="mcpservers.sync" />.**
+
+Quand l’un d’eux constate qu’un outil approuvé ou bloqué a changé, l’outil devient
+<UiPath path="mcpservers.stateChanged" /> : aucune conversation ne le propose, et un appel en attente de confirmation ne
+peut pas s’exécuter. Les membres qui gèrent les intégrations reçoivent une notification (« Des outils de … ont
+changé »), et les conversations dont un appel s’est heurté à ce changement affichent
+<UiPath path="assistant.mcp.changedTitle" />. <UiPath path="assistant.mcp.reviewChange" /> affiche **Avant** et
+**Après** pour la description, le schéma d’entrée et les annotations, avec <UiPath path="mcpservers.blockTool" /> et
+<UiPath path="mcpservers.approveNew" />. Un outil que le serveur ne liste plus devient
+<UiPath path="mcpservers.stateRemoved" />, sans notification.
+
+## Utiliser les serveurs dans une conversation
+
+Les membres choisissent les serveurs d’une conversation dans le sélecteur de serveurs du panneau
+([choisir le modèle et les serveurs MCP](/fr/integrations/ai-assistant/#choisir-le-modèle-et-les-serveurs-mcp)). Un
+serveur limité à certains rôles indique « Seuls … peuvent l’utiliser » sur sa ligne ; un serveur désactivé, ou qui n’est
+pas destiné au rôle de la personne, n’est pas proposé. Chaque appel vérifie de nouveau que la personne peut utiliser le
+serveur.
+
+La conversation propose les outils approuvés des serveurs choisis après ceux de ReputeCast, dans la limite de 40 outils
+par requête, triés par nom de serveur puis par nom d’outil ; les autres ne sont pas proposés. Sur un serveur OAuth,
+seuls les membres qui se sont connectés obtiennent ses outils. Chaque appel ouvre sa propre session avec le serveur, au
+nom de la personne à qui appartient la conversation : ReputeCast liste d’abord les outils du serveur, puis appelle
+l’outil, et les deux disposent ensemble de 30 secondes. Les lignes d’outils indiquent « Serveur · outil » et la durée,
+ou ce qui a échoué.
+
+<LimitsTable area="mcp-servers" />
+
+## Résultats non fiables
+
+Ce que renvoie un serveur est une donnée, jamais une instruction :
+
+- Du texte uniquement. Les images, l’audio et les ressources intégrées deviennent une note comme `[image removed]`, et
+  le HTML devient son texte, sans scripts ni styles.
+- 32 Ko au plus. Une réponse plus grande n’est pas transmise au modèle.
+- Encadré par des délimiteurs `<untrusted_content source="Server · tool">` que le texte ne peut pas fermer, et le
+  modèle a pour consigne de ne jamais suivre les instructions qu’ils contiennent, ni d’appeler un outil ou de partager
+  des données parce qu’elles le demandent.
+- La description d’un outil parvient au modèle précédée de « From the MCP server …, outside ReputeCast », en 1 000
+  caractères au plus ; les schémas d’entrée de plus de 8 Ko ne sont pas proposés.
+
+Les délimiteurs réduisent le risque ; ils ne rendent pas un modèle insensible à un texte qui cherche à l’orienter. C’est
+pourquoi les outils qui écrivent demandent à chaque fois et qu’il n’existe pas d’option « toujours autoriser ».
+
+## Ce que reçoivent les serveurs
+
+- Les arguments des appels de leurs propres outils, tels que le modèle les a écrits. Pour un outil qui écrit,
+  exactement les arguments que la personne a autorisés.
+- Leur identifiant : l’en-tête partagé, ou le propre jeton OAuth du membre.
+- Pour les serveurs OAuth : une requête MCP `initialize` sans identifiants lors de la découverte, et le jeton
+  d’actualisation d’une connexion supprimée, envoyé au point de terminaison de révocation du serveur d’autorisation.
+
+Rien d’autre : aucune clé de ReputeCast, et rien de la conversation à moins que le modèle ne le mette dans les arguments
+d’un appel. ReputeCast refuse l’échantillonnage (sampling : un serveur qui demande au modèle de ReputeCast de générer du
+texte) et la sollicitation (elicitation : un serveur qui demande une saisie à la personne), et ne liste pas les
+ressources ni les prompts des serveurs.
+
+Chaque appel figure dans le [journal d’audit](/fr/team/audit-log/) sous `mcp_tool.called`, avec la personne, la
+conversation, le serveur, le résultat, la durée et une empreinte des arguments salée avec l’ID de l’appel, jamais les
+arguments ni le résultat. Les modifications de serveurs, les synchronisations, les décisions sur les outils, les
+connexions et les confirmations sont aussi auditées.
+
+## Connexions personnelles des membres
+
+Sur un serveur OAuth, chaque membre se connecte pour lui-même :
+
+- <UiPath path="mcpservers.connect" /> sur la ligne du serveur, ou **Se connecter à …** dans le sélecteur de serveurs
+  d’une conversation, ouvre la page de connexion du serveur. Elle revient sur Serveurs MCP avec « Connecté à … »,
+  « Vous avez annulé la connexion à … » ou « … n’a pas terminé la connexion ».
+- La ligne indique alors « Connecté en tant que … », avec <UiPath path="mcpservers.reconnect" /> et
+  <UiPath path="mcpservers.disconnect" />.
+- ReputeCast actualise le jeton de lui-même peu avant son expiration. Quand l’actualisation est refusée, ou que le
+  serveur répond 401 ou 403, la connexion est supprimée et les conversations affichent **Reconnectez-vous à …**.
+- <UiPath path="mcpservers.disconnect" /> supprime les jetons que détient ReputeCast.
+
+Les connexions d’un membre dans un espace de travail sont supprimées quand il le quitte, en est retiré ou est
+désactivé. Désactiver une personne dans l’administration de l’instance supprime ses connexions dans tous les espaces de
+travail, et retirer un serveur supprime la connexion de chaque membre à ce serveur.
+
+### Révoquer les connexions supprimées
+
+Quand le serveur d’autorisation a annoncé un `revocation_endpoint`, ReputeCast révoque aussi le jeton d’actualisation de
+chaque connexion qu’il supprime (RFC 7009) : sur Déconnecter, quand le membre part, est retiré ou est désactivé, quand le
+serveur est retiré, et quand le serveur a refusé la connexion. Sur Déconnecter, il traite la file aussitôt (jusqu’à 10
+jetons, pendant 10 secondes au plus) ; la tâche `mcp.tokens_revoke` envoie le reste toutes les minutes. C’est au mieux :
+chaque jeton est essayé une fois, une révocation échouée est journalisée sans le jeton, et la connexion disparaît dans
+tous les cas. Les jetons d’accès ne sont pas révoqués ; ils deviennent caducs à leur expiration. Sans
+`revocation_endpoint`, rien n’est révoqué : utilisez les réglages propres au serveur.
+
+## Vérifier le résultat
+
+- La ligne du serveur affiche son nombre d’outils, et <UiPath path="mcpservers.showTools" /> liste les outils que vous
+  avez examinés comme <UiPath path="mcpservers.stateApproved" /> ou <UiPath path="mcpservers.stateAsks" />.
+- Dans le [panneau de l’assistant](/fr/integrations/ai-assistant/), le sélecteur de serveurs liste le serveur, et une
+  demande à laquelle ses outils peuvent répondre affiche une ligne « Serveur · outil ».
+
+## Dépannage
+
+<TableScroll label="Problèmes de serveurs MCP">
+
+| Ce que vous voyez | Pourquoi | Que faire |
+|---|---|---|
+| **Reconnectez-vous à …** (<UiPath path="assistant.mcp.signInBadge" />) | Votre connexion au serveur a expiré ou n’a jamais été établie. L’assistant répond sans ce serveur. | **Se connecter à …**. |
+| <UiPath path="assistant.mcp.changedTitle" /> (<UiPath path="assistant.mcp.changedBadge" />) | Le serveur a modifié un outil après son approbation. | Un responsable choisit <UiPath path="assistant.mcp.reviewChange" />. |
+| **… est bloqué** | Un responsable a bloqué l’outil. | Rien ; l’assistant répond sans lui. |
+| **… est injoignable**, ou le badge <UiPath path="mcpservers.badgeUnreachable" /> du serveur | Le serveur n’a pas répondu. | Redemandez plus tard, ou vérifiez l’adresse et le serveur. |
+| **… a mis trop de temps** | L’outil n’a pas répondu en 30 secondes. | Redemandez plus tard. |
+| **… a envoyé trop de données** | La réponse dépassait 32 Ko : le modèle ne l’a donc pas reçue. | Posez une question plus précise. |
+| « La connexion à … n’a pas pu être configurée » | La découverte ou l’enregistrement a échoué. | Vérifiez [ce qu’attend ReputeCast](#ce-que-reputecast-attend-dun-serveur-oauth), ou saisissez un client enregistré. |
+| « Connexion impossible à une adresse privée » | Le serveur est sur votre propre réseau. | Un exploitant définit `providers.allow_private_networks`. |
+
+</TableScroll>
+
+Une ligne d’outil peut aussi indiquer « Vous avez refusé …. Rien n’a été envoyé à …. » ou « … s’est peut-être exécuté,
+mais son résultat a été perdu. Vérifiez … avant de redemander. » Le second cas signifie que l’appel a été envoyé et que
+le worker a été perdu avant l’enregistrement de son résultat ; ReputeCast ne l’envoie jamais de nouveau.
+
+## Voir aussi
+
+<CardGrid>
+  <LinkCard title="Interroger l’assistant IA" href="/fr/integrations/ai-assistant/" />
+  <LinkCard title="Connecter des modèles d’IA avec votre propre clé" href="/fr/integrations/ai-models/" />
+  <LinkCard title="Connecter des agents IA avec MCP" href="/fr/developers/mcp/" />
+  <LinkCard title="Connecter des assistants externes avec MCP et OAuth" href="/fr/developers/mcp-connections/" />
+  <LinkCard title="Configuration : l’assistant IA" href="/fr/self-hosting/configuration/#lassistant-ia" />
+  <LinkCard title="Sécurité et durcissement" href="/fr/self-hosting/security/" />
+</CardGrid>

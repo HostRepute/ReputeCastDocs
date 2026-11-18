@@ -17,8 +17,10 @@ sources:
   - internal/smtprelay
   - internal/app/wire_smtprelay.go
   - internal/config/config.go
-  - internal/app/metrics.go
+  - internal/ai/assistant/stream.go
+  - internal/mcpclient/oauth.go
   - docs/deploy/reverse-proxy.md
+  - internal/app/metrics.go
   - README.md
 sidebar:
   order: 7
@@ -40,17 +42,22 @@ Les configurations ci-dessous ont été testées avec `caddy:2` (2.11), `nginx:s
   d’envoi), `/p/…` (les pages publiques), `/t/…` (le suivi des ouvertures et des clics), `/mcp` et `/healthz`, que
   récupère la vérification de l’URL publique. Depuis la version 1.7.0, les
   [connexions externes](/fr/developers/mcp-connections/) ont aussi besoin de `/mcp/connect`, de `/oauth/mcp/…` et des
-  documents de découverte OAuth sous `/.well-known/`.
+  documents de découverte OAuth sous `/.well-known/`. À partir de la prochaine version après la 1.7.0, les membres qui se
+  connectent aux [serveurs MCP](/fr/integrations/mcp-servers/) de l’assistant IA reviennent sur
+  `/api/v1/ai/mcp/oauth/callback`.
 - **Conserver l’en-tête `Host`.** ReputeCast s’en sert pour reconnaître les domaines personnalisés.
 - **Envoyer `X-Forwarded-For`.** ReputeCast ne le lit que depuis les
   [proxys de confiance](#définir-lurl-publique-et-les-proxys-de-confiance), que le proxy prolonge la ligne du client
   ou ajoute sa propre ligne d’en-tête. Il n’a pas besoin de `X-Forwarded-Proto` : il sait qu’il est en HTTPS grâce à
   `http.public_url`.
-- **Diffuser sans mise en mémoire tampon** deux types de réponses :
+- **Diffuser sans mise en mémoire tampon** ces réponses :
   - le suivi en direct, des Server-Sent Events sur
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (un battement de cœur toutes les
     15 secondes, `retry: 3000`) ;
-  - l’[endpoint MCP](/fr/developers/mcp/) `/mcp` (Streamable HTTP), dont les réponses sont en `text/event-stream`.
+  - l’[endpoint MCP](/fr/developers/mcp/) `/mcp` (Streamable HTTP), dont les réponses sont en `text/event-stream` ;
+  - à partir de la prochaine version après la 1.7.0, les réponses de l’[assistant IA](/fr/integrations/ai-assistant/),
+    des Server-Sent Events sur `GET /api/v1/workspaces/{workspace}/ai/assistant/threads/{thread}/stream` (voir
+    [les flux d’événements de l’assistant](#les-flux-dévénements-de-lassistant)).
 - **Attendre les [requêtes IA longues](#requêtes-ia-longues).** Un brouillon à partir d’une consigne peut mettre jusqu’à
   10 minutes à répondre.
 - **Accepter des corps de requête volumineux.** ReputeCast fixe une limite par opération ; la plus grande est de
@@ -133,8 +140,8 @@ Omettez le bloc `https://` si aucun espace de travail n’utilise de domaine per
 
 Cette configuration s’adresse à nginx 1.25.1 ou ultérieur (la directive `http2` ; avant la 1.25.1, écrivez
 `listen 443 ssl http2;`) sur le serveur lui-même, avec un certificat Let’s Encrypt à l’emplacement par défaut de
-Certbot. Par défaut, nginx met en mémoire tampon les réponses qu’il relaie : les deux chemins de streaming désactivent
-donc la mise en mémoire tampon.
+Certbot. Par défaut, nginx met en mémoire tampon les réponses qu’il relaie : les chemins de streaming désactivent donc
+la mise en mémoire tampon.
 
 ```nginx title="/etc/nginx/conf.d/reputecast.conf"
 upstream reputecast {
@@ -178,6 +185,14 @@ server {
     }
 
     location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    # The AI assistant's answers (Server-Sent Events), from the next release after 1.7.0.
+    location ~ ^/api/v1/workspaces/[^/]+/ai/assistant/threads/[^/]+/stream$ {
         proxy_pass http://reputecast;
         proxy_buffering off;
         proxy_cache off;
@@ -317,6 +332,30 @@ rien. Un répartiteur de charge ou un CDN placé devant le proxy a besoin du mê
 de l’[agent IA](/fr/integrations/ai-agent/) n’en ont pas besoin : leurs appels au modèle s’exécutent en arrière-plan,
 et la page ne fait que lire leur progression. Disponible depuis la version 1.7.0.
 
+## Les flux d’événements de l’assistant
+
+À partir de la prochaine version après la 1.7.0, chaque conversation de l’[assistant IA](/fr/integrations/ai-assistant/)
+ouverte dans un panneau ou en pleine page garde un flux Server-Sent Events (`text/event-stream`). Le proxy doit
+transmettre chaque événement dès qu’il est écrit :
+
+- **Mise en mémoire tampon désactivée.** Par défaut, nginx met les réponses en mémoire tampon : gardez donc la
+  `location` du flux avec `proxy_buffering off;`, comme dans l’exemple ci-dessus (ReputeCast n’envoie pas
+  `X-Accel-Buffering`). Caddy et Traefik transmettent aussitôt les réponses `text/event-stream` sans réglage
+  supplémentaire. Si le proxy ou un CDN placé devant compresse les réponses, excluez `text/event-stream`. Un flux mis en
+  mémoire tampon affiche les réponses en retard, d’un seul coup, ou seulement quand le navigateur abandonne et se
+  reconnecte.
+- **Délais.** Le flux envoie un battement de cœur toutes les 15 secondes quand rien d’autre ne se passe, et le
+  navigateur considère 45 secondes de silence comme une connexion coupée. Tout délai de lecture ou d’inactivité
+  supérieur à 15 secondes convient, y compris les 60 secondes par défaut de nginx. Quand un proxy coupe tout de même un
+  flux, le navigateur se reconnecte avec le dernier événement reçu, et rien n’est perdu ni répété ; la réponse
+  elle-même continue sur le serveur.
+- **HTTP/2.** Chaque conversation ouverte et chaque suivi en direct occupe une connexion. En HTTP/1.1, un navigateur
+  ouvre au plus six connexions vers un même hôte, partagées par tous ses onglets : quelques onglets ouverts peuvent donc
+  faire attendre d’autres requêtes. En HTTP/2, ils partagent une seule connexion.
+
+Un navigateur qui ne lit pas un événement dans les 5 secondes est coupé, puis reprend à son dernier événement. La
+connexion Postgres qu’utilisent les flux est décrite dans [passage à l’échelle](/fr/self-hosting/scaling/#lassistant-ia).
+
 ## Domaines personnalisés
 
 Un espace de travail peut servir sa page d’inscription, son centre de préférences, ses archives et ses autres pages
@@ -400,6 +439,9 @@ certificat : les proxys HTTP ne le transportent donc pas.
 
 - **Le suivi en direct ne bouge pas, ou saute toutes les quelques secondes** : le proxy met le flux en mémoire
   tampon. Dans nginx, ajoutez la `location` du flux en direct avec `proxy_buffering off`.
+- **Les réponses de l’assistant IA arrivent d’un seul coup, ou le panneau indique sans cesse qu’il se reconnecte** : le
+  proxy met en mémoire tampon ou compresse le flux de l’assistant. Dans nginx, ajoutez la `location` de l’assistant avec
+  `proxy_buffering off` ; voir [les flux d’événements de l’assistant](#les-flux-dévénements-de-lassistant).
 - **`413 Request Entity Too Large` lors des imports ou des envois de fichiers** : augmentez le
   `client_max_body_size` de nginx.
 - **Les écrans mettent de nombreuses secondes à s’afficher sur les téléphones** : le proxy parle HTTP/1.1 aux

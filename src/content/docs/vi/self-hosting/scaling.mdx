@@ -14,6 +14,8 @@ sources:
   - internal/cli/serve.go
   - internal/cli/seed.go
   - internal/jobs/jobs.go
+  - internal/ai/assistant/{hub,runtime,stream,retention}.go
+  - internal/mcpclient/catalog.go
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
@@ -139,6 +141,40 @@ Deployment với `mode: split`: các pod web (mặc định 2, có thể kèm au
 - **Không dùng chung giới hạn tần suất**: mỗi tiến trình web tự đếm yêu cầu của riêng nó, nên sau load balancer với ba
   tiến trình web, một client có thể đạt gấp ba lần [giới hạn](/vi/self-hosting/security/#mặc-định-và-giới-hạn).
 
+## Trợ lý AI
+
+Từ bản phát hành tiếp theo sau 1.7.0, [trợ lý AI](/vi/integrations/ai-assistant/) trả lời trên các worker và truyền
+luồng qua các tiến trình web. Người quản lý bật trợ lý cho từng không gian làm việc; đây là những gì nó cần ở hệ thống.
+
+- **Worker** trả lời các lượt trên hàng đợi `ai_assistant`. Tin nhắn của một người được ghi cùng tác vụ của nó và bất kỳ
+  worker nào cũng nhận được, nên `--role=web` và `--role=worker` có thể chạy trên các máy khác nhau. Mỗi tiến trình
+  worker trả lời cùng lúc tối đa một nửa số lượt của `worker.concurrency`, và ít nhất 10 (25 với mặc định 50), cộng thêm
+  các hàng đợi khác của nó; một lượt chủ yếu chờ nhà cung cấp mô hình. Giới hạn số câu trả lời cùng lúc của mỗi không
+  gian làm việc (mặc định 2 mỗi người và 10 mỗi không gian làm việc) áp dụng trên toàn bộ worker.
+- **Không có worker nào chạy**: tin nhắn nằm chờ trong hàng đợi, và sau 30 phút bảng trợ lý hiện "Câu trả lời bị gián
+  đoạn". Một worker đang dừng (khi triển khai, `SIGTERM`) cho các tác vụ đang chạy 10 giây; một lượt vẫn đang trả lời
+  khi đó sẽ thất bại vì bị gián đoạn, giữ phần đã viết, và chi phí của nó vẫn chưa rõ cho đến khi người quản lý
+  [đối soát](/vi/integrations/ai-models/#giữ-trước-ngân-sách-và-mức-sử-dụng-chưa-rõ).
+- **Thêm một kết nối Postgres cho mỗi tiến trình web.** Mỗi tiến trình có vai trò `web` mở một kết nối riêng để `LISTEN`
+  sự kiện của cuộc trò chuyện, bên ngoài pool, với cùng URL cơ sở dữ liệu. Kết nối mở cùng luồng đầu tiên và đóng một
+  phút sau khi luồng cuối cùng kết thúc, và hiện trong `pg_stat_activity` với `application_name` là
+  `reputecast-assistant`. Hãy chừa chỗ cho nó trong `max_connections`: pool của mỗi tiến trình web cộng thêm một.
+- **`LISTEN` cần một phiên**: kết nối trực tiếp, hoặc qua PgBouncer ở chế độ session. Ở chế độ transaction, luồng chỉ
+  bắt kịp ở lần kiểm tra quyền truy cập năm giây một lần, nên câu trả lời đến từng đợt. Khi kết nối bị ngắt, tiến trình
+  ghi log `assistant: listening for thread events failed; streams poll until it listens again` và đánh thức mọi luồng
+  mỗi giây cho đến khi lắng nghe lại được.
+- **Lưu lượng ra ngoài**: cả hai vai trò đều kết nối tới nhà cung cấp mô hình và các
+  [máy chủ MCP](/vi/integrations/mcp-servers/) cùng máy chủ cấp quyền của chúng: worker cho từng lần gọi công cụ, lần
+  `mcp.servers_sync` hằng giờ và tác vụ `mcp.tokens_revoke`; tiến trình web cho các lượt đăng nhập, lệnh Đồng bộ công cụ
+  của người quản lý và việc thu hồi khi Ngắt kết nối. Hãy cho phép cả hai qua tường lửa chiều ra.
+- **Proxy**: các luồng cần tắt chế độ đệm
+  ([luồng sự kiện của trợ lý](/vi/self-hosting/reverse-proxy/#luồng-sự-kiện-của-trợ-lý)).
+
+Bài kiểm thử tải của upstream với 200 luồng cùng lúc trên một tiến trình 4 vCPU chạy mọi vai trò (Postgres 18.7 với
+thiết lập mặc định, trên một máy dùng chung với việc khác) đưa sự kiện từ lúc được ghi đến trình duyệt ở p95 71–77 ms,
+dưới mục tiêu 100 ms, không có lỗi và không sót sự kiện nào. Các lượt hiện trong `reputecast_jobs{queue="ai_assistant"}`,
+và metrics riêng của trợ lý có trong [giám sát](/vi/self-hosting/monitoring/#metrics).
+
 ## Hiệu năng đo được
 
 Trên dữ liệu kiểm thử tải (một triệu liên hệ, 3,2 triệu sự kiện gửi thư), ReputeCast và PostgreSQL 16 trên một máy 4
@@ -171,6 +207,8 @@ gửi thư và nhận webhook trên đó.
 ## Khắc phục sự cố
 
 - **Không có thư nào được gửi và việc nhập dữ liệu không bao giờ xong**: không tiến trình nào chạy vai trò `worker`.
+- **Tin nhắn cho trợ lý AI cứ ở trạng thái "Đang chờ…"**: không có worker nào chạy, hoặc mọi worker đều bận. Hãy kiểm tra
+  `reputecast_jobs{queue="ai_assistant"}`; xem [trợ lý AI](#trợ-lý-ai).
 - **Một tiến trình không giải mã được thông tin xác thực của nhà cung cấp đã lưu**: khóa bí mật của tiến trình đó khác;
   hãy cấp cho mọi tiến trình cùng `secrets.key` hoặc cùng tệp khóa.
 - **Tải sản phẩm thất bại ở một số tiến trình**: `files.dir` không được dùng chung, hoặc các tiến trình không cùng dùng
