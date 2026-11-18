@@ -17,8 +17,10 @@ sources:
   - internal/smtprelay
   - internal/app/wire_smtprelay.go
   - internal/config/config.go
-  - internal/app/metrics.go
+  - internal/ai/assistant/stream.go
+  - internal/mcpclient/oauth.go
   - docs/deploy/reverse-proxy.md
+  - internal/app/metrics.go
   - README.md
 sidebar:
   order: 7
@@ -38,16 +40,20 @@ October 2026.
 - **Forward every path** to ReputeCast: the app and API, `/hooks/…` (sending providers' webhooks), `/p/…` (public
   pages), `/t/…` (open and click tracking), `/mcp` and `/healthz`, which the public URL check fetches. Since 1.7.0,
   [external connections](/developers/mcp-connections/) also need `/mcp/connect`, `/oauth/mcp/…` and the OAuth
-  discovery documents under `/.well-known/`.
+  discovery documents under `/.well-known/`. From the next release after 1.7.0, members signing in to the AI
+  assistant's [MCP servers](/integrations/mcp-servers/) come back to `/api/v1/ai/mcp/oauth/callback`.
 - **Keep the `Host` header.** ReputeCast recognizes custom domains by it.
 - **Send `X-Forwarded-For`.** ReputeCast reads it only from [trusted proxies](#set-the-public-url-and-trusted-proxies),
   whether the proxy extends the client's line or adds its own header line. It doesn't need `X-Forwarded-Proto`: it
   knows it is on HTTPS from `http.public_url`.
-- **Stream without buffering** two kinds of response:
+- **Stream without buffering** these responses:
   - the live monitor, Server-Sent Events at
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (a heartbeat every 15 seconds,
     `retry: 3000`);
-  - the [MCP endpoint](/developers/mcp/) `/mcp` (Streamable HTTP), whose replies are `text/event-stream`.
+  - the [MCP endpoint](/developers/mcp/) `/mcp` (Streamable HTTP), whose replies are `text/event-stream`;
+  - from the next release after 1.7.0, the [AI assistant's](/integrations/ai-assistant/) answers, Server-Sent Events at
+    `GET /api/v1/workspaces/{workspace}/ai/assistant/threads/{thread}/stream` (see
+    [the assistant's event streams](#the-assistants-event-streams)).
 - **Wait for [long AI requests](#long-ai-requests).** A draft from a brief can take up to 10 minutes to answer.
 - **Accept large request bodies.** ReputeCast sets a limit per operation; the largest is 105 MiB (importing
   transactional templates), and contact imports accept 100 MiB.
@@ -126,7 +132,7 @@ Leave out the `https://` block if no workspace uses a custom domain.
 
 This configuration is for nginx 1.25.1 or later (the `http2` directive; before 1.25.1, write `listen 443 ssl http2;`)
 on the server itself, with a Let's Encrypt certificate in Certbot's default location. nginx buffers proxied responses
-by default, so the two streaming paths turn buffering off.
+by default, so the streaming paths turn buffering off.
 
 ```nginx title="/etc/nginx/conf.d/reputecast.conf"
 upstream reputecast {
@@ -170,6 +176,14 @@ server {
     }
 
     location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    # The AI assistant's answers (Server-Sent Events), from the next release after 1.7.0.
+    location ~ ^/api/v1/workspaces/[^/]+/ai/assistant/threads/[^/]+/stream$ {
         proxy_pass http://reputecast;
         proxy_buffering off;
         proxy_cache off;
@@ -300,6 +314,27 @@ Caddy and Traefik set no time limit on a response from ReputeCast by default, so
 CDN in front of the proxy needs the same time for these paths. [AI agent](/integrations/ai-agent/) runs don't: their
 model calls run in the background, and the page only reads their progress. Available since 1.7.0.
 
+## The assistant's event streams
+
+From the next release after 1.7.0, each [AI assistant](/integrations/ai-assistant/) thread open in a panel or a full
+page holds one Server-Sent Events stream (`text/event-stream`). The proxy must pass each event on as it is written:
+
+- **Buffering off.** nginx buffers responses by default, so keep the stream's `location` with `proxy_buffering off;` as
+  in the example above (ReputeCast doesn't send `X-Accel-Buffering`). Caddy and Traefik flush `text/event-stream`
+  responses at once without extra settings. If the proxy or a CDN in front compresses responses, leave
+  `text/event-stream` out. A buffered stream shows answers late, all at once, or not until the browser gives up and
+  reconnects.
+- **Timeouts.** The stream sends a heartbeat every 15 seconds when nothing else happens, and the browser treats 45
+  seconds of silence as a dropped connection. Any read or idle timeout above 15 seconds works, nginx's default of 60
+  seconds included. When a proxy cuts a stream anyway, the browser reconnects with the last event it had, and nothing
+  is lost or repeated; the answer itself continues on the server.
+- **HTTP/2.** Each open thread and each live monitor holds one connection. Over HTTP/1.1 a browser opens at most six
+  connections to one host, shared by all its tabs, so a few open tabs can leave other requests waiting. Over HTTP/2
+  they share one connection.
+
+A browser that doesn't read an event within 5 seconds is cut, and resumes from its last event. The Postgres
+connection the streams use is in [scaling](/self-hosting/scaling/#the-ai-assistant).
+
 ## Custom domains
 
 A workspace can serve its subscribe page, preference center, archive and other public pages at the root of its own
@@ -377,6 +412,9 @@ certificate, so HTTP proxies don't carry it:
 
 - **The live monitor doesn't move, or jumps every few seconds**: the proxy buffers the stream. In nginx, add the
   live-stream `location` with `proxy_buffering off`.
+- **The AI assistant's answers arrive all at once, or the panel keeps saying it is reconnecting**: the proxy buffers or
+  compresses the assistant's stream. In nginx, add the assistant's `location` with `proxy_buffering off`; see
+  [the assistant's event streams](#the-assistants-event-streams).
 - **`413 Request Entity Too Large` on imports or uploads**: raise nginx's `client_max_body_size`.
 - **Screens take many seconds to appear on phones**: the proxy speaks HTTP/1.1 to browsers. In nginx, add `http2 on;`
   to the `server` block.

@@ -1,0 +1,350 @@
+---
+title: Give the assistant tools from MCP servers
+description: "Connect remote MCP servers to ReputeCast's AI assistant: review each tool, let members sign in with OAuth, and confirm every call of a tool that writes."
+type: how-to
+audience: [admin]
+permissions: ['integrations:manage', 'ai:use']
+uiPath: 'nav.settings > settings.integrations > mcpservers.title'
+primaryKeyword: remote MCP servers
+sources:
+  - internal/mcpclient
+  - internal/ai/assistant/mcp.go
+  - internal/app/wire_mcpclient.go
+  - internal/jobs/jobs.go
+  - internal/netguard/netguard.go
+  - web/src/features/mcpservers
+  - web/src/features/assistant/{ServerPicker,Confirmation}.tsx
+  - web/src/features/assistant/mcp.messages.ts
+  - web/src/routes/w/$workspace/_app/settings/integrations/mcp-servers.tsx
+  - migrations/{03650_b5_mcp,03651_b6_mcp}.sql
+  - docs/ai/mcp-servers.md
+sidebar:
+  order: 7.5
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components'
+import Screenshot from '~/components/Screenshot.astro'
+import TableScroll from '~/components/TableScroll.astro'
+import UiPath from '~/components/UiPath.astro'
+import LimitsTable from '~/components/LimitsTable.astro'
+
+Remote MCP servers give ReputeCast's [AI assistant](/integrations/ai-assistant/) the tools of outside services, such as
+an issue tracker, a wiki or a knowledge base. Each tool waits for a manager's review. Tools that only read run once
+approved; tools that write ask the person every time, with the exact arguments. Servers never receive ReputeCast's
+keys, and what they return is treated as untrusted data. Available from the next release after 1.7.0.
+
+<Aside type="caution" title="Not yet tried with public servers">
+  Upstream tested MCP servers with the MCP Go SDK's own server handlers and a fake authorization server on loopback,
+  including the discovery variants and revocation below. No public MCP server or public authorization server has been
+  tried yet. Read [what ReputeCast expects from an OAuth server](#what-reputecast-expects-from-an-oauth-server) before
+  you add one.
+</Aside>
+
+ReputeCast has three MCP features. This page is about the first:
+
+| Feature | Direction | Where |
+|---|---|---|
+| MCP servers | ReputeCast's assistant calls an outside server's tools | <UiPath path="nav.settings > settings.integrations > mcpservers.title" /> |
+| [ReputeCast's MCP server](/developers/mcp/) | An outside agent calls ReputeCast's tools with an agent token | <UiPath path="nav.settings > settings.keys" /> |
+| [External connections](/developers/mcp-connections/) | ChatGPT, Claude or another MCP client signs in with OAuth and proposes drafts | <UiPath path="nav.settings > settings.keys" /> |
+
+## Before you begin
+
+- Adding, editing, syncing and removing servers, and reviewing tools, need `integrations:manage` (Owner and Admin).
+  People with `integrations:view` see the page read-only: the servers, their tools and how each is allowed. With
+  `ai:use` they can connect their own account to an OAuth server.
+- Using a server's tools in a thread needs `ai:use` and a server allowed for the person's role.
+- Have the server's MCP endpoint (Streamable HTTP, or HTTP with SSE) and its credential, if it needs one. Only remote
+  servers can be added: local process servers (stdio) aren't supported.
+- For servers that sign members in with OAuth, the instance's public URL must use `https://` and be reachable from
+  people's browsers ([the OAuth redirect address](#the-oauth-redirect-address)).
+
+## Add a server
+
+<Steps>
+
+1. Open <UiPath path="nav.settings > settings.integrations > mcpservers.title" />. The integrations catalog's
+   <UiPath path="integrations.groupAi" /> group and the AI models page link to it. Choose
+   <UiPath path="mcpservers.addServer" />.
+
+2. Fill in <UiPath path="mcpservers.addTitle" />:
+
+   - <UiPath path="mcpservers.fieldName" />: how threads and tool rows name it ("Linear · search_issues"). Its first
+     letters also prefix its tools' names for the model, such as `mcp__linear__search_issues`.
+   - <UiPath path="mcpservers.fieldUrl" />: the server's MCP endpoint. ReputeCast tries Streamable HTTP and falls back
+     to HTTP with SSE. Use the exact address: ReputeCast doesn't follow redirects.
+   - <UiPath path="mcpservers.fieldAuth" />: <UiPath path="mcpservers.optOAuth" />,
+     <UiPath path="mcpservers.optHeader" /> or <UiPath path="mcpservers.optNone" />. See [sign-in](#sign-in).
+   - <UiPath path="mcpservers.fieldWho" />: <UiPath path="mcpservers.whoAll" /> or
+     <UiPath path="mcpservers.whoManagers" />. The API also takes any list of role keys.
+
+3. Choose <UiPath path="mcpservers.addAndSync" />. A server with a shared header or none is synced at once. An OAuth
+   server sends you to its sign-in first, because a sync lists the tools as you; back on the page, it syncs.
+
+4. [Review each tool](#review-the-tools). Until you do, no thread is offered any of them.
+
+</Steps>
+
+<Screenshot
+  id="mcp-server-add"
+  alt="The Add an MCP server dialog filled in for Acme Wiki at https://wiki.acme.io/mcp, with the note that the address is the server's MCP endpoint over Streamable HTTP or HTTP with SSE; Sign-in set to OAuth, each member signs in, with Use a client registered with the server folded; Who can use it set to Everyone with Use the AI assistant; the note that private addresses need the instance setting; and Add and sync tools."
+/>
+
+Every request ReputeCast makes to a server or its authorization server goes through the SSRF guard, which checks the
+address at every connection. Servers on private or loopback addresses need the instance setting
+[`providers.allow_private_networks`](/reference/configuration/); link-local and cloud metadata addresses are always
+refused. ReputeCast accepts `http://` addresses, but then the header secret or token travels unencrypted: use
+`https://`.
+
+After adding, <UiPath path="mcpservers.edit" /> changes the name, who can use it, the header secret's value
+(<UiPath path="mcpservers.replace" />), the OAuth client and <UiPath path="mcpservers.enabled" /> (off: threads stop
+offering its tools; nothing is removed). The address, the sign-in kind and the header's name can't change: remove the
+server and add it again. <UiPath path="mcpservers.removeServer" />, inside Edit, removes its tools and every member's
+sign-in to it; their refresh tokens are [revoked](#revoking-removed-sign-ins) where the authorization server allows it,
+and a call waiting for confirmation can no longer be allowed, only denied.
+
+## Sign-in
+
+<TableScroll label="Sign-in kinds of an MCP server">
+
+| Kind | Who the server sees | Notes |
+|---|---|---|
+| <UiPath path="mcpservers.optNone" /> | Anonymous requests | For servers that need no credential. |
+| <UiPath path="mcpservers.optHeader" /> | The workspace, as one identity | A <UiPath path="mcpservers.fieldHeaderName" /> (`Authorization` by default) and a <UiPath path="mcpservers.fieldHeaderValue" />. The value is write-only: "ReputeCast never shows it again and only sends it to this server." Everyone allowed to use the server acts with that one credential. |
+| <UiPath path="mcpservers.optOAuth" /> | Each member, as themselves | Each member connects their own account, so the server's own permissions apply per person. |
+
+</TableScroll>
+
+Header secrets, client secrets and tokens are encrypted at rest with the instance's secret key and never returned by
+the API.
+
+### The OAuth redirect address
+
+The authorization server sends people back to the same address for every server and workspace:
+
+```text title="OAuth redirect address"
+<public URL>/api/v1/ai/mcp/oauth/callback
+```
+
+For example `https://news.example.com/api/v1/ai/mcp/oauth/callback`. The public URL is the one saved in
+<UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, or [`REPUTECAST_PUBLIC_URL`](/self-hosting/configuration/).
+
+- When ReputeCast registers itself with the authorization server (dynamic client registration), it registers this
+  address. You don't enter anything.
+- When the server needs a client you registered, open <UiPath path="mcpservers.clientSummary" />, enter the
+  <UiPath path="mcpservers.fieldClientId" /> and, if it has one, the <UiPath path="mcpservers.fieldClientSecret" />,
+  and register the address above as the client's redirect address. After the server is added,
+  <UiPath path="mcpservers.edit" /> shows it as "Redirect address to register: …".
+
+The MCP authorization specification requires redirect addresses to use https (or localhost), and authorization servers
+may refuse others ([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization),
+checked November 2026). If the public URL changes, the redirect address changes with it: register the new one for a
+client you entered. A client ReputeCast registered keeps the old address, so clear its Client ID in Edit and the next
+sign-in registers a new client. Expect members to sign in again.
+
+### What ReputeCast expects from an OAuth server
+
+ReputeCast follows the MCP authorization flow with PKCE (S256), the resource indicator (RFC 8707), and a state bound to
+the person's session that works once and for ten minutes. Discovery runs at the first sign-in to the server, and again
+after its Client ID is cleared:
+
+1. It sends the server an MCP `initialize` request without credentials. If the answer is a 401, it reads
+   `resource_metadata` and `scope` from its `WWW-Authenticate` Bearer challenge.
+2. It reads the protected resource metadata (RFC 9728) from, in order: the address the 401 named;
+   `https://<host>/.well-known/oauth-protected-resource<path>`, built from the server address; and the root
+   `https://<host>/.well-known/oauth-protected-resource`. A document from the first two must name the server address as
+   its `resource`; the root document must name the server's origin, which is then the resource ReputeCast asks tokens
+   for. A document that names any other resource is refused.
+3. It takes the first authorization server listed and reads its metadata: OAuth (RFC 8414) first, then OpenID Connect
+   discovery. The metadata must list `S256` in `code_challenge_methods_supported`.
+4. Without a client you entered, the authorization server needs a `registration_endpoint`. Client ID metadata
+   documents aren't supported.
+5. It asks for the scope the 401 named, or else every scope in the resource's `scopes_supported`.
+6. Client authentication is none, or HTTP basic with the client secret. `client_secret_post` and `private_key_jwt`
+   aren't supported.
+7. Metadata addresses must be https (plain http only on loopback).
+8. It keeps the authorization server's `revocation_endpoint`, if it has one, to
+   [revoke removed sign-ins](#revoking-removed-sign-ins).
+
+When any of these fails, the sign-in says "…'s sign-in couldn't be set up: its authorization server didn't answer as
+expected. Check the address or enter a registered client."
+
+## Review the tools
+
+The page shows the tools of one server at a time: the one you pick with <UiPath path="mcpservers.showTools" />, else
+the first with a changed tool, else the first. <UiPath path="mcpservers.sync" /> lists them again from the server, up
+to 200 per server. A new tool is <UiPath path="mcpservers.statePending" /> and isn't offered to any
+thread.
+
+<Screenshot
+  id="mcp-servers"
+  alt="Settings, Integrations, MCP servers: the Acme Tracker server on a loopback address with no sign-in and the badge 1 tool to review; its tools table with add_comment Not decided and Waiting for review, create_issue Writes and Asks every time, and search_issues Read-only and Approved, each with Review; and the How calls are allowed card."
+>
+  1. The server, how it signs in and its badges.
+  2. Each tool's kind and state.
+  3. How calls are allowed.
+</Screenshot>
+
+<Steps>
+
+1. Choose <UiPath path="mcpservers.review" /> on a tool (<UiPath path="mcpservers.view" /> for people who can't manage
+   integrations). The dialog shows the tool's description, `inputSchema` and annotations as plain text, as the server
+   sent them. Read them as untrusted: they are the server's own words, and what the model will read. Annotations such as
+   `readOnlyHint` are the server's hints, not evidence.
+
+2. Pick its kind: <UiPath path="mcpservers.optReadOnly" />, <UiPath path="mcpservers.optWrites" /> or
+   <UiPath path="mcpservers.optBlocked" />. A tool waiting for review starts at Writes. Mark a tool Writes when it
+   changes anything outside ReputeCast, even if it looks harmless.
+
+3. Save. "Approving pins this description and schema. Any change turns the tool off."
+
+</Steps>
+
+<Screenshot
+  id="mcp-tool-review"
+  alt="Reviewing add_comment from Acme Tracker: the note that the description is the server's own text and untrusted, the description, input schema and annotations as plain text, the reviewed version, the kinds Read-only, Writes (picked) and Blocked, the note that approving pins this description and schema, and Save."
+/>
+
+| Kind | State | What happens |
+|---|---|---|
+| <UiPath path="mcpservers.kindReadOnly" /> | <UiPath path="mcpservers.stateApproved" /> | The model may call it; it runs without asking. |
+| <UiPath path="mcpservers.kindWrites" /> | <UiPath path="mcpservers.stateAsks" /> | Each call waits for the person's [Allow once or Deny](/integrations/ai-assistant/#confirm-tools-that-write). |
+| <UiPath path="mcpservers.kindBlocked" /> | <UiPath path="mcpservers.stateBlocked" /> | Never offered to the model. |
+
+A read-only tool's arguments still leave the instance: the model writes them, and they can contain what a person
+attached. Other states are <UiPath path="mcpservers.stateChanged" /> ([below](#when-a-tool-changes)) and
+<UiPath path="mcpservers.stateRemoved" /> (the server's last listing didn't include it; it isn't offered). If the tool
+changed on the server while you reviewed it, the decision isn't saved and the page shows the new version: "This tool
+changed on the server while you reviewed it."
+
+## When a tool changes
+
+A decision is saved with the hash of the tool's description, input schema and annotations as you reviewed them.
+ReputeCast compares a server's tools with what was decided at three moments:
+
+- **Before every call.** In the call's own session, ReputeCast lists the server's tools first. If the tool is no longer
+  listed, or differs from the version decided on, the call isn't sent.
+- **Every hour**, for servers with <UiPath path="mcpservers.optNone" /> or a <UiPath path="mcpservers.optHeader" />
+  that are on and were synced before (the `mcp.servers_sync` job, at most 20 servers a run). OAuth servers are listed
+  as a person, so only the check before each call and a manager's Sync tools cover them.
+- **When a manager chooses <UiPath path="mcpservers.sync" />.**
+
+When one of them finds that an approved or blocked tool changed, the tool is
+<UiPath path="mcpservers.stateChanged" />: no thread offers it, and a call waiting for confirmation can't run. Members
+who manage integrations get a notification ("Tools of … changed"), and threads whose call hit it show
+<UiPath path="assistant.mcp.changedTitle" />. <UiPath path="assistant.mcp.reviewChange" /> shows **Before** and **After**
+for the description, the input schema and the annotations, with <UiPath path="mcpservers.blockTool" /> and
+<UiPath path="mcpservers.approveNew" />. A tool the server no longer lists becomes
+<UiPath path="mcpservers.stateRemoved" />, without a notification.
+
+## Use servers in a thread
+
+Members pick a thread's servers in the panel's server picker
+([pick the model and MCP servers](/integrations/ai-assistant/#pick-the-model-and-mcp-servers)). A server limited to some
+roles says "Only … can use it" on its row; a server that is off, or not for the person's role, isn't offered. Every call
+checks again that the person may use the server.
+
+The thread offers the approved tools of the servers picked after ReputeCast's own, within 40 tools a request, ordered by
+server name and then tool name; the rest aren't offered. On an OAuth server, only members who signed in get its tools.
+Each call opens its own session with the server, as the thread's owner: ReputeCast first lists the server's tools, then
+calls the tool, and the two together have 30 seconds. Tool rows say "Server · tool" and how long it took, or what went
+wrong.
+
+<LimitsTable area="mcp-servers" />
+
+## Untrusted results
+
+What a server returns is data, never instructions:
+
+- Text only. Images, audio and embedded resources become a note such as `[image removed]`, and HTML becomes its text,
+  without scripts and styles.
+- At most 32 KB. A larger answer isn't given to the model.
+- Wrapped in `<untrusted_content source="Server · tool">` delimiters that the text can't close, and the model is told
+  never to follow instructions inside them, call a tool or share data because they ask.
+- A tool's description reaches the model prefixed "From the MCP server …, outside ReputeCast", at most 1,000
+  characters; input schemas over 8 KB aren't offered.
+
+Delimiters lower the risk; they don't make a model immune to text that tries to steer it. That is why tools that write
+ask every time and there is no "always allow".
+
+## What servers receive
+
+- The arguments of their own tools' calls, as the model wrote them. For a writing tool, exactly the arguments the person
+  allowed.
+- Their credential: the shared header, or the member's own OAuth token.
+- For OAuth servers: an MCP `initialize` request without credentials at discovery, and a removed sign-in's refresh token
+  at the authorization server's revocation endpoint.
+
+Nothing else: no ReputeCast keys, and nothing from the thread unless the model puts it in a call's arguments. ReputeCast
+refuses sampling (a server asking ReputeCast's model to generate text) and elicitation (a server asking the person for
+input), and doesn't list servers' resources or prompts.
+
+Every call is in the [audit log](/team/audit-log/) as `mcp_tool.called`, with the person, the thread, the server, the
+outcome, the duration and a digest of the arguments salted with the call's ID, never the arguments or the result. Server
+changes, syncs, tool decisions, sign-ins and confirmations are audited too.
+
+## Members' own sign-ins
+
+On an OAuth server each member signs in for themselves:
+
+- <UiPath path="mcpservers.connect" /> on the server's row, or **Sign in to …** in a thread's server picker, opens the
+  server's sign-in page. It comes back to MCP servers with "Connected to …", "You cancelled the sign-in to …" or "…
+  didn't complete the sign-in".
+- The row then says "Connected as …", with <UiPath path="mcpservers.reconnect" /> and
+  <UiPath path="mcpservers.disconnect" />.
+- ReputeCast refreshes the token by itself shortly before it expires. When the refresh is refused, or the server answers
+  401 or 403, the sign-in is removed and threads show **Sign in to … again**.
+- <UiPath path="mcpservers.disconnect" /> deletes the tokens ReputeCast holds.
+
+A member's sign-ins in a workspace are deleted when they leave it, are removed from it or are deactivated. Deactivating a
+person in Instance admin deletes their sign-ins in every workspace, and removing a server deletes every member's sign-in
+to it.
+
+### Revoking removed sign-ins
+
+When the authorization server advertised a `revocation_endpoint`, ReputeCast also revokes the refresh token of every
+sign-in it removes (RFC 7009): on Disconnect, when the member leaves, is removed or is deactivated, when the server is
+removed, and when the server refused the sign-in. On Disconnect it works through the queue at once (up to 10 tokens, for
+up to 10 seconds); the `mcp.tokens_revoke` job sends what is left every minute. It is best effort: each token is tried
+once, a failed revocation is logged without the token, and the sign-in is gone either way. Access tokens aren't
+revoked; they lapse when they expire. Without a `revocation_endpoint`, nothing is revoked: use the server's own
+settings.
+
+## Check that it worked
+
+- The server's row shows its tool count, and <UiPath path="mcpservers.showTools" /> lists the tools you reviewed as
+  <UiPath path="mcpservers.stateApproved" /> or <UiPath path="mcpservers.stateAsks" />.
+- In the [assistant's panel](/integrations/ai-assistant/), the server picker lists the server, and asking for something
+  its tools can answer shows a "Server · tool" row.
+
+## Troubleshooting
+
+<TableScroll label="MCP server problems">
+
+| What you see | Why | What to do |
+|---|---|---|
+| **Sign in to … again** (<UiPath path="assistant.mcp.signInBadge" />) | Your sign-in to the server expired or was never made. The assistant answers without that server. | **Sign in to …**. |
+| <UiPath path="assistant.mcp.changedTitle" /> (<UiPath path="assistant.mcp.changedBadge" />) | The server changed a tool after it was approved. | A manager chooses <UiPath path="assistant.mcp.reviewChange" />. |
+| **… is blocked** | A manager blocked the tool. | Nothing; the assistant answers without it. |
+| **… is unreachable**, or the server's <UiPath path="mcpservers.badgeUnreachable" /> badge | The server didn't answer. | Ask again later, or check the address and the server. |
+| **… took too long** | The tool didn't answer within 30 seconds. | Ask again later. |
+| **… sent too much** | The answer was over 32 KB, so the model didn't get it. | Ask a narrower question. |
+| "…'s sign-in couldn't be set up" | Discovery or registration failed. | Check [what ReputeCast expects](#what-reputecast-expects-from-an-oauth-server), or enter a registered client. |
+| "Can't connect to a private address" | The server is on your own network. | An operator sets `providers.allow_private_networks`. |
+
+</TableScroll>
+
+A tool row can also say "You denied …. Nothing was sent to …." or "… may have run, but its result was lost. Check …
+before asking again." The second means the call was sent and the worker was lost before its result was saved;
+ReputeCast never sends it again.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Ask the AI assistant" href="/integrations/ai-assistant/" />
+  <LinkCard title="Connect AI models with your own key" href="/integrations/ai-models/" />
+  <LinkCard title="Connect AI agents with MCP" href="/developers/mcp/" />
+  <LinkCard title="Connect external assistants with MCP and OAuth" href="/developers/mcp-connections/" />
+  <LinkCard title="Configuration: the AI assistant" href="/self-hosting/configuration/#the-ai-assistant" />
+  <LinkCard title="Security and hardening" href="/self-hosting/security/" />
+</CardGrid>
