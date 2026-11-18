@@ -14,6 +14,8 @@ sources:
   - internal/cli/serve.go
   - internal/cli/seed.go
   - internal/jobs/jobs.go
+  - internal/ai/assistant/{hub,runtime,stream,retention}.go
+  - internal/mcpclient/catalog.go
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
@@ -136,6 +138,39 @@ migrations run in a Job before every install and upgrade. Available since 1.7.0.
 - **Not the rate limits**: each web process counts requests on its own, so behind a load balancer with three web
   processes a caller can reach three times the [limits](/self-hosting/security/#defaults-and-limits).
 
+## The AI assistant
+
+From the next release after 1.7.0, the [AI assistant](/integrations/ai-assistant/) answers on the workers and streams
+through the web processes. Managers switch it on per workspace; this is what it asks of the instance.
+
+- **Workers** answer turns on the `ai_assistant` queue. A person's message is committed with its job and any worker
+  takes it, so `--role=web` and `--role=worker` can run on different hosts. Each worker process answers up to half of
+  `worker.concurrency` turns at once, and at least 10 (25 with the default 50), on top of its other queues; a turn
+  mostly waits on the model provider. Each workspace's answers-at-once limits (2 per person and 10 per workspace by
+  default) apply across all workers.
+- **No worker running**: messages stay queued, and after 30 minutes the panel shows "The answer was interrupted". A
+  stopping worker (a deploy, `SIGTERM`) gives running jobs 10 seconds; a turn still answering then fails as interrupted,
+  keeps what it wrote, and its cost stays unknown until a manager
+  [reconciles it](/integrations/ai-models/#reserved-requests-and-unknown-usage).
+- **One extra Postgres connection per web process.** Each process with the `web` role opens one connection of its own
+  to `LISTEN` for thread events, outside the pool, with the same database URL. It opens with the first stream and
+  closes a minute after the last one ends, and shows in `pg_stat_activity` with `application_name`
+  `reputecast-assistant`. Leave room for it in `max_connections`: each web process's pool plus one.
+- **`LISTEN` needs a session**: connect directly, or through PgBouncer in session mode. In transaction mode streams only
+  catch up at their five-second access check, so answers arrive in steps. When the connection drops, the process logs
+  `assistant: listening for thread events failed; streams poll until it listens again` and wakes every stream each
+  second until it listens again.
+- **Outbound traffic**: both roles reach the model providers and the [MCP servers](/integrations/mcp-servers/) with
+  their authorization servers: workers for each tool call, the hourly `mcp.servers_sync` and the `mcp.tokens_revoke`
+  job; web processes for sign-ins, a manager's Sync tools and the revocation on Disconnect. Allow both through an egress
+  firewall.
+- **Proxies**: the streams need buffering off ([the assistant's event streams](/self-hosting/reverse-proxy/#the-assistants-event-streams)).
+
+Upstream's load test of 200 streams at once on one 4-vCPU process with every role (Postgres 18.7 on default settings,
+on a machine shared with other work) delivered events from their commit to the browser at a p95 of 71–77 ms, under its
+100 ms target, with no errors and no events missed. Turns show in `reputecast_jobs{queue="ai_assistant"}`, and the
+assistant's own metrics are in [monitoring](/self-hosting/monitoring/#metrics).
+
 ## Measured performance
 
 On the load test data (a million contacts, 3.2 million delivery events), ReputeCast and PostgreSQL 16 on one host with
@@ -167,6 +202,8 @@ webhook ingest against it.
 ## Troubleshooting
 
 - **Nothing is sent and imports never finish**: no process runs the `worker` role.
+- **AI assistant messages stay "Queued…"**: no worker runs, or every worker is busy. Check
+  `reputecast_jobs{queue="ai_assistant"}`; see [the AI assistant](#the-ai-assistant).
 - **Stored provider credentials can't be decrypted in one process**: its secret key differs; give every process the
   same `secrets.key` or key file.
 - **Product downloads fail from some processes**: `files.dir` is not shared, or the processes don't all use the same
