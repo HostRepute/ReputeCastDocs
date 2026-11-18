@@ -16,7 +16,8 @@
  * Needs upstream `make dev` running (the Vite dev build: release builds offer English only). The run recreates
  * the dev database for each sample and leaves it re-seeded with Acme. Shots marked `prepare` run on an Acme of their
  * own (lib/prepare.ts), whose model is a recorded one on a loopback port (lib/model-fixture.ts): the dev server must
- * run with REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true to reach it.
+ * run with REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true to reach it. Shots marked `assistant` run on an Acme of
+ * their own with a second model account (the recorded model) and a fake MCP server (lib/mcp-fixture.ts) on loopback.
  *
  * Writes src/assets/screenshots/<locale>/<id>.webp, plus <id>.json with the marker boxes in percent.
  *
@@ -40,7 +41,8 @@ import sharp from 'sharp'
 import { setLanguage, signIn } from './lib/auth.ts'
 import { toMarker, type Box, type MarkerFile } from './lib/markers.ts'
 import { startModelFixture } from './lib/model-fixture.ts'
-import { prepare } from './lib/prepare.ts'
+import { startMcpFixture, MCP_FIXTURE_NAME } from './lib/mcp-fixture.ts'
+import { prepare, prepareAssistant } from './lib/prepare.ts'
 import { freshKinds, parsePlaceholders, resolvePath } from './lib/resolve.ts'
 import {
   buildCli,
@@ -73,9 +75,13 @@ const WARN_BYTES = 400 * 1024
 /**
  * True once the app has drawn a screen (its #root holds a main or h1, as the boot screen's CSS asks) and its boot
  * screen, skeleton blocks (.sk) and aria-busy loading regions are all hidden. Pages outside the app have no #root.
+ * Busy regions inside `ignoreBusy` (a shot's own, such as an assistant turn waiting for a confirmation) don't count.
  */
-const STILL_LOADING_GONE = `(!document.getElementById('root') || !!document.querySelector('#root :is(main, h1)')) &&
-  ![...document.querySelectorAll('.boot, .sk, [aria-busy="true"]')].some((e) => e.checkVisibility())`
+function stillLoadingGone(ignoreBusy?: string): string {
+  const outside = ignoreBusy ? ` && !e.closest(${JSON.stringify(ignoreBusy)})` : ''
+  return `(!document.getElementById('root') || !!document.querySelector('#root :is(main, h1)')) &&
+  ![...document.querySelectorAll('.boot, .sk, [aria-busy="true"]')].some((e) => e.checkVisibility()${outside})`
+}
 const OWNER = { email: 'owner@example.com', name: 'Alex Morgan' }
 const emails: Record<Exclude<User, 'anon'>, string> = {
   linh: 'linh@acme.io',
@@ -229,11 +235,12 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
     })
     await goto(page, app + path)
     await page.evaluate('document.fonts.ready')
-    // A draft's first open re-runs Send Readiness in the background, which can take most of a minute in development.
-    if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 60_000 })
+    // A draft's first open re-runs Send Readiness in the background, which can take minutes in development when
+    // blocklist lookups time out.
+    if (s.waitFor) await page.locator(s.waitFor).first().waitFor({ state: 'visible', timeout: 180_000 })
     for (const step of s.before ?? []) await runStep(page, step, locale)
     // The screen must be drawn: a slow dev server otherwise leaves the boot screen or skeletons in the capture.
-    await page.waitForFunction(STILL_LOADING_GONE, null, { timeout: 60_000, polling: 250 }).catch(() => {
+    await page.waitForFunction(stillLoadingGone(s.ignoreBusy), null, { timeout: 60_000, polling: 250 }).catch(() => {
       throw new Error('still loading after 60 s (boot screen, skeleton or aria-busy region visible)')
     })
     // A font first used by what the steps opened (IBM Plex Mono in a detail pane) loads only then.
@@ -288,6 +295,7 @@ async function capture(s: Shot, locale: Locale): Promise<number> {
       const file: MarkerFile = { width: width!, height: height!, markers }
       writeFileSync(json, `${JSON.stringify(file, null, 2)}\n`)
     } else if (existsSync(json)) rmSync(json)
+    for (const step of s.after ?? []) await runStep(page, step, locale)
     return webp.length
   } finally {
     await ctx.close()
@@ -359,8 +367,9 @@ function printSummary(): void {
 async function main(): Promise<void> {
   const u = upstreamFromEnv(resolve(root, '.shots-tmp'), app)
   const fresh = selected.filter((s) => s.sample === 'fresh')
-  const acme = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && !s.demoSend && !s.prepare)
+  const acme = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && !s.demoSend && !s.prepare && !s.assistant)
   const prepared = selected.filter((s) => s.prepare)
+  const assistant = selected.filter((s) => s.assistant)
   const demo = selected.filter((s) => (s.sample ?? 'acme') === 'acme' && s.demoSend)
   const northwind = selected.filter((s) => s.sample === 'northwind')
   // The developer's database is Acme until the run replaces it.
@@ -404,6 +413,21 @@ async function main(): Promise<void> {
         await captureAll(prepared)
       } finally {
         model.server.close()
+      }
+    }
+    if (assistant.length) {
+      console.log('Seeding Acme and preparing a second model account and an MCP server for the AI assistant …')
+      await seed(u, [])
+      database = 'changed'
+      // A fixed port: the AI models page shows the account's address.
+      const model = await startModelFixture(47390)
+      const mcp = await startMcpFixture()
+      try {
+        await prepareAssistant((await session('linh'))!.api, app, model.baseUrl, mcp.url, MCP_FIXTURE_NAME)
+        await captureAll(assistant)
+      } finally {
+        model.server.close()
+        mcp.server.close()
       }
     }
     const groups = Map.groupBy(demo, (s) => JSON.stringify(s.demoSend))
