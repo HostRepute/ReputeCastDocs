@@ -52,7 +52,9 @@ app itself; the REST API reference is generated from the upstream OpenAPI spec.
   the Acme demo when the run ends; to keep yours, run a second upstream stack on other ports and point the run at it
   with `REPUTECAST_SRC`, `PG_PORT` and `--app`. The AI agent, brand voice and external connection shots (`prepare`
   in the manifest) answer with a recorded model on a loopback port, so start the dev server with
-  `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true` for them.
+  `REPUTECAST_PROVIDERS__ALLOW_PRIVATE_NETWORKS=true` for them. The AI models, assistant and MCP server shots
+  (`assistant` in the manifest) add the recorded model as a second model account and a fake MCP server
+  (`scripts/screenshots/lib/mcp-fixture.ts`) on loopback ports 47390 and 47391, so those ports must be free.
 
 ## Deployment
 

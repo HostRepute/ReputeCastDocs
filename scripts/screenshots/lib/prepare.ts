@@ -361,3 +361,49 @@ async function prepareExternal(api: APIRequestContext, app: string): Promise<voi
     4,
   )
 }
+
+type McpTool = { id: string; name: string; hash: string }
+type McpServer = { id: string; tools: McpTool[] }
+
+/**
+ * Prepares the AI assistant shots (`assistant` in the manifest) on a freshly seeded Acme, whose demo model already
+ * answers the assistant: adds the recorded model (lib/model-fixture.ts) as a second account, "Office Ollama", whose
+ * tool check isn't run, and the fake MCP server at `mcpUrl` (lib/mcp-fixture.ts) with no sign-in, synced, with
+ * search_issues approved as read-only, create_issue as writes and add_comment left for review.
+ */
+export async function prepareAssistant(
+  api: APIRequestContext,
+  app: string,
+  modelUrl: string,
+  mcpUrl: string,
+  mcpName: string,
+): Promise<void> {
+  const ai = `${app}/api/v1/workspaces/${WS}/ai`
+  await ok(
+    await api.post(`${ai}/accounts`, {
+      data: {
+        provider: 'compatible',
+        label: 'Office Ollama',
+        baseUrl: modelUrl,
+        model: FIXTURE_MODEL,
+        inputPrice: 0,
+        outputPrice: 0,
+      },
+    }),
+    'add-ai-account',
+  )
+  const created = await ok<McpServer>(
+    await api.post(`${ai}/mcp/servers`, { data: { name: mcpName, url: mcpUrl, auth: 'none' } }),
+    'create-remote-mcp-server',
+  )
+  const synced = await ok<McpServer>(await api.post(`${ai}/mcp/servers/${created.id}/sync`), 'sync-remote-mcp-server')
+  const decisions: Record<string, string> = { search_issues: 'read_only', create_issue: 'writes' }
+  for (const tool of synced.tools) {
+    const decision = decisions[tool.name]
+    if (!decision) continue
+    await ok(
+      await api.put(`${ai}/mcp/servers/${created.id}/tools/${tool.id}`, { data: { decision, hash: tool.hash } }),
+      'decide-remote-mcp-tool',
+    )
+  }
+}

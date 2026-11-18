@@ -33,6 +33,8 @@ export type Shot = {
     | { select: [string, string] } // a <select> and the value of the option to pick
     | { wait: number }
   )[]
+  // steps after the capture, to leave the database as the next shots expect (deny a call the shot left waiting)
+  after?: Shot['before']
   waitFor?: string // selector that must be visible before capture
   mask?: string[] // selectors masked (volatile values)
   // numbered callouts; selectors must be structural (ids, hrefs, data-*, roles), never text. `badge` overrides the
@@ -43,6 +45,12 @@ export type Shot = {
   // model with the agent on and two runs, a saved and a learned brand voice, and an external MCP client allowed over
   // OAuth with one proposal.
   prepare?: true
+  // Runs on a fresh Acme, whose demo model answers the AI assistant, with what lib/prepare.ts prepareAssistant adds:
+  // the recorded model as a second account (tool check not run) and the fake MCP server (lib/mcp-fixture.ts) with one
+  // read-only tool, one that writes and one waiting for review.
+  assistant?: true
+  // A selector whose aria-busy regions don't count as loading (an assistant turn waiting for a confirmation).
+  ignoreBusy?: string
   // `reputecast demo send`; `canary` defaults to the CLI's (on in the normal scenario, off in the others)
   demoSend?: {
     campaign: string
@@ -541,7 +549,6 @@ export const shots: Shot[] = [
     path: `${ws}/settings/integrations/stores/{store:Acme Merch}`,
     feature: 'commerce',
   },
-  { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai' },
   {
     // A Shorten suggestion on #143's intro: edit the text block (the canvas is an iframe), then the text toolbar's
     // first AI action, after its last separator. The demo model answers in a moment.
@@ -1515,7 +1522,7 @@ export const shots: Shot[] = [
   { id: 'notifications-summary', path: `${ws}/notifications`, feature: 'notifications', clip: '#summary' },
 
   // AI agent, drafts from a brief, brand voice and external MCP connections (1.7.0), on the prepared Acme (`prepare`).
-  // AI assistant settings › Agent settings: tool calling verified with the recorded model, the agent on.
+  // AI models › Agent settings: tool calling verified with the recorded model, the agent on.
   {
     id: 'agent-settings',
     path: `${ws}/settings/integrations/ai`,
@@ -1692,4 +1699,165 @@ export const shots: Shot[] = [
   },
   // Settings › External connections, with the prepared connection.
   { id: 'mcp-connections', path: `${ws}/settings/connections`, feature: 'mcpconnect', prepare: true },
+
+  // AI models, the AI assistant and MCP servers (the next release after 1.7.0), on the Acme `assistant` prepares.
+  // Settings › Integrations › AI models: the demo's Anthropic account and the recorded Office Ollama, each feature's
+  // model below.
+  { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai', assistant: true },
+  // Add account › OpenAI-compatible › Service: OpenRouter, its address filled in; nothing is tested or saved.
+  {
+    id: 'ai-models-add',
+    path: `${ws}/settings/integrations/ai`,
+    feature: 'ai',
+    assistant: true,
+    clip: '[role="dialog"]',
+    before: [
+      { click: '#ai-acc-add' },
+      { click: '[role="dialog"] .seg button:nth-child(5)' },
+      { select: ['[role="dialog"] select', 'openrouter'] },
+      { wait: 2500 },
+    ],
+  },
+  // Manage on the Anthropic account: its model, prices, tool check and the features that use it.
+  {
+    id: 'ai-models-manage',
+    path: `${ws}/settings/integrations/ai`,
+    feature: 'ai',
+    assistant: true,
+    clip: '[role="dialog"]',
+    before: [{ click: 'section[aria-labelledby="ai-acc-h"] tbody tr:first-child td:last-child button' }, { wait: 800 }],
+  },
+  // The Assistant card: the switch on (the demo seed), the limits and what leaves the instance.
+  {
+    id: 'ai-models-assistant',
+    path: `${ws}/settings/integrations/ai`,
+    feature: 'ai',
+    assistant: true,
+    clip: 'section[aria-labelledby="ai-asst-h"]',
+  },
+  // The panel docked on a report finished more than 72 hours ago: the report attached through the sharing review, then
+  // a suggestion sent. The demo model reads the report and streams its recorded answer.
+  {
+    id: 'assistant-panel',
+    path: `${ws}/campaigns/{campaign:Weekly Digest #141}/report`,
+    feature: 'assistant',
+    assistant: true,
+    before: [
+      { click: '[data-assistant-launcher]' },
+      { wait: 1500 },
+      { click: '#assistant .asst-chip.suggested button' },
+      { wait: 800 },
+      { click: '[role="dialog"] .dacts button.pri' },
+      { wait: 1500 },
+      { click: '#assistant .asst-suggestions button:nth-child(2)' },
+      { wait: 300 },
+      { click: '#assistant .asst-composer button[type="submit"]' },
+      { wait: 9000 },
+    ],
+    markers: [
+      { n: 1, selector: '#assistant .asst-subwrap > .asst-sub:first-child' },
+      { n: 2, selector: '#assistant .asst-chips' },
+      { n: 3, selector: '#assistant .asst-msg.ai' },
+      { n: 4, selector: '#assistant .asst-composer' },
+    ],
+  },
+  // The panel full screen on a phone, after a suggestion of the Campaigns screen.
+  {
+    id: 'assistant-mobile',
+    path: `${ws}/campaigns`,
+    feature: 'assistant',
+    assistant: true,
+    viewport: 'mobile',
+    before: [
+      { click: '[data-assistant-launcher]' },
+      { wait: 1500 },
+      { click: '#assistant .asst-suggestions button:nth-child(1)' },
+      { wait: 300 },
+      { click: '#assistant .asst-composer button[type="submit"]' },
+      { wait: 9000 },
+    ],
+  },
+  // The model menu: the demo's model, and Office Ollama, which hasn't run its tool check.
+  {
+    id: 'assistant-models',
+    path: `${ws}/campaigns`,
+    feature: 'assistant',
+    assistant: true,
+    clip: '[role="menu"]',
+    before: [
+      { click: '[data-assistant-launcher]' },
+      { wait: 1500 },
+      { click: '#assistant .asst-sub:first-child > .asst-picker:nth-child(1)' },
+      { wait: 600 },
+    ],
+  },
+  // A call of the fake server's create_issue, which writes: the demo model calls the MCP tool a question names with
+  // "#<tool>", and the turn waits for Allow once or Deny.
+  {
+    id: 'assistant-confirmation',
+    path: `${ws}/campaigns`,
+    feature: 'assistant',
+    assistant: true,
+    clip: '#asst-confirm',
+    ignoreBusy: '#assistant',
+    before: [
+      { click: '[data-assistant-launcher]' },
+      { wait: 1500 },
+      { click: '#assistant .asst-sub:first-child > .asst-picker:nth-child(2)' },
+      { click: '[role="menu"] [role="menuitemcheckbox"]' },
+      { press: 'Escape' },
+      {
+        fill: [
+          '#assistant .asst-composer textarea',
+          {
+            en: 'Open an issue about the Outlook bounces #create_issue',
+            de: 'Lege ein Ticket zu den Outlook-Bounces an #create_issue',
+            es: 'Abre una incidencia sobre los rebotes de Outlook #create_issue',
+            fr: 'Ouvre un ticket sur les rebonds Outlook #create_issue',
+            vi: 'Tạo một issue về thư trả lại từ Outlook #create_issue',
+          },
+        ],
+      },
+      { wait: 300 },
+      { click: '#assistant .asst-composer button[type="submit"]' },
+      { wait: 6000 },
+    ],
+    // Deny, so no call waits and no shot after it shows the launcher's dot or the notification.
+    after: [{ click: '#asst-confirm .asst-confirm-acts button:not(.pri)' }, { wait: 2000 }],
+  },
+  // Settings › Integrations › MCP servers with the fake server's tools shown.
+  {
+    id: 'mcp-servers',
+    path: `${ws}/settings/integrations/mcp-servers`,
+    feature: 'mcpservers',
+    assistant: true,
+    markers: [
+      { n: 1, selector: 'section[aria-labelledby="mcp-servers-h"] .mcp-item' },
+      { n: 2, selector: '#mcp-tools table' },
+      { n: 3, selector: 'section[aria-labelledby="mcp-how-h"]' },
+    ],
+  },
+  // Add server, filled in for a wiki that signs members in with OAuth; nothing is saved.
+  {
+    id: 'mcp-server-add',
+    path: `${ws}/settings/integrations/mcp-servers`,
+    feature: 'mcpservers',
+    assistant: true,
+    clip: '[role="dialog"]',
+    before: [
+      { click: '#mcp-add' },
+      { fill: ['#mcp-server-form > .lbl:first-child input', 'Acme Wiki'] },
+      { fill: ['#mcp-server-form input[type="url"]', 'https://wiki.acme.io/mcp'] },
+      { click: '[role="dialog"] h2' },
+    ],
+  },
+  // Review on add_comment, the tool waiting for review (tools are listed by name).
+  {
+    id: 'mcp-tool-review',
+    path: `${ws}/settings/integrations/mcp-servers`,
+    feature: 'mcpservers',
+    assistant: true,
+    clip: '[role="dialog"]',
+    before: [{ click: '#mcp-tools tbody tr:first-child button' }, { wait: 800 }],
+  },
 ]
