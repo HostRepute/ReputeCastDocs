@@ -83,5 +83,5 @@ Each translation is reviewed by a native speaker before it is final.
 
 | Reviewer                 | Date | Scope                                                                        |
 | ------------------------ | ---- | ---------------------------------------------------------------------------- |
-| _pending: project owner_ | —    | Vietnamese: all 209 pages and the `vi` text in `src/data/*.yaml`             |
-| _pending_                | —    | German, Spanish and French: all 209 pages each and their text in `src/data/` |
+| _pending: project owner_ | —    | Vietnamese: all 212 pages and the `vi` text in `src/data/*.yaml`             |
+| _pending_                | —    | German, Spanish and French: all 212 pages each and their text in `src/data/` |

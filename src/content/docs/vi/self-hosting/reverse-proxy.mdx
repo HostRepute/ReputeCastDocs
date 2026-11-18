@@ -17,8 +17,10 @@ sources:
   - internal/smtprelay
   - internal/app/wire_smtprelay.go
   - internal/config/config.go
-  - internal/app/metrics.go
+  - internal/ai/assistant/stream.go
+  - internal/mcpclient/oauth.go
   - docs/deploy/reverse-proxy.md
+  - internal/app/metrics.go
   - README.md
 sidebar:
   order: 7
@@ -39,16 +41,20 @@ ReputeCast vào tháng 10/2026.
 - **Chuyển tiếp mọi đường dẫn** đến ReputeCast: ứng dụng và API, `/hooks/…` (webhook của nhà cung cấp gửi thư), `/p/…`
   (trang công khai), `/t/…` (theo dõi lượt mở và lượt nhấp), `/mcp` và `/healthz`, đường dẫn mà kiểm tra URL công khai
   gọi đến. Từ bản 1.7.0, [kết nối bên ngoài](/vi/developers/mcp-connections/) còn cần `/mcp/connect`, `/oauth/mcp/…` và
-  các tài liệu OAuth discovery trong `/.well-known/`.
+  các tài liệu OAuth discovery trong `/.well-known/`. Từ bản phát hành tiếp theo sau 1.7.0, thành viên đăng nhập vào
+  các [máy chủ MCP](/vi/integrations/mcp-servers/) của trợ lý AI sẽ quay về `/api/v1/ai/mcp/oauth/callback`.
 - **Giữ nguyên header `Host`.** ReputeCast nhận diện tên miền tùy chỉnh dựa vào header này.
 - **Gửi `X-Forwarded-For`.** ReputeCast chỉ đọc header này từ
   [proxy tin cậy](#đặt-url-công-khai-và-proxy-tin-cậy), dù proxy nối thêm vào dòng của client hay thêm một dòng header
   riêng. ReputeCast không cần `X-Forwarded-Proto`: nó biết mình chạy trên HTTPS nhờ `http.public_url`.
-- **Truyền không đệm** hai loại phản hồi:
+- **Truyền không đệm** các phản hồi sau:
   - theo dõi trực tiếp, dùng Server-Sent Events tại
     `GET /api/v1/workspaces/{workspace}/campaigns/{campaignId}/live/stream` (heartbeat mỗi 15 giây,
     `retry: 3000`);
-  - [endpoint MCP](/vi/developers/mcp/) `/mcp` (Streamable HTTP), có phản hồi dạng `text/event-stream`.
+  - [endpoint MCP](/vi/developers/mcp/) `/mcp` (Streamable HTTP), có phản hồi dạng `text/event-stream`;
+  - từ bản phát hành tiếp theo sau 1.7.0, câu trả lời của [trợ lý AI](/vi/integrations/ai-assistant/), dùng
+    Server-Sent Events tại `GET /api/v1/workspaces/{workspace}/ai/assistant/threads/{thread}/stream` (xem
+    [luồng sự kiện của trợ lý](#luồng-sự-kiện-của-trợ-lý)).
 - **Chờ đủ lâu cho [yêu cầu AI kéo dài](#yêu-cầu-ai-kéo-dài).** Một bản nháp từ yêu cầu có thể mất đến 10 phút mới có
   phản hồi.
 - **Chấp nhận phần thân yêu cầu lớn.** ReputeCast đặt giới hạn riêng cho từng thao tác; lớn nhất là 105 MiB (nhập mẫu
@@ -128,7 +134,7 @@ Hãy bỏ khối `https://` nếu không có không gian làm việc nào dùng 
 
 Cấu hình này dành cho nginx 1.25.1 trở lên (chỉ thị `http2`; trước 1.25.1, hãy viết `listen 443 ssl http2;`) chạy ngay
 trên máy chủ, với chứng chỉ Let's Encrypt ở vị trí mặc định của Certbot. Mặc định nginx đệm các phản hồi được proxy, nên
-hai đường dẫn streaming tắt chế độ đệm.
+các đường dẫn streaming tắt chế độ đệm.
 
 ```nginx title="/etc/nginx/conf.d/reputecast.conf"
 upstream reputecast {
@@ -172,6 +178,14 @@ server {
     }
 
     location = /mcp {
+        proxy_pass http://reputecast;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    # The AI assistant's answers (Server-Sent Events), from the next release after 1.7.0.
+    location ~ ^/api/v1/workspaces/[^/]+/ai/assistant/threads/[^/]+/stream$ {
         proxy_pass http://reputecast;
         proxy_buffering off;
         proxy_cache off;
@@ -305,6 +319,28 @@ bằng tải hoặc CDN đặt trước proxy cũng cần cùng khoảng thời 
 [tác tử AI](/vi/integrations/ai-agent/) thì không cần: các lệnh gọi mô hình của chúng chạy ở chế độ nền, và trang chỉ
 đọc tiến độ. Có từ bản 1.7.0.
 
+## Luồng sự kiện của trợ lý
+
+Từ bản phát hành tiếp theo sau 1.7.0, mỗi cuộc trò chuyện với [trợ lý AI](/vi/integrations/ai-assistant/) đang mở trong
+bảng trợ lý hoặc trên trang riêng giữ một luồng Server-Sent Events (`text/event-stream`). Proxy phải chuyển tiếp từng sự
+kiện ngay khi nó được ghi:
+
+- **Tắt chế độ đệm.** Mặc định nginx đệm phản hồi, nên hãy giữ `location` của luồng với `proxy_buffering off;` như
+  trong ví dụ ở trên (ReputeCast không gửi `X-Accel-Buffering`). Caddy và Traefik đẩy ngay các phản hồi
+  `text/event-stream` mà không cần thiết lập thêm. Nếu proxy hoặc một CDN đặt trước nó nén phản hồi, hãy loại
+  `text/event-stream` ra. Một luồng bị đệm sẽ hiện câu trả lời muộn, hiện tất cả cùng lúc, hoặc không hiện cho đến khi
+  trình duyệt bỏ cuộc và kết nối lại.
+- **Thời gian chờ.** Luồng gửi heartbeat mỗi 15 giây khi không có gì khác xảy ra, và trình duyệt coi 45 giây im lặng là
+  kết nối bị ngắt. Mọi thời gian chờ đọc hoặc chờ rảnh trên 15 giây đều được, kể cả mặc định 60 giây của nginx. Khi proxy
+  vẫn cắt một luồng, trình duyệt kết nối lại với sự kiện cuối cùng nó đã nhận, và không có gì bị mất hay lặp lại; bản
+  thân câu trả lời vẫn tiếp tục trên máy chủ.
+- **HTTP/2.** Mỗi cuộc trò chuyện đang mở và mỗi màn hình theo dõi trực tiếp giữ một kết nối. Qua HTTP/1.1, một trình
+  duyệt mở tối đa sáu kết nối tới một máy chủ, dùng chung cho mọi tab, nên chỉ vài tab đang mở cũng có thể khiến các yêu
+  cầu khác phải chờ. Qua HTTP/2, chúng dùng chung một kết nối.
+
+Một trình duyệt không đọc một sự kiện trong vòng 5 giây sẽ bị cắt, rồi tiếp tục từ sự kiện cuối cùng của nó. Kết nối
+Postgres mà các luồng dùng được mô tả trong [mở rộng](/vi/self-hosting/scaling/#trợ-lý-ai).
+
 ## Tên miền tùy chỉnh
 
 Một không gian làm việc có thể phục vụ trang đăng ký, trung tâm tùy chọn, trang lưu trữ và các trang công khai khác tại
@@ -383,6 +419,9 @@ riêng, nên proxy HTTP không chuyển tiếp được:
 
 - **Theo dõi trực tiếp không cập nhật, hoặc vài giây mới nhảy một lần**: proxy đang đệm stream. Trong nginx, hãy thêm
   `location` của live stream với `proxy_buffering off`.
+- **Câu trả lời của trợ lý AI đến cùng một lúc, hoặc bảng trợ lý liên tục báo đang kết nối lại**: proxy đang đệm hoặc
+  nén luồng của trợ lý. Trong nginx, hãy thêm `location` của trợ lý với `proxy_buffering off`; xem
+  [luồng sự kiện của trợ lý](#luồng-sự-kiện-của-trợ-lý).
 - **`413 Request Entity Too Large` khi nhập dữ liệu hoặc tải tệp lên**: hãy tăng `client_max_body_size` của nginx.
 - **Màn hình mất nhiều giây mới hiện trên điện thoại**: proxy dùng HTTP/1.1 với trình duyệt. Trong nginx, hãy thêm
   `http2 on;` vào khối `server`.

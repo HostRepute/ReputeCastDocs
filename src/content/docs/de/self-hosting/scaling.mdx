@@ -14,6 +14,8 @@ sources:
   - internal/cli/serve.go
   - internal/cli/seed.go
   - internal/jobs/jobs.go
+  - internal/ai/assistant/{hub,runtime,stream,retention}.go
+  - internal/mcpclient/catalog.go
   - internal/providers/remote/runtime.go
   - internal/server/sessionlimit.go
   - internal/loadtest
@@ -143,6 +145,44 @@ jeder Installation und jedem Upgrade in einem Job. Verfügbar seit Version 1.7.0
   Balancer mit drei Web-Prozessen das Dreifache der [Limits](/de/self-hosting/security/#standardwerte-und-grenzen)
   erreichen.
 
+## Der KI-Assistent
+
+Ab der nächsten Version nach 1.7.0 antwortet der [KI-Assistent](/de/integrations/ai-assistant/) auf den Workern und
+streamt über die Web-Prozesse. Verantwortliche schalten ihn je Arbeitsbereich ein; das braucht er von der Instanz.
+
+- **Worker** beantworten Runden über die Warteschlange `ai_assistant`. Die Nachricht einer Person wird mit ihrem Job
+  gespeichert, und jeder Worker kann ihn übernehmen, sodass `--role=web` und `--role=worker` auf verschiedenen Hosts
+  laufen können. Jeder Worker-Prozess beantwortet bis zur Hälfte von `worker.concurrency` Runden gleichzeitig,
+  mindestens 10 (25 beim Standardwert 50), zusätzlich zu seinen anderen Warteschlangen; eine Runde wartet meist auf den
+  Modellanbieter. Die Limits jedes Arbeitsbereichs für gleichzeitige Antworten (standardmäßig 2 pro Person und 10 im
+  Arbeitsbereich) gelten über alle Worker hinweg.
+- **Kein Worker läuft**: Nachrichten bleiben in der Warteschlange, und nach 30 Minuten zeigt der Bereich „Die Antwort
+  wurde unterbrochen“. Ein Worker, der stoppt (ein Deployment, `SIGTERM`), gibt laufenden Jobs 10 Sekunden; eine Runde,
+  die dann noch antwortet, schlägt als unterbrochen fehl, behält, was sie geschrieben hat, und ihre Kosten bleiben
+  unbekannt, bis Verantwortliche sie [abgleichen](/de/integrations/ai-models/#reservierte-anfragen-und-unbekannte-nutzung).
+- **Eine zusätzliche Postgres-Verbindung pro Web-Prozess.** Jeder Prozess mit der Rolle `web` öffnet eine eigene
+  Verbindung, um mit `LISTEN` auf Ereignisse der Unterhaltungen zu warten, außerhalb des Pools und mit derselben
+  Datenbank-URL. Sie öffnet sich mit dem ersten Strom, schließt sich eine Minute nach dem Ende des letzten und erscheint
+  in `pg_stat_activity` mit dem `application_name` `reputecast-assistant`. Planen Sie sie in `max_connections` ein: den
+  Pool jedes Web-Prozesses plus eins.
+- **`LISTEN` braucht eine Sitzung**: Verbinden Sie sich direkt oder über PgBouncer im Session-Modus. Im
+  Transaktionsmodus holen Ströme erst bei ihrer Zugriffsprüfung alle fünf Sekunden auf, sodass Antworten in Schüben
+  ankommen. Bricht die Verbindung ab, protokolliert der Prozess
+  `assistant: listening for thread events failed; streams poll until it listens again` und weckt jeden Strom jede
+  Sekunde, bis er wieder lauscht.
+- **Ausgehender Verkehr**: Beide Rollen erreichen die Modellanbieter und die [MCP-Server](/de/integrations/mcp-servers/)
+  mit ihren Autorisierungsservern: Worker für jeden Tool-Aufruf, das stündliche `mcp.servers_sync` und den Job
+  `mcp.tokens_revoke`; Web-Prozesse für Anmeldungen, das Synchronisieren der Tools durch Verantwortliche und den
+  Widerruf beim Trennen. Lassen Sie beide durch eine Egress-Firewall.
+- **Proxys**: Die Ströme brauchen ausgeschaltete Pufferung
+  ([die Ereignisströme des Assistenten](/de/self-hosting/reverse-proxy/#die-ereignisströme-des-assistenten)).
+
+Der Lasttest von Upstream mit 200 gleichzeitigen Strömen auf einem Prozess mit 4 vCPUs und allen Rollen (Postgres 18.7
+mit Standardeinstellungen, auf einer Maschine, die auch andere Arbeit erledigte) lieferte Ereignisse von ihrem Commit
+bis zum Browser mit einem p95 von 71–77 ms, unter dem Ziel von 100 ms, ohne Fehler und ohne verpasste Ereignisse. Runden
+erscheinen in `reputecast_jobs{queue="ai_assistant"}`, und die eigenen Metriken des Assistenten stehen unter
+[Überwachung](/de/self-hosting/monitoring/#metriken).
+
 ## Gemessene Leistung
 
 Mit den Daten des Lasttests (eine Million Kontakte, 3,2 Millionen Zustellereignisse) beantworteten ReputeCast und
@@ -174,6 +214,8 @@ Kontaktliste, Segmentzählungen, die Sende-API und den Empfang von Webhooks.
 ## Fehlerbehebung
 
 - **Nichts wird gesendet, und Importe werden nie fertig**: Kein Prozess führt die Rolle `worker` aus.
+- **Nachrichten an den KI-Assistenten bleiben bei „In Warteschlange…“**: Kein Worker läuft, oder alle Worker sind
+  ausgelastet. Prüfen Sie `reputecast_jobs{queue="ai_assistant"}`; siehe [Der KI-Assistent](#der-ki-assistent).
 - **Gespeicherte Zugangsdaten der Anbieter lassen sich in einem Prozess nicht entschlüsseln**: Sein geheimer Schlüssel
   weicht ab; geben Sie jedem Prozess denselben `secrets.key` oder dieselbe Schlüsseldatei.
 - **Produkt-Downloads schlagen in manchen Prozessen fehl**: `files.dir` wird nicht gemeinsam genutzt, oder die
