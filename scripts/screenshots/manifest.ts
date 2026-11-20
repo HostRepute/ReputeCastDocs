@@ -1700,7 +1700,7 @@ export const shots: Shot[] = [
   // Settings › External connections, with the prepared connection.
   { id: 'mcp-connections', path: `${ws}/settings/connections`, feature: 'mcpconnect', prepare: true },
 
-  // AI models, the AI assistant and MCP servers (the next release after 1.7.0), on the Acme `assistant` prepares.
+  // AI models, the AI assistant and MCP servers (1.8.0), on the Acme `assistant` prepares.
   // Settings › Integrations › AI models: the demo's Anthropic account and the recorded Office Ollama, each feature's
   // model below.
   { id: 'ai-settings', path: `${ws}/settings/integrations/ai`, feature: 'ai', assistant: true },
