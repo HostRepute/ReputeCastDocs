@@ -84,7 +84,7 @@ changelog của nó trong <UiPath path="shell.userMenuInstanceAdmin > admin.inst
    docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
    ```
 
-2. Nếu bạn ghim phiên bản trong `.env` (`REPUTECAST_VERSION=v1.7.0`), hãy đổi sang tag của bản phát hành mới. Tag của
+2. Nếu bạn ghim phiên bản trong `.env` (`REPUTECAST_VERSION=v1.8.0`), hãy đổi sang tag của bản phát hành mới. Tag của
    image là tag phát hành, giữ nguyên chữ `v` ở đầu, cùng với `latest`. Nếu không có `REPUTECAST_VERSION`, tệp compose
    dùng `latest`.
 
@@ -159,6 +159,54 @@ dùng phiên bản mới.
 Migration giữ một khóa trong PostgreSQL: khi nhiều tiến trình cùng khởi động với `--auto-migrate`, một tiến trình áp
 dụng migration còn các tiến trình khác chờ (tối đa 15 phút), nên mỗi migration chỉ chạy một lần. Hãy chạy migration qua
 kết nối trực tiếp hoặc ở chế độ session, không qua PgBouncer ở chế độ transaction.
+
+## Nâng cấp lên 1.8.0
+
+Phiên bản 1.8.0 thay đổi những điều sau trên máy chủ; [ghi chú phát hành](/vi/reference/release-notes/#180) liệt kê phần
+còn lại.
+
+- **Những gì được giữ lại.** Kết nối AI của mỗi không gian làm việc trở thành tài khoản mô hình đầu tiên, với cùng khóa,
+  giá, hạn mức và mức sử dụng, và mô hình của nó trở thành mặc định của mọi tính năng; kết quả kiểm tra công cụ đã đạt
+  vẫn được tính. [Trợ lý AI](/vi/integrations/ai-assistant/) và [khóa cá nhân](/vi/integrations/ai-models/#khóa-cá-nhân)
+  vẫn tắt cho đến khi người có `integrations:manage` bật chúng.
+- **Sao lưu trước:** cơ sở dữ liệu, khóa bí mật và thư mục tệp ([sao lưu và khôi phục](/vi/self-hosting/backups/)). Quay
+  lại 1.7.0 cần bản sao lưu đó hoặc các migration down ở bên dưới.
+- **7 migration mới** (`03630` đến `03660`). Khởi động tệp nhị phân hoặc image mới trước: cho đến khi chúng chạy xong,
+  nó chỉ đọc, và việc đọc những gì chúng thêm vào trả về `503` với mã `maintenance`
+  ([trong lúc còn migration chưa chạy](#trong-lúc-còn-migration-chưa-chạy)). Sau đó chạy `reputecast migrate up`, hoặc
+  để `--auto-migrate` chạy chúng, và thay mọi tiến trình 1.7.0: ngay khi migration đầu tiên được commit, các trang AI
+  của 1.7.0 bị lỗi.
+- **Khóa bảng.** Trong lần kiểm thử nâng cấp của upstream, các migration mất tổng cộng 1 đến 6 giây, nhưng chúng khóa
+  nhật ký hoạt động AI và, trong thời gian ngắn, các bảng người dùng và không gian làm việc. Với 2 triệu yêu cầu AI,
+  thao tác ghi vào nhật ký hoạt động AI chờ tối đa 2,8 giây, thao tác đọc chờ tối đa 1,5 giây, còn đăng nhập và các thay
+  đổi khác về người dùng và không gian làm việc chờ tối đa 1,5 giây. Hãy chạy vào lúc ít người dùng và không có giao
+  dịch dài nào đang mở: một migration đang chờ giao dịch như vậy sẽ khiến mọi yêu cầu tới các bảng đó phải chờ sau nó.
+- **Quay lại 1.7.0** là ngoại lệ của quy tắc lùi một bản minor ([quay lại phiên bản trước](#quay-lại-phiên-bản-trước)):
+  1.7.0 báo sẵn sàng trên schema của 1.8.0, nhưng các trang AI của nó trả về `500`. Hãy khôi phục bản sao lưu, hoặc dừng
+  mọi tiến trình 1.8.0 rồi chạy `reputecast migrate down` bảy lần bằng tệp nhị phân 1.8.0 trước khi khởi động 1.7.0.
+  Việc này xóa những gì đã tạo trong 1.8.0: cài đặt của trợ lý, các cuộc trò chuyện và mức sử dụng của chúng; máy chủ
+  MCP, công cụ của chúng, lượt đăng nhập của thành viên và các xác nhận đang chờ, còn refresh token đang chờ thu hồi sẽ
+  không bao giờ được gửi; khóa cá nhân và mô hình mà từng thành viên tự chọn; và mọi tài khoản mô hình sau tài khoản đầu
+  tiên của một không gian làm việc, mọi mô hình sau mô hình đầu tiên của tài khoản đó và mô hình mặc định của từng tính
+  năng. Yêu cầu dùng khóa cá nhân lại được tính vào hạn mức của không gian làm việc. Không gian làm việc có tài khoản
+  được nâng cấp đã bị gỡ sẽ nhận lại tài khoản còn lại cũ nhất ở trạng thái ngắt kết nối và không có khóa, còn không
+  gian không còn tài khoản nào sẽ mất hạn mức và các tính năng đã tắt. Những thay đổi 1.8.0 đã làm với tài khoản đầu
+  tiên, như hạn mức hoặc khóa đã thay, được giữ lại.
+- **Worker và hàng đợi `ai_assistant`.** Câu trả lời của trợ lý chạy trong các tiến trình có vai trò `worker`, tối đa
+  một nửa `worker.concurrency` cùng lúc và ít nhất 10. Khi tách vai trò, hãy giữ một worker chạy: nếu không, tin nhắn
+  nằm trong hàng đợi và thất bại sau 30 phút ([mở rộng](/vi/self-hosting/scaling/#trợ-lý-ai)).
+- **Thêm một kết nối PostgreSQL cho mỗi tiến trình web.** Mỗi tiến trình có vai trò `web` giữ một kết nối ngoài pool để
+  `LISTEN` sự kiện của cuộc trò chuyện: hãy chừa chỗ cho nó trong `max_connections`, và kết nối trực tiếp hoặc qua
+  PgBouncer ở chế độ session, không phải chế độ transaction
+  ([PostgreSQL](/vi/self-hosting/postgres/#chọn-kích-thước-pool-kết-nối)).
+- **Luồng sự kiện sau proxy.** Câu trả lời của trợ lý là Server-Sent Events: tắt buffering, không nén
+  `text/event-stream` và phục vụ HTTP/2
+  ([luồng sự kiện của trợ lý](/vi/self-hosting/reverse-proxy/#luồng-sự-kiện-của-trợ-lý)).
+- **Máy chủ MCP.** Đăng nhập OAuth cần URL công khai `https://`: thành viên quay về
+  `<URL công khai>/api/v1/ai/mcp/oauth/callback`, và tài liệu metadata client của ReputeCast chỉ được phục vụ dưới một
+  URL `https://` ([địa chỉ chuyển hướng OAuth](/vi/integrations/mcp-servers/#địa-chỉ-chuyển-hướng-oauth)).
+  `providers.allow_private_networks` giờ cũng cho phép máy chủ MCP và máy chủ ủy quyền của chúng nằm ở địa chỉ nội bộ,
+  như đã cho phép với máy chủ mô hình tương thích OpenAI ([cấu hình](/vi/self-hosting/configuration/#trợ-lý-ai)).
 
 ## Nâng cấp lên 1.7.0
 
@@ -289,11 +337,8 @@ phần còn lại.
 Chạy lại image hoặc tệp nhị phân cũ không hoàn tác migration: cơ sở dữ liệu vẫn giữ schema mới hơn. Trong cùng một bản
 phát hành minor (1.3.0 sang 1.3.2), migration chỉ thêm vào, và khi lùi một bản minor (1.3 về 1.2), tệp nhị phân cũ hơn
 vẫn chạy trên schema mới hơn. Hãy đọc ghi chú phát hành trước: bản phát hành nào xóa hoặc đổi tên một thứ gì đó sẽ nói
-rõ. Bản 1.8.0 là một trường hợp như vậy: các trang AI của 1.7.0 lỗi trên schema của nó. Muốn quay lại 1.7.0, hãy khôi
-phục bản sao lưu, hoặc chạy `reputecast migrate down` bảy lần bằng tệp nhị phân 1.8.0 trước khi khởi động 1.7.0; việc
-này xóa những gì đã tạo trong 1.8.0
-([quay lại từ 1.8.0 về 1.7.0](https://github.com/hostrepute/reputecast/blob/v1.8.0/docs/deploy/README.md#from-170-to-180)).
-Lùi xa hơn thì hãy khôi phục bản sao lưu.
+rõ. Bản 1.8.0 là một trường hợp như vậy: muốn quay lại 1.7.0 cần bản sao lưu, hoặc bảy migration down xóa những gì 1.8.0
+đã tạo ([nâng cấp lên 1.8.0](#nâng-cấp-lên-180)). Lùi xa hơn thì hãy khôi phục bản sao lưu.
 
 - **Khôi phục bản sao lưu** để trở về chính xác trạng thái trước khi nâng cấp: dừng ReputeCast, khôi phục bản dump bạn
   đã tạo (xem [khôi phục](/vi/self-hosting/backups/#khôi-phục)), rồi khởi động phiên bản bạn chạy trước đó. Mọi thay đổi
@@ -304,7 +349,7 @@ Lùi xa hơn thì hãy khôi phục bản sao lưu.
   `03460` đã xóa chúng; các tài khoản WhatsApp đã chuyển sang URL callback mới cần dán lại URL cũ vào Meta khi chạy 1.4.
 - `reputecast migrate down` chỉ hoàn tác migration mới nhất của ReputeCast, mỗi lần chạy một migration, và không đụng
   đến các bảng của hàng đợi công việc. Lệnh này dành cho môi trường phát triển: migration down xóa dữ liệu, nên đừng
-  chạy nó trên cơ sở dữ liệu production, trừ khi quay lại từ 1.8.0 về 1.7.0 như trên.
+  chạy nó trên cơ sở dữ liệu production, trừ khi quay lại từ 1.8.0 về 1.7.0 ([nâng cấp lên 1.8.0](#nâng-cấp-lên-180)).
 
 ## Khắc phục sự cố
 

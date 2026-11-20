@@ -140,6 +140,11 @@ Por ejemplo `https://news.example.com/api/v1/ai/mcp/oauth/callback`. La URL púb
 <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, o
 [`REPUTECAST_PUBLIC_URL`](/es/self-hosting/configuration/).
 
+- Cuando el servidor de autorización acepta documentos de metadatos de ID de cliente, el cliente de ReputeCast es su
+  propio [documento de metadatos de cliente](#el-documento-de-metadatos-de-cliente) en
+  `<URL pública>/api/v1/ai/mcp/oauth/client-metadata.json`, y el servidor de autorización lee de él esta dirección de
+  redirección. Necesita una URL pública `https://`, y la fila del servidor indica entonces "Cliente: esta instancia
+  (documento de metadatos del cliente)". No tienes que escribir nada.
 - Cuando ReputeCast se registra en el servidor de autorización (registro dinámico de clientes), registra esta
   dirección. No tienes que escribir nada.
 - Cuando el servidor necesita un cliente que registraste tú, abre <UiPath path="mcpservers.clientSummary" />, escribe el
@@ -151,9 +156,28 @@ La especificación de autorización de MCP exige que las direcciones de redirecc
 servidores de autorización pueden rechazar otras
 ([autorización de MCP](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), comprobado en
 noviembre de 2026). Si la URL pública cambia, la dirección de redirección cambia con ella: registra la nueva en un
-cliente que hayas introducido tú. Un cliente que registró ReputeCast conserva la dirección antigua, así que borra su ID
-de cliente en Editar y el siguiente inicio de sesión registrará un cliente nuevo. Cuenta con que los miembros tengan
-que volver a iniciar sesión.
+cliente que hayas introducido tú. Un cliente que registró ReputeCast, o su documento de metadatos de cliente, conserva
+la dirección antigua, así que borra su ID de cliente en Editar y el siguiente inicio de sesión configurará un cliente
+nuevo. Cuenta con que los miembros tengan que volver a iniciar sesión.
+
+### El documento de metadatos de cliente
+
+`GET <URL pública>/api/v1/ai/mcp/oauth/client-metadata.json` no necesita iniciar sesión, se sirve como
+`application/json` con `Cache-Control: public, max-age=300` y dice:
+
+```json title="client-metadata.json"
+{
+  "client_id": "https://news.example.com/api/v1/ai/mcp/oauth/client-metadata.json",
+  "client_name": "ReputeCast",
+  "redirect_uris": ["https://news.example.com/api/v1/ai/mcp/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+Es un cliente público: PKCE, sin secreto. Cuando la URL pública no es `https://`, la dirección responde `404` y
+ReputeCast no lo ofrece.
 
 ### Qué espera ReputeCast de un servidor OAuth
 
@@ -170,17 +194,24 @@ primer inicio de sesión en el servidor, y de nuevo después de borrar su ID de 
    el recurso para el que ReputeCast pide tokens. Se rechaza un documento que indique cualquier otro recurso.
 3. Toma el primer servidor de autorización de la lista y lee sus metadatos: primero OAuth (RFC 8414) y después el
    descubrimiento de OpenID Connect. Los metadatos tienen que incluir `S256` en `code_challenge_methods_supported`.
-4. Sin un cliente introducido por ti, el servidor de autorización necesita un `registration_endpoint`. Los documentos
-   de metadatos de ID de cliente (Client ID metadata documents) no se admiten.
+4. El cliente, en el orden que da la especificación de MCP: el que introdujiste; si no, el
+   [documento de metadatos de cliente](#el-documento-de-metadatos-de-cliente) de ReputeCast, cuando los metadatos
+   indican `client_id_metadata_document_supported` y la URL pública es `https://`; si no, un cliente registrado en su
+   `registration_endpoint`. Sin ninguno de ellos, el inicio de sesión se detiene con `mcp_oauth_client`.
 5. Pide el scope que indicó el 401 o, si no, todos los scopes de `scopes_supported` del recurso.
-6. La autenticación del cliente es ninguna, o HTTP basic con el secreto de cliente. `client_secret_post` y
-   `private_key_jwt` no se admiten.
+6. La autenticación del cliente, en las solicitudes de token, de renovación y de revocación, sigue
+   `token_endpoint_auth_methods_supported`: ninguna para un cliente sin secreto; con secreto, `client_secret_basic`
+   cuando aparece (o cuando no aparece nada), si no `client_secret_post`. El propio `token_endpoint_auth_method` de un
+   registro dinámico tiene prioridad. `private_key_jwt` y los métodos TLS no se admiten (`mcp_oauth_client_auth`).
 7. Las direcciones de los metadatos tienen que ser https (http simple solo en loopback).
 8. Guarda el `revocation_endpoint` del servidor de autorización, si tiene uno, para
    [revocar los inicios de sesión eliminados](#revocar-los-inicios-de-sesión-eliminados).
 
 Cuando falla cualquiera de estos pasos, el inicio de sesión indica "No se pudo configurar el inicio de sesión de …: su
-servidor de autorización no respondió como se esperaba. Revisa la dirección o introduce un cliente registrado."
+servidor de autorización no respondió como se esperaba. Revisa la dirección o introduce un cliente registrado." Sin un
+cliente, o cuando el servidor solo acepta métodos que ReputeCast no admite, quienes administran las integraciones
+reciben Editar con "Introduce un cliente para …" o "El método de inicio de sesión de … no es compatible" y el motivo; el
+resto ve el mismo título en un mensaje.
 
 ## Revisar las herramientas
 
@@ -234,10 +265,14 @@ página muestra la versión nueva: "Esta herramienta cambió en el servidor mien
 ## Cuando cambia una herramienta
 
 Una decisión se guarda con el hash de la descripción, el esquema de entrada y las anotaciones de la herramienta tal como
-los revisaste. ReputeCast compara las herramientas de un servidor con lo decidido en tres momentos:
+los revisaste. ReputeCast compara las herramientas de un servidor con lo decidido en estos momentos:
 
 - **Antes de cada llamada.** En la propia sesión de la llamada, ReputeCast lista primero las herramientas del servidor.
   Si la herramienta ya no aparece, o difiere de la versión decidida, la llamada no se envía.
+- **Cuando el servidor avisa durante una llamada de que sus herramientas cambiaron**
+  (`notifications/tools/list_changed`). ReputeCast las vuelve a listar en esa sesión. Si la herramienta llamada cambió o
+  desapareció, su resultado no se usa y la llamada termina con `mcp_tool_changed`, aunque puede que el servidor ya haya
+  actuado.
 - **Cada hora**, para los servidores con inicio de sesión <UiPath path="mcpservers.optNone" /> o
   <UiPath path="mcpservers.optHeader" /> que están activados y se sincronizaron antes (la tarea `mcp.servers_sync`, como
   máximo 20 servidores por ejecución). Los servidores OAuth se listan en nombre de una persona, así que solo los cubren
@@ -321,12 +356,13 @@ espacios de trabajo, y quitar un servidor elimina el inicio de sesión de cada m
 ### Revocar los inicios de sesión eliminados
 
 Cuando el servidor de autorización anunció un `revocation_endpoint`, ReputeCast también revoca el token de renovación
-de cada inicio de sesión que elimina (RFC 7009): al desconectar, cuando el miembro se va, se le quita o se le
-desactiva, cuando se quita el servidor y cuando el servidor rechazó el inicio de sesión. Al desconectar procesa la cola
-al momento (hasta 10 tokens, durante hasta 10 segundos); la tarea `mcp.tokens_revoke` envía lo que queda cada minuto.
-Es un mejor esfuerzo: cada token se intenta una vez, una revocación fallida se registra sin el token, y el inicio de
-sesión desaparece en cualquier caso. Los tokens de acceso no se revocan; dejan de valer cuando caducan. Sin un
-`revocation_endpoint`, no se revoca nada: usa los ajustes del propio servidor.
+de cada inicio de sesión que elimina (RFC 7009), autenticándose como lo hace su cliente en el endpoint de token: al
+desconectar, cuando el miembro se va, se le quita o se le desactiva, cuando se quita el servidor y cuando el servidor
+rechazó el inicio de sesión. Al desconectar procesa la cola al momento (hasta 10 tokens, durante hasta 10 segundos); la
+tarea `mcp.tokens_revoke` envía lo que queda cada minuto. Es un mejor esfuerzo: cada token se intenta una vez, una
+revocación fallida se registra sin el token, y el inicio de sesión desaparece en cualquier caso. Los tokens de acceso no
+se revocan; dejan de valer cuando caducan. Sin un `revocation_endpoint`, no se revoca nada: usa los ajustes del propio
+servidor.
 
 ## Comprobar que funciona
 
@@ -348,6 +384,8 @@ sesión desaparece en cualquier caso. Los tokens de acceso no se revocan; dejan 
 | **… tardó demasiado** | La herramienta no respondió en 30 segundos. | Vuelve a preguntar más tarde. |
 | **… envió demasiado** | La respuesta superaba los 32 KB, así que el modelo no la recibió. | Haz una pregunta más concreta. |
 | "No se pudo configurar el inicio de sesión de …" | Falló el descubrimiento o el registro. | Revisa [qué espera ReputeCast](#qué-espera-reputecast-de-un-servidor-oauth), o introduce un cliente registrado. |
+| "Introduce un cliente para …" | El servidor de autorización no acepta el documento de metadatos de cliente de ReputeCast ni el registro dinámico (`mcp_oauth_client`). | Quien administra registra allí un cliente con la [dirección de redirección](#la-dirección-de-redirección-de-oauth) y lo introduce en Editar. |
+| "El método de inicio de sesión de … no es compatible" | El servidor de autorización solo acepta autenticación de cliente que ReputeCast no admite, como `private_key_jwt` (`mcp_oauth_client_auth`). | Registra un cliente que use none, `client_secret_basic` o `client_secret_post`. |
 | "No se puede conectar a una dirección privada" | El servidor está en tu propia red. | Un operador define `providers.allow_private_networks`. |
 
 </TableScroll>

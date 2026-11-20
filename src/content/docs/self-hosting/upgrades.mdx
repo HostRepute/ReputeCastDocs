@@ -83,7 +83,7 @@ changelog under <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, 
    docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
    ```
 
-2. If you pin a version in `.env` (`REPUTECAST_VERSION=v1.7.0`), change it to the new release tag. Image tags are the
+2. If you pin a version in `.env` (`REPUTECAST_VERSION=v1.8.0`), change it to the new release tag. Image tags are the
    release tags with their leading `v`, plus `latest`. Without `REPUTECAST_VERSION`, the compose file uses `latest`.
 
 3. Pull the new image and recreate the app container:
@@ -154,6 +154,51 @@ to load the new version.
 Migrations hold a lock in PostgreSQL: when several processes start with `--auto-migrate`, one applies them while the
 others wait for it (up to 15 minutes), so each migration runs once. Run them over a direct or session-mode connection,
 not through PgBouncer in transaction mode.
+
+## Upgrade to 1.8.0
+
+Version 1.8.0 changes these things on the server; the [release notes](/reference/release-notes/#180) list the rest.
+
+- **What carries over.** Each workspace's AI connection becomes its first model account, with the same key, prices, cap
+  and usage, and its model becomes every feature's default; a tool check it passed still counts. The
+  [AI assistant](/integrations/ai-assistant/) and [personal keys](/integrations/ai-models/#personal-keys) stay off until
+  someone with `integrations:manage` turns them on.
+- **Back up first:** the database, the secret key and the files folder ([back up](/self-hosting/backups/)). Going back
+  to 1.7.0 needs that backup or the down migrations below.
+- **7 new migrations** (`03630` to `03660`). Start the new binary or image first: until they run it serves read-only,
+  and reads of what they add answer `503` with the code `maintenance`
+  ([while migrations are pending](#while-migrations-are-pending)). Then run `reputecast migrate up`, or let
+  `--auto-migrate` run them, and replace every 1.7.0 process: once the first migration commits, 1.7.0's AI pages fail.
+- **Locks.** The migrations took 1 to 6 seconds in total in upstream's upgrade test, but they lock the AI activity log
+  and, briefly, the users and workspaces tables. With 2 million AI requests, writes to the AI activity log waited up to
+  2.8 seconds, its reads up to 1.5 seconds, and sign-ins and other changes to people and workspaces up to 1.5 seconds.
+  Run them at a quiet moment, with no long-running transaction open: a migration waiting for one makes every request on
+  those tables wait behind it.
+- **Going back to 1.7.0** is an exception to the one-minor-release rule ([roll back](#roll-back)): 1.7.0 reports ready
+  on the 1.8.0 schema, but its AI pages answer `500`. Restore the backup, or stop every 1.8.0 process and run
+  `reputecast migrate down` seven times with the 1.8.0 binary before you start 1.7.0. That deletes what was created in
+  1.8.0: the assistant's settings, threads and their usage; MCP servers, their tools, members' sign-ins and waiting
+  confirmations, while refresh tokens still queued for revocation are never sent; personal keys and members' own model
+  picks; and every model account after a workspace's first, every model after that account's first and the default model
+  of each feature. Requests on personal keys count toward the workspace's cap again. A workspace whose upgraded account
+  was removed gets its oldest remaining account back disconnected and without a key, and one with no account left loses
+  its cap and the features it switched off. Changes 1.8.0 made to the first account, such as its cap or a replaced key,
+  are kept.
+- **Workers and the `ai_assistant` queue.** Assistant answers run in processes with the `worker` role, up to half of
+  `worker.concurrency` at once and at least 10. With split roles, keep a worker running: without one, messages stay
+  queued and fail after 30 minutes ([scaling](/self-hosting/scaling/#the-ai-assistant)).
+- **One more PostgreSQL connection per web process.** Each process with the `web` role keeps one connection outside its
+  pool to `LISTEN` for thread events: leave room for it in `max_connections`, and connect directly or through PgBouncer
+  in session mode, not transaction mode ([PostgreSQL](/self-hosting/postgres/#size-the-connection-pool)).
+- **Event streams behind a proxy.** The assistant's answers are Server-Sent Events: turn buffering off, don't compress
+  `text/event-stream`, and serve HTTP/2
+  ([the assistant's event streams](/self-hosting/reverse-proxy/#the-assistants-event-streams)).
+- **MCP servers.** OAuth sign-in needs an `https://` public URL: members come back to
+  `<public URL>/api/v1/ai/mcp/oauth/callback`, and ReputeCast's client metadata document is served only under an
+  `https://` one ([the OAuth redirect address](/integrations/mcp-servers/#the-oauth-redirect-address)).
+  `providers.allow_private_networks` now also lets MCP servers and their authorization servers be on private addresses,
+  as it already did for OpenAI-compatible model servers
+  ([configuration](/self-hosting/configuration/#the-ai-assistant)).
 
 ## Upgrade to 1.7.0
 
@@ -270,11 +315,9 @@ Version 1.2.0 changes these things on the server; the [release notes](/reference
 
 Going back to the previous image or binary does not undo migrations: the database keeps the newer schema. Within a
 minor release (1.3.0 to 1.3.2) migrations only add, and across one minor release (1.3 to 1.2) the older binary runs on
-the newer schema. Read the release notes first: a release that drops or renames something says so. 1.8.0 is one: 1.7.0's
-AI pages fail on its schema. Going back to 1.7.0 needs the backup, or `reputecast migrate down` seven times with the
-1.8.0 binary before 1.7.0 starts, which deletes what was created in 1.8.0
-([going back from 1.8.0 to 1.7.0](https://github.com/hostrepute/reputecast/blob/v1.8.0/docs/deploy/README.md#from-170-to-180)).
-Further back, restore the backup.
+the newer schema. Read the release notes first: a release that drops or renames something says so. 1.8.0 is one: going
+back to 1.7.0 needs the backup, or seven down migrations that delete what 1.8.0 created
+([upgrade to 1.8.0](#upgrade-to-180)). Further back, restore the backup.
 
 - **Restore the backup** for an exact return to the state before the upgrade: stop ReputeCast, restore the dump you
   took (see [restore](/self-hosting/backups/#restore)), then start the version you ran before. Changes made after the
@@ -286,7 +329,7 @@ Further back, restore the backup.
   old one in Meta again on 1.4.
 - `reputecast migrate down` rolls back only the latest ReputeCast migration, one per run, and leaves the job queue's
   tables alone. It is meant for development: down migrations drop data, so don't run it on a production database, except
-  to go back from 1.8.0 to 1.7.0 as above.
+  to go back from 1.8.0 to 1.7.0 ([upgrade to 1.8.0](#upgrade-to-180)).
 
 ## Troubleshooting
 

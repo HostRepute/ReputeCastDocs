@@ -86,7 +86,7 @@ publicada y su registro de cambios en <UiPath path="shell.userMenuInstanceAdmin 
    docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
    ```
 
-2. Si fijas una versión en `.env` (`REPUTECAST_VERSION=v1.7.0`), cámbiala por la etiqueta de la nueva versión. Las
+2. Si fijas una versión en `.env` (`REPUTECAST_VERSION=v1.8.0`), cámbiala por la etiqueta de la nueva versión. Las
    etiquetas de la imagen son las etiquetas de las versiones con su `v` inicial, más `latest`. Sin
    `REPUTECAST_VERSION`, el archivo Compose usa `latest`.
 
@@ -161,6 +161,62 @@ actualización ofrecen <UiPath path="shell.bannerReload" /> para cargar la nueva
 Las migraciones mantienen un bloqueo en PostgreSQL: cuando varios procesos arrancan con `--auto-migrate`, uno las
 aplica mientras los demás lo esperan (hasta 15 minutos), así que cada migración se ejecuta una vez. Ejecútalas con una
 conexión directa o en modo sesión, no a través de PgBouncer en modo transacción.
+
+## Actualizar a 1.8.0
+
+La versión 1.8.0 cambia estas cosas en el servidor; las [notas de la versión](/es/reference/release-notes/#180) recogen
+el resto.
+
+- **Lo que se conserva.** La conexión de IA de cada espacio de trabajo pasa a ser su primera cuenta de modelo, con la
+  misma clave, los mismos precios, el mismo límite y el mismo uso, y su modelo pasa a ser el predeterminado de todas las
+  funciones; una comprobación de herramientas que superó sigue contando. El
+  [asistente de IA](/es/integrations/ai-assistant/) y las
+  [claves personales](/es/integrations/ai-models/#claves-personales) siguen desactivados hasta que alguien con
+  `integrations:manage` los activa.
+- **Haz primero una copia de seguridad:** la base de datos, la clave secreta y la carpeta de archivos
+  ([copias de seguridad](/es/self-hosting/backups/)). Volver a la 1.7.0 necesita esa copia o las migraciones de
+  reversión de abajo.
+- **7 migraciones nuevas** (de la `03630` a la `03660`). Arranca primero el binario o la imagen nuevos: hasta que se
+  ejecuten funciona en solo lectura, y las lecturas de lo que añaden responden `503` con el código `maintenance`
+  ([mientras hay migraciones pendientes](#mientras-hay-migraciones-pendientes)). Después ejecuta
+  `reputecast migrate up`, o deja que las ejecute `--auto-migrate`, y reemplaza todos los procesos de la 1.7.0: en
+  cuanto se confirma la primera migración, las páginas de IA de la 1.7.0 fallan.
+- **Bloqueos.** Las migraciones tardaron de 1 a 6 segundos en total en la prueba de actualización del equipo de
+  ReputeCast, pero bloquean el registro de actividad de IA y, un momento, las tablas de usuarios y espacios de trabajo.
+  Con 2 millones de solicitudes de IA, las escrituras en el registro de actividad de IA esperaron hasta 2,8 segundos,
+  sus lecturas hasta 1,5 segundos, y los inicios de sesión y otros cambios de personas y espacios de trabajo hasta 1,5
+  segundos. Ejecútalas en un momento tranquilo, sin transacciones largas abiertas: una migración que espera a una hace
+  esperar detrás de ella a todas las solicitudes a esas tablas.
+- **Volver a la 1.7.0** es una excepción a la regla de una versión menor
+  ([volver a la versión anterior](#volver-a-la-versión-anterior)): la 1.7.0 se declara lista con el esquema de la 1.8.0,
+  pero sus páginas de IA responden `500`. Restaura la copia de seguridad, o detén todos los procesos de la 1.8.0 y
+  ejecuta `reputecast migrate down` siete veces con el binario de la 1.8.0 antes de arrancar la 1.7.0. Eso borra lo
+  creado en la 1.8.0: la configuración del asistente, las conversaciones y su uso; los servidores MCP, sus herramientas,
+  los inicios de sesión de los miembros y las confirmaciones pendientes, y los tokens de renovación que aún esperaban su
+  revocación nunca se envían; las claves personales y los modelos elegidos por cada miembro; y cada cuenta de modelo
+  después de la primera de un espacio de trabajo, cada modelo después del primero de esa cuenta y el modelo
+  predeterminado de cada función. Las solicitudes con claves personales vuelven a contar para el límite del espacio de
+  trabajo. Un espacio de trabajo cuya cuenta actualizada se quitó recupera su cuenta restante más antigua desconectada y
+  sin clave, y uno sin cuentas pierde su límite y las funciones que había desactivado. Los cambios que la 1.8.0 hizo en
+  la primera cuenta, como su límite o una clave reemplazada, se conservan.
+- **Workers y la cola `ai_assistant`.** Las respuestas del asistente se ejecutan en los procesos con el rol `worker`,
+  hasta la mitad de `worker.concurrency` a la vez y al menos 10. Con los roles separados, mantén un worker en marcha:
+  sin él, los mensajes se quedan en cola y fallan a los 30 minutos
+  ([escalar](/es/self-hosting/scaling/#el-asistente-de-ia)).
+- **Una conexión más a PostgreSQL por proceso web.** Cada proceso con el rol `web` mantiene una conexión fuera de su
+  pool para hacer `LISTEN` de los eventos de las conversaciones: deja sitio para ella en `max_connections`, y conéctate
+  directamente o a través de PgBouncer en modo sesión, no en modo transacción
+  ([PostgreSQL](/es/self-hosting/postgres/#dimensionar-el-pool-de-conexiones)).
+- **Flujos de eventos detrás de un proxy.** Las respuestas del asistente son Server-Sent Events: desactiva el búfer, no
+  comprimas `text/event-stream` y sirve HTTP/2
+  ([los flujos de eventos del asistente](/es/self-hosting/reverse-proxy/#los-flujos-de-eventos-del-asistente)).
+- **Servidores MCP.** El inicio de sesión con OAuth necesita una URL pública `https://`: los miembros vuelven a
+  `<URL pública>/api/v1/ai/mcp/oauth/callback`, y el documento de metadatos de cliente de ReputeCast solo se sirve con
+  una `https://`
+  ([la dirección de redirección de OAuth](/es/integrations/mcp-servers/#la-dirección-de-redirección-de-oauth)).
+  `providers.allow_private_networks` ahora también permite servidores MCP y sus servidores de autorización en
+  direcciones privadas, como ya hacía con los servidores de modelos compatibles con OpenAI
+  ([configuración](/es/self-hosting/configuration/#el-asistente-de-ia)).
 
 ## Actualizar a 1.7.0
 
@@ -299,11 +355,9 @@ recogen el resto.
 Volver a la imagen o al binario anterior no deshace las migraciones: la base de datos conserva el esquema más
 reciente. Dentro de una versión menor (de la 1.3.0 a la 1.3.2) las migraciones solo añaden, y con una versión menor de
 diferencia (de la 1.3 a la 1.2) el binario más antiguo funciona sobre el esquema más reciente. Lee antes las notas de
-la versión: una versión que elimina o cambia el nombre de algo lo indica. La 1.8.0 es una de ellas: las páginas de IA de
-la 1.7.0 fallan con su esquema. Volver a la 1.7.0 requiere la copia de seguridad, o ejecutar `reputecast migrate down`
-siete veces con el binario de la 1.8.0 antes de arrancar la 1.7.0, lo que elimina lo creado en la 1.8.0
-([volver de la 1.8.0 a la 1.7.0](https://github.com/hostrepute/reputecast/blob/v1.8.0/docs/deploy/README.md#from-170-to-180)).
-Para ir más atrás, restaura la copia de seguridad.
+la versión: una versión que elimina o cambia el nombre de algo lo indica. La 1.8.0 es una de ellas: volver a la 1.7.0
+requiere la copia de seguridad, o siete migraciones de reversión que eliminan lo creado en la 1.8.0
+([actualizar a 1.8.0](#actualizar-a-180)). Para ir más atrás, restaura la copia de seguridad.
 
 - **Restaura la copia de seguridad** para volver exactamente al estado anterior a la actualización: detén ReputeCast,
   restaura el volcado que hiciste (consulta [restaurar](/es/self-hosting/backups/#restaurar)) y arranca la versión que
@@ -315,7 +369,8 @@ Para ir más atrás, restaura la copia de seguridad.
   nueva URL de devolución de llamada necesitan de nuevo la antigua en Meta en la 1.4.
 - `reputecast migrate down` revierte solo la última migración de ReputeCast, una por ejecución, y no toca las tablas
   de la cola de tareas. Está pensado para desarrollo: las migraciones de reversión eliminan datos, así que no lo
-  ejecutes en una base de datos de producción, salvo para volver de la 1.8.0 a la 1.7.0 como se indica arriba.
+  ejecutes en una base de datos de producción, salvo para volver de la 1.8.0 a la 1.7.0
+  ([actualizar a 1.8.0](#actualizar-a-180)).
 
 ## Solución de problemas
 
