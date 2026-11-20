@@ -86,7 +86,7 @@ dessen Changelog unter <UiPath path="shell.userMenuInstanceAdmin > admin.instanc
    docker compose exec -T postgres pg_dump -U reputecast -d reputecast -Fc > reputecast-before-upgrade.dump
    ```
 
-2. Wenn Sie in `.env` eine Version festlegen (`REPUTECAST_VERSION=v1.7.0`), ändern Sie sie auf das Tag des neuen
+2. Wenn Sie in `.env` eine Version festlegen (`REPUTECAST_VERSION=v1.8.0`), ändern Sie sie auf das Tag des neuen
    Releases. Die Image-Tags sind die Release-Tags mit ihrem führenden `v`, dazu `latest`. Ohne `REPUTECAST_VERSION`
    verwendet die Compose-Datei `latest`.
 
@@ -162,6 +162,61 @@ bieten <UiPath path="shell.bannerReload" /> an, um die neue Version zu laden.
 Migrationen halten eine Sperre in PostgreSQL: Starten mehrere Prozesse mit `--auto-migrate`, wendet einer sie an,
 während die anderen auf ihn warten (bis zu 15 Minuten), sodass jede Migration einmal läuft. Führen Sie sie über eine
 direkte Verbindung oder eine Verbindung im Session-Modus aus, nicht über PgBouncer im Transaktionsmodus.
+
+## Upgrade auf 1.8.0
+
+Version 1.8.0 ändert auf dem Server Folgendes; die [Versionshinweise](/de/reference/release-notes/#180) listen den Rest
+auf.
+
+- **Was erhalten bleibt.** Die KI-Verbindung jedes Arbeitsbereichs wird sein erstes Modellkonto, mit demselben
+  Schlüssel, denselben Preisen, demselben Limit und derselben Nutzung, und ihr Modell wird der Standard jeder Funktion;
+  eine bestandene Tool-Prüfung gilt weiter. Der [KI-Assistent](/de/integrations/ai-assistant/) und
+  [persönliche Schlüssel](/de/integrations/ai-models/#persönliche-schlüssel) bleiben aus, bis jemand mit
+  `integrations:manage` sie einschaltet.
+- **Zuerst sichern:** die Datenbank, den geheimen Schlüssel und den Dateiordner
+  ([Sichern und wiederherstellen](/de/self-hosting/backups/)). Zurück zu 1.7.0 geht es nur mit dieser Sicherung oder mit
+  den Down-Migrationen unten.
+- **7 neue Migrationen** (`03630` bis `03660`). Starten Sie zuerst die neue Binärdatei oder das neue Image: Bis sie
+  gelaufen sind, arbeitet es nur lesend, und Lesezugriffe auf das, was sie hinzufügen, antworten mit `503` und dem Code
+  `maintenance` ([Solange Migrationen ausstehen](#solange-migrationen-ausstehen)). Führen Sie dann
+  `reputecast migrate up` aus oder lassen Sie `--auto-migrate` sie ausführen, und ersetzen Sie jeden Prozess von 1.7.0:
+  Sobald die erste Migration festgeschrieben ist, schlagen die KI-Seiten von 1.7.0 fehl.
+- **Sperren.** Die Migrationen dauerten im Upgrade-Test von Upstream insgesamt 1 bis 6 Sekunden, sperren aber das
+  KI-Aktivitätsprotokoll und kurz die Tabellen der Benutzer und Arbeitsbereiche. Bei 2 Millionen KI-Anfragen warteten
+  Schreibzugriffe auf das KI-Aktivitätsprotokoll bis zu 2,8 Sekunden, seine Lesezugriffe bis zu 1,5 Sekunden und
+  Anmeldungen und andere Änderungen an Personen und Arbeitsbereichen bis zu 1,5 Sekunden. Führen Sie sie zu einem
+  ruhigen Zeitpunkt aus, ohne offene lang laufende Transaktion: Eine Migration, die auf eine solche wartet, lässt jede
+  Anfrage an diese Tabellen hinter sich warten.
+- **Zurück zu 1.7.0** ist eine Ausnahme von der Regel für ein Minor-Release
+  ([Rollback durchführen](#rollback-durchführen)): 1.7.0 meldet sich auf dem Schema von 1.8.0 als bereit, aber seine
+  KI-Seiten antworten mit `500`. Stellen Sie die Sicherung wieder her oder stoppen Sie jeden Prozess von 1.8.0 und
+  führen Sie `reputecast migrate down` siebenmal mit der Binärdatei von 1.8.0 aus, bevor Sie 1.7.0 starten. Das löscht,
+  was in 1.8.0 angelegt wurde: die Einstellungen des Assistenten, die Unterhaltungen und ihre Nutzung; MCP-Server, ihre
+  Tools, die Anmeldungen der Mitglieder und wartende Bestätigungen, wobei noch zum Widerruf vorgemerkte Refresh-Tokens
+  nie gesendet werden; persönliche Schlüssel und die eigene Modellwahl der Mitglieder; und jedes Modellkonto nach dem
+  ersten eines Arbeitsbereichs, jedes Modell nach dem ersten dieses Kontos und das Standardmodell jeder Funktion.
+  Anfragen über persönliche Schlüssel zählen wieder zum Limit des Arbeitsbereichs. Ein Arbeitsbereich, dessen
+  übernommenes Konto entfernt wurde, erhält sein ältestes verbleibendes Konto getrennt und ohne Schlüssel zurück, und
+  einer ohne verbleibendes Konto verliert sein Limit und die Funktionen, die er ausgeschaltet hatte. Änderungen, die
+  1.8.0 am ersten Konto vorgenommen hat, etwa sein Limit oder ein ersetzter Schlüssel, bleiben erhalten.
+- **Worker und die Warteschlange `ai_assistant`.** Antworten des Assistenten laufen in Prozessen mit der Rolle `worker`,
+  bis zur Hälfte von `worker.concurrency` gleichzeitig und mindestens 10. Bei aufgeteilten Rollen lassen Sie einen
+  Worker laufen: Ohne ihn bleiben Nachrichten in der Warteschlange und schlagen nach 30 Minuten fehl
+  ([Skalieren](/de/self-hosting/scaling/#der-ki-assistent)).
+- **Eine PostgreSQL-Verbindung mehr je Web-Prozess.** Jeder Prozess mit der Rolle `web` hält außerhalb seines Pools eine
+  Verbindung, um mit `LISTEN` auf Ereignisse der Unterhaltungen zu warten: Lassen Sie dafür Platz in `max_connections`
+  und verbinden Sie sich direkt oder über PgBouncer im Session-Modus, nicht im Transaction-Modus
+  ([PostgreSQL](/de/self-hosting/postgres/#verbindungspool-dimensionieren)).
+- **Ereignisströme hinter einem Proxy.** Die Antworten des Assistenten sind Server-Sent Events: Schalten Sie die
+  Pufferung ab, komprimieren Sie `text/event-stream` nicht und liefern Sie HTTP/2 aus
+  ([Die Ereignisströme des Assistenten](/de/self-hosting/reverse-proxy/#die-ereignisströme-des-assistenten)).
+- **MCP-Server.** Die Anmeldung per OAuth braucht eine öffentliche `https://`-URL: Mitglieder kommen zu
+  `<öffentliche URL>/api/v1/ai/mcp/oauth/callback` zurück, und das Client-Metadatendokument von ReputeCast wird nur
+  unter einer `https://`-URL ausgeliefert
+  ([Die OAuth-Weiterleitungsadresse](/de/integrations/mcp-servers/#die-oauth-weiterleitungsadresse)).
+  `providers.allow_private_networks` erlaubt jetzt auch MCP-Server und ihre Autorisierungsserver unter privaten
+  Adressen, wie bisher schon OpenAI-kompatible Modellserver
+  ([Konfiguration](/de/self-hosting/configuration/#der-ki-assistent)).
 
 ## Upgrade auf 1.7.0
 
@@ -299,12 +354,9 @@ Rest auf.
 Die Rückkehr zum vorherigen Image oder zur vorherigen Binärdatei macht Migrationen nicht rückgängig: Die Datenbank
 behält das neuere Schema. Innerhalb eines Minor-Releases (1.3.0 bis 1.3.2) fügen Migrationen nur hinzu, und über ein
 Minor-Release hinweg (1.3 zu 1.2) läuft die ältere Binärdatei auf dem neueren Schema. Lesen Sie zuerst die
-Versionshinweise: Ein Release, das etwas entfernt oder umbenennt, sagt das. Version 1.8.0 ist ein solches Release: Die
-KI-Seiten von 1.7.0 schlagen auf ihrem Schema fehl. Zurück zu 1.7.0 geht es nur mit der Sicherung oder mit sieben
-Aufrufen von `reputecast migrate down` mit der Binärdatei von 1.8.0, bevor 1.7.0 startet; das löscht, was in 1.8.0
-angelegt wurde
-([Rückkehr von 1.8.0 zu 1.7.0](https://github.com/hostrepute/reputecast/blob/v1.8.0/docs/deploy/README.md#from-170-to-180)).
-Für weiter zurückliegende Versionen stellen Sie die Sicherung wieder her.
+Versionshinweise: Ein Release, das etwas entfernt oder umbenennt, sagt das. Version 1.8.0 ist ein solches Release:
+Zurück zu 1.7.0 geht es nur mit der Sicherung oder mit sieben Down-Migrationen, die löschen, was 1.8.0 angelegt hat
+([Upgrade auf 1.8.0](#upgrade-auf-180)). Für weiter zurückliegende Versionen stellen Sie die Sicherung wieder her.
 
 - **Stellen Sie die Sicherung wieder her**, um exakt zum Zustand vor dem Upgrade zurückzukehren: Stoppen Sie
   ReputeCast, stellen Sie den erstellten Dump wieder her (siehe
@@ -317,8 +369,8 @@ Für weiter zurückliegende Versionen stellen Sie die Sicherung wieder her.
   Callback-URL umgestellt wurden, brauchen unter 1.4 wieder die alte in Meta.
 - `reputecast migrate down` macht nur die neueste ReputeCast-Migration rückgängig, eine pro Aufruf, und lässt die
   Tabellen der Job-Warteschlange unberührt. Der Befehl ist für die Entwicklung gedacht: Down-Migrationen löschen Daten,
-  führen Sie ihn daher nicht auf einer Produktionsdatenbank aus, außer für die Rückkehr von 1.8.0 zu 1.7.0 wie oben
-  beschrieben.
+  führen Sie ihn daher nicht auf einer Produktionsdatenbank aus, außer für die Rückkehr von 1.8.0 zu 1.7.0
+  ([Upgrade auf 1.8.0](#upgrade-auf-180)).
 
 ## Fehlerbehebung
 

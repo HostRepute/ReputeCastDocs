@@ -138,6 +138,11 @@ Par exemple `https://news.example.com/api/v1/ai/mcp/oauth/callback`. L’URL pub
 <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, ou
 [`REPUTECAST_PUBLIC_URL`](/fr/self-hosting/configuration/).
 
+- Quand le serveur d’autorisation accepte les documents de métadonnées d’ID client, le client de ReputeCast est son
+  propre [document de métadonnées client](#le-document-de-métadonnées-client) à
+  `<URL publique>/api/v1/ai/mcp/oauth/client-metadata.json`, et le serveur d’autorisation y lit cette adresse de
+  redirection. Il faut pour cela une URL publique en `https://`, et la ligne du serveur indique alors « Client : cette
+  instance (document de métadonnées du client) ». Vous n’avez rien à saisir.
 - Quand ReputeCast s’enregistre lui-même auprès du serveur d’autorisation (enregistrement dynamique de client), il
   enregistre cette adresse. Vous n’avez rien à saisir.
 - Quand le serveur exige un client que vous avez enregistré, ouvrez <UiPath path="mcpservers.clientSummary" />,
@@ -150,9 +155,28 @@ La spécification d’autorisation de MCP exige que les adresses de redirection 
 serveurs d’autorisation peuvent refuser les autres
 ([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), vérifié en
 novembre 2026). Si l’URL publique change, l’adresse de redirection change avec elle : enregistrez la nouvelle pour un
-client que vous avez saisi. Un client que ReputeCast a enregistré garde l’ancienne adresse : effacez donc son ID client
-dans Modifier, et la connexion suivante enregistre un nouveau client. Attendez-vous à ce que les membres doivent se
-reconnecter.
+client que vous avez saisi. Un client que ReputeCast a enregistré, ou son document de métadonnées client, garde
+l’ancienne adresse : effacez donc son ID client dans Modifier, et la connexion suivante configure un nouveau client.
+Attendez-vous à ce que les membres doivent se reconnecter.
+
+### Le document de métadonnées client
+
+`GET <URL publique>/api/v1/ai/mcp/oauth/client-metadata.json` ne demande aucune connexion, est servi en
+`application/json` avec `Cache-Control: public, max-age=300`, et contient :
+
+```json title="client-metadata.json"
+{
+  "client_id": "https://news.example.com/api/v1/ai/mcp/oauth/client-metadata.json",
+  "client_name": "ReputeCast",
+  "redirect_uris": ["https://news.example.com/api/v1/ai/mcp/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+C’est un client public : PKCE, sans secret. Quand l’URL publique n’est pas en `https://`, l’adresse répond `404` et
+ReputeCast ne le propose pas.
 
 ### Ce que ReputeCast attend d’un serveur OAuth
 
@@ -169,17 +193,25 @@ connexion au serveur, puis de nouveau après l’effacement de son ID client :
    ressource pour laquelle ReputeCast demande des jetons. Un document qui nomme une autre ressource est refusé.
 3. Il prend le premier serveur d’autorisation listé et lit ses métadonnées : OAuth (RFC 8414) d’abord, puis la
    découverte OpenID Connect. Les métadonnées doivent lister `S256` dans `code_challenge_methods_supported`.
-4. Sans client que vous avez saisi, le serveur d’autorisation doit avoir un `registration_endpoint`. Les documents de
-   métadonnées d’ID client (Client ID metadata documents) ne sont pas pris en charge.
+4. Le client, dans l’ordre que donne la spécification MCP : celui que vous avez saisi ; sinon le
+   [document de métadonnées client](#le-document-de-métadonnées-client) de ReputeCast, quand les métadonnées indiquent
+   `client_id_metadata_document_supported` et que l’URL publique est en `https://` ; sinon un client enregistré à son
+   `registration_endpoint`. Sans aucun d’eux, la connexion s’arrête avec `mcp_oauth_client`.
 5. Il demande le scope que nommait le 401, sinon tous les scopes de `scopes_supported` de la ressource.
-6. L’authentification du client est soit aucune, soit HTTP basic avec le secret client. `client_secret_post` et
-   `private_key_jwt` ne sont pas pris en charge.
+6. L’authentification du client, pour les requêtes de jeton, d’actualisation et de révocation, suit
+   `token_endpoint_auth_methods_supported` : aucune pour un client sans secret ; avec un secret, `client_secret_basic`
+   quand il est listé (ou quand rien n’est listé), sinon `client_secret_post`. Le `token_endpoint_auth_method` propre à
+   un enregistrement dynamique l’emporte. `private_key_jwt` et les méthodes TLS ne sont pas pris en charge
+   (`mcp_oauth_client_auth`).
 7. Les adresses de métadonnées doivent être en https (http simple uniquement en loopback).
 8. Il conserve le `revocation_endpoint` du serveur d’autorisation, s’il en a un, pour
    [révoquer les connexions supprimées](#révoquer-les-connexions-supprimées).
 
 Quand l’une de ces étapes échoue, la connexion indique « La connexion à … n’a pas pu être configurée : son serveur
-d’autorisation n’a pas répondu comme prévu. Vérifiez l’adresse ou saisissez un client enregistré. »
+d’autorisation n’a pas répondu comme prévu. Vérifiez l’adresse ou saisissez un client enregistré. » Sans client, ou
+quand le serveur n’accepte que des méthodes que ReputeCast ne prend pas en charge, les personnes qui gèrent les
+intégrations obtiennent Modifier avec « Saisissez un client pour … » ou « La méthode de connexion de … n’est pas prise
+en charge » et la raison ; les autres voient le même titre dans un message.
 
 ## Examiner les outils
 
@@ -233,10 +265,13 @@ pas enregistrée et la page affiche la nouvelle version : « Cet outil a chang
 ## Quand un outil change
 
 Une décision est enregistrée avec l’empreinte de la description, du schéma d’entrée et des annotations de l’outil tels
-que vous les avez examinés. ReputeCast compare les outils d’un serveur avec ce qui a été décidé à trois moments :
+que vous les avez examinés. ReputeCast compare les outils d’un serveur avec ce qui a été décidé à ces moments :
 
 - **Avant chaque appel.** Dans la session propre à l’appel, ReputeCast liste d’abord les outils du serveur. Si l’outil
   n’est plus listé, ou diffère de la version sur laquelle porte la décision, l’appel n’est pas envoyé.
+- **Quand le serveur signale pendant un appel que ses outils ont changé** (`notifications/tools/list_changed`).
+  ReputeCast les liste de nouveau dans cette session. Si l’outil appelé a changé ou a disparu, son résultat n’est pas
+  utilisé et l’appel se termine par `mcp_tool_changed`, même si le serveur a peut-être déjà agi.
 - **Toutes les heures**, pour les serveurs dont la connexion est <UiPath path="mcpservers.optNone" /> ou un
   <UiPath path="mcpservers.optHeader" />, qui sont activés et ont déjà été synchronisés (la tâche `mcp.servers_sync`, au
   plus 20 serveurs par passage). Les serveurs OAuth sont listés au nom d’une personne : seuls la vérification avant
@@ -323,12 +358,13 @@ travail, et retirer un serveur supprime la connexion de chaque membre à ce serv
 ### Révoquer les connexions supprimées
 
 Quand le serveur d’autorisation a annoncé un `revocation_endpoint`, ReputeCast révoque aussi le jeton d’actualisation de
-chaque connexion qu’il supprime (RFC 7009) : sur Déconnecter, quand le membre part, est retiré ou est désactivé, quand le
-serveur est retiré, et quand le serveur a refusé la connexion. Sur Déconnecter, il traite la file aussitôt (jusqu’à 10
-jetons, pendant 10 secondes au plus) ; la tâche `mcp.tokens_revoke` envoie le reste toutes les minutes. C’est au mieux :
-chaque jeton est essayé une fois, une révocation échouée est journalisée sans le jeton, et la connexion disparaît dans
-tous les cas. Les jetons d’accès ne sont pas révoqués ; ils deviennent caducs à leur expiration. Sans
-`revocation_endpoint`, rien n’est révoqué : utilisez les réglages propres au serveur.
+chaque connexion qu’il supprime (RFC 7009), en s’authentifiant comme son client le fait au point de terminaison de
+jeton : sur Déconnecter, quand le membre part, est retiré ou est désactivé, quand le serveur est retiré, et quand le
+serveur a refusé la connexion. Sur Déconnecter, il traite la file aussitôt (jusqu’à 10 jetons, pendant 10 secondes au
+plus) ; la tâche `mcp.tokens_revoke` envoie le reste toutes les minutes. C’est au mieux : chaque jeton est essayé une
+fois, une révocation échouée est journalisée sans le jeton, et la connexion disparaît dans tous les cas. Les jetons
+d’accès ne sont pas révoqués ; ils deviennent caducs à leur expiration. Sans `revocation_endpoint`, rien n’est révoqué :
+utilisez les réglages propres au serveur.
 
 ## Vérifier le résultat
 
@@ -350,6 +386,8 @@ tous les cas. Les jetons d’accès ne sont pas révoqués ; ils deviennent ca
 | **… a mis trop de temps** | L’outil n’a pas répondu en 30 secondes. | Redemandez plus tard. |
 | **… a envoyé trop de données** | La réponse dépassait 32 Ko : le modèle ne l’a donc pas reçue. | Posez une question plus précise. |
 | « La connexion à … n’a pas pu être configurée » | La découverte ou l’enregistrement a échoué. | Vérifiez [ce qu’attend ReputeCast](#ce-que-reputecast-attend-dun-serveur-oauth), ou saisissez un client enregistré. |
+| « Saisissez un client pour … » | Le serveur d’autorisation n’accepte ni le document de métadonnées client de ReputeCast ni l’enregistrement dynamique (`mcp_oauth_client`). | Un responsable y enregistre un client avec l’[adresse de redirection](#ladresse-de-redirection-oauth) et le saisit dans Modifier. |
+| « La méthode de connexion de … n’est pas prise en charge » | Le serveur d’autorisation n’accepte qu’une authentification client que ReputeCast ne prend pas en charge, comme `private_key_jwt` (`mcp_oauth_client_auth`). | Enregistrez un client qui utilise none, `client_secret_basic` ou `client_secret_post`. |
 | « Connexion impossible à une adresse privée » | Le serveur est sur votre propre réseau. | Un exploitant définit `providers.allow_private_networks`. |
 
 </TableScroll>

@@ -129,6 +129,10 @@ The authorization server sends people back to the same address for every server 
 For example `https://news.example.com/api/v1/ai/mcp/oauth/callback`. The public URL is the one saved in
 <UiPath path="shell.userMenuInstanceAdmin > admin.instance" />, or [`REPUTECAST_PUBLIC_URL`](/self-hosting/configuration/).
 
+- When the authorization server takes Client ID Metadata Documents, ReputeCast's client is its own
+  [client metadata document](#the-client-metadata-document) at `<public URL>/api/v1/ai/mcp/oauth/client-metadata.json`,
+  and the authorization server reads this redirect address from it. This needs an `https://` public URL, and the
+  server's row then says "Client: this instance (client metadata document)". You don't enter anything.
 - When ReputeCast registers itself with the authorization server (dynamic client registration), it registers this
   address. You don't enter anything.
 - When the server needs a client you registered, open <UiPath path="mcpservers.clientSummary" />, enter the
@@ -139,8 +143,27 @@ For example `https://news.example.com/api/v1/ai/mcp/oauth/callback`. The public 
 The MCP authorization specification requires redirect addresses to use https (or localhost), and authorization servers
 may refuse others ([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization),
 checked November 2026). If the public URL changes, the redirect address changes with it: register the new one for a
-client you entered. A client ReputeCast registered keeps the old address, so clear its Client ID in Edit and the next
-sign-in registers a new client. Expect members to sign in again.
+client you entered. A client ReputeCast registered, or its client metadata document, keeps the old address, so clear its
+Client ID in Edit and the next sign-in sets up a new client. Expect members to sign in again.
+
+### The client metadata document
+
+`GET <public URL>/api/v1/ai/mcp/oauth/client-metadata.json` needs no sign-in, is sent as `application/json` with
+`Cache-Control: public, max-age=300`, and reads:
+
+```json title="client-metadata.json"
+{
+  "client_id": "https://news.example.com/api/v1/ai/mcp/oauth/client-metadata.json",
+  "client_name": "ReputeCast",
+  "redirect_uris": ["https://news.example.com/api/v1/ai/mcp/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+It is a public client: PKCE, no secret. When the public URL isn't `https://`, the address answers `404` and ReputeCast
+doesn't offer it.
 
 ### What ReputeCast expects from an OAuth server
 
@@ -157,17 +180,23 @@ after its Client ID is cleared:
    for. A document that names any other resource is refused.
 3. It takes the first authorization server listed and reads its metadata: OAuth (RFC 8414) first, then OpenID Connect
    discovery. The metadata must list `S256` in `code_challenge_methods_supported`.
-4. Without a client you entered, the authorization server needs a `registration_endpoint`. Client ID metadata
-   documents aren't supported.
+4. The client, in the order the MCP specification gives: the one you entered; else ReputeCast's
+   [client metadata document](#the-client-metadata-document), when the metadata says
+   `client_id_metadata_document_supported` and the public URL is `https://`; else a client registered at its
+   `registration_endpoint`. Without any of them, the sign-in stops with `mcp_oauth_client`.
 5. It asks for the scope the 401 named, or else every scope in the resource's `scopes_supported`.
-6. Client authentication is none, or HTTP basic with the client secret. `client_secret_post` and `private_key_jwt`
-   aren't supported.
+6. Client authentication, for the token, refresh and revocation requests, follows
+   `token_endpoint_auth_methods_supported`: none for a client without a secret; with a secret, `client_secret_basic`
+   when listed (or when nothing is listed), else `client_secret_post`. A dynamic registration's own
+   `token_endpoint_auth_method` wins. `private_key_jwt` and the TLS methods aren't supported (`mcp_oauth_client_auth`).
 7. Metadata addresses must be https (plain http only on loopback).
 8. It keeps the authorization server's `revocation_endpoint`, if it has one, to
    [revoke removed sign-ins](#revoking-removed-sign-ins).
 
 When any of these fails, the sign-in says "…'s sign-in couldn't be set up: its authorization server didn't answer as
-expected. Check the address or enter a registered client."
+expected. Check the address or enter a registered client." Without a client, or when the server accepts only methods
+ReputeCast doesn't support, people who manage integrations get Edit with "Enter a client for …" or "…'s sign-in method
+isn't supported" and the reason; others see the same title in a message.
 
 ## Review the tools
 
@@ -220,10 +249,13 @@ changed on the server while you reviewed it."
 ## When a tool changes
 
 A decision is saved with the hash of the tool's description, input schema and annotations as you reviewed them.
-ReputeCast compares a server's tools with what was decided at three moments:
+ReputeCast compares a server's tools with what was decided at these moments:
 
 - **Before every call.** In the call's own session, ReputeCast lists the server's tools first. If the tool is no longer
   listed, or differs from the version decided on, the call isn't sent.
+- **When the server says its tools changed during a call** (`notifications/tools/list_changed`). ReputeCast lists them
+  again in that session. If the tool being called changed or went, its result isn't used and the call ends as
+  `mcp_tool_changed`, though the server may already have acted on it.
 - **Every hour**, for servers with <UiPath path="mcpservers.optNone" /> or a <UiPath path="mcpservers.optHeader" />
   that are on and were synced before (the `mcp.servers_sync` job, at most 20 servers a run). OAuth servers are listed
   as a person, so only the check before each call and a manager's Sync tools cover them.
@@ -303,12 +335,12 @@ to it.
 ### Revoking removed sign-ins
 
 When the authorization server advertised a `revocation_endpoint`, ReputeCast also revokes the refresh token of every
-sign-in it removes (RFC 7009): on Disconnect, when the member leaves, is removed or is deactivated, when the server is
-removed, and when the server refused the sign-in. On Disconnect it works through the queue at once (up to 10 tokens, for
-up to 10 seconds); the `mcp.tokens_revoke` job sends what is left every minute. It is best effort: each token is tried
-once, a failed revocation is logged without the token, and the sign-in is gone either way. Access tokens aren't
-revoked; they lapse when they expire. Without a `revocation_endpoint`, nothing is revoked: use the server's own
-settings.
+sign-in it removes (RFC 7009), authenticating as its client does at the token endpoint: on Disconnect, when the member
+leaves, is removed or is deactivated, when the server is removed, and when the server refused the sign-in. On Disconnect
+it works through the queue at once (up to 10 tokens, for up to 10 seconds); the `mcp.tokens_revoke` job sends what is
+left every minute. It is best effort: each token is tried once, a failed revocation is logged without the token, and the
+sign-in is gone either way. Access tokens aren't revoked; they lapse when they expire. Without a `revocation_endpoint`,
+nothing is revoked: use the server's own settings.
 
 ## Check that it worked
 
@@ -330,6 +362,8 @@ settings.
 | **… took too long** | The tool didn't answer within 30 seconds. | Ask again later. |
 | **… sent too much** | The answer was over 32 KB, so the model didn't get it. | Ask a narrower question. |
 | "…'s sign-in couldn't be set up" | Discovery or registration failed. | Check [what ReputeCast expects](#what-reputecast-expects-from-an-oauth-server), or enter a registered client. |
+| "Enter a client for …" | The authorization server takes neither ReputeCast's client metadata document nor dynamic registration (`mcp_oauth_client`). | A manager registers a client there with the [redirect address](#the-oauth-redirect-address) and enters it in Edit. |
+| "…'s sign-in method isn't supported" | The authorization server accepts only client authentication ReputeCast doesn't support, such as `private_key_jwt` (`mcp_oauth_client_auth`). | Register a client that uses none, `client_secret_basic` or `client_secret_post`. |
 | "Can't connect to a private address" | The server is on your own network. | An operator sets `providers.allow_private_networks`. |
 
 </TableScroll>

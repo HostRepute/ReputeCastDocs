@@ -136,6 +136,11 @@ Zum Beispiel `https://news.example.com/api/v1/ai/mcp/oauth/callback`. Die öffen
 <UiPath path="shell.userMenuInstanceAdmin > admin.instance" /> gespeichert ist, oder
 [`REPUTECAST_PUBLIC_URL`](/de/self-hosting/configuration/).
 
+- Nimmt der Autorisierungsserver Client-ID-Metadatendokumente an, ist der Client von ReputeCast dessen eigenes
+  [Client-Metadatendokument](#das-client-metadatendokument) unter
+  `<öffentliche URL>/api/v1/ai/mcp/oauth/client-metadata.json`, und der Autorisierungsserver liest diese
+  Weiterleitungsadresse daraus. Dafür braucht es eine öffentliche `https://`-URL; die Zeile des Servers zeigt dann
+  „Client: diese Instanz (Client-Metadatendokument)“. Sie geben nichts ein.
 - Wenn sich ReputeCast selbst beim Autorisierungsserver registriert (dynamische Client-Registrierung), registriert es
   diese Adresse. Sie geben nichts ein.
 - Wenn der Server einen von Ihnen registrierten Client braucht, öffnen Sie <UiPath path="mcpservers.clientSummary" />,
@@ -148,9 +153,28 @@ Die MCP-Autorisierungsspezifikation verlangt, dass Weiterleitungsadressen https 
 Autorisierungsserver dürfen andere ablehnen
 ([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), geprüft im November
 2026). Ändert sich die öffentliche URL, ändert sich die Weiterleitungsadresse mit: Registrieren Sie die neue für einen
-Client, den Sie eingetragen haben. Ein Client, den ReputeCast registriert hat, behält die alte Adresse; leeren Sie daher
-seine Client-ID in Bearbeiten, und die nächste Anmeldung registriert einen neuen Client. Rechnen Sie damit, dass sich
-Mitglieder erneut anmelden müssen.
+Client, den Sie eingetragen haben. Ein Client, den ReputeCast registriert hat, oder sein Client-Metadatendokument behält
+die alte Adresse; leeren Sie daher seine Client-ID in Bearbeiten, und die nächste Anmeldung richtet einen neuen Client
+ein. Rechnen Sie damit, dass sich Mitglieder erneut anmelden müssen.
+
+### Das Client-Metadatendokument
+
+`GET <öffentliche URL>/api/v1/ai/mcp/oauth/client-metadata.json` braucht keine Anmeldung, wird als `application/json`
+mit `Cache-Control: public, max-age=300` ausgeliefert und lautet:
+
+```json title="client-metadata.json"
+{
+  "client_id": "https://news.example.com/api/v1/ai/mcp/oauth/client-metadata.json",
+  "client_name": "ReputeCast",
+  "redirect_uris": ["https://news.example.com/api/v1/ai/mcp/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+Es ist ein öffentlicher Client: PKCE, kein Secret. Ist die öffentliche URL nicht `https://`, antwortet die Adresse mit
+`404`, und ReputeCast bietet sie nicht an.
 
 ### Was ReputeCast von einem OAuth-Server erwartet
 
@@ -167,18 +191,25 @@ Anmeldung beim Server und erneut, nachdem seine Client-ID geleert wurde:
    Ressource ist, für die ReputeCast Tokens anfordert. Ein Dokument, das eine andere Ressource nennt, wird abgelehnt.
 3. Es nimmt den ersten aufgeführten Autorisierungsserver und liest seine Metadaten: zuerst OAuth (RFC 8414), dann
    OpenID Connect Discovery. Die Metadaten müssen `S256` in `code_challenge_methods_supported` aufführen.
-4. Ohne einen von Ihnen eingetragenen Client braucht der Autorisierungsserver einen `registration_endpoint`.
-   Client-ID-Metadatendokumente werden nicht unterstützt.
+4. Der Client, in der Reihenfolge der MCP-Spezifikation: der von Ihnen eingetragene; sonst das
+   [Client-Metadatendokument](#das-client-metadatendokument) von ReputeCast, wenn die Metadaten
+   `client_id_metadata_document_supported` angeben und die öffentliche URL `https://` ist; sonst ein Client, der an
+   seinem `registration_endpoint` registriert wird. Ohne einen davon endet die Anmeldung mit `mcp_oauth_client`.
 5. Es fordert den Scope an, den der 401 genannt hat, sonst jeden Scope aus den `scopes_supported` der Ressource.
-6. Die Client-Authentifizierung ist keine oder HTTP Basic mit dem Client-Secret. `client_secret_post` und
-   `private_key_jwt` werden nicht unterstützt.
+6. Die Client-Authentifizierung für die Token-, Refresh- und Widerrufsanfragen richtet sich nach
+   `token_endpoint_auth_methods_supported`: keine für einen Client ohne Secret; mit Secret `client_secret_basic`, wenn
+   aufgeführt (oder wenn nichts aufgeführt ist), sonst `client_secret_post`. Die eigene `token_endpoint_auth_method`
+   einer dynamischen Registrierung hat Vorrang. `private_key_jwt` und die TLS-Methoden werden nicht unterstützt
+   (`mcp_oauth_client_auth`).
 7. Metadatenadressen müssen https verwenden (einfaches http nur auf Loopback).
 8. Es merkt sich den `revocation_endpoint` des Autorisierungsservers, falls vorhanden, um
    [entfernte Anmeldungen zu widerrufen](#entfernte-anmeldungen-widerrufen).
 
 Schlägt einer dieser Schritte fehl, meldet die Anmeldung: „Die Anmeldung bei … ließ sich nicht einrichten: Der
 Autorisierungsserver hat nicht wie erwartet geantwortet. Prüfen Sie die Adresse oder tragen Sie einen registrierten
-Client ein.“
+Client ein.“ Fehlt ein Client oder nimmt der Server nur Methoden an, die ReputeCast nicht unterstützt, öffnet sich für
+Verantwortliche Bearbeiten mit „Client für … eintragen“ oder „Die Anmeldemethode von … wird nicht unterstützt“ und dem
+Grund; andere sehen denselben Titel in einer Meldung.
 
 ## Tools prüfen
 
@@ -233,11 +264,15 @@ geändert, während Sie es geprüft haben.“
 ## Wenn sich ein Tool ändert
 
 Eine Entscheidung wird mit dem Hash der Beschreibung, des Eingabeschemas und der Annotations des Tools gespeichert, so
-wie Sie sie geprüft haben. ReputeCast vergleicht die Tools eines Servers zu drei Zeitpunkten mit dem, was entschieden
+wie Sie sie geprüft haben. ReputeCast vergleicht die Tools eines Servers zu diesen Zeitpunkten mit dem, was entschieden
 wurde:
 
 - **Vor jedem Aufruf.** In der eigenen Sitzung des Aufrufs listet ReputeCast zuerst die Tools des Servers. Ist das Tool
   nicht mehr aufgeführt oder weicht es von der entschiedenen Version ab, wird der Aufruf nicht gesendet.
+- **Wenn der Server während eines Aufrufs meldet, dass sich seine Tools geändert haben**
+  (`notifications/tools/list_changed`). ReputeCast listet sie in dieser Sitzung erneut. Hat sich das aufgerufene Tool
+  geändert oder ist es verschwunden, wird sein Ergebnis nicht verwendet, und der Aufruf endet mit `mcp_tool_changed`,
+  auch wenn der Server womöglich schon gehandelt hat.
 - **Jede Stunde** für eingeschaltete Server mit der Anmeldung <UiPath path="mcpservers.optNone" /> oder
   <UiPath path="mcpservers.optHeader" />, die schon einmal synchronisiert wurden (der Job `mcp.servers_sync`, höchstens
   20 Server pro Lauf). OAuth-Server werden im Namen einer Person gelistet, daher decken sie nur die Prüfung vor jedem
@@ -321,13 +356,13 @@ Arbeitsbereich, und das Entfernen eines Servers löscht die Anmeldungen aller Mi
 ### Entfernte Anmeldungen widerrufen
 
 Hat der Autorisierungsserver einen `revocation_endpoint` angegeben, widerruft ReputeCast außerdem das Refresh-Token
-jeder Anmeldung, die es entfernt (RFC 7009): beim Trennen, wenn das Mitglied den Arbeitsbereich verlässt, daraus
-entfernt oder deaktiviert wird, wenn der Server entfernt wird und wenn der Server die Anmeldung abgelehnt hat. Beim
-Trennen arbeitet es die Warteschlange sofort ab (bis zu 10 Tokens, bis zu 10 Sekunden lang); der Job
-`mcp.tokens_revoke` sendet den Rest jede Minute. Das geschieht nach bestem Bemühen: Jedes Token wird einmal versucht,
-ein fehlgeschlagener Widerruf wird ohne das Token protokolliert, und die Anmeldung ist in jedem Fall entfernt.
-Access-Tokens werden nicht widerrufen; sie verfallen, wenn sie ablaufen. Ohne `revocation_endpoint` wird nichts
-widerrufen: Nutzen Sie die Einstellungen des Servers selbst.
+jeder Anmeldung, die es entfernt (RFC 7009), und authentifiziert sich dabei so wie sein Client am Token-Endpunkt: beim
+Trennen, wenn das Mitglied den Arbeitsbereich verlässt, daraus entfernt oder deaktiviert wird, wenn der Server entfernt
+wird und wenn der Server die Anmeldung abgelehnt hat. Beim Trennen arbeitet es die Warteschlange sofort ab (bis zu 10
+Tokens, bis zu 10 Sekunden lang); der Job `mcp.tokens_revoke` sendet den Rest jede Minute. Das geschieht nach bestem
+Bemühen: Jedes Token wird einmal versucht, ein fehlgeschlagener Widerruf wird ohne das Token protokolliert, und die
+Anmeldung ist in jedem Fall entfernt. Access-Tokens werden nicht widerrufen; sie verfallen, wenn sie ablaufen. Ohne
+`revocation_endpoint` wird nichts widerrufen: Nutzen Sie die Einstellungen des Servers selbst.
 
 ## Prüfen, ob es funktioniert hat
 
@@ -349,6 +384,8 @@ widerrufen: Nutzen Sie die Einstellungen des Servers selbst.
 | **… hat zu lange gebraucht** | Das Tool hat nicht innerhalb von 30 Sekunden geantwortet. | Fragen Sie später erneut. |
 | **… hat zu viel gesendet** | Die Antwort war größer als 32 KB, daher hat das Modell sie nicht erhalten. | Stellen Sie eine engere Frage. |
 | „Die Anmeldung bei … ließ sich nicht einrichten“ | Erkennung oder Registrierung sind fehlgeschlagen. | Prüfen Sie, [was ReputeCast erwartet](#was-reputecast-von-einem-oauth-server-erwartet), oder tragen Sie einen registrierten Client ein. |
+| „Client für … eintragen“ | Der Autorisierungsserver nimmt weder das Client-Metadatendokument von ReputeCast noch eine dynamische Registrierung an (`mcp_oauth_client`). | Verantwortliche registrieren dort einen Client mit der [Weiterleitungsadresse](#die-oauth-weiterleitungsadresse) und tragen ihn unter Bearbeiten ein. |
+| „Die Anmeldemethode von … wird nicht unterstützt“ | Der Autorisierungsserver akzeptiert nur Client-Authentifizierung, die ReputeCast nicht unterstützt, etwa `private_key_jwt` (`mcp_oauth_client_auth`). | Registrieren Sie einen Client, der none, `client_secret_basic` oder `client_secret_post` nutzt. |
 | „Keine Verbindung zu einer privaten Adresse möglich“ | Der Server liegt in Ihrem eigenen Netzwerk. | Ein Serverbetreiber setzt `providers.allow_private_networks`. |
 
 </TableScroll>
